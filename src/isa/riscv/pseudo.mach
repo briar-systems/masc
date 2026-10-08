@@ -1,0 +1,460 @@
+# the risc-v pseudo instructions that are several instructions: li, la, lla, call and tail
+#
+# a respelling of one instruction is an alias of the syntax. these are
+# macros: each expands to the instructions the vendor tools write for it, as
+# `relax.Expansion`s over the rows of the catalog, found by mnemonic through
+# the syntax's index and admitted by the selection. `li` follows llvm's
+# constant materialisation (RISCVMatInt.cpp), so its sequence is the one the
+# vendor tools produce. the pair of a symbol's high and low parts takes a
+# label naming its first instruction, which is what the low part's
+# `%pcrel_lo` relocation names, and the pairs of call and tail carry the
+# marker that lets the linker relax them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use std.allocator.testing;
+
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.row;
+use masc.core.spelling;
+
+use riscv_catalog:   masc.isa.riscv.catalog;
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_fixup:     masc.isa.riscv.fixup;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_syntax:    masc.isa.riscv.syntax;
+
+use masc.isa.riscv.gen_syntax;
+
+# the instructions a constant is built from, in the order they run
+# ---
+# LUI:   the upper twenty bits
+# ADDI:  an addition of a signed twelve bit immediate
+# ADDIW: the same, sign extending its 32 bit result
+# SLLI:  a left shift
+# SRLI:  a logical right shift
+pub def Op: u8;
+
+pub val LUI:   Op = 0;
+pub val ADDI:  Op = 1;
+pub val ADDIW: Op = 2;
+pub val SLLI:  Op = 3;
+pub val SRLI:  Op = 4;
+
+# one step of a constant's materialisation
+pub rec Step {
+    op:  Op;
+    imm: i64;
+}
+
+# a constant's materialisation, which llvm keeps to eight steps and which the alternatives tried on the way may exceed
+pub rec Sequence {
+    steps: [16]Step;
+    len:   u32;
+}
+
+fun push(seq: *Sequence, op: Op, imm: i64) {
+    # no sequence the alternatives build is longer than the room, the longest being eleven
+    if (seq.len >= 16) { ret; }
+    seq.steps[seq.len] = Step{op: op, imm: imm};
+    seq.len            = seq.len + 1;
+}
+
+fun int12(v: i64) bool {
+    ret v >= -2048 && v < 2048;
+}
+
+fun int32(v: i64) bool {
+    ret v >= -2147483648 && v < 2147483648;
+}
+
+# the low twelve bits of `v`, sign extended
+fun lo12(v: i64) i64 {
+    ret ((v & 0xFFF) ^ 0x800) - 0x800;
+}
+
+# the number of zero bits `v` ends in, 64 for zero
+fun trailing_zeros(v: i64) u32 {
+    if (v == 0) { ret 64; }
+    var n: u32 = 0;
+    var u: u64 = v:~u64;
+    for ((u & 1) == 0) {
+        u = u >> 1;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# the number of zero bits `v` starts with, 64 for zero
+fun leading_zeros(v: i64) u32 {
+    var n: u32 = 0;
+    var u: u64 = v:~u64;
+    for (n < 64 && (u & (1::u64 << 63)) == 0) {
+        u = u << 1;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# llvm's sequence for `v`, before the shifted alternatives (generateInstSeqImpl)
+fun materialize(v: i64, rv64: bool, seq: *Sequence) {
+    if (int32(v)) {
+        val hi: i64 = ((v + 0x800) >> 12) & 0xFFFFF;
+        val lo: i64 = lo12(v);
+        if (hi != 0) { push(seq, LUI, hi); }
+        if (lo != 0 || hi == 0) {
+            # lui sign extends bit 31, so the addition needs the word form when it carries out of 32 bits
+            val upper: i64 = (((hi << 12) ^ 0x80000000) - 0x80000000);
+            if (rv64 && upper + lo != v) { push(seq, ADDIW, lo); }
+            or                           { push(seq, ADDI, lo); }
+        }
+        ret;
+    }
+    split(v, lo12(v), rv64, seq);
+}
+
+# the constant `v` less its low part `low`, built as a constant of the width the shift leaves, shifted back, and `low` added
+fun split(v: i64, low: i64, rv64: bool, seq: *Sequence) {
+    var upper: u64 = (v:~u64 - low:~u64) >> 12;
+    var shift: u32 = 12 + trailing_zeros(upper:~i64);
+    upper = upper >> (shift - 12)::u64;
+    var rest: i64 = ((upper << shift::u64):~i64) >> shift::i64;
+    # fewer shifted bits when what remains fits a lui, which clears the low twelve
+    if (shift > 12 && !int12(rest) && int32((rest:~u64 << 12):~i64)) {
+        shift = shift - 12;
+        rest  = (rest:~u64 << 12):~i64;
+    }
+    materialize(rest, rv64, seq);
+    if (shift != 0) { push(seq, SLLI, shift::i64); }
+    if (low >= -2048 && low < 2048) {
+        if (low != 0) { push(seq, ADDI, low); }
+        ret;
+    }
+    var first: i64 = -2048;
+    if (low > 0) { first = 2047; }
+    push(seq, ADDI, first);
+    push(seq, ADDI, low - first);
+}
+
+# the sequence that builds the constant `v`, llvm's choice among its alternatives (generateInstSeq)
+pub fun sequence(v: i64, rv64: bool, out: *Sequence) {
+    out.len = 0;
+    materialize(v, rv64, out);
+    # a low part that is positive can be two additions of a negative one, which leaves the rest with more zeros to shift out
+    if (!int32(v) && (v & 1) != 0 && lo12(v) > 0) {
+        var tmp: Sequence;
+        tmp.len = 0;
+        split(v, lo12(v) - 4096, rv64, ?tmp);
+        if (tmp.len < out.len) { @out = tmp; }
+    }
+    # trailing zeros: build the constant shifted down, and shift it back
+    if ((v & 0xFFF) != 0 && (v & 1) == 0 && out.len >= 2) {
+        val zeros:   u32 = trailing_zeros(v);
+        val shifted: i64 = v >> zeros::i64;
+        var tmp:     Sequence;
+        tmp.len = 0;
+        materialize(shifted, rv64, ?tmp);
+        if (tmp.len + 1 < out.len || (shifted >= -32 && shifted < 32)) {
+            push(?tmp, SLLI, zeros::i64);
+            @out = tmp;
+        }
+    }
+    # leading zeros: build the constant shifted up with ones below, and shift it back
+    if (v > 0 && out.len > 2) {
+        val zeros: u32 = leading_zeros(v);
+        var wide:  u64 = v:~u64 << zeros::u64;
+        wide = wide | ((1::u64 << zeros::u64) - 1);
+        var tmp: Sequence;
+        tmp.len = 0;
+        materialize(wide:~i64, rv64, ?tmp);
+        if (tmp.len + 1 < out.len) {
+            push(?tmp, SRLI, zeros::i64);
+            @out = tmp;
+        }
+        wide    = wide & ~((1::u64 << zeros::u64) - 1);
+        tmp.len = 0;
+        materialize(wide:~i64, rv64, ?tmp);
+        if (tmp.len + 1 < out.len) {
+            push(?tmp, SRLI, zeros::i64);
+            @out = tmp;
+        }
+    }
+}
+
+# the first row spelled `name` that the selection admits, none when no row is: a binary search of the syntax's index
+fun row_named(available: *register.Available, name: str) opt[*row.Row] {
+    val key: View = view(name, str_len(name));
+    var lo:  u32  = 0;
+    var hi:  u32  = gen_syntax.ENTRY_COUNT;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        val at:  str = gen_syntax.ENTRIES[mid].key;
+        val c:   i64 = spelling.compare(?riscv_syntax.SYNTAX, view(at, str_len(at)), key);
+        if (c == 0) {
+            var i: u32 = 0;
+            for (i < gen_syntax.ENTRIES[mid].len) {
+                val cand: spelling.Candidate = gen_syntax.CANDIDATES[gen_syntax.ENTRIES[mid].first + i];
+                val r:    *row.Row           = ?riscv_catalog.CODEC.rows.at[cand.row];
+                if (cand.alias == 0 && extension.admits(available.selection, r.requires)) { ret opt[*row.Row].some{r}; }
+                i = i + 1;
+            }
+            ret opt[*row.Row].none{};
+        }
+        if (c < 0) { lo = mid + 1; }
+        or         { hi = mid; }
+    }
+    ret opt[*row.Row].none{};
+}
+
+fun reg(n: u16) operand.Value {
+    ret operand.Value.register{register.make(0, n)};
+}
+
+fun imm(v: i64) operand.Value {
+    ret operand.Value.immediate{v};
+}
+
+# the next instruction of `out`, of the row spelled `name`
+fun next(available: *register.Available, name: str, out: *relax.Expansion) *relax.Emitted {
+    val r: opt[*row.Row] = row_named(available, name);
+    if (sel r.none)                   { ret nil; }
+    if (out.count >= relax.MAX_STEPS) { ret nil; }
+    val e: *relax.Emitted = ?out.steps[out.count];
+    e.row     = r.some;
+    e.marker  = operand.NO_FIXUP;
+    out.count = out.count + 1;
+    ret e;
+}
+
+# whether the selection holds the 64 bit base
+fun wide(available: *register.Available) bool {
+    ret extension.has(available.selection, riscv_extension.RV64);
+}
+
+# `li rd, v`: the constant `v` built in `rd`, `v` being any 64 bit value at rv64 and any 32 bit value, signed or not, at rv32
+# ---
+# ret: whether the selection admits every row it needs and the constant fits the width
+pub fun li(available: *register.Available, rd: register.Id, v: i64, out: *relax.Expansion) bool {
+    out.count = 0;
+    val rv64:  bool = wide(available);
+    var value: i64  = v;
+    if (!rv64) {
+        if (v < -2147483648 || v > 4294967295) { ret false; }
+        value = ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000;
+    }
+    var seq: Sequence;
+    sequence(value, rv64, ?seq);
+    var i: u32 = 0;
+    for (i < seq.len) {
+        val s:    Step = seq.steps[i];
+        var name: str  = "addi";
+        if (s.op == LUI)   { name = "lui"; }
+        if (s.op == ADDIW) { name = "addiw"; }
+        if (s.op == SLLI)  { name = "slli"; }
+        if (s.op == SRLI)  { name = "srli"; }
+        val e: *relax.Emitted = next(available, name, out);
+        if (e == nil) { ret false; }
+        e.values[0] = operand.Value.register{rd};
+        if (s.op == LUI) { e.values[1] = imm(s.imm); }
+        or {
+            # the first addi adds to zero, every other step to what is built
+            if (i == 0) { e.values[1] = reg(0); }
+            or          { e.values[1] = operand.Value.register{rd}; }
+            e.values[2] = imm(s.imm);
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a symbol operand of the fixup kind `kind`, the operand's own when `kind` is operand.NO_FIXUP
+fun symbolic(id: u32, addend: i64, kind: operand.FixupKind) operand.Value {
+    ret operand.Value.symbol{operand.Symbol{id: id, addend: addend, fixup: kind}};
+}
+
+# the pair of a high part and a low part, the low naming the label of the high. the high takes the fixup kind its operand takes anyway when `high` is operand.NO_FIXUP
+fun pair(available: *register.Available, rd: register.Id, target: operand.Symbol, label: u32, high: operand.FixupKind, low: str, out: *relax.Expansion) bool {
+    out.count = 0;
+    val a: *relax.Emitted = next(available, "auipc", out);
+    if (a == nil) { ret false; }
+    a.values[0] = operand.Value.register{rd};
+    a.values[1] = symbolic(target.id, target.addend, high);
+    val b: *relax.Emitted = next(available, low, out);
+    if (b == nil) { ret false; }
+    b.values[0] = operand.Value.register{rd};
+    b.values[1] = operand.Value.register{rd};
+    b.values[2] = symbolic(label, 0, riscv_fixup.PCREL_LO12_I);
+    ret true;
+}
+
+# `lla rd, target`: the address of `target`, relative to the program counter
+# ---
+# label: the handle of the label at the first instruction, which the low part's relocation names
+pub fun lla(available: *register.Available, rd: register.Id, target: operand.Symbol, label: u32, out: *relax.Expansion) bool {
+    ret pair(available, rd, target, label, operand.NO_FIXUP, "addi", out);
+}
+
+# `la rd, target` for code that is position independent: the address of `target` loaded from the global offset table
+pub fun la(available: *register.Available, rd: register.Id, target: operand.Symbol, label: u32, out: *relax.Expansion) bool {
+    var load: str = "lw";
+    if (wide(available)) { load = "ld"; }
+    ret pair(available, rd, target, label, riscv_fixup.GOT_PCREL_HI20, load, out);
+}
+
+# the call or tail pair through `temp`: an auipc whose relocation covers both instructions, and a jalr linking to `link`
+fun call_pair(available: *register.Available, link: register.Id, temp: register.Id, target: operand.Symbol, plt: bool, out: *relax.Expansion) bool {
+    out.count = 0;
+    var kind: operand.FixupKind = riscv_fixup.CALL_PAIR;
+    if (plt) { kind = riscv_fixup.CALL_PLT_PAIR; }
+    val a: *relax.Emitted = next(available, "auipc", out);
+    if (a == nil) { ret false; }
+    a.values[0] = operand.Value.register{temp};
+    a.values[1] = symbolic(target.id, target.addend, kind);
+    # the linker may relax the pair
+    a.marker = riscv_fixup.RELAX;
+    val j: *relax.Emitted = next(available, "jalr", out);
+    if (j == nil) { ret false; }
+    j.values[0] = operand.Value.register{link};
+    j.values[1] = operand.Value.register{temp};
+    j.values[2] = imm(0);
+    ret true;
+}
+
+# `call target`, or `call rd, target` linking to `rd`: a jump and link through the register it links to
+pub fun call(available: *register.Available, link: register.Id, target: operand.Symbol, plt: bool, out: *relax.Expansion) bool {
+    ret call_pair(available, link, link, target, plt, out);
+}
+
+# `tail target`: a jump through `temp`, t1 by convention, that links nowhere
+pub fun tail(available: *register.Available, temp: register.Id, target: operand.Symbol, plt: bool, out: *relax.Expansion) bool {
+    ret call_pair(available, register.make(0, 0), temp, target, plt, out);
+}
+
+# a test's selection and its register view
+#[testing]
+rec T {
+    t: testing.Testing;
+    s: extension.Selection;
+    v: register.Available;
+}
+
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t.t), ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[register.Available, register.Error] = register.select(testing.allocator_of(?t.t), ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    ret true;
+}
+
+# whether the sequence for `v` is exactly the `count` steps of `ops` and `imms`
+#[testing]
+fun t_sequence(v: i64, ops: *Op, imms: *i64, count: u32) bool {
+    var seq: Sequence;
+    sequence(v, true, ?seq);
+    if (seq.len != count) { ret false; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (seq.steps[i].op != ops[i] || seq.steps[i].imm != imms[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the sequences llvm-mc 23.1.1 expands `li a0, v` to for riscv64
+test li__a_64_bit_constant_expands_to_the_vendor_sequence {
+    val long_ops:  [8]Op  = [8]Op{LUI, ADDI, SLLI, ADDI, SLLI, ADDI, SLLI, ADDI};
+    val long_imms: [8]i64 = [8]i64{583, -1875, 14, -947, 12, 1511, 13, -272};
+    if (!t_sequence(0x123456789abcdef0, ?long_ops[0], ?long_imms[0], 8)) { ret 1; }
+    # a low part of 13 bits, written as two additions of the negative one, is shorter
+    val pair_ops:  [5]Op  = [5]Op{LUI, ADDI, SLLI, ADDI, ADDI};
+    val pair_imms: [5]i64 = [5]i64{361338, 1939, 14, -2048, -1451};
+    if (!t_sequence(0x160de9e4b255, ?pair_ops[0], ?pair_imms[0], 5)) { ret 2; }
+    val ones_ops:  [2]Op  = [2]Op{ADDI, SRLI};
+    val ones_imms: [2]i64 = [2]i64{-1, 32};
+    if (!t_sequence(0xffffffff, ?ones_ops[0], ?ones_imms[0], 2)) { ret 3; }
+    val edge_ops:  [2]Op  = [2]Op{LUI, ADDIW};
+    val edge_imms: [2]i64 = [2]i64{524288, -1};
+    if (!t_sequence(0x7fffffff, ?edge_ops[0], ?edge_imms[0], 2)) { ret 4; }
+    val high_ops:  [2]Op  = [2]Op{ADDI, SLLI};
+    val high_imms: [2]i64 = [2]i64{1, 32};
+    if (!t_sequence(0x100000000, ?high_ops[0], ?high_imms[0], 2)) { ret 5; }
+    ret 0;
+}
+
+test li__the_rows_it_expands_to_are_those_the_selection_admits {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var out: relax.Expansion;
+    if (!li(?t.v, register.make(0, 10), 0x123456789abcdef0, ?out))                                       { ret 2; }
+    if (out.count != 8)                                                                                  { ret 3; }
+    if (!str_equals(out.steps[0].row.mnemonic, "lui") || !str_equals(out.steps[2].row.mnemonic, "slli")) { ret 4; }
+    # the first addi adds to zero and the later steps to the register being built
+    val first: operand.Value = out.steps[1].values[1];
+    val later: operand.Value = out.steps[3].values[1];
+    if (!(sel first.register && first.register == register.make(0, 10))) { ret 5; }
+    if (!(sel later.register && later.register == register.make(0, 10))) { ret 6; }
+    # a value past 32 bits has no expansion at rv32
+    var narrow: T;
+    if (!t_make(?narrow, "rv32i"))                              { ret 7; }
+    if (li(?narrow.v, register.make(0, 10), 0x100000000, ?out)) { ret 8; }
+    if (!li(?narrow.v, register.make(0, 10), 0xffffffff, ?out)) { ret 9; }
+    if (out.count != 1)                                         { ret 10; }
+    ret 0;
+}
+
+test call__a_call_pair_carries_the_relax_marker_on_its_auipc {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var out:    relax.Expansion;
+    val target: operand.Symbol = operand.Symbol{id: 1, addend: 4, fixup: operand.NO_FIXUP};
+    if (!call(?t.v, register.make(0, 1), target, true, ?out))                                              { ret 2; }
+    if (out.count != 2)                                                                                    { ret 3; }
+    if (!str_equals(out.steps[0].row.mnemonic, "auipc") || !str_equals(out.steps[1].row.mnemonic, "jalr")) { ret 4; }
+    if (out.steps[0].marker != riscv_fixup.RELAX || out.steps[1].marker != operand.NO_FIXUP)               { ret 5; }
+    val hi: operand.Value = out.steps[0].values[1];
+    if (!(sel hi.symbol && (hi.symbol.fixup == riscv_fixup.CALL_PLT_PAIR && hi.symbol.addend == 4))) { ret 6; }
+    # tail links to zero through the temporary it is given
+    if (!tail(?t.v, register.make(0, 6), target, false, ?out)) { ret 7; }
+    val link: operand.Value = out.steps[1].values[0];
+    val temp: operand.Value = out.steps[1].values[1];
+    if (!(sel link.register && link.register == register.make(0, 0))) { ret 8; }
+    if (!(sel temp.register && temp.register == register.make(0, 6))) { ret 9; }
+    val pair: operand.Value = out.steps[0].values[1];
+    if (!(sel pair.symbol && pair.symbol.fixup == riscv_fixup.CALL_PAIR)) { ret 10; }
+    ret 0;
+}
+
+test lla__the_low_part_names_the_label_of_the_high_part {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var out:    relax.Expansion;
+    val target: operand.Symbol = operand.Symbol{id: 1, addend: 0, fixup: operand.NO_FIXUP};
+    if (!lla(?t.v, register.make(0, 10), target, 2, ?out)) { ret 2; }
+    val hi: operand.Value = out.steps[0].values[1];
+    val lo: operand.Value = out.steps[1].values[2];
+    if (!(sel hi.symbol && hi.symbol.id == 1))                                                  { ret 3; }
+    if (!(sel lo.symbol && (lo.symbol.id == 2 && lo.symbol.fixup == riscv_fixup.PCREL_LO12_I))) { ret 4; }
+    # la through the global offset table loads, and takes the got relocation
+    if (!la(?t.v, register.make(0, 10), target, 2, ?out)) { ret 5; }
+    if (!str_equals(out.steps[1].row.mnemonic, "ld"))     { ret 6; }
+    val got: operand.Value = out.steps[0].values[1];
+    if (!(sel got.symbol && got.symbol.fixup == riscv_fixup.GOT_PCREL_HI20)) { ret 7; }
+    ret 0;
+}
