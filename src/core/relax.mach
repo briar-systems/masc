@@ -7,6 +7,20 @@
 # risc-v beq becomes bne past a jal to the target. the builder only ever
 # replaces a row by its longer form, so its fixed point terminates.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.walk;
+
 # an enumerant or condition operand's value with `mask` flipped, as an inverted branch condition
 # ---
 # operand: the operand of the row relaxed
@@ -71,4 +85,131 @@ pub rec Relaxation {
 pub rec Relaxations {
     at:  *Relaxation;
     len: u32;
+}
+
+# the most instructions an expansion holds
+pub val MAX_STEPS: u32 = 8;
+
+# one instruction of an expansion
+# ---
+# row:    the row it encodes
+# values: its operand values, one per operand of the row
+# marker: the marker fixup kind that rides beside it, operand.NO_FIXUP for none
+pub rec Emitted {
+    row:    *row.Row;
+    values: [row.MAX_OPERANDS]operand.Value;
+    marker: operand.FixupKind;
+}
+
+# the instructions a relaxation or a pseudo instruction becomes
+pub rec Expansion {
+    steps: [MAX_STEPS]Emitted;
+    count: u32;
+}
+
+# the relaxation of row `index`, a binary search of the set's relaxations, which are in ascending order of row
+pub fun find(all: Relaxations, index: u32) opt[*Relaxation] {
+    var lo: u32 = 0;
+    var hi: u32 = all.len;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (all.at[mid].row < index) { lo = mid + 1; }
+        or                           { hi = mid; }
+    }
+    if (lo >= all.len || all.at[lo].row != index) { ret opt[*Relaxation].none{}; }
+    ret opt[*Relaxation].some{?all.at[lo]};
+}
+
+# how many bytes row `r` encodes to, which holds for rows whose fields have a fixed width
+pub fun length(r: *row.Row) u32 {
+    var bits: u32 = 0;
+    var i:    u32 = 0;
+    for (i < r.encoding.len) {
+        bits = bits + r.encoding.at[i].width::u32;
+        i    = i + 1;
+    }
+    ret bits / 8;
+}
+
+# whether a target `distance` bytes from the start of an instruction of `rx`'s row is past the range of its relative operand
+pub fun far(codec: *walk.Codec, rx: *Relaxation, distance: i64) bool {
+    val r:    *row.Row         = ?codec.rows.at[rx.row];
+    val desc: *operand.Operand = ?r.operands.at[rx.operand];
+    if (!sel desc.shape.relative) { ret false; }
+    var offset: i64 = distance;
+    if (desc.shape.relative.anchor == operand.END) { offset = distance - length(r)::i64; }
+    val why: opt[str] = walk.unrepresentable(?desc.shape.relative.offset, offset);
+    ret sel why.some && str_equals(why.some, field.OUT_OF_RANGE);
+}
+
+# `v` with the bits of `mask` flipped, none for a value with no bits to flip
+fun flip(v: *operand.Value, mask: u32) operand.Value {
+    if (sel v.enumerant) { ret operand.Value.enumerant{v.enumerant ^ mask}; }
+    if (sel v.condition) { ret operand.Value.condition{v.condition ^ mask}; }
+    ret operand.Value.none{};
+}
+
+# the value of one source of the step of row `step`, which starts `at` bytes into the form of `total`
+fun source_value(codec: *walk.Codec, src: Source, from: *inst.Inst, distance: i64, at: u32, step: *row.Row, k: u32, total: u32, out: *operand.Value) bool {
+    if (sel src.operand) {
+        @out = from.values[src.operand];
+        ret true;
+    }
+    if (sel src.flipped) {
+        @out = flip(?from.values[src.flipped.operand], src.flipped.mask);
+        ret !sel out.none;
+    }
+    if (sel src.register) {
+        if (codec.registers == nil || src.register >= codec.registers.register_count) { ret false; }
+        @out = operand.Value.register{register.id_of(?codec.registers.registers[src.register])};
+        ret true;
+    }
+    if (sel src.immediate) {
+        @out = operand.Value.immediate{src.immediate};
+        ret true;
+    }
+    if (sel src.none) {
+        @out = operand.Value.none{};
+        ret true;
+    }
+    val desc: *operand.Operand = ?step.operands.at[k];
+    if (!sel desc.shape.relative) { ret false; }
+    var from_here: i64 = 0;
+    if (sel src.target)                            { from_here = distance - at::i64; }
+    or                                             { from_here = total::i64 - at::i64; }
+    if (desc.shape.relative.anchor == operand.END) { from_here = from_here - length(step)::i64; }
+    @out = operand.Value.relative{from_here};
+    ret true;
+}
+
+# the instructions row `from.row` becomes under `rx` for a target `distance` bytes from its start
+# ---
+# out: the steps, each operand's value taken from the row relaxed, a fixed register or immediate, or the target
+# ret: whether every source gave a value
+pub fun expand(codec: *walk.Codec, rx: *Relaxation, from: *inst.Inst, distance: i64, out: *Expansion) bool {
+    if (rx.form.len > MAX_STEPS) { ret false; }
+    var total: u32 = 0;
+    var i:     u32 = 0;
+    for (i < rx.form.len) {
+        total = total + length(?codec.rows.at[rx.form.at[i].row]);
+        i     = i + 1;
+    }
+    var at: u32 = 0;
+    out.count = 0;
+    i         = 0;
+    for (i < rx.form.len) {
+        val s:    *Step    = ?rx.form.at[i];
+        val step: *row.Row = ?codec.rows.at[s.row];
+        out.steps[i].row    = step;
+        out.steps[i].marker = operand.NO_FIXUP;
+        var k: u32 = 0;
+        for (k < step.operands.len) {
+            if (!source_value(codec, s.values.at[k], from, distance, at, step, k, total, ?out.steps[i].values[k])) { ret false; }
+            k = k + 1;
+        }
+        at        = at + length(step);
+        out.count = out.count + 1;
+        i         = i + 1;
+    }
+    ret true;
 }
