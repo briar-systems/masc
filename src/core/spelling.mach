@@ -1,0 +1,381 @@
+# the syntax rows every instruction set fills in
+#
+# a syntax spells each row of a set by one template: its mnemonic, its
+# operands in their written order and the text between them. the printer
+# and the parser in `masc.syntax` both read the template, the register
+# file's names and aliases, and each enumeration's members, so no spelling
+# is written twice. an alias is a further template over a base row, with
+# where each base operand's value comes from, the condition under which it
+# applies and its preference for printing. specifiers spell the fixup kinds
+# a symbol takes, and hooks spell what differs per set: immediates, memory,
+# register lists, ids and literals. a set carries one or more syntaxes, its
+# established one first.
+#
+# a template is text with holes. `<n>` is operand n, and `<n:format>` hands
+# `format` to the operand's hook. `<[` and `]>` enclose an optional group,
+# printed when every operand in it is present and read when the text holds
+# it, so a group of optional operands is absent exactly when they are none,
+# and a group with no operand, as aarch64's `<[#]>`, is printed and optional
+# to read. a space prints as one space and reads any run of white space,
+# white space is also read before text that follows a hole, and every other
+# character is itself.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use std.collections.vector;
+
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.walk;
+
+# what a piece of a template is
+# ---
+# END:    the end of the template
+# TEXT:   a character that is itself
+# SPACE:  a space
+# HOLE:   an operand
+# OPEN:   the start of an optional group
+# CLOSE:  the end of an optional group
+# BROKEN: a `<` that opens nothing well formed
+pub def Kind: u8;
+
+pub val END:    Kind = 0;
+pub val TEXT:   Kind = 1;
+pub val SPACE:  Kind = 2;
+pub val HOLE:   Kind = 3;
+pub val OPEN:   Kind = 4;
+pub val CLOSE:  Kind = 5;
+pub val BROKEN: Kind = 6;
+
+# one piece of a template
+# ---
+# kind:    what it is
+# at:      its offset in the template
+# len:     its length in the template
+# operand: a hole's operand
+# format:  a hole's format, empty when it has none
+pub rec Piece {
+    kind:    Kind;
+    at:      usize;
+    len:     usize;
+    operand: u8;
+    format:  View;
+}
+
+# the piece of `template` at `at`
+pub fun piece(template: str, at: usize) Piece {
+    var p: Piece = Piece{kind: END, at: at, len: 0, operand: 0, format: View{data: nil, len: 0}};
+    val c: u8    = template[at];
+    if (c == 0) { ret p; }
+    p.len = 1;
+    if (c == ' ') {
+        p.kind = SPACE;
+        ret p;
+    }
+    if (c == ']' && template[at + 1] == '>') {
+        p.kind = CLOSE;
+        p.len  = 2;
+        ret p;
+    }
+    if (c != '<') {
+        p.kind = TEXT;
+        ret p;
+    }
+    if (template[at + 1] == '[') {
+        p.kind = OPEN;
+        p.len  = 2;
+        ret p;
+    }
+    var i: usize = at + 1;
+    var n: u32   = 0;
+    for (template[i] >= '0' && template[i] <= '9' && n < row.MAX_OPERANDS) {
+        n = n * 10 + (template[i] - '0')::u32;
+        i = i + 1;
+    }
+    p.kind = BROKEN;
+    if (i == at + 1 || n >= row.MAX_OPERANDS) { ret p; }
+    var format: usize = i;
+    if (template[i] == ':') {
+        format = i + 1;
+        i      = format;
+        for (template[i] != 0 && template[i] != '>') {
+            i = i + 1;
+        }
+    }
+    if (template[i] != '>') { ret p; }
+    p.kind    = HOLE;
+    p.operand = n::u8;
+    p.len     = i + 1 - at;
+    p.format  = View{data: ?template[format], len: i - format};
+    ret p;
+}
+
+# a set's spelling of each of its rows, one template per row of its codec
+pub rec Forms {
+    at:  *str;
+    len: u32;
+}
+
+# an enumerant, condition or immediate operand of an alias with bits flipped, as an inverted condition
+# ---
+# operand: the alias's operand
+# mask:    the bits flipped
+pub rec Flip {
+    operand: u8;
+    mask:    u32;
+}
+
+# where an alias takes one of its base row's operand values from
+# ---
+# operand:  the value of this operand of the alias
+# flipped:  an operand of the alias with bits flipped
+# register: the register at this row of the file, as the x0 of risc-v's `j`
+# value:    this value, which holds no register
+# derived:  what the alias's derivation computes
+pub tag Source: u8 {
+    operand:  u8;
+    flipped:  Flip;
+    register: u32;
+    value:    operand.Value;
+    derived;
+}
+
+# sources as a pointer to static sources and a count, one per operand of the base row
+pub rec Sources {
+    at:  *Source;
+    len: u32;
+}
+
+# the values an alias computes rather than states, as aarch64's `lsl` over `ubfm`
+# ---
+# operands: the alias's operands, which its sources do not then give
+# base:     fills each derived base value from the alias's values, false when they have no base form
+# alias:    fills each alias value no source gives from the base's values, false when the alias does not apply
+pub rec Derive {
+    operands: row.Operands;
+    base:     fun(*operand.Value, *operand.Value) bool;
+    alias:    fun(*operand.Value, *operand.Value) bool;
+}
+
+# a further spelling of a base row, as risc-v's `mv` of `addi` or aarch64's `cmp` of `subs`
+# ---
+# row:        the base row, by its index in the codec's rows
+# template:   its spelling over its own operands
+# count:      how many operands it has
+# sources:    where each base operand's value comes from, one per base operand
+# derive:     what it computes, nil when its sources state everything
+# preference: 0 when it is only read, or its rank among the aliases of its base that apply, the highest printed
+#
+# an alias applies to a base value when every source agrees with it and its
+# derivation, if any, accepts it. the operands of an alias without a
+# derivation are the base operands its sources take them from
+pub rec Alias {
+    row:        u32;
+    template:   str;
+    count:      u8;
+    sources:    Sources;
+    derive:     *Derive;
+    preference: u8;
+}
+
+# aliases as a pointer to static aliases and a count, in base row order
+pub rec Aliases {
+    at:  *Alias;
+    len: u32;
+}
+
+# the spelling of a fixup kind on a symbol, as `%pcrel_hi(<0>)`, `:lo12:<0>` or `<0>@PLT`
+# ---
+# template: its spelling around one hole, the expression it applies to. a
+#           template that starts with its hole binds the symbol before it, so
+#           an addend follows it, and any other template wraps the whole expression
+# operand:  the fixup kind an operand takes by default that it applies to
+# fixup:    the fixup kind it gives the symbol there
+# fold:     its value over a constant, nil when it refuses one
+pub rec Specifier {
+    template: str;
+    operand:  operand.FixupKind;
+    fixup:    operand.FixupKind;
+    fold:     fun(i64) i64;
+}
+
+# specifiers as a pointer to static specifiers and a count
+pub rec Specifiers {
+    at:  *Specifier;
+    len: u32;
+}
+
+# what a name in an operand resolves to
+# ---
+# constant: an absolute value, as a name `.equ` defines
+# symbol:   the caller's handle for a symbol, never operand.NO_SYMBOL
+pub tag Resolved: u8 {
+    constant: i64;
+    symbol:   u32;
+}
+
+# the caller's symbols, which the parser names and the printer spells
+# ---
+# context: the caller's state, handed to both functions
+# resolve: what a name is, or the message it is refused with
+# name:    the spelling of a symbol handle
+pub rec Symbols {
+    context: ptr;
+    resolve: fun(ptr, View) res[Resolved, str];
+    name:    fun(ptr, u32) View;
+}
+
+# the state the parser hands a hook, positioned at the operand it reads
+# ---
+# text:      the source text
+# start:     the offset of the instruction's first byte
+# at:        the offset of the next byte to read
+# end:       the offset just past the instruction's text
+# origin:    the position of the instruction's first byte in its source
+# codec:     the set's codec
+# available: the selection's view of the register file, through which names resolve
+# syntax:    the syntax read
+# symbols:   the caller's symbols
+# context:   the state the syntax's hooks keep across instructions, the caller's
+# row:       the base row whose spelling is read
+# pool:      storage for list and variadic members, after the operand values
+# cap:       how many pool slots there are
+# used:      how many pool slots are taken
+# bytes:     storage for literal bytes that cannot be borrowed from the text
+# room:      how many bytes there are
+# taken:     how many bytes are taken
+pub rec Reader {
+    text:      *u8;
+    start:     usize;
+    at:        usize;
+    end:       usize;
+    origin:    diagnostic.Position;
+    codec:     *walk.Codec;
+    available: *register.Available;
+    syntax:    *Syntax;
+    symbols:   *Symbols;
+    context:   ptr;
+    row:       *row.Row;
+    pool:      *operand.Value;
+    cap:       u32;
+    used:      u32;
+    bytes:     *u8;
+    room:      u32;
+    taken:     u32;
+}
+
+# the state the printer hands a hook
+# ---
+# out:     the text appended to
+# codec:   the set's codec
+# syntax:  the syntax written
+# symbols: the caller's symbols
+# context: the state the syntax's hooks keep across instructions, the caller's
+# row:     the base row whose value is printed
+pub rec Writer {
+    out:     *vector.Vector[u8];
+    codec:   *walk.Codec;
+    syntax:  *Syntax;
+    symbols: *Symbols;
+    context: ptr;
+    row:     *row.Row;
+}
+
+# how one kind of operand is spelled
+# ---
+# parse: reads one value of the operand at the reader's position, its format given, or refuses the text
+# print: writes one value of the operand, its format given, or refuses a value it cannot spell
+pub rec Hook {
+    parse: fun(*Reader, *operand.Operand, View, *operand.Value) err[diagnostic.Diagnostic];
+    print: fun(*Writer, *operand.Operand, View, *operand.Value) err[field.Refusal];
+}
+
+# the hooks of a syntax, each nil when no row of the set has such an operand.
+# registers, enumerants and conditions are spelled from their one table and take no hook
+# ---
+# immediate: immediates and relative targets
+# memory:    memory operands
+# list:      register lists
+# id:        ids
+# literal:   byte literals
+pub rec Hooks {
+    immediate: *Hook;
+    memory:    *Hook;
+    list:      *Hook;
+    id:        *Hook;
+    literal:   *Hook;
+}
+
+# one assembly syntax of a set
+# ---
+# name:       the name it is chosen by, as `intel` or `att`
+# forms:      one template per row of the codec
+# aliases:    its alias rows
+# specifiers: its specifiers
+# hooks:      its operand hooks
+# register:   the text before every register name, as at&t's `%`, empty for none
+# join:       the text between the members of a mask
+# variadic:   the text between the values of a variadic operand
+# fold:       whether mnemonics, registers, enumerants and specifiers read without regard to ascii case
+pub rec Syntax {
+    name:       str;
+    forms:      Forms;
+    aliases:    Aliases;
+    specifiers: Specifiers;
+    hooks:      Hooks;
+    register:   str;
+    join:       str;
+    variadic:   str;
+    fold:       bool;
+}
+
+# a set's syntaxes as a pointer to static syntaxes and a count, its established syntax first
+pub rec Syntaxes {
+    at:  *Syntax;
+    len: u32;
+}
+
+# the syntax of `syntaxes` named `name`, as a directive or an option chooses one
+pub fun find(syntaxes: Syntaxes, name: str) opt[*Syntax] {
+    var i: u32 = 0;
+    for (i < syntaxes.len) {
+        if (str_equals(syntaxes.at[i].name, name)) { ret opt[*Syntax].some{?syntaxes.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Syntax].none{};
+}
+
+# the hook of `syntax` that spells `shape`, nil for a shape spelled from its table
+pub fun hook(syntax: *Syntax, shape: *operand.Shape) *Hook {
+    if (sel shape.immediate || sel shape.relative) { ret syntax.hooks.immediate; }
+    if (sel shape.memory)                          { ret syntax.hooks.memory; }
+    if (sel shape.list)                            { ret syntax.hooks.list; }
+    if (sel shape.id)                              { ret syntax.hooks.id; }
+    if (sel shape.literal)                         { ret syntax.hooks.literal; }
+    ret nil;
+}
+
+# the operand an alias reads as its operand `k`, nil when neither its derivation nor a source gives one
+pub fun alias_operand(a: *Alias, base: *row.Row, k: u8) *operand.Operand {
+    if (a.derive != nil) {
+        if (k::u32 >= a.derive.operands.len) { ret nil; }
+        ret ?a.derive.operands.at[k];
+    }
+    var j: u32 = 0;
+    for (j < a.sources.len && j < base.operands.len) {
+        val src: Source = a.sources.at[j];
+        if ((sel src.operand && src.operand == k) || (sel src.flipped && src.flipped.operand == k)) { ret ?base.operands.at[j]; }
+        j = j + 1;
+    }
+    ret nil;
+}
