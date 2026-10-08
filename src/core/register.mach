@@ -5,15 +5,31 @@
 # mirl's allocator all read these rows, so no register fact lives anywhere
 # else. reserved and allocatable sets are calling-convention facts and are not
 # modelled here.
+#
+# a register row states the extensions a selection must hold for it to exist.
+# a mode is an extension of the set's catalog, as x86 long mode or risc-v's
+# rv64, and an absence is the presence of its conflicting complement, as x16
+# to x31 require risc-v's i base, which the e base conflicts with. a
+# selection filters the file through these conditions once, and every query
+# after that reads its view.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.view.View;
 use std.types.view.view;
 use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.bitset;
+
+use masc.core.extension;
 
 # a register's identity: its class index plus one in the high half and its
 # hardware number in the low half, so 0 names no register
@@ -72,23 +88,25 @@ pub val PC:    Flags = 0x4;
 
 # one register
 # ---
-# name:   the spelling the printer writes
-# class:  the index of its class in the file
-# number: its hardware number within the class
-# bank:   the storage it shares with every register of the same bank
-# offset: the bit within the bank where its first piece starts
-# stride: the bits from the start of one of its pieces to the next
-# count:  its pieces, each its class's width, so a contiguous register has 1
-# flags:  its fixed architectural roles
+# name:     the spelling the printer writes
+# class:    the index of its class in the file
+# number:   its hardware number within the class
+# bank:     the storage it shares with every register of the same bank
+# offset:   the bit within the bank where its first piece starts
+# stride:   the bits from the start of one of its pieces to the next
+# count:    its pieces, each its class's width, so a contiguous register has 1
+# flags:    its fixed architectural roles
+# requires: the extensions and modes a selection must hold for it to exist, none for every selection
 pub rec Register {
-    name:   str;
-    class:  u16;
-    number: u16;
-    bank:   u16;
-    offset: Scaled;
-    stride: Scaled;
-    count:  Scaled;
-    flags:  Flags;
+    name:     str;
+    class:    u16;
+    number:   u16;
+    bank:     u16;
+    offset:   Scaled;
+    stride:   Scaled;
+    count:    Scaled;
+    flags:    Flags;
+    requires: extension.Ids;
 }
 
 # a further spelling of a register the parser accepts
@@ -154,8 +172,8 @@ pub fun id_of(row: *Register) Id {
     ret make(row.class, row.number);
 }
 
-# the register spelled `name`, by its name or one of its aliases
-pub fun lookup(file: *File, name: View) opt[Id] {
+# the register spelled `name` in `file`, by its name or one of its aliases, whatever the selection
+fun named(file: *File, name: View) opt[Id] {
     var i: u32 = 0;
     for (i < file.register_count) {
         val row: *Register = ?file.registers[i];
@@ -210,6 +228,91 @@ pub fun debug_number(file: *File, reg: Id, format: Format) opt[u32] {
         i = i + 1;
     }
     ret opt[u32].none{};
+}
+
+# whether the selection admits the register `row`. the one availability
+# predicate: a selection's view is built from it, so the parser, the encoder,
+# decode and the instruction api all read its answer
+pub fun admits(s: *extension.Selection, row: *Register) bool {
+    ret extension.admits(s, row.requires);
+}
+
+# a selection's view of a register file: the rows it admits
+# ---
+# file:      the file, nil for a set with none, whose view then holds nothing
+# selection: the selection the view filters by
+# rows:      one bit per register row, set when the selection admits it
+pub rec Available {
+    file:      *File;
+    selection: *extension.Selection;
+    rows:      bitset.Bitset;
+}
+
+# a register named that the selection does not admit
+# ---
+# row:   its row
+# lacks: the first extension it requires that the selection does not hold
+pub rec Unavailable {
+    row:   *Register;
+    lacks: extension.Id;
+}
+
+# why a view refused a register
+# ---
+# unknown:     no row of the file is it or spells it
+# unavailable: its row's condition is unmet by the selection
+pub tag Absent: u8 {
+    unknown;
+    unavailable: Unavailable;
+}
+
+# the view of `file` through the selection `s`, which must outlive it
+pub fun select(a: *A.Allocator, file: *File, s: *extension.Selection) res[Available, A.Error] {
+    var count: u32 = 0;
+    if (file != nil) { count = file.register_count; }
+    val made: res[bitset.Bitset, A.Error] = bitset.init(a, count::usize);
+    if (sel made.err) { ret res[Available, A.Error].err{made.err}; }
+    var v: Available = Available{file: file, selection: s, rows: made.ok};
+    var i: u32       = 0;
+    for (i < count) {
+        if (admits(s, ?file.registers[i])) { bitset.set(?v.rows, i::usize); }
+        i = i + 1;
+    }
+    ret res[Available, A.Error].ok{v};
+}
+
+# release a view's storage
+pub fun release(v: *Available) err[A.Error] {
+    ret bitset.dnit(?v.rows);
+}
+
+# the register `reg` through the view
+# ---
+# ret: ok when the view holds it, or why it does not
+pub fun admitted(v: *Available, reg: Id) err[Absent] {
+    if (v.file == nil) { ret err[Absent].err{Absent.unknown{}}; }
+    val at: opt[u32] = index_of(v.file, reg);
+    if (sel at.none)                         { ret err[Absent].err{Absent.unknown{}}; }
+    if (bitset.get(?v.rows, at.some::usize)) { ret err[Absent].ok{}; }
+    val row:      *Register     = ?v.file.registers[at.some];
+    val required: extension.Ids = row.requires;
+    var i:        u32           = 0;
+    for (i < required.len && extension.has(v.selection, required.at[i])) {
+        i = i + 1;
+    }
+    ret err[Absent].err{Absent.unavailable{Unavailable{row: row, lacks: required.at[i]}}};
+}
+
+# the register spelled `name` through the view, by its name or one of its aliases
+# ---
+# ret: the register, or why the view refuses the name
+pub fun lookup(v: *Available, name: View) res[Id, Absent] {
+    if (v.file == nil) { ret res[Id, Absent].err{Absent.unknown{}}; }
+    val found: opt[Id] = named(v.file, name);
+    if (sel found.none) { ret res[Id, Absent].err{Absent.unknown{}}; }
+    val held: err[Absent] = admitted(v, found.some);
+    if (sel held.err) { ret res[Id, Absent].err{held.err}; }
+    ret res[Id, Absent].ok{found.some};
 }
 
 # the value of `q` at multiplier `m` of its scale
@@ -292,11 +395,11 @@ val X86_CLASSES: [4]Class = [4]Class{
 
 #[testing]
 val X86_REGISTERS: [5]Register = [5]Register{
-    Register{name: "rax", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
-    Register{name: "ax", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
-    Register{name: "al", class: 2, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
-    Register{name: "ah", class: 3, number: 4, bank: 0, offset: Scaled{fixed: 8, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
-    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK},
+    Register{name: "rax", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "ax", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "al", class: 2, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "ah", class: 3, number: 4, bank: 0, offset: Scaled{fixed: 8, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: extension.Ids{at: nil, len: 0}},
 };
 
 #[testing]
@@ -334,11 +437,16 @@ val RISCV_CLASSES: [1]Class = [1]Class{
     Class{kind: GENERAL, width: Scaled{fixed: 0, per: 32, scale: 0}, count: 32},
 };
 
+# x16 exists only with the i base, which the e base conflicts with
 #[testing]
-val RISCV_REGISTERS: [3]Register = [3]Register{
-    Register{name: "x0", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: ZERO},
-    Register{name: "x2", class: 0, number: 2, bank: 2, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK},
-    Register{name: "x8", class: 0, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
+val RISCV_I: [1]extension.Id = [1]extension.Id{0};
+
+#[testing]
+val RISCV_REGISTERS: [4]Register = [4]Register{
+    Register{name: "x0", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: ZERO, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "x2", class: 0, number: 2, bank: 2, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "x8", class: 0, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "x16", class: 0, number: 16, bank: 16, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: extension.Ids{at: ?RISCV_I[0], len: 1}},
 };
 
 #[testing]
@@ -356,7 +464,7 @@ val RISCV: File = File{
     classes:        ?RISCV_CLASSES[0],
     class_count:    1,
     registers:      ?RISCV_REGISTERS[0],
-    register_count: 3,
+    register_count: 4,
     aliases:        ?RISCV_ALIASES[0],
     alias_count:    4,
     columns:        nil,
@@ -377,9 +485,9 @@ val AARCH64_CLASSES: [2]Class = [2]Class{
 
 #[testing]
 val AARCH64_REGISTERS: [3]Register = [3]Register{
-    Register{name: "za0.b", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 128, scale: 0}, count: Scaled{fixed: 0, per: 16, scale: 0}, flags: 0},
-    Register{name: "za0.d", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0},
-    Register{name: "za1.d", class: 1, number: 1, bank: 0, offset: Scaled{fixed: 0, per: 128, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0},
+    Register{name: "za0.b", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 128, scale: 0}, count: Scaled{fixed: 0, per: 16, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "za0.d", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
+    Register{name: "za1.d", class: 1, number: 1, bank: 0, offset: Scaled{fixed: 0, per: 128, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: extension.Ids{at: nil, len: 0}},
 };
 
 #[testing]
@@ -396,10 +504,10 @@ val AARCH64: File = File{
     column_count:   0,
 };
 
-test lookup__name_and_alias_reach_one_id {
-    val x8: opt[Id] = lookup(?RISCV, view("x8", 2));
-    val s0: opt[Id] = lookup(?RISCV, view("s0", 2));
-    val fp: opt[Id] = lookup(?RISCV, view("fp", 2));
+test named__name_and_alias_reach_one_id {
+    val x8: opt[Id] = named(?RISCV, view("x8", 2));
+    val s0: opt[Id] = named(?RISCV, view("s0", 2));
+    val fp: opt[Id] = named(?RISCV, view("fp", 2));
     if (!sel x8.some)                                                      { ret 1; }
     if (!sel s0.some)                                                      { ret 2; }
     if (!sel fp.some)                                                      { ret 3; }
@@ -407,9 +515,41 @@ test lookup__name_and_alias_reach_one_id {
     ret 0;
 }
 
-test lookup__unknown_name_refused {
-    val partial: opt[Id] = lookup(?RISCV, view("s", 1));
-    val unknown: opt[Id] = lookup(?RISCV, view("x9", 2));
+#[testing]
+val RISCV_BASES: [2]extension.Extension = [2]extension.Extension{
+    extension.Extension{name: "i", implies: extension.Ids{at: nil, len: 0}, revision: "2.1"},
+    extension.Extension{name: "e", implies: extension.Ids{at: nil, len: 0}, revision: "2.0"},
+};
+
+#[testing]
+val RISCV_BASE_CONFLICT: [1]extension.Conflict = [1]extension.Conflict{extension.Conflict{a: 0, b: 1}};
+
+#[testing]
+val RISCV_CATALOG: extension.Catalog = extension.Catalog{extensions: ?RISCV_BASES[0], count: 2, levels: nil, level_count: 0, conflicts: ?RISCV_BASE_CONFLICT[0], conflict_count: 1, syntax: ?extension.LIST};
+
+test lookup__an_unavailable_register_is_refused_naming_it_and_what_the_selection_lacks {
+    var t: testing.Testing;
+    testing.make(?t);
+    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t), ?RISCV_CATALOG, "e");
+    if (sel made.err) { ret 1; }
+    var s:      extension.Selection     = made.ok;
+    val viewed: res[Available, A.Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
+    if (sel viewed.err) { ret 2; }
+    var v:   Available       = viewed.ok;
+    val x16: res[Id, Absent] = lookup(?v, view("x16", 3));
+    if (sel x16.ok)                                                                                                       { ret 3; }
+    if (!(sel x16.err.unavailable && (x16.err.unavailable.row == ?RISCV_REGISTERS[3] && x16.err.unavailable.lacks == 0))) { ret 4; }
+    val s0: res[Id, Absent] = lookup(?v, view("s0", 2));
+    if (!(sel s0.ok && s0.ok == make(0, 8))) { ret 5; }
+    release(?v);
+    extension.release(?s);
+    if (testing.live_count(?t) != 0) { ret 6; }
+    ret 0;
+}
+
+test named__unknown_name_refused {
+    val partial: opt[Id] = named(?RISCV, view("s", 1));
+    val unknown: opt[Id] = named(?RISCV, view("x9", 2));
     if (!sel partial.none || !sel unknown.none) { ret 1; }
     ret 0;
 }
