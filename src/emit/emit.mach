@@ -1,0 +1,664 @@
+# the instruction-level api: code emitted one instruction at a time by row and operands
+#
+# mirl hands masc its code through this api, in memory, into the sections of
+# a `masc.build` builder, which hands back mink's neutral object. an opcode is
+# a row of the set's catalog, reached by its generated handle or its key. an
+# instruction is started on a row the selection admits and given its operands
+# in the row's order, each by a constructor of its kind that walk admits as
+# encode would, so an operand of the wrong kind is refused as it is given and
+# a refusal leaves the instruction as it was. a symbolic operand names a label
+# of the builder and becomes a fixup there.
+#
+# an instruction is written alone or as one sequence. a sequence is written
+# all or none, and when it holds a symbol in the form its relocations fix, so
+# a pair one relocation covers, as risc-v's call, is a sequence: the builder
+# refuses the pair's first instruction alone. labels, sections, alignment and
+# data are the builder's own calls.
+#
+# the queries read their one owner: the register file and its classes, the
+# fixed operands walk encodes by, a row's control transfer under the effect's
+# rules and its admission under a selection. the listing prints the builder's
+# listing records through one of the set's syntaxes. nothing here names an
+# architecture.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use mink;
+
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.effect;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use rf: masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.set;
+use masc.core.spelling;
+use masc.core.walk;
+use masc.syntax.parse;
+use masc.syntax.print;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_fixup:     masc.isa.riscv.fixup;
+use riscv_pseudo:    masc.isa.riscv.pseudo;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_set:       masc.isa.riscv.set;
+
+use masc.isa.riscv.gen_row;
+
+pub val SURPLUS:   str = "operand past the last of its row";
+pub val SHORT:     str = "instruction given fewer operands than its row has";
+pub val NO_LINE:   str = "no line of the listing at this index";
+pub val NO_SYNTAX: str = "no syntax of the set at this index";
+pub val NO_NAMES:  str = "a listing resolves no names";
+
+# the syntax a set lists in by default, its established one
+pub val DEFAULT: u32 = 0;
+
+# the spelling of an anonymous label in a listing, its handle following
+pub val ANONYMOUS: str = ".Ltmp";
+
+# an instruction as it is given its operands
+# ---
+# step:  its row and the values given, with no marker
+# given: how many operands are given, in the row's order
+pub rec Instruction {
+    step:  relax.Emitted;
+    given: u32;
+}
+
+fun refusal(message: str) build.Refusal {
+    ret build.Refusal{message: message, label: operand.NO_SYMBOL};
+}
+
+fun encoding(r: field.Refusal) build.Refusal {
+    ret build.Refusal{message: r.message, label: operand.NO_SYMBOL, encode: opt[field.Refusal].some{r}};
+}
+
+# an instruction of row `r` to give its operands, refused when the selection does not admit the row, the refusal carrying its requirement
+pub fun start(b: *build.Builder, r: *row.Row) res[Instruction, build.Refusal] {
+    if (!extension.admits(b.available.selection, r.requires)) { ret res[Instruction, build.Refusal].err{encoding(field.unadmitted(r.requires, 0))}; }
+    ret res[Instruction, build.Refusal].ok{Instruction{step: relax.Emitted{row: r, marker: operand.NO_FIXUP}, given: 0}};
+}
+
+# `v` given as the next operand of `ins` when walk admits it there, `ins` as it was when refused
+fun give(b: *build.Builder, ins: *Instruction, v: operand.Value) err[build.Refusal] {
+    if (ins.given >= ins.step.row.operands.len) { ret err[build.Refusal].err{refusal(SURPLUS)}; }
+    var held:     operand.Value      = v;
+    val admitted: err[field.Refusal] = walk.admits_operand(b.set.codec, b.available, ins.step.row, ins.given::u8, ?held);
+    if (sel admitted.err) { ret err[build.Refusal].err{encoding(admitted.err)}; }
+    ins.step.values[ins.given] = v;
+    ins.given                  = ins.given + 1;
+    ret err[build.Refusal].ok{};
+}
+
+# the register `reg`, by its masc identity
+pub fun register(b: *build.Builder, ins: *Instruction, reg: rf.Id) err[build.Refusal] {
+    ret give(b, ins, operand.Value.register{reg});
+}
+
+# the number `n`
+pub fun immediate(b: *build.Builder, ins: *Instruction, n: i64) err[build.Refusal] {
+    ret give(b, ins, operand.Value.immediate{n});
+}
+
+# a target `offset` bytes from the instruction's anchor
+pub fun relative(b: *build.Builder, ins: *Instruction, offset: i64) err[build.Refusal] {
+    ret give(b, ins, operand.Value.relative{offset});
+}
+
+# label `l` plus `addend`, relocated by the set's fixup kind `fixup`, operand.NO_FIXUP for the operand's own
+pub fun symbol(b: *build.Builder, ins: *Instruction, l: build.Label, addend: i64, fixup: operand.FixupKind) err[build.Refusal] {
+    ret give(b, ins, operand.Value.symbol{operand.Symbol{id: l.id, addend: addend, fixup: fixup}});
+}
+
+# the address `a`, its symbol a label's handle or operand.NO_SYMBOL
+pub fun memory(b: *build.Builder, ins: *Instruction, a: operand.Address) err[build.Refusal] {
+    ret give(b, ins, operand.Value.memory{a});
+}
+
+# the enumerant of value `v`
+pub fun enumerant(b: *build.Builder, ins: *Instruction, v: u32) err[build.Refusal] {
+    ret give(b, ins, operand.Value.enumerant{v});
+}
+
+# the condition of value `v`
+pub fun condition(b: *build.Builder, ins: *Instruction, v: u32) err[build.Refusal] {
+    ret give(b, ins, operand.Value.condition{v});
+}
+
+# the list of `members`, which the builder copies when the instruction is written
+pub fun list(b: *build.Builder, ins: *Instruction, members: operand.Values) err[build.Refusal] {
+    ret give(b, ins, operand.Value.list{members});
+}
+
+# the id `n` of the operand's id space
+pub fun id(b: *build.Builder, ins: *Instruction, n: u32) err[build.Refusal] {
+    ret give(b, ins, operand.Value.id{n});
+}
+
+# the literal `bytes`, which the builder copies when the instruction is written
+pub fun literal(b: *build.Builder, ins: *Instruction, bytes: operand.Bytes) err[build.Refusal] {
+    ret give(b, ins, operand.Value.literal{bytes});
+}
+
+# no value, for an optional operand
+pub fun absent(b: *build.Builder, ins: *Instruction) err[build.Refusal] {
+    ret give(b, ins, operand.Value.none{});
+}
+
+# `ins` written at the cursor of the current section, in the shortest form the selection admits
+pub fun put(b: *build.Builder, ins: *Instruction) err[build.Refusal] {
+    if (ins.given != ins.step.row.operands.len) { ret err[build.Refusal].err{refusal(SHORT)}; }
+    var one: inst.Inst = inst.Inst{row: ins.step.row, values: ?ins.step.values[0], count: ins.given};
+    ret build.emit(b, ?one, operand.NO_FIXUP);
+}
+
+# the `count` instructions at `steps` written at the cursor of the current section as one sequence, all or none,
+# in the form its relocations fix when it holds a symbol
+pub fun sequence(b: *build.Builder, steps: *Instruction, count: u32) err[build.Refusal] {
+    if (count > relax.MAX_STEPS) { ret err[build.Refusal].err{refusal(build.TOO_MANY)}; }
+    var ex: relax.Expansion;
+    ex.count = count;
+    var i: u32 = 0;
+    for (i < count) {
+        if (steps[i].given != steps[i].step.row.operands.len) { ret err[build.Refusal].err{refusal(SHORT)}; }
+        ex.steps[i] = steps[i].step;
+        i           = i + 1;
+    }
+    ret build.expansion(b, ?ex);
+}
+
+# why `r` was refused spelled onto `out`: its message, and what the selection lacks when it names a requirement,
+# worded by `extension.spell_requirement`
+pub fun spell(b: *build.Builder, r: *build.Refusal, out: *vector.Vector[u8]) err[A.Error] {
+    val worded: err[A.Error] = extension.append(out, r.message);
+    if (sel worded.err)    { ret worded; }
+    if (sel r.encode.none) { ret worded; }
+    val required: requirement.Requirement = r.encode.some.requires;
+    if (required.len == 0) { ret worded; }
+    val because: err[A.Error] = extension.append(out, ": ");
+    if (sel because.err) { ret because; }
+    ret extension.spell_requirement(b.available.selection, required, out);
+}
+
+# the register file of `s`, none for a set with none
+pub fun registers(s: *set.Set) opt[*rf.File] {
+    if (s.codec.registers == nil) { ret opt[*rf.File].none{}; }
+    ret opt[*rf.File].some{s.codec.registers};
+}
+
+# the index of the class of `s` named `name`, none when the set has no such class
+pub fun class_named(s: *set.Set, name: str) opt[u16] {
+    if (s.codec.registers == nil) { ret opt[u16].none{}; }
+    ret rf.class_named(s.codec.registers, name);
+}
+
+# the row of `s` keyed `key`
+pub fun row_keyed(s: *set.Set, key: str) opt[*row.Row] {
+    ret walk.row_keyed(s.codec, key);
+}
+
+# the register operand `op` of row `r` of `s` must be, none when the row does not fix it
+pub fun fixed(s: *set.Set, r: *row.Row, op: u8) opt[rf.Id] {
+    ret walk.fixed(s.codec, r, op);
+}
+
+# the control transfer of row `r` of `s` holding `values`, the rule of its effect they meet or its own
+pub fun control(s: *set.Set, r: *row.Row, values: operand.Values) effect.Control {
+    ret effect.control(s.codec.registers, r.effect, values);
+}
+
+# whether `selection` admits row `r`
+pub fun admits(selection: *extension.Selection, r: *row.Row) bool {
+    ret extension.admits(selection, r.requires);
+}
+
+# the names a listing spells: a label's own, or ANONYMOUS and its handle
+# ---
+# b:       the builder whose labels are named
+# scratch: the spelling of the last anonymous label
+rec Namer {
+    b:       *build.Builder;
+    scratch: [24]u8;
+}
+
+fun named(context: ptr, id: u32) View {
+    val n:   *Namer    = context::*Namer;
+    val own: opt[View] = build.label_name(n.b, build.Label{id: id});
+    if (sel own.some) { ret own.some; }
+    val lead: usize = str_len(ANONYMOUS);
+    var i:    usize = 0;
+    for (i < lead) {
+        n.scratch[i] = ANONYMOUS[i];
+        i            = i + 1;
+    }
+    var digits: [10]u8;
+    var count:  usize = 0;
+    var left:   u32   = id;
+    for {
+        digits[count] = '0' + (left % 10)::u8;
+        count         = count + 1;
+        left          = left / 10;
+        if (left == 0) { brk; }
+    }
+    var k: usize = 0;
+    for (k < count) {
+        n.scratch[lead + k] = digits[count - 1 - k];
+        k                   = k + 1;
+    }
+    ret view(?n.scratch[0], lead + count);
+}
+
+fun unresolved(context: ptr, name: View) res[spelling.Resolved, str] {
+    ret res[spelling.Resolved, str].err{NO_NAMES};
+}
+
+# line `i` of the listing of the finished builder `b` appended to `out` in the set's syntax `syntax`
+# ---
+# ret: ok, or the printer's refusal with `out` as it was
+pub fun listed(b: *build.Builder, i: usize, syntax: u32, out: *vector.Vector[u8]) err[field.Refusal] {
+    if (i >= build.line_count(b))     { ret err[field.Refusal].err{field.refusal(NO_LINE, field.NO_OPERAND, 0)}; }
+    if (syntax >= b.set.syntaxes.len) { ret err[field.Refusal].err{field.refusal(NO_SYNTAX, field.NO_OPERAND, 0)}; }
+    var namer:   Namer            = Namer{b: b};
+    var symbols: spelling.Symbols = spelling.Symbols{context: (?namer)::ptr, resolve: unresolved, name: named};
+    var w:       spelling.Writer  = spelling.Writer{
+        out:       out,
+        codec:     b.set.codec,
+        selection: b.available.selection,
+        syntax:    ?b.set.syntaxes.at[syntax],
+        symbols:   ?symbols,
+        context:   nil,
+        row:       nil,
+    };
+    var ln: build.Line = build.line(b, i);
+    ret print.instruction(?w, ?ln.inst);
+}
+
+# the listing of the finished builder `b` appended to `out` in the set's syntax `syntax`, a line per instruction
+# ---
+# ret: ok, or the first refusal with `out` holding the lines before it
+pub fun listing(b: *build.Builder, syntax: u32, out: *vector.Vector[u8]) err[field.Refusal] {
+    var i: usize = 0;
+    for (i < build.line_count(b)) {
+        val one: err[field.Refusal] = listed(b, i, syntax, out);
+        if (sel one.err) { ret one; }
+        val pushed: res[usize, A.Error] = vector.push[u8](out, '\n');
+        if (sel pushed.err) { ret err[field.Refusal].err{field.refusal(field.MEMORY, field.NO_OPERAND, out.len)}; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# a test's selection, its register view and a builder of a risc-v object over them
+#[testing]
+rec T {
+    t: testing.Testing;
+    s: extension.Selection;
+    v: rf.Available;
+    b: build.Builder;
+}
+
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[rf.Available, rf.Error] = rf.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    val built: res[build.Builder, build.Refusal] = build.make(a, ?riscv_set.SET, ?t.v, ?mink.arch.RISCV64);
+    if (sel built.err) { ret false; }
+    t.b = built.ok;
+    ret true;
+}
+
+# a code section, made current
+#[testing]
+fun t_text(t: *T) bool {
+    val s: res[build.Section, build.Refusal] = build.open(?t.b, build.Spec{name: ".text", kind: ?mink.section.TEXT, flags: mink.section.TEXT.flags, disposition: ?mink.section.WHOLE});
+    if (sel s.err) { ret false; }
+    val switched: err[build.Refusal] = build.switch(?t.b, s.ok);
+    ret sel switched.ok;
+}
+
+#[testing]
+fun t_x(n: u16) rf.Id {
+    ret rf.make(0, n);
+}
+
+#[testing]
+fun t_ok(e: err[build.Refusal]) bool {
+    ret sel e.ok;
+}
+
+# row `r` of two registers and an immediate started, given and put
+#[testing]
+fun t_rri(t: *T, r: *row.Row, x: u16, y: u16, n: i64) bool {
+    val started: res[Instruction, build.Refusal] = start(?t.b, r);
+    if (sel started.err) { ret false; }
+    var ins: Instruction = started.ok;
+    if (!t_ok(register(?t.b, ?ins, t_x(x))) || !t_ok(register(?t.b, ?ins, t_x(y))) || !t_ok(immediate(?t.b, ?ins, n))) { ret false; }
+    ret t_ok(put(?t.b, ?ins));
+}
+
+# row `r` of two registers and a label started and given, into `out`
+#[testing]
+fun t_rrl(t: *T, r: *row.Row, x: u16, y: u16, l: build.Label, fixup: operand.FixupKind, out: *Instruction) bool {
+    val started: res[Instruction, build.Refusal] = start(?t.b, r);
+    if (sel started.err) { ret false; }
+    @out = started.ok;
+    if (!t_ok(register(?t.b, out, t_x(x))) || !t_ok(register(?t.b, out, t_x(y)))) { ret false; }
+    ret t_ok(symbol(?t.b, out, l, 0, fixup));
+}
+
+#[testing]
+fun t_named(t: *T, name: str) build.Label {
+    val l: res[build.Label, build.Refusal] = build.label(?t.b, name);
+    if (sel l.err) { ret build.Label{id: operand.NO_SYMBOL}; }
+    ret l.ok;
+}
+
+#[testing]
+fun t_anon(t: *T) build.Label {
+    val l: res[build.Label, build.Refusal] = build.anonymous(?t.b);
+    if (sel l.err) { ret build.Label{id: operand.NO_SYMBOL}; }
+    ret l.ok;
+}
+
+#[testing]
+val T_GLOBAL: build.Exposure = build.Exposure{binding: ?mink.symbol.GLOBAL, visibility: ?mink.symbol.DEFAULT, kind: ?mink.symbol.FUNCTION};
+
+#[testing]
+fun t_spelled(out: *vector.Vector[u8], want: str) bool {
+    if (out.len != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < out.len) {
+        if (out.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# everything the test made given back, and whether nothing is left live
+#[testing]
+fun t_release(t: *T) bool {
+    build.release(?t.b);
+    rf.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+#[testing]
+fun t_done(t: *T, o: *mink.object.Object) bool {
+    mink.object.release(o);
+    ret t_release(t);
+}
+
+test emit__an_opcode_handle_reaches_its_row {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val keyed: opt[*row.Row] = row_keyed(?riscv_set.SET, gen_row.ADDI.key);
+    if (sel keyed.none)                             { ret 2; }
+    if (keyed.some != gen_row.ADDI)                 { ret 3; }
+    if (!str_equals(gen_row.ADDI.mnemonic, "addi")) { ret 4; }
+    # a class handle is the class its name finds
+    val x:    opt[u16]      = class_named(?riscv_set.SET, riscv_register.X.name);
+    val file: opt[*rf.File] = registers(?riscv_set.SET);
+    if (sel x.none)                                     { ret 5; }
+    if (sel file.none)                                  { ret 5; }
+    if (?file.some.classes[x.some] != riscv_register.X) { ret 6; }
+    # what the handle emits is its row
+    if (!t_text(?t))                         { ret 7; }
+    if (!t_rri(?t, gen_row.ADDI, 10, 10, 1)) { ret 8; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 9; }
+    var o: mink.object.Object = done.ok;
+    if (build.line(?t.b, 0).inst.row != gen_row.ADDI) { ret 10; }
+    if (!t_done(?t, ?o))                              { ret 11; }
+    ret 0;
+}
+
+test emit__an_operand_of_the_wrong_kind_is_refused_at_construction {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val started: res[Instruction, build.Refusal] = start(?t.b, gen_row.ADDI);
+    if (sel started.err) { ret 2; }
+    var ins: Instruction = started.ok;
+    if (!t_ok(register(?t.b, ?ins, t_x(10)))) { ret 3; }
+    # a number where the row reads a register, refused at its operand and leaving the instruction as it was
+    val number: err[build.Refusal] = immediate(?t.b, ?ins, 5);
+    if (sel number.ok)                                         { ret 4; }
+    if (!str_equals(number.err.message, field.WRONG_KIND))     { ret 5; }
+    if (sel number.err.encode.none)                            { ret 6; }
+    if (number.err.encode.some.operand != 1 || ins.given != 1) { ret 7; }
+    if (!t_ok(register(?t.b, ?ins, t_x(11))))                  { ret 8; }
+    # a register where it reads a number
+    val reg: err[build.Refusal] = register(?t.b, ?ins, t_x(12));
+    if (sel reg.ok)                                     { ret 9; }
+    if (!str_equals(reg.err.message, field.WRONG_KIND)) { ret 10; }
+    if (ins.given != 2)                                 { ret 11; }
+    if (!t_ok(immediate(?t.b, ?ins, 5)))                { ret 12; }
+    val surplus: err[build.Refusal] = immediate(?t.b, ?ins, 6);
+    if (sel surplus.ok)                            { ret 13; }
+    if (!str_equals(surplus.err.message, SURPLUS)) { ret 14; }
+    if (!t_release(?t))                            { ret 15; }
+    ret 0;
+}
+
+test emit__emission_refuses_a_row_the_selection_does_not_admit {
+    var t: T;
+    if (!t_make(?t, "rv64i"))      { ret 1; }
+    if (admits(?t.s, gen_row.MUL)) { ret 2; }
+    val refused: res[Instruction, build.Refusal] = start(?t.b, gen_row.MUL);
+    if (sel refused.ok) { ret 3; }
+    var why:    build.Refusal     = refused.err;
+    var out:    vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t.t));
+    val worded: err[A.Error]      = spell(?t.b, ?why, ?out);
+    if (sel worded.err)                                                             { ret 4; }
+    if (!t_spelled(?out, "instruction not admitted by the selection: needs zmmul")) { ret 5; }
+    vector.dnit[u8](?out);
+    if (!t_release(?t)) { ret 6; }
+    # a selection holding m admits it
+    var m: T;
+    if (!t_make(?m, "rv64im")) { ret 7; }
+    val admitted: res[Instruction, build.Refusal] = start(?m.b, gen_row.MUL);
+    if (sel admitted.err) { ret 8; }
+    if (!t_release(?m))   { ret 9; }
+    ret 0;
+}
+
+test emit__a_symbolic_operand_becomes_a_fixup {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    if (!t_text(?t))           { ret 2; }
+    val f:    build.Label = t_named(?t, "f");
+    val g:    build.Label = t_named(?t, "g");
+    val skip: build.Label = t_anon(?t);
+    if (!t_ok(build.expose(?t.b, f, T_GLOBAL)) || !t_ok(build.expose(?t.b, g, T_GLOBAL)) || !t_ok(build.define(?t.b, f))) { ret 3; }
+    # a function that saves ra, calls g unless a0 is zero, and returns
+    if (!t_rri(?t, gen_row.ADDI, 2, 2, -16)) { ret 4; }
+    if (!t_rri(?t, gen_row.SD, 2, 1, 8))     { ret 5; }
+    var branch: Instruction;
+    if (!t_rrl(?t, gen_row.BEQ, 10, 0, skip, operand.NO_FIXUP, ?branch)) { ret 6; }
+    if (!t_ok(put(?t.b, ?branch)))                                       { ret 6; }
+    var pair: [2]Instruction;
+    val high: res[Instruction, build.Refusal] = start(?t.b, gen_row.AUIPC);
+    if (sel high.err) { ret 7; }
+    pair[0] = high.ok;
+    if (!t_ok(register(?t.b, ?pair[0], t_x(1))) || !t_ok(symbol(?t.b, ?pair[0], g, 0, riscv_fixup.CALL_PLT_PAIR))) { ret 8; }
+    # the call's relocation covers the jalr after it, so its auipc alone is refused
+    val alone: err[build.Refusal] = put(?t.b, ?pair[0]);
+    if (sel alone.ok)                                                           { ret 9; }
+    if (!str_equals(alone.err.message, build.SPLIT) || alone.err.label != g.id) { ret 10; }
+    val low: res[Instruction, build.Refusal] = start(?t.b, gen_row.JALR);
+    if (sel low.err) { ret 11; }
+    pair[1] = low.ok;
+    if (!t_ok(register(?t.b, ?pair[1], t_x(1))) || !t_ok(register(?t.b, ?pair[1], t_x(1))) || !t_ok(immediate(?t.b, ?pair[1], 0))) { ret 12; }
+    if (!t_ok(sequence(?t.b, ?pair[0], 2)))                                                                                        { ret 13; }
+    if (!t_ok(build.define(?t.b, skip)))                                                                                           { ret 14; }
+    if (!t_rri(?t, gen_row.LD, 1, 2, 8))                                                                                           { ret 15; }
+    if (!t_rri(?t, gen_row.ADDI, 2, 2, 16))                                                                                        { ret 16; }
+    if (!t_rri(?t, gen_row.JALR, 0, 1, 0))                                                                                         { ret 17; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 18; }
+    var o: mink.object.Object = done.ok;
+    # every instruction compressed but those holding a symbol, the branch and the pair, whose form the relocation fixes
+    if (build.line_count(?t.b) != 8) { ret 19; }
+    val lens: [8]u64 = [8]u64{2, 2, 4, 4, 4, 2, 2, 2};
+    var size: u64    = 0;
+    var i:    usize  = 0;
+    for (i < 8) {
+        if (build.line(?t.b, i).length != lens[i]) { ret 20; }
+        size = size + lens[i];
+        i    = i + 1;
+    }
+    val text: *mink.object.Section = mink.object.section_at(?o, mink.table.Id[mink.object.Section]{index: 0});
+    if (mink.object.bytes(?o, ?text.contents).len != size::usize) { ret 21; }
+    # the branch folds within the section, and the call is the one fixup, relocating against g
+    if (o.relocs.count != 1) { ret 22; }
+    val call: *mink.object.Reloc = ?o.relocs.items[0];
+    if (call.kind != ?mink.reloc.CALL_PLT_PAIR || call.offset != build.line(?t.b, 3).offset) { ret 23; }
+    if (!sel call.target.symbol)                                                             { ret 24; }
+    val callee: *mink.object.Symbol = mink.object.symbol_at(?o, call.target.symbol);
+    if (!sel callee.def.undefined) { ret 25; }
+    # mink's elf relocations for the object's architecture take each of its relocations
+    val relocations: res[mink.row.Registry, mink.fail.Fail] = mink.builtin.registry();
+    if (sel relocations.err) { ret 26; }
+    var registry: mink.row.Registry                  = relocations.ok;
+    val elf:      res[*mink.row.Set, mink.fail.Fail] = mink.row.find(?registry, ?mink.format.ELF, o.arch);
+    if (sel elf.err) { ret 26; }
+    var r: usize = 0;
+    for (r < o.relocs.count) {
+        val taken: res[*mink.row.Row, mink.fail.Fail] = mink.row.by_kind(elf.ok, o.relocs.items[r].kind);
+        if (sel taken.err) { ret 27; }
+        r = r + 1;
+    }
+    if (!t_done(?t, ?o)) { ret 28; }
+    ret 0;
+}
+
+# the label of the builder a listing spells `name`, by the listing's own names, for reading a listing back
+#[testing]
+fun t_resolve(context: ptr, name: View) res[spelling.Resolved, str] {
+    val n:  *Namer = context::*Namer;
+    var id: u32    = 1;
+    for (id::usize <= n.b.labels.len) {
+        val spelled: View = named(context, id);
+        if (spelled.len == name.len) {
+            var k: usize = 0;
+            for (k < name.len && spelled.data[k] == name.data[k]) {
+                k = k + 1;
+            }
+            if (k == name.len) { ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{id}}; }
+        }
+        id = id + 1;
+    }
+    ret res[spelling.Resolved, str].err{"unknown symbol"};
+}
+
+# whether line `i` of the listing, the text of `out` from `from` to `to`, reads back to the instruction it lists
+#[testing]
+fun t_reads_back(t: *T, out: *vector.Vector[u8], from: usize, to: usize, i: usize) bool {
+    var namer:      Namer            = Namer{b: ?t.b};
+    var symbols:    spelling.Symbols = spelling.Symbols{context: (?namer)::ptr, resolve: t_resolve, name: named};
+    var store:      [16]operand.Value;
+    var admissions: [8]requirement.Ids;
+    var rd:         spelling.Reader  = spelling.Reader{
+        text:      out.data,
+        start:     from,
+        at:        from,
+        end:       to,
+        origin:    diagnostic.START,
+        codec:     t.b.set.codec,
+        available: ?t.v,
+        syntax:    ?t.b.set.syntaxes.at[DEFAULT],
+        symbols:   ?symbols,
+        context:   nil,
+        row:       nil,
+        pool:      ?store[0],
+        cap:       16,
+        used:      0,
+        bytes:     nil,
+        room:      0,
+        taken:     0,
+        refused:   field.Admissions{at: ?admissions[0], cap: 8, used: 0},
+    };
+    val got: res[inst.Inst, diagnostic.Diagnostic] = parse.instruction(?rd);
+    if (sel got.err) { ret false; }
+    val listed_: build.Line = build.line(?t.b, i);
+    if (got.ok.row != listed_.inst.row || got.ok.count != listed_.inst.count) { ret false; }
+    var k: u32 = 0;
+    for (k < got.ok.count) {
+        if (!operand.equal(?got.ok.values[k], ?listed_.inst.values[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+test emit__the_listing_of_emitted_code_prints_through_the_sets_syntax {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    if (!t_text(?t))          { ret 2; }
+    val ext:  build.Label = t_named(?t, "ext");
+    val next: build.Label = t_anon(?t);
+    val hi:   build.Label = t_anon(?t);
+    if (!t_ok(build.expose(?t.b, ext, T_GLOBAL))) { ret 3; }
+    if (!t_rri(?t, gen_row.ADDI, 10, 0, 3))       { ret 4; }
+    var branch: Instruction;
+    if (!t_rrl(?t, gen_row.BEQ, 10, 0, next, operand.NO_FIXUP, ?branch)) { ret 5; }
+    if (!t_ok(put(?t.b, ?branch)))                                       { ret 5; }
+    val jump: res[Instruction, build.Refusal] = start(?t.b, gen_row.JAL);
+    if (sel jump.err) { ret 6; }
+    var call: Instruction = jump.ok;
+    if (!t_ok(register(?t.b, ?call, t_x(1))) || !t_ok(symbol(?t.b, ?call, ext, 0, operand.NO_FIXUP)) || !t_ok(put(?t.b, ?call))) { ret 7; }
+    # a set's pseudo instruction is written by the builder as its sequence, and its low part names an anonymous label
+    var ex: relax.Expansion;
+    if (!riscv_pseudo.lla(?t.v, t_x(11), operand.Symbol{id: ext.id, addend: 0, fixup: operand.NO_FIXUP}, hi.id, ?ex)) { ret 8; }
+    if (!t_ok(build.define(?t.b, hi)) || !t_ok(build.expansion(?t.b, ?ex)) || !t_ok(build.define(?t.b, next)))        { ret 9; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 10; }
+    var o:       mink.object.Object = done.ok;
+    var out:     vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t.t));
+    val printed: err[field.Refusal] = listing(?t.b, DEFAULT, ?out);
+    if (sel printed.err) { ret 11; }
+    # aliases where they apply, a folded branch as its distance, and labels by name
+    if (!t_spelled(?out, "li a0, 3\nbeqz a0, 16\njal ext\nauipc a1, ext\naddi a1, a1, %pcrel_lo(.Ltmp3)\n")) { ret 12; }
+    # each line reads back to the instruction it lists
+    var from: usize = 0;
+    var line: usize = 0;
+    var at:   usize = 0;
+    for (at < out.len) {
+        if (out.data[at] == '\n') {
+            if (!t_reads_back(?t, ?out, from, at, line)) { ret 13; }
+            from = at + 1;
+            line = line + 1;
+        }
+        at = at + 1;
+    }
+    if (line != build.line_count(?t.b)) { ret 14; }
+    vector.dnit[u8](?out);
+    if (!t_done(?t, ?o)) { ret 15; }
+    ret 0;
+}
