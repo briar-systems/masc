@@ -42,6 +42,12 @@ Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.
 `mach dep pull .` realizes the committed pins and `mach dep update` moves them.
 
+`gen` is a root of its own, so it pins masc's dependencies again under
+`gen/dep/`. A pin of `mink` or `std` moved in `dep/` moves to the same commit
+in `gen/dep/` in the same commit, or the generators build masc against
+different code than masc builds against. mach does not report the two
+disagreeing, so check them with `git ls-files -s dep gen/dep`.
+
 
 ## Testing and formatting
 
