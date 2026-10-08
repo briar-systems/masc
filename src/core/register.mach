@@ -49,12 +49,36 @@ pub val FLAGS:     Kind = 4;
 pub val TILE:      Kind = 5;
 pub val SYSTEM:    Kind = 6;
 
+# a multiplier an extension fixes for a scale, as riscv's rv64 fixes xlen at 2
+# ---
+# by:         the extension or mode whose presence in a selection fixes it
+# multiplier: the multiplier, a power of two from 1 to the scale's max
+pub rec Fixing {
+    by:         extension.Id;
+    multiplier: u32;
+}
+
+# fixings as a pointer to static rows and a count, so a static row can hold a list
+# ---
+# at:  the first fixing, nil when the list is empty
+# len: how many fixings the list holds
+pub rec Fixings {
+    at:  *Fixing;
+    len: u32;
+}
+
 # a quantity that scales with the implementation or the selection, such as
 # the vector length or riscv xlen, whose multiplier of its minimum is a power
 # of two from 1 to max
+# ---
+# name:  the spelling diagnostics use
+# max:   the largest multiplier
+# fixes: the multipliers extensions fix, empty when none does and the implementation chooses.
+#        two fixings of different multipliers must belong to extensions that conflict
 pub rec Scale {
-    name: str;
-    max:  u32;
+    name:  str;
+    max:   u32;
+    fixes: Fixings;
 }
 
 # a quantity of the fixed part plus per times the multiplier of one scale
@@ -238,15 +262,39 @@ pub fun admits(s: *extension.Selection, row: *Register) bool {
     ret extension.admits(s, row.requires);
 }
 
-# a selection's view of a register file: the rows it admits
+# a selection's view of a register file: the rows it admits and the scales it fixes
 # ---
-# file:      the file, nil for a set with none, whose view then holds nothing
-# selection: the selection the view filters by
-# rows:      one bit per register row, set when the selection admits it
+# file:        the file, nil for a set with none, whose view then holds nothing
+# selection:   the selection the view filters by
+# allocator:   the allocator the view's storage came from
+# rows:        one bit per register row, set when the selection admits it
+# multipliers: one multiplier per scale of the file, 0 when no extension of the selection fixes it
 pub rec Available {
-    file:      *File;
-    selection: *extension.Selection;
-    rows:      bitset.Bitset;
+    file:        *File;
+    selection:   *extension.Selection;
+    allocator:   *A.Allocator;
+    rows:        bitset.Bitset;
+    multipliers: *u32;
+}
+
+# two extensions of one selection that fix a scale at different multipliers
+# ---
+# scale:  the scale's index in the file
+# first:  one extension
+# second: the other
+pub rec Fixed {
+    scale:  u8;
+    first:  extension.Id;
+    second: extension.Id;
+}
+
+# why a view was not made
+# ---
+# memory: the allocator refused the view's storage
+# fixed:  the selection fixes one scale twice with different multipliers
+pub tag Error: u8 {
+    memory: A.Error;
+    fixed:  Fixed;
 }
 
 # a register named that the selection does not admit
@@ -267,23 +315,70 @@ pub tag Absent: u8 {
     unavailable: Unavailable;
 }
 
+# the multiplier the selection fixes for scale `i` of `file`, none when no
+# extension of it does, or the pair that fix it twice
+fun resolve(file: *File, s: *extension.Selection, i: u32) res[opt[u32], Fixed] {
+    val fixes: Fixings     = file.scales[i].fixes;
+    var seen:  opt[Fixing] = opt[Fixing].none{};
+    var j:     u32         = 0;
+    for (j < fixes.len) {
+        val f: Fixing = fixes.at[j];
+        if (extension.has(s, f.by)) {
+            if (sel seen.some) {
+                if (seen.some.multiplier != f.multiplier) {
+                    ret res[opt[u32], Fixed].err{Fixed{scale: i::u8, first: seen.some.by, second: f.by}};
+                }
+            }
+            or { seen = opt[Fixing].some{f}; }
+        }
+        j = j + 1;
+    }
+    if (sel seen.some) { ret res[opt[u32], Fixed].ok{opt[u32].some{seen.some.multiplier}}; }
+    ret res[opt[u32], Fixed].ok{opt[u32].none{}};
+}
+
 # the view of `file` through the selection `s`, which must outlive it
-pub fun select(a: *A.Allocator, file: *File, s: *extension.Selection) res[Available, A.Error] {
-    var count: u32 = 0;
-    if (file != nil) { count = file.register_count; }
+# ---
+# ret: the view, or why it was not made
+pub fun select(a: *A.Allocator, file: *File, s: *extension.Selection) res[Available, Error] {
+    var count:  u32 = 0;
+    var scales: u32 = 0;
+    if (file != nil) {
+        count  = file.register_count;
+        scales = file.scale_count;
+    }
     val made: res[bitset.Bitset, A.Error] = bitset.init(a, count::usize);
-    if (sel made.err) { ret res[Available, A.Error].err{made.err}; }
-    var v: Available = Available{file: file, selection: s, rows: made.ok};
-    var i: u32       = 0;
+    if (sel made.err) { ret res[Available, Error].err{Error.memory{made.err}}; }
+    var v: Available = Available{file: file, selection: s, allocator: a, rows: made.ok, multipliers: nil};
+    if (scales != 0) {
+        val kept: res[*u32, A.Error] = A.zallocate[u32](a, scales::usize);
+        if (sel kept.err) {
+            bitset.dnit(?v.rows);
+            ret res[Available, Error].err{Error.memory{kept.err}};
+        }
+        v.multipliers = kept.ok;
+    }
+    var k: u32 = 0;
+    for (k < scales) {
+        val fixed: res[opt[u32], Fixed] = resolve(file, s, k);
+        if (sel fixed.err) {
+            release(?v);
+            ret res[Available, Error].err{Error.fixed{fixed.err}};
+        }
+        if (sel fixed.ok.some) { v.multipliers[k] = fixed.ok.some; }
+        k = k + 1;
+    }
+    var i: u32 = 0;
     for (i < count) {
         if (admits(s, ?file.registers[i])) { bitset.set(?v.rows, i::usize); }
         i = i + 1;
     }
-    ret res[Available, A.Error].ok{v};
+    ret res[Available, Error].ok{v};
 }
 
 # release a view's storage
 pub fun release(v: *Available) err[A.Error] {
+    if (v.multipliers != nil) { A.deallocate[u32](v.allocator, v.multipliers, v.file.scale_count::usize); }
     ret bitset.dnit(?v.rows);
 }
 
@@ -314,6 +409,28 @@ pub fun lookup(v: *Available, name: View) res[Id, Absent] {
     val held: err[Absent] = admitted(v, found.some);
     if (sel held.err) { ret res[Id, Absent].err{held.err}; }
     ret res[Id, Absent].ok{found.some};
+}
+
+# the multiplier the selection fixes for scale `scale`, none when no extension of
+# it does or the file has no such scale
+pub fun multiplier(v: *Available, scale: u8) opt[u32] {
+    if (v.file == nil || scale::u32 >= v.file.scale_count) { ret opt[u32].none{}; }
+    val m: u32 = v.multipliers[scale];
+    if (m == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{m};
+}
+
+# the bits of each member of the class of `reg` through the view
+# ---
+# ret: the width, none when its scale is unknown to the selection, or why the view refuses the register
+pub fun width(v: *Available, reg: Id) res[opt[u64], Absent] {
+    val held: err[Absent] = admitted(v, reg);
+    if (sel held.err) { ret res[opt[u64], Absent].err{held.err}; }
+    val q: Scaled = v.file.classes[class_of(reg)].width;
+    if (q.per == 0) { ret res[opt[u64], Absent].ok{opt[u64].some{q.fixed::u64}}; }
+    val m: opt[u32] = multiplier(v, q.scale);
+    if (sel m.none) { ret res[opt[u64], Absent].ok{opt[u64].none{}}; }
+    ret res[opt[u64], Absent].ok{opt[u64].some{at(q, m.some::u64)}};
 }
 
 # the value of `q` at multiplier `m` of its scale
@@ -428,9 +545,16 @@ val X86: File = File{
     column_count:   2,
 };
 
+# rv32 and rv64 fix xlen at 1 and 2, and rv128 would fix it at 4
+#[testing]
+val RISCV_XLEN: [2]Fixing = [2]Fixing{
+    Fixing{by: 2, multiplier: 1},
+    Fixing{by: 3, multiplier: 2},
+};
+
 #[testing]
 val RISCV_SCALES: [1]Scale = [1]Scale{
-    Scale{name: "xlen", max: 4},
+    Scale{name: "xlen", max: 4, fixes: Fixings{at: ?RISCV_XLEN[0], len: 2}},
 };
 
 #[testing]
@@ -474,7 +598,7 @@ val RISCV: File = File{
 
 #[testing]
 val AARCH64_SCALES: [1]Scale = [1]Scale{
-    Scale{name: "svl", max: 16},
+    Scale{name: "svl", max: 16, fixes: Fixings{at: nil, len: 0}},
 };
 
 # za has svl / 8 rows of svl bits, and zan.d takes every eighth row from row n
@@ -517,24 +641,26 @@ test named__name_and_alias_reach_one_id {
 }
 
 #[testing]
-val RISCV_BASES: [2]extension.Extension = [2]extension.Extension{
+val RISCV_BASES: [4]extension.Extension = [4]extension.Extension{
     extension.Extension{name: "i", implies: extension.Ids{at: nil, len: 0}, revision: "2.1"},
     extension.Extension{name: "e", implies: extension.Ids{at: nil, len: 0}, revision: "2.0"},
+    extension.Extension{name: "rv32", implies: extension.Ids{at: nil, len: 0}, revision: "2.1"},
+    extension.Extension{name: "rv64", implies: extension.Ids{at: nil, len: 0}, revision: "2.1"},
 };
 
 #[testing]
-val RISCV_BASE_CONFLICT: [1]extension.Conflict = [1]extension.Conflict{extension.Conflict{a: 0, b: 1}};
+val RISCV_BASE_CONFLICT: [2]extension.Conflict = [2]extension.Conflict{extension.Conflict{a: 0, b: 1}, extension.Conflict{a: 2, b: 3}};
 
 #[testing]
-val RISCV_CATALOG: extension.Catalog = extension.Catalog{extensions: ?RISCV_BASES[0], count: 2, levels: nil, level_count: 0, conflicts: ?RISCV_BASE_CONFLICT[0], conflict_count: 1, syntax: ?extension.LIST};
+val RISCV_CATALOG: extension.Catalog = extension.Catalog{extensions: ?RISCV_BASES[0], count: 4, levels: nil, level_count: 0, conflicts: ?RISCV_BASE_CONFLICT[0], conflict_count: 2, syntax: ?extension.LIST};
 
 test lookup__an_unavailable_register_is_refused_naming_it_and_what_the_selection_lacks {
     var t: testing.Testing;
     testing.make(?t);
     val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t), ?RISCV_CATALOG, "e", diagnostic.START);
     if (sel made.err) { ret 1; }
-    var s:      extension.Selection     = made.ok;
-    val viewed: res[Available, A.Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
+    var s:      extension.Selection   = made.ok;
+    val viewed: res[Available, Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
     if (sel viewed.err) { ret 2; }
     var v:   Available       = viewed.ok;
     val x16: res[Id, Absent] = lookup(?v, view("x16", 3));
@@ -545,6 +671,36 @@ test lookup__an_unavailable_register_is_refused_naming_it_and_what_the_selection
     release(?v);
     extension.release(?s);
     if (testing.live_count(?t) != 0) { ret 6; }
+    ret 0;
+}
+
+# the width of x0 under the selection `spelling`, in `bits` when known
+#[testing]
+fun t_width(spelling: str, known: *bool, bits: *u64) u8 {
+    var t: testing.Testing;
+    testing.make(?t);
+    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t), ?RISCV_CATALOG, spelling);
+    if (sel made.err) { ret 1; }
+    var s:      extension.Selection   = made.ok;
+    val viewed: res[Available, Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
+    if (sel viewed.err) { ret 2; }
+    var v:    Available             = viewed.ok;
+    val read: res[opt[u64], Absent] = width(?v, make(0, 0));
+    if (sel read.err) { ret 3; }
+    @known = sel read.ok.some;
+    if (sel read.ok.some) { @bits = read.ok.some; }
+    release(?v);
+    extension.release(?s);
+    if (testing.live_count(?t) != 0) { ret 4; }
+    ret 0;
+}
+
+test width__resolves_where_an_extension_fixes_the_scale_and_stays_unknown_where_none_does {
+    var known: bool = false;
+    var bits:  u64  = 0;
+    if (t_width("i,rv32", ?known, ?bits) != 0 || !known || bits != 32) { ret 1; }
+    if (t_width("i,rv64", ?known, ?bits) != 0 || !known || bits != 64) { ret 2; }
+    if (t_width("i", ?known, ?bits) != 0 || known)                     { ret 3; }
     ret 0;
 }
 
