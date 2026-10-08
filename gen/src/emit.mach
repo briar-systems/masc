@@ -1,0 +1,581 @@
+# the emitter of generated tables as static mach literals
+#
+# a generator describes each table it emits as declarations of values:
+# numbers, text, names, addresses, records and arrays. nothing in the
+# description is a call, so every table is a static literal. the emitter
+# owns where a table lives and what it is called, src/isa/<set>/gen_<table>.mach
+# as the module masc.isa.<set>.gen_<table>, and the header that marks it as
+# generated, naming the generator and the source with its revision.
+#
+# output never depends on the order a generator described things in: imports
+# are sorted and deduplicated, declarations are written sorted by name, and a
+# keyed array is sorted by its keys, so a name or a key given twice is
+# refused rather than ordered by chance. the layout is the one `mach fmt`
+# keeps: one declaration per paragraph, one array item per line.
+#
+# a description refused part way, by its storage or by a name or a value the
+# emitter does not admit, keeps the first refusal, which `render` reports.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_empty;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+
+use gen.diag;
+use gen.source;
+
+# a value of a generated literal
+# ---
+# number:  an integer, written in decimal
+# hex:     an integer, written in hexadecimal, as masks and fixed bits read best
+# text:    a string, written escaped. a byte table is an array of u8, never text
+# name:    a constant, a function or a path written as is, such as `true`, `nil` or `field.NO_OPERAND`
+# address: the address of a constant, as `?` and the path. a record constant of another module is always reached this way
+# record:  a record literal
+# array:   an array literal
+pub tag Value: u8 {
+    number:  i64;
+    hex:     u64;
+    text:    str;
+    name:    str;
+    address: str;
+    record:  *Record;
+    array:   *Array;
+}
+
+# a named member of a record literal
+pub rec Member {
+    name:  str;
+    value: Value;
+}
+
+# a record literal of type `of`, its members in the order given
+pub rec Record {
+    of:      str;
+    members: vector.Vector[Member];
+}
+
+# an item of an array, with the key a keyed array is sorted by
+pub rec Item {
+    key:   str;
+    value: Value;
+}
+
+# an array literal of `element`s
+# ---
+# keyed:  whether its items are sorted by key, rather than kept in the order given
+# sealed: whether a keyed array has been sorted and its keys checked
+pub rec Array {
+    element: str;
+    items:   vector.Vector[Item];
+    keyed:   bool;
+    sealed:  bool;
+}
+
+# a public constant of a generated table
+pub rec Decl {
+    name:  str;
+    of:    str;
+    value: Value;
+}
+
+# one generated table
+# ---
+# alloc:     allocator for the description, which outlives the render
+# path:      where it lives, relative to masc's root
+# module:    its module path
+# generator: the generator that emits it
+# source:    the source it is generated from
+# imports:   the modules it uses
+# decls:     its constants
+# failed:    whether its description was refused
+# failure:   the first refusal of its description
+pub rec File {
+    alloc:     *A.Allocator;
+    path:      str;
+    module:    str;
+    generator: str;
+    source:    *source.Source;
+    imports:   vector.Vector[str];
+    decls:     vector.Vector[Decl];
+    failed:    bool;
+    failure:   diag.Refusal;
+}
+
+pub val NOT_IDENTIFIER: str = "set or table name is not a lowercase identifier";
+pub val TWICE:          str = "name declared twice";
+pub val KEY_TWICE:      str = "key given twice in a keyed array";
+pub val NO_KEY:         str = "key not in the keyed array";
+pub val NO_TEXT:        str = "text value is nil";
+
+# the root of every generated module's path, and the prefix of its file
+pub val ROOT:   str = "masc.isa.";
+pub val PREFIX: str = "gen_";
+
+fun fail(f: *File, message: str, subject: str) {
+    if (f.failed) { ret; }
+    f.failed  = true;
+    f.failure = diag.refusal(f.path, 0, message, subject);
+}
+
+fun joined(f: *File, r: res[str, StrError]) str {
+    if (sel r.err) {
+        fail(f, diag.MEMORY, nil);
+        ret "";
+    }
+    ret r.ok;
+}
+
+fun lower_identifier(s: str) bool {
+    if (str_empty(s)) { ret false; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (!((c >= 'a' && c <= 'z') || c == '_' || (i > 0 && c >= '0' && c <= '9'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the table `table` of set `set`, emitted by `generator` from `src`
+pub fun file(a: *A.Allocator, set: str, table: str, generator: str, src: *source.Source) File {
+    var f: File = File{
+        alloc:     a,
+        path:      "",
+        module:    "",
+        generator: generator,
+        source:    src,
+        imports:   vector.init[str](a),
+        decls:     vector.init[Decl](a),
+        failed:    false,
+        failure:   diag.refusal(nil, 0, nil, nil),
+    };
+    if (!lower_identifier(set) || !lower_identifier(table)) {
+        fail(?f, NOT_IDENTIFIER, table);
+        ret f;
+    }
+    f.path   = joined(?f, str_join(a, "src/isa/", set, "/", PREFIX, table, ".mach"));
+    f.module = joined(?f, str_join(a, ROOT, set, ".", PREFIX, table));
+    ret f;
+}
+
+# `module` used by the table
+pub fun uses(f: *File, module: str) {
+    val pushed: res[usize, A.Error] = vector.push[str](?f.imports, module);
+    if (sel pushed.err) { fail(f, diag.MEMORY, module); }
+}
+
+# a new record literal of type `of`, nil when its storage is refused
+pub fun record(f: *File, of: str) *Record {
+    val got: res[*Record, A.Error] = A.allocate[Record](f.alloc, 1);
+    if (sel got.err) {
+        fail(f, diag.MEMORY, of);
+        ret nil;
+    }
+    got.ok.of      = of;
+    got.ok.members = vector.init[Member](f.alloc);
+    ret got.ok;
+}
+
+# member `name` of `r` set to `v`
+pub fun member(f: *File, r: *Record, name: str, v: Value) {
+    if (r == nil) { ret; }
+    val pushed: res[usize, A.Error] = vector.push[Member](?r.members, Member{name: name, value: v});
+    if (sel pushed.err) { fail(f, diag.MEMORY, name); }
+}
+
+fun make_array(f: *File, element: str, keyed: bool) *Array {
+    val got: res[*Array, A.Error] = A.allocate[Array](f.alloc, 1);
+    if (sel got.err) {
+        fail(f, diag.MEMORY, element);
+        ret nil;
+    }
+    got.ok.element = element;
+    got.ok.items   = vector.init[Item](f.alloc);
+    got.ok.keyed   = keyed;
+    got.ok.sealed  = false;
+    ret got.ok;
+}
+
+# a new array literal of `element`s, its items in the order given
+pub fun array(f: *File, element: str) *Array {
+    ret make_array(f, element, false);
+}
+
+# a new array literal of `element`s, its items sorted by key
+pub fun keyed(f: *File, element: str) *Array {
+    ret make_array(f, element, true);
+}
+
+# `v` appended to `arr`
+pub fun item(f: *File, arr: *Array, v: Value) {
+    entry(f, arr, nil, v);
+}
+
+# `v` added to keyed array `arr` under `key`
+pub fun entry(f: *File, arr: *Array, key: str, v: Value) {
+    if (arr == nil) { ret; }
+    arr.sealed = false;
+    val pushed: res[usize, A.Error] = vector.push[Item](?arr.items, Item{key: key, value: v});
+    if (sel pushed.err) { fail(f, diag.MEMORY, key); }
+}
+
+fun by_key(a: *Item, b: *Item) i64 {
+    ret str_compare(a.key, b.key);
+}
+
+# keyed array `arr` sorted by key, refusing a key given twice
+pub fun seal(f: *File, arr: *Array) {
+    if (arr == nil || !arr.keyed || arr.sealed) { ret; }
+    sort.sort_by[Item](arr.items.data, arr.items.len, by_key);
+    var i: usize = 1;
+    for (i < arr.items.len) {
+        if (str_compare(arr.items.data[i - 1].key, arr.items.data[i].key) == 0) { fail(f, KEY_TWICE, arr.items.data[i].key); }
+        i = i + 1;
+    }
+    arr.sealed = true;
+}
+
+# the position of `key` in keyed array `arr`, sealing it first
+pub fun position(f: *File, arr: *Array, key: str) opt[u32] {
+    if (arr == nil) { ret opt[u32].none{}; }
+    seal(f, arr);
+    var lo: usize = 0;
+    var hi: usize = arr.items.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = str_compare(arr.items.data[mid].key, key);
+        if (c == 0) { ret opt[u32].some{mid::u32}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    fail(f, NO_KEY, key);
+    ret opt[u32].none{};
+}
+
+# how many items `arr` holds
+pub fun length(arr: *Array) u32 {
+    if (arr == nil) { ret 0; }
+    ret arr.items.len::u32;
+}
+
+# `left` and `right` joined, as a constant's name or path
+pub fun concat(f: *File, left: str, right: str) str {
+    ret joined(f, str_join(f.alloc, left, right));
+}
+
+# public constant `name` of type `of` declared as `v`
+pub fun declare(f: *File, name: str, of: str, v: Value) {
+    val pushed: res[usize, A.Error] = vector.push[Decl](?f.decls, Decl{name: name, of: of, value: v});
+    if (sel pushed.err) { fail(f, diag.MEMORY, name); }
+}
+
+# array `arr` declared as `name`, and the address of its first item, or nil when it is empty and nothing is declared
+pub fun declare_array(f: *File, name: str, arr: *Array) Value {
+    if (length(arr) == 0) { ret Value.name{"nil"}; }
+    declare(f, name, nil, Value.array{arr});
+    ret Value.address{concat(f, name, "[0]")};
+}
+
+# an upper-case constant name for `text`, each byte outside letters and digits an underscore
+pub fun ident(f: *File, text: str) str {
+    val len: usize             = str_len(text);
+    val got: res[*u8, A.Error] = A.allocate[u8](f.alloc, len + 2);
+    if (sel got.err) {
+        fail(f, diag.MEMORY, text);
+        ret "";
+    }
+    var at: usize = 0;
+    if (len == 0 || (text[0] >= '0' && text[0] <= '9')) {
+        got.ok[0] = '_';
+        at        = 1;
+    }
+    var i: usize = 0;
+    for (i < len) {
+        var c: u8 = text[i];
+        if (c >= 'a' && c <= 'z')                                { c = c - 32; }
+        or (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) { c = '_'; }
+        got.ok[at] = c;
+        at         = at + 1;
+        i          = i + 1;
+    }
+    got.ok[at] = 0;
+    ret got.ok;
+}
+
+# an array of `len` bytes from `data`, the way every byte table is written
+pub fun bytes(f: *File, data: *u8, len: usize) *Array {
+    val arr: *Array = array(f, "u8");
+    var i:   usize  = 0;
+    for (i < len) {
+        item(f, arr, Value.hex{data[i]::u64});
+        i = i + 1;
+    }
+    ret arr;
+}
+
+# the text being written, and whether its storage was refused
+rec Out {
+    bytes:   vector.Vector[u8];
+    refused: bool;
+}
+
+fun put_byte(o: *Out, b: u8) {
+    val pushed: res[usize, A.Error] = vector.push[u8](?o.bytes, b);
+    if (sel pushed.err) { o.refused = true; }
+}
+
+fun put(o: *Out, s: str) {
+    if (s == nil) { ret; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        put_byte(o, s[i]);
+        i = i + 1;
+    }
+}
+
+fun put_number(o: *Out, n: i64) {
+    var digits: [24]u8;
+    val len:    usize = format.put_i64(?digits[0], n);
+    var i:      usize = 0;
+    for (i < len) {
+        put_byte(o, digits[i]);
+        i = i + 1;
+    }
+}
+
+fun put_hex(o: *Out, n: u64) {
+    val digits: str = "0123456789ABCDEF";
+    put(o, "0x");
+    var shift: i64 = 60;
+    for (shift > 0 && ((n >> shift::u64) & 0xF) == 0) {
+        shift = shift - 4;
+    }
+    for (shift >= 0) {
+        put_byte(o, digits[(n >> shift::u64) & 0xF]);
+        shift = shift - 4;
+    }
+}
+
+fun put_text(f: *File, o: *Out, s: str) {
+    if (s == nil) {
+        fail(f, NO_TEXT, nil);
+        ret;
+    }
+    val digits: str = "0123456789ABCDEF";
+    put_byte(o, '"');
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (c == '"' || c == '\\') {
+            put_byte(o, '\\');
+            put_byte(o, c);
+        }
+        or (c == '\n')             { put(o, "\\n"); }
+        or (c == '\t')             { put(o, "\\t"); }
+        or (c == '\r')             { put(o, "\\r"); }
+        or (c >= 0x20 && c < 0x7F) { put_byte(o, c); }
+        or {
+            put(o, "\\x");
+            put_byte(o, digits[c >> 4]);
+            put_byte(o, digits[c & 0xF]);
+        }
+        i = i + 1;
+    }
+    put_byte(o, '"');
+}
+
+fun put_array_type(o: *Out, arr: *Array) {
+    put_byte(o, '[');
+    put_number(o, arr.items.len::i64);
+    put_byte(o, ']');
+    put(o, arr.element);
+}
+
+fun put_value(f: *File, o: *Out, v: Value) {
+    if (sel v.number) { put_number(o, v.number); }
+    or (sel v.hex)    { put_hex(o, v.hex); }
+    or (sel v.text)   { put_text(f, o, v.text); }
+    or (sel v.name)   { put(o, v.name); }
+    or (sel v.address) {
+        put_byte(o, '?');
+        put(o, v.address);
+    }
+    or (sel v.record) {
+        val r: *Record = v.record;
+        put(o, r.of);
+        put_byte(o, '{');
+        var i: usize = 0;
+        for (i < r.members.len) {
+            if (i > 0) { put(o, ", "); }
+            put(o, r.members.data[i].name);
+            put(o, ": ");
+            put_value(f, o, r.members.data[i].value);
+            i = i + 1;
+        }
+        put_byte(o, '}');
+    }
+    or (sel v.array) {
+        val arr: *Array = v.array;
+        seal(f, arr);
+        put_array_type(o, arr);
+        put_byte(o, '{');
+        var i: usize = 0;
+        for (i < arr.items.len) {
+            if (i > 0) { put(o, ", "); }
+            put_value(f, o, arr.items.data[i].value);
+            i = i + 1;
+        }
+        put_byte(o, '}');
+    }
+}
+
+fun put_array_decl(f: *File, o: *Out, arr: *Array) {
+    seal(f, arr);
+    put_array_type(o, arr);
+    put(o, " = ");
+    put_array_type(o, arr);
+    put(o, "{\n");
+    var i: usize = 0;
+    for (i < arr.items.len) {
+        put(o, "    ");
+        put_value(f, o, arr.items.data[i].value);
+        put(o, ",\n");
+        i = i + 1;
+    }
+    put(o, "};\n");
+}
+
+fun put_decl(f: *File, o: *Out, d: *Decl) {
+    put(o, "pub val ");
+    put(o, d.name);
+    put(o, ": ");
+    val v: Value = d.value;
+    if (d.of == nil) {
+        if (sel v.array) {
+            put_array_decl(f, o, v.array);
+            ret;
+        }
+    }
+    put(o, d.of);
+    put(o, " = ");
+    put_value(f, o, d.value);
+    put(o, ";\n");
+}
+
+fun by_name(a: *Decl, b: *Decl) i64 {
+    ret str_compare(a.name, b.name);
+}
+
+fun by_text(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+# one group of imports, std's or the others, sorted with duplicates dropped
+fun put_imports(o: *Out, imports: *vector.Vector[str], std: bool) {
+    var wrote: bool  = false;
+    var i:     usize = 0;
+    for (i < imports.len) {
+        val m: str = imports.data[i];
+        if (str_starts_with(m, "std.") == std && !(i > 0 && str_compare(imports.data[i - 1], m) == 0)) {
+            put(o, "use ");
+            put(o, m);
+            put(o, ";\n");
+            wrote = true;
+        }
+        i = i + 1;
+    }
+    if (wrote) { put_byte(o, '\n'); }
+}
+
+# the text of `f`, or the first refusal of its description
+pub fun render(f: *File) res[vector.Vector[u8], diag.Refusal] {
+    var o: Out = Out{bytes: vector.init[u8](f.alloc), refused: false};
+    put(?o, "# generated by gen ");
+    put(?o, f.generator);
+    put(?o, " from ");
+    put(?o, f.source.name);
+    put(?o, " at ");
+    put(?o, f.source.revision);
+    put(?o, ", do not edit\n\n");
+    sort.sort_by[str](f.imports.data, f.imports.len, by_text);
+    put_imports(?o, ?f.imports, true);
+    put_imports(?o, ?f.imports, false);
+    sort.sort_by[Decl](f.decls.data, f.decls.len, by_name);
+    var i: usize = 0;
+    for (i < f.decls.len) {
+        if (i > 0) {
+            if (str_compare(f.decls.data[i - 1].name, f.decls.data[i].name) == 0) { fail(f, TWICE, f.decls.data[i].name); }
+            put_byte(?o, '\n');
+        }
+        put_decl(f, ?o, ?f.decls.data[i]);
+        i = i + 1;
+    }
+    if (o.refused) { fail(f, diag.MEMORY, nil); }
+    if (f.failed)  { ret res[vector.Vector[u8], diag.Refusal].err{f.failure}; }
+    ret res[vector.Vector[u8], diag.Refusal].ok{o.bytes};
+}
+
+#[testing]
+val T_SOURCE: source.Source = source.Source{name: "fixture", upstream: nil, revision: "1.0", licence: "MIT", notice: "LICENSE", path: "fixture", checksum: nil};
+
+# a small table described in the order `order` gives its rows
+#[testing]
+fun t_describe(a: *A.Allocator, order: *u32) File {
+    val mnemonics: [3]str = [3]str{"addi", "beq", "c.li"};
+    var f:         File   = file(a, "fixture", "rows", "fixture", ?T_SOURCE);
+    val rows:      *Array = keyed(?f, "row.Row");
+    var i:         u32    = 0;
+    for (i < 3) {
+        val m: str = mnemonics[order[i]];
+        uses(?f, "masc.core.row");
+        uses(?f, "std.types.bool.true");
+        val r: *Record = record(?f, "row.Row");
+        member(?f, r, "mnemonic", Value.text{m});
+        member(?f, r, "mask", Value.hex{0x707F});
+        member(?f, r, "count", Value.number{order[i]::i64 - 1});
+        entry(?f, rows, m, Value.record{r});
+        declare(?f, ident(?f, m), "u32", Value.number{order[i]::i64});
+        i = i + 1;
+    }
+    declare(?f, "ROWS", "row.Rows", Value.name{"nil"});
+    declare(?f, "ROW_TABLE", nil, Value.array{rows});
+    ret f;
+}
+
+test render__output_does_not_depend_on_input_order {
+    var t: testing.Testing;
+    testing.make(?t);
+    val forward:  [3]u32                               = [3]u32{0, 1, 2};
+    val backward: [3]u32                               = [3]u32{2, 0, 1};
+    var a:        File                                 = t_describe(testing.allocator_of(?t), ?forward[0]);
+    var b:        File                                 = t_describe(testing.allocator_of(?t), ?backward[0]);
+    val x:        res[vector.Vector[u8], diag.Refusal] = render(?a);
+    val y:        res[vector.Vector[u8], diag.Refusal] = render(?b);
+    if (sel x.err) { ret 1; }
+    if (sel y.err) { ret 1; }
+    val xb: vector.Vector[u8] = x.ok;
+    val yb: vector.Vector[u8] = y.ok;
+    if (xb.len != yb.len) { ret 2; }
+    var i: usize = 0;
+    for (i < xb.len) {
+        if (xb.data[i] != yb.data[i]) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
