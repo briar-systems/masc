@@ -1,0 +1,544 @@
+# the risc-v catalog
+#
+# the rows, their codec and decode dispatch, the csr id space, the relaxation
+# rows and the code fill are generated from riscv-opcodes by gen's riscv
+# generator, the fixup bindings are masc.isa.riscv.fixup, and the field
+# kinds, extension catalog and register file are their own modules. the
+# tests here walk the shipped rows: every row encodes and decodes back to
+# itself, every row's effect agrees with its fields, and the encode and
+# decode walks of the core refuse what they must on real rows.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.core.diagnostic;
+use masc.core.effect;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.walk;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_field:     masc.isa.riscv.field;
+use riscv_register:  masc.isa.riscv.register;
+
+fwd masc.isa.riscv.gen_csr.TABLE;
+fwd masc.isa.riscv.gen_relax.FILL;
+fwd masc.isa.riscv.gen_relax.RELAXATIONS;
+fwd masc.isa.riscv.gen_row.CODEC;
+fwd masc.isa.riscv.fixup.BINDINGS;
+
+use masc.isa.riscv.gen_row;
+
+# a test's selection of one row's extensions, its register view and output buffers
+#[testing]
+rec T {
+    t:      testing.Testing;
+    s:      extension.Selection;
+    v:      register.Available;
+    out:    vector.Vector[u8];
+    fixups: vector.Vector[field.Fixup];
+}
+
+#[testing]
+fun t_view(t: *T) bool {
+    val viewed: res[register.Available, register.Error] = register.select(testing.allocator_of(?t.t), ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v      = viewed.ok;
+    t.out    = vector.init[u8](testing.allocator_of(?t.t));
+    t.fixups = vector.init[field.Fixup](testing.allocator_of(?t.t));
+    ret true;
+}
+
+# a test over the selection `spelling` makes
+#[testing]
+fun t_make(t: *T, spelling: str) bool {
+    testing.make(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t.t), ?riscv_extension.CATALOG, spelling, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    ret t_view(t);
+}
+
+# a test over the first alternative of `r`'s requirement, the i base and a width: rv32 when the alternative names it, else rv64
+#[testing]
+fun t_make_for(t: *T, r: *row.Row) bool {
+    testing.make(?t.t);
+    val made: res[extension.Request, extension.Error] = extension.request(testing.allocator_of(?t.t), ?riscv_extension.CATALOG, "", diagnostic.START);
+    if (sel made.err) { ret false; }
+    var req:   extension.Request = made.ok;
+    var width: extension.Id      = riscv_extension.RV64;
+    if (r.requires.len > 0) {
+        val alt: extension.Ids = r.requires.at[0];
+        var i:   u32           = 0;
+        for (i < alt.len) {
+            extension.request_add(?req, alt.at[i]);
+            if (alt.at[i] == riscv_extension.RV32) { width = riscv_extension.RV32; }
+            i = i + 1;
+        }
+    }
+    extension.request_add(?req, width);
+    extension.request_add(?req, riscv_extension.I);
+    val closed: res[extension.Selection, extension.Error] = extension.close(req);
+    if (sel closed.err) { ret false; }
+    t.s = closed.ok;
+    ret t_view(t);
+}
+
+# the index of the first row spelled `mnemonic`
+#[testing]
+fun t_row(mnemonic: str) u32 {
+    var i: u32 = 0;
+    for (i < CODEC.rows.len) {
+        if (str_equals(CODEC.rows.at[i].mnemonic, mnemonic)) { ret i; }
+        i = i + 1;
+    }
+    ret CODEC.rows.len;
+}
+
+#[testing]
+fun t_encode(t: *T, r: u32, values: *operand.Value, count: u32) res[usize, field.Refusal] {
+    var ins: inst.Inst = inst.Inst{row: ?CODEC.rows.at[r], values: values, count: count};
+    ret walk.encode(?CODEC, ?t.v, ?ins, ?t.out, ?t.fixups);
+}
+
+#[testing]
+fun t_refused(got: res[usize, field.Refusal], message: str, op: u8) bool {
+    ret sel got.err && (got.err.message == message && got.err.operand == op);
+}
+
+# whether the output is exactly `want`
+#[testing]
+fun t_wrote(t: *T, want: *u8, len: usize) bool {
+    if (t.out.len != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (t.out.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_x(n: u16) operand.Value {
+    ret operand.Value.register{register.make(0, n)};
+}
+
+# the largest value `imm` holds, its scale's multiple, less `k` steps of the scale
+#[testing]
+fun t_immediate(imm: *operand.Immediate, k: u32) i64 {
+    var top: i64 = field.ones(imm.bits)::i64;
+    if (imm.signed) { top = (1::i64 << (imm.bits - 1)::i64) - 1; }
+    val step: i64 = 1::i64 << imm.scale::i64;
+    top = top - (top % step);
+    ret top - k::i64 * step + imm.bias;
+}
+
+# the value of operand `desc` at try `k`: registers from the top of the range down,
+# immediates from the largest down by their scale, enumerants from the last member, a mask from all of them
+#[testing]
+fun t_value(desc: *operand.Operand, k: u32) opt[operand.Value] {
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel shape.register) {
+        val r:     *operand.Register = ?shape.register;
+        val class: u16               = r.classes.at[0];
+        val count: u32               = riscv_register.FILE.classes[class].count;
+        val span:  u32               = operand.span(r, count);
+        if (k >= span) { ret opt[operand.Value].none{}; }
+        ret opt[operand.Value].some{operand.Value.register{register.make(class, (r.first + span - 1 - k)::u16)}};
+    }
+    if (sel shape.immediate) { ret opt[operand.Value].some{operand.Value.immediate{t_immediate(?shape.immediate, k)}}; }
+    if (sel shape.relative)  { ret opt[operand.Value].some{operand.Value.relative{t_immediate(?shape.relative.offset, k)}}; }
+    if (sel shape.id)        { ret opt[operand.Value].some{operand.Value.id{(field.ones(shape.id.bits)::u32 - k)}}; }
+    if (sel shape.enumerant) {
+        val e: *operand.Enumeration = ?shape.enumerant;
+        if (e.mask) {
+            if (k == 0) {
+                var all: u32 = 0;
+                var i:   u32 = 0;
+                for (i < e.count) {
+                    all = all | e.members[i].value;
+                    i   = i + 1;
+                }
+                ret opt[operand.Value].some{operand.Value.enumerant{all}};
+            }
+            if (k > e.count) { ret opt[operand.Value].none{}; }
+            ret opt[operand.Value].some{operand.Value.enumerant{e.members[e.count - k].value}};
+        }
+        if (k >= e.count) { ret opt[operand.Value].none{}; }
+        ret opt[operand.Value].some{operand.Value.enumerant{e.members[e.count - 1 - k].value}};
+    }
+    ret opt[operand.Value].none{};
+}
+
+test walk__every_row_encodes_and_decodes_back_to_itself {
+    var i: u32 = 0;
+    for (i < CODEC.rows.len) {
+        val r: *row.Row = ?CODEC.rows.at[i];
+        var t: T;
+        if (!t_make_for(?t, r)) { ret 1; }
+        var values: [row.MAX_OPERANDS]operand.Value;
+        var tries:  [row.MAX_OPERANDS]u32;
+        var k:      u32 = 0;
+        for (k < r.operands.len) {
+            val fixed: opt[u32] = effect.fixed(r.effect, k::u8);
+            if (sel fixed.some) { values[k] = operand.Value.register{register.id_of(?riscv_register.FILE.registers[fixed.some])}; }
+            or {
+                val first: opt[operand.Value] = t_value(?r.operands.at[k], 0);
+                if (sel first.none) { ret 2; }
+                values[k] = first.some;
+            }
+            k = k + 1;
+        }
+        # a refused operand takes its next value, until every operand is admitted
+        var wrote: res[usize, field.Refusal] = t_encode(?t, i, ?values[0], r.operands.len);
+        var left:  u32                       = 4096;
+        for (sel wrote.err && left > 0) {
+            val op: u8 = t_operand_refused(wrote);
+            if (op == field.NO_OPERAND || op::u32 >= r.operands.len) { ret 3; }
+            tries[op] = tries[op] + 1;
+            val next: opt[operand.Value] = t_value(?r.operands.at[op], tries[op]);
+            if (sel next.none) { ret 4; }
+            values[op] = next.some;
+            wrote      = t_encode(?t, i, ?values[0], r.operands.len);
+            left       = left - 1;
+        }
+        if (sel wrote.err) { ret 5; }
+        var store: [32]operand.Value;
+        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, t.out.data, t.out.len, 0, ?store[0], 32);
+        if (sel got.err)             { ret 6; }
+        if (got.ok.inst.row != r)    { ret 7; }
+        if (got.ok.len != t.out.len) { ret 8; }
+        k = 0;
+        for (k < r.operands.len) {
+            if (!operand.equal(?store[k], ?values[k])) { ret 9; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# whether operand `op` of `r` is encoded: a slice of its field takes it, its field's kind takes it whole, or it is fixed
+#[testing]
+fun t_encoded(r: *row.Row, op: u8) bool {
+    var f: u32 = 0;
+    for (f < r.encoding.len) {
+        val fl: *field.Field = ?r.encoding.at[f];
+        if (fl.operand == op)                                                                                           { ret true; }
+        if (fl.kind == riscv_field.SREGS_KIND && ((fl.param & 0xFF) == op::u64 || ((fl.param >> 8) & 0xFF) == op::u64)) { ret true; }
+        var s: u32 = 0;
+        for (s < fl.slices.len) {
+            if (fl.slices.at[s].operand == op) { ret true; }
+            s = s + 1;
+        }
+        f = f + 1;
+    }
+    ret false;
+}
+
+# the operand a refusal names, field.NO_OPERAND for none
+#[testing]
+fun t_operand_refused(got: res[usize, field.Refusal]) u8 {
+    if (sel got.err) { ret got.err.operand; }
+    ret field.NO_OPERAND;
+}
+
+# whether operand `op` of `r` is relative, an enumerant, or an immediate
+#[testing]
+fun t_relative(r: *row.Row, op: u8) bool {
+    if (op::u32 >= r.operands.len) { ret false; }
+    val d: *operand.Operand = ?r.operands.at[op];
+    ret sel d.shape.relative;
+}
+
+#[testing]
+fun t_enumerant(r: *row.Row, op: u8) bool {
+    if (op::u32 >= r.operands.len) { ret false; }
+    val d: *operand.Operand = ?r.operands.at[op];
+    ret sel d.shape.enumerant;
+}
+
+#[testing]
+fun t_immediate_shape(r: *row.Row, op: u8) bool {
+    if (op::u32 >= r.operands.len) { ret false; }
+    val d: *operand.Operand = ?r.operands.at[op];
+    ret sel d.shape.immediate;
+}
+
+#[testing]
+fun t_reads(r: *row.Row, op: u8) bool {
+    ret op::u32 < r.operands.len && (r.operands.at[op].role & operand.READ) != 0;
+}
+
+#[testing]
+fun t_register(r: *row.Row, op: u8) bool {
+    if (op::u32 >= r.operands.len) { ret false; }
+    val d: *operand.Operand = ?r.operands.at[op];
+    ret sel d.shape.register;
+}
+
+test effect__every_row_states_roles_its_fields_agree_with {
+    var i: u32 = 0;
+    for (i < CODEC.rows.len) {
+        val r: *row.Row       = ?CODEC.rows.at[i];
+        val e: *effect.Effect = r.effect;
+        # every operand is used, and encoded by its field or fixed and so held in no field
+        var k: u32 = 0;
+        for (k < r.operands.len) {
+            if (r.operands.at[k].role == operand.NONE) { ret 1; }
+            val fixed: opt[u32] = effect.fixed(e, k::u8);
+            if (t_encoded(r, k::u8) == sel fixed.some)   { ret 2; }
+            if (sel fixed.some && !t_register(r, k::u8)) { ret 3; }
+            k = k + 1;
+        }
+        # an access reads its address register and the operands that form the address
+        var a: u32 = 0;
+        for (a < e.memory.len) {
+            val acc: *effect.Access = ?e.memory.at[a];
+            if (acc.operand != field.NO_OPERAND && !(t_register(r, acc.operand) && t_reads(r, acc.operand))) { ret 4; }
+            if (acc.operand == field.NO_OPERAND && acc.base == effect.NO_ROW)                                { ret 5; }
+            k = 0;
+            for (k < r.operands.len) {
+                if (((acc.forming >> k) & 1) != 0 && !t_reads(r, k::u8)) { ret 6; }
+                k = k + 1;
+            }
+            if (acc.governor != field.NO_OPERAND && !t_enumerant(r, acc.governor)) { ret 7; }
+            a = a + 1;
+        }
+        # a transfer's target operand is read, a direct one is relative, and an indirect one is a register
+        val c: effect.Control = e.control;
+        if (c.operand != field.NO_OPERAND) {
+            if (!t_reads(r, c.operand))                                  { ret 8; }
+            if (c.target == effect.DIRECT && !t_relative(r, c.operand))  { ret 9; }
+            if (c.target == effect.INDIRECT && t_relative(r, c.operand)) { ret 10; }
+        }
+        or (c.transfer == effect.JUMP || c.transfer == effect.CALL) {
+            ret 11;
+        }
+        # a relative operand is a transfer's target
+        k = 0;
+        for (k < r.operands.len) {
+            if (t_relative(r, k::u8) && c.operand != k::u8) { ret 12; }
+            k = k + 1;
+        }
+        val st: effect.Stack = e.stack;
+        if (sel st.delta && !t_immediate_shape(r, st.delta.operand)) { ret 13; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test encode__an_immediate_out_of_range_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val addi:   u32              = t_row("addi");
+    var values: [3]operand.Value = [3]operand.Value{t_x(1), t_x(2), operand.Value.immediate{2048}};
+    if (!t_refused(t_encode(?t, addi, ?values[0], 3), field.OUT_OF_RANGE, 2)) { ret 2; }
+    values[2] = operand.Value.immediate{-2049};
+    if (!t_refused(t_encode(?t, addi, ?values[0], 3), field.OUT_OF_RANGE, 2)) { ret 3; }
+    if (t.out.len != 0)                                                       { ret 4; }
+    ret 0;
+}
+
+test encode__a_misaligned_scaled_immediate_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val values: [3]operand.Value = [3]operand.Value{t_x(1), t_x(2), operand.Value.relative{3}};
+    if (!t_refused(t_encode(?t, t_row("beq"), ?values[0], 3), field.MISALIGNED, 2)) { ret 2; }
+    ret 0;
+}
+
+test encode__a_register_of_the_wrong_class_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64if")) { ret 1; }
+    val values: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(1, 1)}, t_x(2), operand.Value.immediate{0}};
+    if (!t_refused(t_encode(?t, t_row("addi"), ?values[0], 3), field.WRONG_CLASS, 0)) { ret 2; }
+    ret 0;
+}
+
+test walk__a_register_range_refuses_outside_it_and_round_trips_inside_it {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    val cand:   u32              = t_row("c.and");
+    var values: [2]operand.Value = [2]operand.Value{t_x(7), t_x(9)};
+    if (!t_refused(t_encode(?t, cand, ?values[0], 2), field.OUTSIDE_RANGE, 0)) { ret 2; }
+    values[0] = t_x(16);
+    if (!t_refused(t_encode(?t, cand, ?values[0], 2), field.OUTSIDE_RANGE, 0)) { ret 3; }
+    values[0] = t_x(9);
+    val wrote: res[usize, field.Refusal] = t_encode(?t, cand, ?values[0], 2);
+    val want:  [2]u8                     = [2]u8{0xE5, 0x8C};
+    if (!(sel wrote.ok && t_wrote(?t, ?want[0], 2))) { ret 4; }
+    var store: [2]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[cand], t.out.data, t.out.len, 0, ?store[0], 2);
+    if (sel got.err)                                                          { ret 5; }
+    if (!(sel store[0].register && store[0].register == register.make(0, 9))) { ret 6; }
+    ret 0;
+}
+
+test walk__signed_boundary_values_encode_and_decode {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val addi:   u32    = t_row("addi");
+    val bounds: [2]i64 = [2]i64{-2048, 2047};
+    val want:   [8]u8  = [8]u8{0x93, 0x00, 0x01, 0x80, 0x93, 0x00, 0xF1, 0x7F};
+    var i:      u32    = 0;
+    for (i < 2) {
+        val values: [3]operand.Value          = [3]operand.Value{t_x(1), t_x(2), operand.Value.immediate{bounds[i]}};
+        val wrote:  res[usize, field.Refusal] = t_encode(?t, addi, ?values[0], 3);
+        if (!(sel wrote.ok && wrote.ok == 4)) { ret 2; }
+        i = i + 1;
+    }
+    if (!t_wrote(?t, ?want[0], 8)) { ret 3; }
+    var store: [3]operand.Value;
+    i = 0;
+    for (i < 2) {
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[addi], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        if (sel got.err)                                                  { ret 4; }
+        if (!(sel store[2].immediate && store[2].immediate == bounds[i])) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test walk__a_split_immediate_reassembles {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val beq:     u32    = t_row("beq");
+    val offsets: [2]i64 = [2]i64{2730, -4096};
+    val want:    [8]u8  = [8]u8{0xE3, 0x85, 0x20, 0x2A, 0x63, 0x80, 0x20, 0x80};
+    var i:       u32    = 0;
+    for (i < 2) {
+        val values: [3]operand.Value          = [3]operand.Value{t_x(1), t_x(2), operand.Value.relative{offsets[i]}};
+        val wrote:  res[usize, field.Refusal] = t_encode(?t, beq, ?values[0], 3);
+        if (sel wrote.err) { ret 2; }
+        i = i + 1;
+    }
+    if (!t_wrote(?t, ?want[0], 8)) { ret 3; }
+    var store: [3]operand.Value;
+    i = 0;
+    for (i < 2) {
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[beq], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        if (sel got.err)                                                 { ret 4; }
+        if (!(sel store[2].relative && store[2].relative == offsets[i])) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test decode_row__fixed_bits_that_do_not_match_refuse {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val beq:   [4]u8                            = [4]u8{0xE3, 0x85, 0x20, 0x2A};
+    var store: [3]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[t_row("addi")], ?beq[0], 4, 0, ?store[0], 3);
+    if (!(sel got.err && got.err.message == field.MISMATCH)) { ret 2; }
+    ret 0;
+}
+
+test decode__a_truncated_stream_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val addi:  [3]u8                            = [3]u8{0x93, 0x00, 0x01};
+    var store: [3]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?addi[0], 3, 0, ?store[0], 3);
+    if (!(sel got.err && got.err.message == field.TRUNCATED)) { ret 2; }
+    val one: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[t_row("addi")], ?addi[0], 3, 0, ?store[0], 3);
+    if (!(sel one.err && one.err.message == field.TRUNCATED)) { ret 3; }
+    ret 0;
+}
+
+test decode__dispatch_selects_the_row_whose_fixed_bits_match {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    # c.li a0, -1, then addi x1, x2, 2047, then beq x1, x2, 2730
+    val stream: [10]u8 = [10]u8{0x7D, 0x55, 0x93, 0x00, 0xF1, 0x7F, 0xE3, 0x85, 0x20, 0x2A};
+    val rows:   [3]u32 = [3]u32{t_row("c.li"), t_row("addi"), t_row("beq")};
+    var store:  [3]operand.Value;
+    var at:     usize  = 0;
+    var i:      u32    = 0;
+    for (i < 3) {
+        val got: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?stream[0], 10, at, ?store[0], 3);
+        if (sel got.err)                                { ret 2; }
+        if (got.ok.inst.row != ?CODEC.rows.at[rows[i]]) { ret 3; }
+        at = at + got.ok.len;
+        i  = i + 1;
+    }
+    if (at != 10)                                                             { ret 4; }
+    if (!(sel store[0].register && store[0].register == register.make(0, 1))) { ret 5; }
+    ret 0;
+}
+
+test encode__a_fixed_operand_refuses_any_other_register {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    val spadd:  u32              = t_row("c.addi16sp");
+    var values: [2]operand.Value = [2]operand.Value{t_x(3), operand.Value.immediate{32}};
+    if (!t_refused(t_encode(?t, spadd, ?values[0], 2), field.NOT_FIXED, 0)) { ret 2; }
+    values[0] = t_x(2);
+    val wrote: res[usize, field.Refusal] = t_encode(?t, spadd, ?values[0], 2);
+    if (!(sel wrote.ok && wrote.ok == 2)) { ret 3; }
+    var store: [2]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[spadd], t.out.data, t.out.len, 0, ?store[0], 2);
+    if (sel got.err)                                                          { ret 4; }
+    if (!(sel store[0].register && store[0].register == register.make(0, 2))) { ret 5; }
+    ret 0;
+}
+
+test walk__a_register_is_excluded_by_a_selection_lacking_its_condition_and_admitted_by_one_meeting_it {
+    var with_i: T;
+    var with_e: T;
+    if (!t_make(?with_i, "rv64i") || !t_make(?with_e, "rv64e")) { ret 1; }
+    val addi:   u32                       = t_row("addi");
+    val values: [3]operand.Value          = [3]operand.Value{t_x(16), t_x(1), operand.Value.immediate{0}};
+    val wrote:  res[usize, field.Refusal] = t_encode(?with_i, addi, ?values[0], 3);
+    if (!(sel wrote.ok && wrote.ok == 4))                                         { ret 2; }
+    if (!t_refused(t_encode(?with_e, addi, ?values[0], 3), field.UNAVAILABLE, 0)) { ret 3; }
+    var store: [3]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?with_e.v, ?CODEC.rows.at[addi], with_i.out.data, with_i.out.len, 0, ?store[0], 3);
+    if (!(sel got.err && (got.err.message == field.UNAVAILABLE && got.err.operand == 0))) { ret 4; }
+    ret 0;
+}
+
+test walk__an_excluded_value_is_refused_and_decode_tries_the_next_candidate {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    val lui:    u32              = t_row("c.lui");
+    var values: [2]operand.Value = [2]operand.Value{t_x(0), operand.Value.immediate{1}};
+    if (!t_refused(t_encode(?t, lui, ?values[0], 2), field.EXCLUDED, 0)) { ret 2; }
+    values[0] = t_x(2);
+    if (!t_refused(t_encode(?t, lui, ?values[0], 2), field.EXCLUDED, 0)) { ret 3; }
+    values[0] = t_x(8);
+    values[1] = operand.Value.immediate{0};
+    if (!t_refused(t_encode(?t, lui, ?values[0], 2), field.EXCLUDED, 1)) { ret 4; }
+    if (t.out.len != 0)                                                  { ret 5; }
+    # c.lui's rd of x2 is c.addi16sp, and its rd of x8 is itself
+    val spadd: [2]u8                            = [2]u8{0x05, 0x61};
+    val own:   [2]u8                            = [2]u8{0x05, 0x64};
+    val zero:  [2]u8                            = [2]u8{0x01, 0x64};
+    var store: [2]operand.Value;
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?spadd[0], 2, 0, ?store[0], 2);
+    if (!(sel got.ok && got.ok.inst.row == ?CODEC.rows.at[t_row("c.addi16sp")])) { ret 6; }
+    if (!(sel store[1].immediate && store[1].immediate == 32))                   { ret 7; }
+    val got_own: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?own[0], 2, 0, ?store[0], 2);
+    if (!(sel got_own.ok && got_own.ok.inst.row == ?CODEC.rows.at[lui])) { ret 8; }
+    # c.lui x8, 0 is excluded and no other candidate holds it
+    val none: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?zero[0], 2, 0, ?store[0], 2);
+    if (!sel none.err) { ret 9; }
+    val row: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[lui], ?zero[0], 2, 0, ?store[0], 2);
+    if (!(sel row.err && (row.err.message == field.EXCLUDED && row.err.operand == 1))) { ret 10; }
+    ret 0;
+}
