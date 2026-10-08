@@ -8,6 +8,7 @@
 
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.option.opt;
 use std.types.string.str;
 use std.types.view.View;
@@ -31,24 +32,34 @@ pub val FLAGS:     Kind = 4;
 pub val TILE:      Kind = 5;
 pub val SYSTEM:    Kind = 6;
 
-# the width of every member of a class
-pub tag Width: u8 {
-    # a fixed width in bits
-    bits: u32;
-    # the selected base's register width, such as riscv xlen
-    word;
-    # a multiple of the implementation's vector length, given in bits at its minimum
-    scalable: u32;
+# a quantity that scales with the implementation or the selection, such as
+# the vector length or riscv xlen, whose multiplier of its minimum is a power
+# of two from 1 to max
+pub rec Scale {
+    name: str;
+    max:  u32;
+}
+
+# a quantity of the fixed part plus per times the multiplier of one scale
+# ---
+# fixed: the part no scale changes
+# per:   the part added for each unit of the multiplier
+# scale: the index of the scale in the file, read only when per is nonzero, and one
+#        scale for every part of a register and its class width
+pub rec Scaled {
+    fixed: u32;
+    per:   u32;
+    scale: u8;
 }
 
 # a class of registers an operand can name
 # ---
 # kind:  what its members hold
-# width: the width of each member
+# width: the bits of each member, or of one row of a tile
 # count: the hardware numbers its encoding spans, 0 to count - 1
 pub rec Class {
     kind:  Kind;
-    width: Width;
+    width: Scaled;
     count: u32;
 }
 
@@ -65,14 +76,18 @@ pub val PC:    Flags = 0x4;
 # class:  the index of its class in the file
 # number: its hardware number within the class
 # bank:   the storage it shares with every register of the same bank
-# offset: its first bit within the bank
+# offset: the bit within the bank where its first piece starts
+# stride: the bits from the start of one of its pieces to the next
+# count:  its pieces, each its class's width, so a contiguous register has 1
 # flags:  its fixed architectural roles
 pub rec Register {
     name:   str;
     class:  u16;
     number: u16;
     bank:   u16;
-    offset: u16;
+    offset: Scaled;
+    stride: Scaled;
+    count:  Scaled;
     flags:  Flags;
 }
 
@@ -100,8 +115,10 @@ pub rec Column {
     numbers: *u32;
 }
 
-# a register file: its classes, its registers, their aliases and their debug columns
+# a register file: its scales, classes, registers, aliases and debug columns
 pub rec File {
+    scales:         *Scale;
+    scale_count:    u32;
     classes:        *Class;
     class_count:    u32;
     registers:      *Register;
@@ -190,36 +207,91 @@ pub fun debug_number(file: *File, reg: Id, format: Format) opt[u32] {
     ret opt[u32].none{};
 }
 
-# the bits a register covers in its bank, where a width that varies with the
-# selection reaches the end of the bank
-fun extent(file: *File, row: *Register) u32 {
-    val width: Width = file.classes[row.class].width;
-    if (sel width.bits) { ret row.offset::u32 + width.bits; }
-    ret 0xFFFF_FFFF;
+# the value of `q` at multiplier `m` of its scale
+fun at(q: Scaled, m: u64) u64 {
+    ret q.fixed::u64 + q.per::u64 * m;
 }
 
-# whether rows `a` and `b` of `file` share storage: the same bank with intersecting bit ranges
+# the scale a row's footprint varies with, none when it is fixed
+fun scale_of(file: *File, row: *Register) opt[u8] {
+    val width: Scaled = file.classes[row.class].width;
+    if (width.per != 0)      { ret opt[u8].some{width.scale}; }
+    if (row.offset.per != 0) { ret opt[u8].some{row.offset.scale}; }
+    if (row.stride.per != 0) { ret opt[u8].some{row.stride.scale}; }
+    if (row.count.per != 0)  { ret opt[u8].some{row.count.scale}; }
+    ret opt[u8].none{};
+}
+
+# the largest multiplier of a scale, 1 for a fixed footprint
+fun scale_max(file: *File, scale: opt[u8]) u64 {
+    if (sel scale.some) { ret file.scales[scale.some].max::u64; }
+    ret 1;
+}
+
+# whether the footprints of `a` at multiplier `ma` and `b` at `mb` intersect
+fun intersect(file: *File, a: *Register, ma: u64, b: *Register, mb: u64) bool {
+    val a_offset: u64 = at(a.offset, ma);
+    val a_stride: u64 = at(a.stride, ma);
+    val a_count:  u64 = at(a.count, ma);
+    val a_width:  u64 = at(file.classes[a.class].width, ma);
+    val b_offset: u64 = at(b.offset, mb);
+    val b_stride: u64 = at(b.stride, mb);
+    val b_count:  u64 = at(b.count, mb);
+    val b_width:  u64 = at(file.classes[b.class].width, mb);
+    if (a_width == 0 || b_width == 0 || b_count == 0) { ret false; }
+    var i: u64 = 0;
+    for (i < a_count) {
+        val start: u64 = a_offset + i * a_stride;
+        # only the first piece of b ending past start can begin before this piece ends
+        var j: u64 = 0;
+        if (b_offset + b_width <= start) {
+            if (b_stride == 0) { ret false; }
+            j = (start - b_offset - b_width) / b_stride + 1;
+        }
+        if (j < b_count && b_offset + j * b_stride < start + a_width) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether rows `a` and `b` of `file` share storage at some legal multiplier of
+# each scale, which is what an allocator must assume when the scale is unknown
 pub fun overlap(file: *File, a: *Register, b: *Register) bool {
     if (a.bank != b.bank) { ret false; }
-    ret a.offset::u32 < extent(file, b) && b.offset::u32 < extent(file, a);
+    val sa:   opt[u8] = scale_of(file, a);
+    val sb:   opt[u8] = scale_of(file, b);
+    var same: bool    = false;
+    if (sel sa.some) {
+        if (sel sb.some) { same = sa.some == sb.some; }
+    }
+    var ma: u64 = 1;
+    for (ma <= scale_max(file, sa)) {
+        var mb: u64 = 1;
+        for (mb <= scale_max(file, sb)) {
+            if ((!same || ma == mb) && intersect(file, a, ma, b, mb)) { ret true; }
+            mb = mb * 2;
+        }
+        ma = ma * 2;
+    }
+    ret false;
 }
 
-# slices of the x86-64 and risc-v files for the tests below
+# slices of the x86-64, risc-v and aarch64 files for the tests below
 #[testing]
 val X86_CLASSES: [4]Class = [4]Class{
-    Class{kind: GENERAL, width: Width.bits{64}, count: 32},
-    Class{kind: GENERAL, width: Width.bits{16}, count: 32},
-    Class{kind: GENERAL, width: Width.bits{8}, count: 32},
-    Class{kind: GENERAL, width: Width.bits{8}, count: 8},
+    Class{kind: GENERAL, width: Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
+    Class{kind: GENERAL, width: Scaled{fixed: 16, per: 0, scale: 0}, count: 32},
+    Class{kind: GENERAL, width: Scaled{fixed: 8, per: 0, scale: 0}, count: 32},
+    Class{kind: GENERAL, width: Scaled{fixed: 8, per: 0, scale: 0}, count: 8},
 };
 
 #[testing]
 val X86_REGISTERS: [5]Register = [5]Register{
-    Register{name: "rax", class: 0, number: 0, bank: 0, offset: 0, flags: 0},
-    Register{name: "ax", class: 1, number: 0, bank: 0, offset: 0, flags: 0},
-    Register{name: "al", class: 2, number: 0, bank: 0, offset: 0, flags: 0},
-    Register{name: "ah", class: 3, number: 4, bank: 0, offset: 8, flags: 0},
-    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: 0, flags: STACK},
+    Register{name: "rax", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
+    Register{name: "ax", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
+    Register{name: "al", class: 2, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
+    Register{name: "ah", class: 3, number: 4, bank: 0, offset: Scaled{fixed: 8, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
+    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK},
 };
 
 #[testing]
@@ -235,6 +307,8 @@ val X86_COLUMNS: [2]Column = [2]Column{
 
 #[testing]
 val X86: File = File{
+    scales:         nil,
+    scale_count:    0,
     classes:        ?X86_CLASSES[0],
     class_count:    4,
     registers:      ?X86_REGISTERS[0],
@@ -246,15 +320,20 @@ val X86: File = File{
 };
 
 #[testing]
+val RISCV_SCALES: [1]Scale = [1]Scale{
+    Scale{name: "xlen", max: 4},
+};
+
+#[testing]
 val RISCV_CLASSES: [1]Class = [1]Class{
-    Class{kind: GENERAL, width: Width.word{}, count: 32},
+    Class{kind: GENERAL, width: Scaled{fixed: 0, per: 32, scale: 0}, count: 32},
 };
 
 #[testing]
 val RISCV_REGISTERS: [3]Register = [3]Register{
-    Register{name: "x0", class: 0, number: 0, bank: 0, offset: 0, flags: ZERO},
-    Register{name: "x2", class: 0, number: 2, bank: 2, offset: 0, flags: STACK},
-    Register{name: "x8", class: 0, number: 8, bank: 8, offset: 0, flags: 0},
+    Register{name: "x0", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: ZERO},
+    Register{name: "x2", class: 0, number: 2, bank: 2, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK},
+    Register{name: "x8", class: 0, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0},
 };
 
 #[testing]
@@ -267,12 +346,47 @@ val RISCV_ALIASES: [4]Alias = [4]Alias{
 
 #[testing]
 val RISCV: File = File{
+    scales:         ?RISCV_SCALES[0],
+    scale_count:    1,
     classes:        ?RISCV_CLASSES[0],
     class_count:    1,
     registers:      ?RISCV_REGISTERS[0],
     register_count: 3,
     aliases:        ?RISCV_ALIASES[0],
     alias_count:    4,
+    columns:        nil,
+    column_count:   0,
+};
+
+#[testing]
+val AARCH64_SCALES: [1]Scale = [1]Scale{
+    Scale{name: "svl", max: 16},
+};
+
+# za has svl / 8 rows of svl bits, and zan.d takes every eighth row from row n
+#[testing]
+val AARCH64_CLASSES: [2]Class = [2]Class{
+    Class{kind: TILE, width: Scaled{fixed: 0, per: 128, scale: 0}, count: 1},
+    Class{kind: TILE, width: Scaled{fixed: 0, per: 128, scale: 0}, count: 8},
+};
+
+#[testing]
+val AARCH64_REGISTERS: [3]Register = [3]Register{
+    Register{name: "za0.b", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 128, scale: 0}, count: Scaled{fixed: 0, per: 16, scale: 0}, flags: 0},
+    Register{name: "za0.d", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0},
+    Register{name: "za1.d", class: 1, number: 1, bank: 0, offset: Scaled{fixed: 0, per: 128, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0},
+};
+
+#[testing]
+val AARCH64: File = File{
+    scales:         ?AARCH64_SCALES[0],
+    scale_count:    1,
+    classes:        ?AARCH64_CLASSES[0],
+    class_count:    2,
+    registers:      ?AARCH64_REGISTERS[0],
+    register_count: 3,
+    aliases:        nil,
+    alias_count:    0,
     columns:        nil,
     column_count:   0,
 };
@@ -305,6 +419,15 @@ test overlap__shared_bank_both_directions {
     if (!overlap(?X86, al, ax) || !overlap(?X86, ax, al))   { ret 2; }
     if (overlap(?X86, al, ah) || overlap(?X86, ah, al))     { ret 3; }
     if (overlap(?X86, rsp, rax) || overlap(?X86, rax, rsp)) { ret 4; }
+    ret 0;
+}
+
+test overlap__strided_tiles {
+    val za0_b: *Register = ?AARCH64_REGISTERS[0];
+    val za0_d: *Register = ?AARCH64_REGISTERS[1];
+    val za1_d: *Register = ?AARCH64_REGISTERS[2];
+    if (!overlap(?AARCH64, za0_d, za0_b) || !overlap(?AARCH64, za0_b, za0_d)) { ret 1; }
+    if (overlap(?AARCH64, za0_d, za1_d) || overlap(?AARCH64, za1_d, za0_d))   { ret 2; }
     ret 0;
 }
 
