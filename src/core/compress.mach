@@ -1,0 +1,196 @@
+# the compressions of an instruction set
+#
+# a compression names a base row and a shorter row that encodes the same
+# instruction when its values fit: risc-v's `addi rd, rd, imm` becomes
+# `c.addi rd, imm` when the selection holds C or Zca. each operand of the
+# shorter row takes its value from an operand of the base row or a fixed
+# register, and the base row's values must satisfy the conditions the shorter
+# row fixes, as `addi`'s source being its destination. whether the values fit
+# the shorter row's ranges is the shorter row's own check, so a compression
+# states only the shape, and the selection decides whether the row exists. a
+# base row may have several, tried in the order given, which is the order of
+# the encoder's preference.
+#
+# a symbolic value is never compressed: its size is the linker's and the
+# relaxation's to decide, not the encoder's.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.row;
+use masc.core.walk;
+
+# where an operand of the shorter row takes its value from
+# ---
+# operand:  this operand of the base row
+# register: the register at this row of the file
+# extended: this operand of the base row, its number sign extended from the bits given
+pub tag Origin: u8 {
+    operand:  u8;
+    register: u32;
+    extended: Extension;
+}
+
+# an operand of the base row, its value taken as a number of `bits` bits and sign extended
+pub rec Extension {
+    operand: u8;
+    bits:    u8;
+}
+
+# origins as a pointer to static origins and a count, one per operand of the shorter row
+pub rec Origins {
+    at:  *Origin;
+    len: u32;
+}
+
+# what an operand of the base row must hold
+# ---
+# operand:   the same value as this operand of the base row
+# register:  the register at this row of the file
+# immediate: this number
+pub tag Need: u8 {
+    operand:   u8;
+    register:  u32;
+    immediate: i64;
+}
+
+# a condition on the base row's values
+# ---
+# operand: the operand of the base row
+# needs:   what it must hold
+pub rec Condition {
+    operand: u8;
+    needs:   Need;
+}
+
+# conditions as a pointer to static conditions and a count
+pub rec Conditions {
+    at:  *Condition;
+    len: u32;
+}
+
+# one compression
+# ---
+# base:   the row compressed, by its index in the set's rows
+# packed: the shorter row, by its index
+# from:   where each operand of the shorter row takes its value from
+# when:   what the base row's values must hold
+pub rec Compression {
+    base:   u32;
+    packed: u32;
+    from:   Origins;
+    when:   Conditions;
+}
+
+# compressions as a pointer to static compressions and a count, in ascending order of base row and then in preference order
+pub rec Compressions {
+    at:  *Compression;
+    len: u32;
+}
+
+# the index of `r` among the codec's rows
+fun index_of(codec: *walk.Codec, r: *row.Row) u32 {
+    ret ((r:~u64 - codec.rows.at:~u64) / $size_of(row.Row)::u64)::u32;
+}
+
+# `v` taken as a number of `bits` bits and sign extended, none for a value that is not a number
+fun extended(v: *operand.Value, bits: u8) operand.Value {
+    var n: i64 = 0;
+    if (sel v.immediate) { n = v.immediate; }
+    or (sel v.relative)  { n = v.relative; }
+    or                   { ret operand.Value.none{}; }
+    if (bits < 64) {
+        val low: u64 = n:~u64 & ((1::u64 << bits::u64) - 1);
+        n = ((low ^ (1::u64 << (bits - 1)::u64)):~i64) - (1::i64 << (bits - 1)::i64);
+    }
+    if (sel v.relative) { ret operand.Value.relative{n}; }
+    ret operand.Value.immediate{n};
+}
+
+fun register_value(codec: *walk.Codec, at: u32) operand.Value {
+    if (codec.registers == nil || at >= codec.registers.register_count) { ret operand.Value.none{}; }
+    ret operand.Value.register{register.id_of(?codec.registers.registers[at])};
+}
+
+# whether the values satisfy condition `c`
+fun holds(codec: *walk.Codec, c: *Condition, values: *operand.Value) bool {
+    var want: operand.Value = operand.Value.none{};
+    if (sel c.needs.operand)   { want = values[c.needs.operand]; }
+    if (sel c.needs.register)  { want = register_value(codec, c.needs.register); }
+    if (sel c.needs.immediate) { want = operand.Value.immediate{c.needs.immediate}; }
+    if (sel want.none)         { ret false; }
+    ret operand.equal(?values[c.operand], ?want);
+}
+
+# whether any value is a symbol
+fun symbolic(ins: *inst.Inst) bool {
+    var i: u32 = 0;
+    for (i < ins.count) {
+        if (sel ins.values[i].symbol) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the shorter form of `ins`, a value of a base row, under the selection `available`
+# ---
+# all: the set's compressions
+# out: the shorter instruction, its row and values
+# ret: whether the base row has a compression whose conditions hold and whose row the selection admits and takes the values
+pub fun compress(codec: *walk.Codec, all: Compressions, available: *register.Available, ins: *inst.Inst, out: *relax.Emitted) bool {
+    if (symbolic(ins)) { ret false; }
+    val base: u32 = index_of(codec, ins.row);
+    var lo:   u32 = 0;
+    var hi:   u32 = all.len;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (all.at[mid].base < base) { lo = mid + 1; }
+        or                           { hi = mid; }
+    }
+    var i: u32 = lo;
+    for (i < all.len && all.at[i].base == base) {
+        val c:      *Compression = ?all.at[i];
+        val packed: *row.Row     = ?codec.rows.at[c.packed];
+        i = i + 1;
+        if (!extension.admits(available.selection, packed.requires)) { cnt; }
+        var met: bool = true;
+        var k:   u32  = 0;
+        for (k < c.when.len && met) {
+            met = holds(codec, ?c.when.at[k], ins.values);
+            k   = k + 1;
+        }
+        if (!met) { cnt; }
+        var values: [row.MAX_OPERANDS]operand.Value;
+        var fits:   bool = c.from.len == packed.operands.len;
+        k = 0;
+        for (k < c.from.len && fits) {
+            val o: Origin = c.from.at[k];
+            if (sel o.operand)  { values[k] = ins.values[o.operand]; }
+            if (sel o.register) { values[k] = register_value(codec, o.register); }
+            if (sel o.extended) { values[k] = extended(?ins.values[o.extended.operand], o.extended.bits); }
+            fits = !sel values[k].none;
+            k    = k + 1;
+        }
+        if (!fits) { cnt; }
+        var shorter:  inst.Inst          = inst.Inst{row: packed, values: ?values[0], count: packed.operands.len};
+        val admitted: err[field.Refusal] = walk.admits(codec, available, ?shorter);
+        if (sel admitted.err) { cnt; }
+        out.row    = packed;
+        out.marker = operand.NO_FIXUP;
+        k          = 0;
+        for (k < packed.operands.len) {
+            out.values[k] = values[k];
+            k             = k + 1;
+        }
+        ret true;
+    }
+    ret false;
+}
