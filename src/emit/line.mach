@@ -1,0 +1,839 @@
+# the line facts of an object: a file table and one location per run of instructions, as calls on the builder
+#
+# mirl states its source places here, in memory and with no text, and the
+# assembler's `.file` and `.loc` directives are only a front end over the same
+# calls. a file is a directory, a name and optionally an md5 checksum, and a
+# location is a file, a line, a column and the flags of one row of the line
+# table. a location attaches to the builder's position, a label placed at the
+# cursor, and never to an offset the caller computes: the builder alone knows
+# where the instructions lie once relaxation and compression have settled.
+#
+# the line program is written when the builder finishes, by a writer the first
+# location adds to it. it is built from the final places of those labels, into
+# a `.debug_line` section in DWARF 5 form, one sequence per section that holds
+# locations. its only relocation is the address that starts a sequence, a datum
+# of the section's start through the builder, so a linker places it as it does
+# any other. every advance is written in its shortest encoding.
+#
+# a location is a record of the row, not of DWARF: `runs` states each as the
+# final place it covers, from its address to the next location's or the end of
+# its section, which is what a CodeView writer reads. CodeView needs what DWARF
+# does not carry: the end column of a location, kept here and unused by DWARF,
+# the code size of each function it contributes lines for, which the symbols'
+# own extents give, and a file checksum table that names each file once, which
+# the file table is. its checksum kind is md5 here, the one the table holds.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.encoding.leb128;
+
+use mink;
+
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.set;
+use masc.emit.emit;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_set:       masc.isa.riscv.set;
+
+use masc.isa.riscv.gen_row;
+
+pub val UNKNOWN_FILE: str = "location names a file not in the file table";
+pub val NO_NAME:      str = "file has no name";
+pub val TWO_BUILDERS: str = "line facts attached to more than one builder";
+pub val SOME_DIGESTS: str = "an md5 checksum on some files of the table and not all";
+pub val LINE_SECTION: str = ".debug_line";
+
+# the flags of a location, the registers of the line state machine that hold for one row only, and is_stmt, which holds
+# until the next row states it
+pub def Flags: u8;
+
+pub val BASIC_BLOCK:    Flags = 0x1;
+pub val PROLOGUE_END:   Flags = 0x2;
+pub val EPILOGUE_BEGIN: Flags = 0x4;
+pub val IS_STMT:        Flags = 0x8;
+
+# a file's md5 checksum
+pub rec Digest {
+    bytes: [16]u8;
+}
+
+# a file of the table, as the caller states it
+# ---
+# directory: the directory it is in, empty for the compilation directory
+# name:      its name
+# md5:       its checksum, absent when the producer has none
+pub rec Source {
+    directory: View;
+    name:      View;
+    md5:       opt[Digest];
+}
+
+# one row of the line table
+# ---
+# file:          the file's index in the table
+# line:          the line, from one
+# column:        the column, from one, 0 for none
+# end_column:    where it ends, 0 for none, which DWARF does not state and CodeView does
+# flags:         the flags of the row
+# isa:           the instruction set variant, 0 for the default
+# discriminator: which of the blocks of one line the row is of, 0 for none
+pub rec Location {
+    file:          u32;
+    line:          u32;
+    column:        u32;
+    end_column:    u32;
+    flags:         Flags;
+    isa:           u32;
+    discriminator: u32;
+}
+
+# bytes of the text the table keeps
+rec Span {
+    at:  usize;
+    len: usize;
+}
+
+# a file of the table, its text in the table's text
+rec Entry {
+    directory: Span;
+    name:      Span;
+    md5:       Digest;
+    sum:       bool;
+}
+
+# a location and the label that places it
+rec Mark {
+    at:  build.Label;
+    loc: Location;
+}
+
+# the line facts of one object
+# ---
+# a:       the allocator
+# text:    the bytes of every file's directory and name
+# files:   the file table
+# marks:   the locations in the order they were attached
+# builder: the builder they are attached to, nil before the first
+pub rec Lines {
+    a:       *A.Allocator;
+    text:    vector.Vector[u8];
+    files:   vector.Vector[Entry];
+    marks:   vector.Vector[Mark];
+    builder: *build.Builder;
+}
+
+# the line facts of an object, empty
+pub fun make(a: *A.Allocator) Lines {
+    ret Lines{a: a, text: vector.init[u8](a), files: vector.init[Entry](a), marks: vector.init[Mark](a), builder: nil};
+}
+
+# give back everything the facts own
+pub fun release(l: *Lines) {
+    vector.dnit[u8](?l.text);
+    vector.dnit[Entry](?l.files);
+    vector.dnit[Mark](?l.marks);
+}
+
+fun refusal(message: str) build.Refusal {
+    ret build.Refusal{message: message, label: operand.NO_SYMBOL};
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# `v` copied into the table's text
+fun keep(l: *Lines, v: View) res[Span, build.Refusal] {
+    if (!held(vector.reserve[u8](?l.text, v.len))) { ret res[Span, build.Refusal].err{refusal(field.MEMORY)}; }
+    val at: usize = l.text.len;
+    var i:  usize = 0;
+    for (i < v.len) {
+        l.text.data[at + i] = v.data[i];
+        i                   = i + 1;
+    }
+    l.text.len = at + v.len;
+    ret res[Span, build.Refusal].ok{Span{at: at, len: v.len}};
+}
+
+# the file `s` added to the table at the next index, which is returned. the first file is the table's file 0, the
+# primary source file, and its directory the compilation directory the others' empty directory means
+pub fun file(l: *Lines, s: Source) res[u32, build.Refusal] {
+    if (s.name.len == 0)                           { ret res[u32, build.Refusal].err{refusal(NO_NAME)}; }
+    if (!held(vector.reserve[Entry](?l.files, 1))) { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
+    val kept_dir: res[Span, build.Refusal] = keep(l, s.directory);
+    if (sel kept_dir.err) { ret res[u32, build.Refusal].err{kept_dir.err}; }
+    val kept_name: res[Span, build.Refusal] = keep(l, s.name);
+    if (sel kept_name.err) { ret res[u32, build.Refusal].err{kept_name.err}; }
+    var e: Entry = Entry{directory: kept_dir.ok, name: kept_name.ok, sum: sel s.md5.some};
+    if (sel s.md5.some) { e.md5 = s.md5.some; }
+    val index: u32 = l.files.len::u32;
+    l.files.data[l.files.len] = e;
+    l.files.len               = l.files.len + 1;
+    ret res[u32, build.Refusal].ok{index};
+}
+
+# how many files the table holds
+pub fun file_count(l: *Lines) u32 {
+    ret l.files.len::u32;
+}
+
+# the location `loc` attached to the cursor of the builder's current section, which its next instruction follows. the
+# first location adds the writer of the line program to the builder
+pub fun location(l: *Lines, b: *build.Builder, loc: Location) err[build.Refusal] {
+    if (loc.file::usize >= l.files.len)           { ret err[build.Refusal].err{refusal(UNKNOWN_FILE)}; }
+    if (l.builder != nil && l.builder != b)       { ret err[build.Refusal].err{refusal(TWO_BUILDERS)}; }
+    if (!held(vector.reserve[Mark](?l.marks, 1))) { ret err[build.Refusal].err{refusal(field.MEMORY)}; }
+    val at: res[build.Label, build.Refusal] = build.position(b);
+    if (sel at.err) { ret err[build.Refusal].err{at.err}; }
+    if (l.builder == nil) {
+        val added: err[build.Refusal] = build.writer(b, build.Writer{name: LINE_SECTION, context: l::ptr, write: write});
+        if (sel added.err) { ret added; }
+        l.builder = b;
+    }
+    l.marks.data[l.marks.len] = Mark{at: at.ok, loc: loc};
+    l.marks.len               = l.marks.len + 1;
+    ret err[build.Refusal].ok{};
+}
+
+# a location as the final place it covers
+# ---
+# section: the section it lies in
+# start:   where its instructions start
+# end:     where they end: the next location's start in the section, or the section's end
+# index:   the location's number in the order they were attached
+pub rec Run {
+    section: build.Section;
+    start:   u64;
+    end:     u64;
+    index:   usize;
+}
+
+# the locations as runs, once the builder's layout is settled, grouped by section in ascending order and within one in
+# the order they were attached, which is ascending in start
+pub fun runs(l: *Lines, b: *build.Builder, out: *vector.Vector[Run]) err[build.Refusal] {
+    out.len = 0;
+    var top: u32   = 0;
+    var i:   usize = 0;
+    for (i < l.marks.len) {
+        val p: opt[mink.object.Place] = build.place_of(b, l.marks.data[i].at);
+        if (sel p.none)                 { ret err[build.Refusal].err{refusal(build.UNRESOLVED)}; }
+        if (p.some.section.index > top) { top = p.some.section.index; }
+        i = i + 1;
+    }
+    var s: u32 = 0;
+    for (s <= top) {
+        i = 0;
+        for (i < l.marks.len) {
+            val p: opt[mink.object.Place] = build.place_of(b, l.marks.data[i].at);
+            if (sel p.some) {
+                if (p.some.section.index == s) {
+                    if (!held(vector.push[Run](out, Run{section: build.Section{index: s}, start: p.some.offset, end: 0, index: i}))) { ret err[build.Refusal].err{refusal(field.MEMORY)}; }
+                }
+            }
+            i = i + 1;
+        }
+        s = s + 1;
+    }
+    i = 0;
+    for (i < out.len) {
+        var stop: u64 = build.size_of(b, out.data[i].section);
+        if (i + 1 < out.len && out.data[i + 1].section.index == out.data[i].section.index) { stop = out.data[i + 1].start; }
+        out.data[i].end = stop;
+        i               = i + 1;
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# the line program's bytes as they are built, and whether any write was refused for want of memory
+rec Sink {
+    bytes: vector.Vector[u8];
+    b:     *build.Builder;
+    ok:    bool;
+}
+
+fun byte(o: *Sink, v: u8) {
+    if (!held(vector.push[u8](?o.bytes, v))) { o.ok = false; }
+}
+
+fun uleb(o: *Sink, v: u64) {
+    var tmp: [10]u8;
+    val n:   usize = leb128.put_unsigned(?tmp[0], v);
+    var i:   usize = 0;
+    for (i < n) {
+        byte(o, tmp[i]);
+        i = i + 1;
+    }
+}
+
+fun sleb(o: *Sink, v: i64) {
+    var tmp: [10]u8;
+    val n:   usize = leb128.put_signed(?tmp[0], v);
+    var i:   usize = 0;
+    for (i < n) {
+        byte(o, tmp[i]);
+        i = i + 1;
+    }
+}
+
+# the low `width` bytes of `v` in the set's byte order
+fun word(o: *Sink, v: u64, width: usize) {
+    var tmp: [8]u8;
+    build.ordered(o.b, v, width, ?tmp[0]);
+    var i: usize = 0;
+    for (i < width) {
+        byte(o, tmp[i]);
+        i = i + 1;
+    }
+}
+
+fun text(o: *Sink, l: *Lines, s: Span) {
+    var i: usize = 0;
+    for (i < s.len) {
+        byte(o, l.text.data[s.at + i]);
+        i = i + 1;
+    }
+    byte(o, 0);
+}
+
+# the table's header parameters, which every advance is measured against
+val LINE_BASE:   i64 = -5;
+val LINE_RANGE:  u64 = 14;
+val OPCODE_BASE: u8  = 13;
+
+# the standard opcodes
+val COPY:             u8 = 1;
+val ADVANCE_PC:       u8 = 2;
+val ADVANCE_LINE:     u8 = 3;
+val SET_FILE:         u8 = 4;
+val SET_COLUMN:       u8 = 5;
+val NEGATE_STMT:      u8 = 6;
+val SET_BASIC_BLOCK:  u8 = 7;
+val CONST_ADD_PC:     u8 = 8;
+val SET_PROLOGUE_END: u8 = 10;
+val SET_EPILOGUE:     u8 = 11;
+val SET_ISA:          u8 = 12;
+
+# the extended opcodes
+val END_SEQUENCE:      u8 = 1;
+val SET_ADDRESS:       u8 = 2;
+val SET_DISCRIMINATOR: u8 = 4;
+
+# the address advance the special opcode 255 makes, (255 - opcode_base) / line_range, which `const_add_pc` makes alone
+val CONST_ADVANCE: u64 = 17;
+
+val NEVER: u32 = 0xFFFF;
+
+# what no special opcode is
+val NONE: u32 = 256;
+
+# the special opcode that advances the address by `addr` and the line by `line`, NONE when it does not fit
+fun special(addr: u64, line: i64) u32 {
+    if (line < LINE_BASE || line >= LINE_BASE + LINE_RANGE::i64) { ret NONE; }
+    if (addr > 255)                                              { ret NONE; }
+    val v: u64 = (line - LINE_BASE)::u64 + LINE_RANGE * addr + OPCODE_BASE::u64;
+    if (v > 255) { ret NONE; }
+    ret v::u32;
+}
+
+# the cost in bytes of the plain advance of the address by `addr`, nothing for none
+fun pc_cost(addr: u64) u32 {
+    if (addr == 0) { ret 0; }
+    ret 1 + leb128.unsigned_size(addr)::u32;
+}
+
+# the cost in bytes of the plain advance of the line by `line`, nothing for none
+fun line_cost(line: i64) u32 {
+    if (line == 0) { ret 0; }
+    ret 1 + leb128.signed_size(line)::u32;
+}
+
+# the row at the address advanced by `addr` and the line by `line`, written in the fewest bytes: a special opcode, a
+# `const_add_pc` and a special opcode, a plain advance of one and a special opcode for the other, or plain advances
+# and a copy
+fun advance(o: *Sink, addr: u64, line: i64) {
+    var cost: [6]u32 = [6]u32{NEVER, NEVER, NEVER, NEVER, NEVER, NEVER};
+    var near: u64    = 0;
+    if (addr >= CONST_ADVANCE) { near = addr - CONST_ADVANCE; }
+    val whole:    u32 = special(addr, line);
+    val folded:   u32 = special(near, line);
+    val bare:     u32 = special(0, line);
+    val level:    u32 = special(addr, 0);
+    val levelled: u32 = special(near, 0);
+    if (whole != NONE)                                          { cost[0] = 1; }
+    if (addr >= CONST_ADVANCE && folded != NONE)                { cost[1] = 2; }
+    if (addr > 0 && bare != NONE)                               { cost[2] = pc_cost(addr) + 1; }
+    if (line != 0 && level != NONE)                             { cost[3] = line_cost(line) + 1; }
+    if (line != 0 && addr >= CONST_ADVANCE && levelled != NONE) { cost[4] = line_cost(line) + 2; }
+    cost[5] = line_cost(line) + pc_cost(addr) + 1;
+    var best: usize = 0;
+    var k:    usize = 1;
+    for (k < 6) {
+        if (cost[k] < cost[best]) { best = k; }
+        k = k + 1;
+    }
+    if (best == 0) {
+        byte(o, whole::u8);
+    }
+    or (best == 1) {
+        byte(o, CONST_ADD_PC);
+        byte(o, folded::u8);
+    }
+    or (best == 2) {
+        byte(o, ADVANCE_PC);
+        uleb(o, addr);
+        byte(o, bare::u8);
+    }
+    or (best == 3) {
+        byte(o, ADVANCE_LINE);
+        sleb(o, line);
+        byte(o, level::u8);
+    }
+    or (best == 4) {
+        byte(o, ADVANCE_LINE);
+        sleb(o, line);
+        byte(o, CONST_ADD_PC);
+        byte(o, levelled::u8);
+    }
+    or {
+        if (line != 0) {
+            byte(o, ADVANCE_LINE);
+            sleb(o, line);
+        }
+        if (addr != 0) {
+            byte(o, ADVANCE_PC);
+            uleb(o, addr);
+        }
+        byte(o, COPY);
+    }
+}
+
+# the state machine's registers the program keeps track of
+rec Machine {
+    file:   u32;
+    line:   u32;
+    column: u32;
+    stmt:   bool;
+    isa:    u32;
+}
+
+val RESET: Machine = Machine{file: 1, line: 1, column: 0, stmt: true, isa: 0};
+
+# the registers `loc` changes, written, then the row
+fun write_row(o: *Sink, m: *Machine, loc: *Location, addr: u64) {
+    if (loc.file != m.file) {
+        byte(o, SET_FILE);
+        uleb(o, loc.file::u64);
+        m.file = loc.file;
+    }
+    if (loc.column != m.column) {
+        byte(o, SET_COLUMN);
+        uleb(o, loc.column::u64);
+        m.column = loc.column;
+    }
+    val stmt: bool = (loc.flags & IS_STMT) != 0;
+    if (stmt != m.stmt) {
+        byte(o, NEGATE_STMT);
+        m.stmt = stmt;
+    }
+    if (loc.isa != m.isa) {
+        byte(o, SET_ISA);
+        uleb(o, loc.isa::u64);
+        m.isa = loc.isa;
+    }
+    if ((loc.flags & BASIC_BLOCK) != 0)    { byte(o, SET_BASIC_BLOCK); }
+    if ((loc.flags & PROLOGUE_END) != 0)   { byte(o, SET_PROLOGUE_END); }
+    if ((loc.flags & EPILOGUE_BEGIN) != 0) { byte(o, SET_EPILOGUE); }
+    if (loc.discriminator != 0) {
+        byte(o, 0);
+        uleb(o, 1 + leb128.unsigned_size(loc.discriminator::u64)::u64);
+        byte(o, SET_DISCRIMINATOR);
+        uleb(o, loc.discriminator::u64);
+    }
+    advance(o, addr, loc.line::i64 - m.line::i64);
+    m.line = loc.line;
+}
+
+# where the sequence address of a run is to be relocated
+rec Slot {
+    at:    usize;
+    label: build.Label;
+}
+
+fun same(l: *Lines, x: Span, y: Span) bool {
+    if (x.len != y.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        if (l.text.data[x.at + i] != l.text.data[y.at + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the index of directory `s` among the directories `dirs` holds, the directory appended when it is new. the
+# compilation directory, the first file's, is directory 0, and a file with no directory is in it
+fun directory(l: *Lines, dirs: *vector.Vector[Span], s: Span, o: *Sink) u32 {
+    if (s.len == 0) { ret 0; }
+    var i: usize = 0;
+    for (i < dirs.len) {
+        if (same(l, dirs.data[i], s)) { ret i::u32; }
+        i = i + 1;
+    }
+    if (!held(vector.push[Span](dirs, s))) { o.ok = false; }
+    ret (dirs.len - 1)::u32;
+}
+
+# the header of the table up to the first byte of the program, the lengths left to patch
+fun header(l: *Lines, o: *Sink, address: usize) err[build.Refusal] {
+    var sums: u32   = 0;
+    var i:    usize = 0;
+    for (i < l.files.len) {
+        if (l.files.data[i].sum) { sums = sums + 1; }
+        i = i + 1;
+    }
+    if (sums != 0 && sums != l.files.len::u32) { ret err[build.Refusal].err{refusal(SOME_DIGESTS)}; }
+    var dirs: vector.Vector[Span] = vector.init[Span](l.a);
+    if (!held(vector.push[Span](?dirs, l.files.data[0].directory))) { o.ok = false; }
+    var index: vector.Vector[u32] = vector.init[u32](l.a);
+    i = 0;
+    for (i < l.files.len) {
+        if (!held(vector.push[u32](?index, directory(l, ?dirs, l.files.data[i].directory, o)))) { o.ok = false; }
+        i = i + 1;
+    }
+    word(o, 0, 4);
+    word(o, 5, 2);
+    byte(o, address::u8);
+    byte(o, 0);
+    word(o, 0, 4);
+    byte(o, 1);
+    byte(o, 1);
+    byte(o, 1);
+    byte(o, 0xFB);
+    byte(o, LINE_RANGE::u8);
+    byte(o, OPCODE_BASE);
+    val lengths: [12]u8 = [12]u8{0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
+    i = 0;
+    for (i < 12) {
+        byte(o, lengths[i]);
+        i = i + 1;
+    }
+    # directories: a path as an inline string
+    byte(o, 1);
+    uleb(o, 1);
+    uleb(o, 0x08);
+    uleb(o, dirs.len::u64);
+    i = 0;
+    for (i < dirs.len) {
+        text(o, l, dirs.data[i]);
+        i = i + 1;
+    }
+    # files: a path, its directory's index, and its checksum when the table has them
+    if (sums != 0) { byte(o, 3); }
+    or             { byte(o, 2); }
+    uleb(o, 1);
+    uleb(o, 0x08);
+    uleb(o, 2);
+    uleb(o, 0x0f);
+    if (sums != 0) {
+        uleb(o, 5);
+        uleb(o, 0x1e);
+    }
+    uleb(o, l.files.len::u64);
+    i = 0;
+    for (i < l.files.len) {
+        text(o, l, l.files.data[i].name);
+        uleb(o, index.data[i]::u64);
+        if (sums != 0) {
+            var k: usize = 0;
+            for (k < 16) {
+                byte(o, l.files.data[i].md5.bytes[k]);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    vector.dnit[Span](?dirs);
+    vector.dnit[u32](?index);
+    ret err[build.Refusal].ok{};
+}
+
+# the bytes at `at` of the sink given the value `v` of `width` bytes in the set's byte order
+fun patch(o: *Sink, at: usize, v: u64, width: usize) {
+    build.ordered(o.b, v, width, ?o.bytes.data[at]);
+}
+
+# the line program, built from the final places of the locations and written into `.debug_line`
+fun write(context: ptr, b: *build.Builder) err[build.Refusal] {
+    val l: *Lines = context::*Lines;
+    if (l.marks.len == 0) { ret err[build.Refusal].ok{}; }
+    var found:  vector.Vector[Run] = vector.init[Run](l.a);
+    val placed: err[build.Refusal] = runs(l, b, ?found);
+    if (sel placed.err) {
+        vector.dnit[Run](?found);
+        ret placed;
+    }
+    var o:       Sink                = Sink{bytes: vector.init[u8](l.a), b: b, ok: true};
+    var slots:   vector.Vector[Slot] = vector.init[Slot](l.a);
+    val address: usize               = b.arch.pointer_bytes::usize;
+    val head:    err[build.Refusal]  = header(l, ?o, address);
+    var made:    err[build.Refusal]  = head;
+    if (sel head.ok) {
+        val program: usize = o.bytes.len;
+        var i:       usize = 0;
+        for (i < found.len) {
+            var m: Machine = RESET;
+            byte(?o, 0);
+            uleb(?o, 1 + address::u64);
+            byte(?o, SET_ADDRESS);
+            if (!held(vector.push[Slot](?slots, Slot{at: o.bytes.len, label: l.marks.data[found.data[i].index].at}))) { o.ok = false; }
+            word(?o, 0, address);
+            val first: u64   = found.data[i].start;
+            var last:  u64   = first;
+            var j:     usize = i;
+            for (j < found.len && found.data[j].section.index == found.data[i].section.index) {
+                write_row(?o, ?m, ?l.marks.data[found.data[j].index].loc, found.data[j].start - last);
+                last = found.data[j].start;
+                j    = j + 1;
+            }
+            val stop: u64 = found.data[j - 1].end - last;
+            if (stop == CONST_ADVANCE) { byte(?o, CONST_ADD_PC); }
+            or (stop != 0) {
+                byte(?o, ADVANCE_PC);
+                uleb(?o, stop);
+            }
+            byte(?o, 0);
+            byte(?o, 1);
+            byte(?o, END_SEQUENCE);
+            i = j;
+        }
+        patch(?o, 0, (o.bytes.len - 4)::u64, 4);
+        patch(?o, 8, (program - 12)::u64, 4);
+        made = flush(l, b, ?o, ?slots, address);
+    }
+    if (!o.ok && sel made.ok) { made = err[build.Refusal].err{refusal(field.MEMORY)}; }
+    vector.dnit[u8](?o.bytes);
+    vector.dnit[Slot](?slots);
+    vector.dnit[Run](?found);
+    ret made;
+}
+
+# the program's bytes into the builder's `.debug_line`, an address slot a datum of the label that places it
+fun flush(l: *Lines, b: *build.Builder, o: *Sink, slots: *vector.Vector[Slot], address: usize) err[build.Refusal] {
+    if (!o.ok) { ret err[build.Refusal].err{refusal(field.MEMORY)}; }
+    var section: build.Section      = build.Section{index: 0};
+    val known:   opt[build.Section] = build.section_named(b, View{data: LINE_SECTION, len: str_len(LINE_SECTION)});
+    if (sel known.some) { section = known.some; }
+    or {
+        val opened: res[build.Section, build.Refusal] = build.open(b, build.Spec{name: LINE_SECTION, kind: ?mink.section.DEBUG_INFO, flags: 0, disposition: ?mink.section.WHOLE, entsize: 0});
+        if (sel opened.err) { ret err[build.Refusal].err{opened.err}; }
+        section = opened.ok;
+    }
+    val switched: err[build.Refusal] = build.switch(b, section);
+    if (sel switched.err) { ret switched; }
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (i < slots.len) {
+        val s: *Slot = ?slots.data[i];
+        if (s.at > at) {
+            val chunk: err[build.Refusal] = build.data(b, ?o.bytes.data[at], s.at - at);
+            if (sel chunk.err) { ret chunk; }
+        }
+        val placed: err[build.Refusal] = build.datum(b, build.Reference{target: s.label, addend: 0, width: address::u8, basis: set.ABSOLUTE});
+        if (sel placed.err) { ret placed; }
+        at = s.at + address;
+        i  = i + 1;
+    }
+    if (o.bytes.len > at) { ret build.data(b, ?o.bytes.data[at], o.bytes.len - at); }
+    ret err[build.Refusal].ok{};
+}
+
+# a test's selection, its register view and a builder of a risc-v object over them
+#[testing]
+rec T {
+    t: testing.Testing;
+    s: extension.Selection;
+    v: register.Available;
+    b: build.Builder;
+    l: Lines;
+}
+
+#[testing]
+val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?mink.arch.RISCV_FLOAT_ABI, setting: mink.trait.Setting.choice{?mink.arch.RISCV_DOUBLE}}};
+
+# a builder with a code section current and one file in the table
+#[testing]
+fun t_make(t: *T) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, "rv64i", diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[register.Available, register.Error] = register.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    val built: res[build.Builder, build.Refusal] = build.make(a, ?riscv_set.SET, ?t.v, ?mink.arch.RISCV64, set.Traits{at: ?T_DOUBLE[0], len: 1});
+    if (sel built.err) { ret false; }
+    t.b = built.ok;
+    t.l = make(a);
+    val s: res[build.Section, build.Refusal] = build.open(?t.b, build.Spec{name: ".text", kind: ?mink.section.TEXT, flags: mink.section.TEXT.flags, disposition: ?mink.section.WHOLE, entsize: 0});
+    if (sel s.err) { ret false; }
+    val switched: err[build.Refusal] = build.switch(?t.b, s.ok);
+    if (sel switched.err) { ret false; }
+    val f: res[u32, build.Refusal] = file(?t.l, Source{directory: View{data: "/src", len: 4}, name: View{data: "a.c", len: 3}, md5: opt[Digest].none{}});
+    ret sel f.ok;
+}
+
+#[testing]
+fun t_ok(e: err[build.Refusal]) bool {
+    ret sel e.ok;
+}
+
+# the location of line `n` in file 0, a statement
+#[testing]
+fun t_at(t: *T, n: u32) bool {
+    val placed: err[build.Refusal] = location(?t.l, ?t.b, Location{file: 0, line: n, column: 0, end_column: 0, flags: IS_STMT, isa: 0, discriminator: 0});
+    ret sel placed.ok;
+}
+
+# row `r` started and given registers 10 and 11
+#[testing]
+fun t_given(t: *T, ins: *emit.Instruction, r: *row.Row) bool {
+    val started: res[emit.Instruction, build.Refusal] = emit.start(?t.b, r);
+    if (sel started.err) { ret false; }
+    @ins = started.ok;
+    val x: err[build.Refusal] = emit.register(?t.b, ins, register.make(0, 10));
+    if (sel x.err) { ret false; }
+    val y: err[build.Refusal] = emit.register(?t.b, ins, register.make(0, 11));
+    ret sel y.ok;
+}
+
+# `addi a0, a1, 1` emitted
+#[testing]
+fun t_addi(t: *T) bool {
+    var ins: emit.Instruction;
+    if (!t_given(t, ?ins, gen_row.ADDI)) { ret false; }
+    val n: err[build.Refusal] = emit.immediate(?t.b, ?ins, 1);
+    if (sel n.err) { ret false; }
+    ret t_ok(emit.put(?t.b, ?ins));
+}
+
+#[testing]
+fun t_is(v: View, s: str) bool {
+    if (v.len != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bytes of the line program of `o`, after its header
+#[testing]
+fun t_program(o: *mink.object.Object, out: *vector.Vector[u8]) bool {
+    var i: usize = 0;
+    for (i < o.sections.count) {
+        val name: View = mink.object.name_of(o, o.sections.items[i].name);
+        if (t_is(name, LINE_SECTION)) {
+            val bytes: mink.store.Bytes = mink.object.bytes(o, ?o.sections.items[i].contents);
+            val start: usize            = 12 + bytes.data[8]::usize + bytes.data[9]::usize * 256;
+            var k:     usize            = start;
+            for (k < bytes.len) {
+                vector.push[u8](out, bytes.data[k]);
+                k = k + 1;
+            }
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether `got` begins with the `n` bytes of `want` and is `total` long
+#[testing]
+fun t_begins(got: *vector.Vector[u8], want: *u8, n: usize, total: usize) bool {
+    if (got.len != total) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (got.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_done(t: *T, o: *mink.object.Object) bool {
+    mink.object.release(o);
+    release(?t.l);
+    build.release(?t.b);
+    register.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+test line__an_advance_is_written_as_the_shortest_opcode {
+    var t: T;
+    if (!t_make(?t))  { ret 1; }
+    if (!t_at(?t, 1)) { ret 2; }
+    if (!t_addi(?t))  { ret 3; }
+    if (!t_at(?t, 3)) { ret 4; }
+    if (!t_addi(?t))  { ret 5; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 6; }
+    var o:   mink.object.Object = done.ok;
+    var got: vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t.t));
+    if (!t_program(?o, ?got)) { ret 7; }
+    # set_address, set_file 0, line 1 at 0, one special opcode for 4 bytes and 2 lines, advance_pc 4 and end_sequence
+    val want: [20]u8 = [20]u8{0, 9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 18, 76, 2, 4, 0, 1, 1};
+    if (!t_begins(?got, ?want[0], 20, 20)) { ret 8; }
+    vector.dnit[u8](?got);
+    if (!t_done(?t, ?o)) { ret 9; }
+    ret 0;
+}
+
+test line__a_relaxed_branch_moves_the_next_location_to_its_final_address {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val far: res[build.Label, build.Refusal] = build.anonymous(?t.b);
+    if (sel far.err)  { ret 2; }
+    if (!t_at(?t, 1)) { ret 3; }
+    var ins: emit.Instruction;
+    if (!t_given(?t, ?ins, gen_row.BEQ)) { ret 4; }
+    val to: err[build.Refusal] = emit.symbol(?t.b, ?ins, far.ok, 0, operand.NO_FIXUP);
+    if (sel to.err)                        { ret 5; }
+    if (!t_ok(emit.put(?t.b, ?ins)))       { ret 6; }
+    if (!t_at(?t, 2))                      { ret 7; }
+    if (!t_addi(?t))                       { ret 8; }
+    if (!t_ok(build.zero(?t.b, 5000)))     { ret 9; }
+    if (!t_ok(build.define(?t.b, far.ok))) { ret 10; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 11; }
+    var o:   mink.object.Object = done.ok;
+    var got: vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t.t));
+    if (!t_program(?o, ?got)) { ret 12; }
+    # the branch grew to 8 bytes, so line 2 is 8 addresses on: opcode 131, where 4 would be 75. advance_pc 5004 to the end
+    val want: [18]u8 = [18]u8{0, 9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 18, 131, 2, 0x8C, 0x27};
+    if (!t_begins(?got, ?want[0], 18, 21)) { ret 13; }
+    vector.dnit[u8](?got);
+    if (!t_done(?t, ?o)) { ret 14; }
+    ret 0;
+}
