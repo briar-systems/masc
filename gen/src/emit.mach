@@ -32,6 +32,7 @@ use std.types.string.str_starts_with;
 
 use A: std.allocator;
 use std.allocator.testing;
+use std.collections.map;
 use std.collections.sort;
 use std.collections.vector;
 use std.format;
@@ -48,6 +49,7 @@ use gen.source;
 # address: the address of a constant, as `?` and the path. a record constant of another module is always reached this way
 # record:  a record literal
 # array:   an array literal
+# variant: a case of a tag, with its payload when it has one
 pub tag Value: u8 {
     number:  i64;
     hex:     u64;
@@ -56,6 +58,18 @@ pub tag Value: u8 {
     address: str;
     record:  *Record;
     array:   *Array;
+    variant: *Variant;
+}
+
+# a case of a tag, written as the case's path and its payload in braces, as `Shape.register{...}` or `Stack.none{}`
+# ---
+# of:      the case's path, its tag type and case name
+# filled:  whether the case has a payload
+# payload: the payload, when it has one
+pub rec Variant {
+    of:      str;
+    filled:  bool;
+    payload: Value;
 }
 
 # a named member of a record literal
@@ -212,6 +226,26 @@ fun make_array(f: *File, element: str, keyed: bool) *Array {
     ret got.ok;
 }
 
+# the case `of` of a tag carrying `payload`, nil when its storage is refused
+pub fun variant(f: *File, of: str, payload: Value) *Variant {
+    val got: res[*Variant, A.Error] = A.allocate[Variant](f.alloc, 1);
+    if (sel got.err) {
+        fail(f, diag.MEMORY, of);
+        ret nil;
+    }
+    got.ok.of      = of;
+    got.ok.filled  = true;
+    got.ok.payload = payload;
+    ret got.ok;
+}
+
+# the case `of` of a tag with no payload, nil when its storage is refused
+pub fun bare(f: *File, of: str) *Variant {
+    val got: *Variant = variant(f, of, Value.number{0});
+    if (got != nil) { got.filled = false; }
+    ret got;
+}
+
 # a new array literal of `element`s, its items in the order given
 pub fun array(f: *File, element: str) *Array {
     ret make_array(f, element, false);
@@ -329,6 +363,57 @@ pub fun bytes(f: *File, data: *u8, len: usize) *Array {
     ret arr;
 }
 
+# an array whose runs of items are shared: a run given again is the run already
+# there, found by its text, so a table of many rows holds each distinct list once
+# ---
+# array: the array the runs are items of
+# runs:  the first item of each run by the text of its items
+pub rec Pool {
+    array: *Array;
+    runs:  map.Map[str, u32];
+}
+
+# a new pool of `element`s
+pub fun pool(f: *File, element: str) Pool {
+    ret Pool{array: array(f, element), runs: map.init[str, u32](f.alloc)};
+}
+
+# the index in `p` of the run `items` of `count` values, appended when no run has their text
+pub fun pooled(f: *File, p: *Pool, items: *Value, count: u32) u32 {
+    var o: Out = Out{bytes: vector.init[u8](f.alloc), refused: false};
+    var i: u32 = 0;
+    for (i < count) {
+        put_value(f, ?o, items[i]);
+        put_byte(?o, '\n');
+        i = i + 1;
+    }
+    put_byte(?o, 0);
+    if (o.refused) {
+        fail(f, diag.MEMORY, nil);
+        ret 0;
+    }
+    val text:  str       = o.bytes.data;
+    val known: opt[*u32] = map.get[str, u32](?p.runs, ?text);
+    if (sel known.some) { ret @known.some; }
+    val at: u32 = length(p.array);
+    i = 0;
+    for (i < count) {
+        item(f, p.array, items[i]);
+        i = i + 1;
+    }
+    val inserted: res[bool, A.Error] = map.insert[str, u32](?p.runs, text, at);
+    if (sel inserted.err) { fail(f, diag.MEMORY, nil); }
+    ret at;
+}
+
+# the address of item `at` of the array declared as `name`
+pub fun element(f: *File, name: str, at: u32) Value {
+    var digits: [24]u8;
+    val len:    usize = format.put_i64(?digits[0], at::i64);
+    digits[len] = 0;
+    ret Value.address{joined(f, str_join(f.alloc, name, "[", ?digits[0], "]"))};
+}
+
 # the text being written, and whether its storage was refused
 rec Out {
     bytes:   vector.Vector[u8];
@@ -430,6 +515,13 @@ fun put_value(f: *File, o: *Out, v: Value) {
         }
         put_byte(o, '}');
     }
+    or (sel v.variant) {
+        val c: *Variant = v.variant;
+        put(o, c.of);
+        put_byte(o, '{');
+        if (c.filled) { put_value(f, o, c.payload); }
+        put_byte(o, '}');
+    }
     or (sel v.array) {
         val arr: *Array = v.array;
         seal(f, arr);
@@ -482,19 +574,78 @@ fun by_name(a: *Decl, b: *Decl) i64 {
     ret str_compare(a.name, b.name);
 }
 
+# the length of the alias `m` binds, 0 when it binds none, as `riscv_field: masc.isa.riscv.field` binds riscv_field
+fun alias_len(m: str) usize {
+    var i: usize = 0;
+    for (m[i] != 0) {
+        if (m[i] == ':') { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the module path `m` uses, past its alias
+fun path_of(m: str) str {
+    val at: usize = alias_len(m);
+    if (at == 0) { ret m; }
+    var i: usize = at + 1;
+    for (m[i] == ' ') {
+        i = i + 1;
+    }
+    ret ?m[i];
+}
+
+# imports in the order `mach fmt` keeps them: by the module path, then as written
 fun by_text(a: *str, b: *str) i64 {
+    val c: i64 = str_compare(path_of(@a), path_of(@b));
+    if (c != 0) { ret c; }
     ret str_compare(@a, @b);
 }
 
-# one group of imports, std's or the others, sorted with duplicates dropped
+fun same_import(imports: *vector.Vector[str], i: usize) bool {
+    ret i > 0 && str_compare(imports.data[i - 1], imports.data[i]) == 0;
+}
+
+# whether import `i` is an aliased import of the group `std` selects
+fun aliased(imports: *vector.Vector[str], i: usize, std: bool) bool {
+    ret alias_len(imports.data[i]) > 0 && str_starts_with(path_of(imports.data[i]), "std.") == std;
+}
+
+# one group of imports, std's or the others, sorted with duplicates dropped. a
+# run of aliased imports aligns its paths, as `mach fmt` does
 fun put_imports(o: *Out, imports: *vector.Vector[str], std: bool) {
     var wrote: bool  = false;
     var i:     usize = 0;
     for (i < imports.len) {
         val m: str = imports.data[i];
-        if (str_starts_with(m, "std.") == std && !(i > 0 && str_compare(imports.data[i - 1], m) == 0)) {
+        if (str_starts_with(path_of(m), "std.") == std && !same_import(imports, i)) {
             put(o, "use ");
-            put(o, m);
+            val alias: usize = alias_len(m);
+            if (alias > 0) {
+                var start: usize = i;
+                for (start > 0 && aliased(imports, start - 1, std)) {
+                    start = start - 1;
+                }
+                var widest: usize = alias;
+                var k:      usize = start;
+                for (k < imports.len && aliased(imports, k, std)) {
+                    if (alias_len(imports.data[k]) > widest) { widest = alias_len(imports.data[k]); }
+                    k = k + 1;
+                }
+                var c: usize = 0;
+                for (c < alias) {
+                    put_byte(o, m[c]);
+                    c = c + 1;
+                }
+                put_byte(o, ':');
+                c = alias;
+                for (c <= widest) {
+                    put_byte(o, ' ');
+                    c = c + 1;
+                }
+                put(o, path_of(m));
+            }
+            or { put(o, m); }
             put(o, ";\n");
             wrote = true;
         }
