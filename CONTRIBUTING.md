@@ -6,13 +6,17 @@ constructive, and professional.
 
 ## Building
 
-masc is built with the Mach compiler built from mach's `dev` branch, as CI does,
-because masc's manifest and its std dependency use keys the released compiler
-cannot read. Build it with the released seed (`MACH_VERSION` in
-`.github/workflows/ci.yml`) on `PATH`, and keep the result out of the tree.
+masc is built with the Mach compiler built from the commit pinned as `MACH_REF`
+in `.github/workflows/ci.yml`, as CI does, because masc's manifest and its std
+dependency use keys the released compiler cannot read. Build it with the
+released seed (`MACH_VERSION` in the same file) on `PATH`, and keep the result
+out of the tree.
 
 ```bash
-git clone --branch dev https://github.com/briar-systems/mach.git mach-dev
+git init mach-dev
+git -C mach-dev remote add origin https://github.com/briar-systems/mach.git
+git -C mach-dev fetch --depth 1 origin 5470b803eecb044d3c907419a97a54dcee51993b
+git -C mach-dev checkout FETCH_HEAD
 cd mach-dev
 mkdir -p ../mach-bin
 bash .github/scripts/seed-build.sh "$(command -v mach)" ../mach-bin/mach
