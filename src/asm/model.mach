@@ -1,0 +1,1303 @@
+# the assembly source model: statements read into a builder through a table of directives
+#
+# the assembler reads statements from a feed and writes them through one
+# `masc.build` builder, which owns the sections, labels, layout and
+# relocations. what it keeps of its own is what only the source states: the
+# facts the directives declare of each symbol, indexed by the builder's
+# label, the numbered labels by number, the section stack, and the
+# directives by name. a label and an instruction are read here, and every
+# directive is a row of a name, the syntax of its operands and a handler, in
+# a layer of rows: the core rows, the set's integer data rows, and any the
+# caller adds. the rows are indexed once, and a name two layers state is
+# refused, so adding a directive is adding a row and never an edit here.
+#
+# a name in an expression resolves through the builder's labels: `.` is the
+# place the operand is written, `1b` and `1f` are the nearest numbered label
+# before and after, and a name `.set` or `.equ` equates stands for its value.
+# a difference of labels is the builder's to measure. assembly stops at the
+# first refusal, and the refusal is the assembler's result: nothing it read
+# is handed on.
+#
+# at the end, every name the source holds becomes a symbol as the gnu
+# assembler makes one: with the binding a directive declared, local when it
+# is defined, and another object's when it is only referred to. a name in
+# the private spelling of the object's format, as elf's `.L`, stays out of
+# the symbol table unless declared otherwise.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use mink;
+
+use masc.asm.source;
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.set;
+use masc.core.spelling;
+use masc.syntax.expr;
+use masc.syntax.parse;
+use masc.syntax.read;
+
+use number: std.text.parse;
+
+pub val UNKNOWN_DIRECTIVE: str = "unknown directive";
+pub val DUPLICATE:         str = "directive stated by two rows";
+pub val NO_SYNTAX:         str = "no syntax of the set at this index";
+pub val NOT_CONSTANT:      str = "expression is not a constant";
+pub val SPECIFIED:         str = "a specifier has no meaning here";
+pub val RANGE:             str = "value out of range of its width";
+pub val TWO_BINDINGS:      str = "symbol given two bindings";
+pub val TWO_VISIBILITIES:  str = "symbol given two visibilities";
+pub val TWO_TYPES:         str = "symbol given two types";
+pub val FIXED:             str = "symbol defined by .equ cannot be redefined";
+pub val LABELLED:          str = "symbol already defined as a label";
+pub val EQUATED:           str = "label already equated to a value";
+pub val NO_BEFORE:         str = "numbered label not defined before this reference";
+pub val NEVER_AFTER:       str = "numbered label never defined after this reference";
+pub val LOCAL_UNDEFINED:   str = "local symbol never defined";
+pub val LATE_DIFFERENCE:   str = "symbol referred to before it is equated to a difference of labels";
+pub val SHOWN_DIFFERENCE:  str = "symbol equated to a difference of labels is not a symbol of the object";
+pub val CHANGED:           str = "section given other attributes than it was opened with";
+pub val EMPTY_STACK:       str = "section stack is empty";
+pub val NO_PREVIOUS:       str = "no previous section";
+pub val NOT_A_NAME:        str = "expected a symbol name";
+pub val NOT_A_STRING:      str = "expected a string";
+pub val NOT_A_NUMBER:      str = "expected a number";
+
+# the handle `.` resolves to, which every operand binds to the place it is written before the builder sees it
+pub val HERE: u32 = 0xFFFF_FFFF;
+
+# what one operand of a directive is
+# ---
+# NAME:       a symbol name
+# EXPRESSION: an expression
+# STRING:     a string in quotes, its escapes read
+# REGISTER:   a register of the set, by its syntax's names
+# WORD:       a name after any of the set's type prefixes, as `@function`
+# FLOAT:      a decimal floating point number
+pub def Item: u8;
+
+pub val NAME:       Item = 0;
+pub val EXPRESSION: Item = 1;
+pub val STRING:     Item = 2;
+pub val REGISTER:   Item = 3;
+pub val WORD:       Item = 4;
+pub val FLOAT:      Item = 5;
+
+# the syntax of a directive's operands, items separated by commas
+# ---
+# items:  each operand's kind in order
+# len:    how many kinds
+# least:  how many operands must be present, those after them optional, and any of them empty when it is not one of these
+# repeat: whether the last kind repeats, as a list of values
+# text:   whether the handler reads its operands itself, from the reader, and the items say nothing
+pub rec Shape {
+    items:  *Item;
+    len:    u32;
+    least:  u32;
+    repeat: bool;
+    text:   bool;
+}
+
+# one operand read
+# ---
+# absent:     an empty operand
+# name:       a name
+# expression: an expression, its `.` still HERE
+# string:     a string's bytes
+# register:   a register
+# word:       a word, its prefix left out
+# float:      a floating point number
+pub tag Argument: u8 {
+    absent;
+    name:       View;
+    expression: expr.Expr;
+    string:     View;
+    register:   register.Id;
+    word:       View;
+    float:      f64;
+}
+
+# an operand and the text it was read from
+pub rec Operand {
+    at:    usize;
+    len:   usize;
+    value: Argument;
+}
+
+# what a handler is handed
+# ---
+# directive: its row
+# layer:     the layer of the row
+# statement: the statement
+# reader:    a reader over the operands, at their end once read or at their start for a row that reads them itself
+# items:     the operands read
+# count:     how many
+pub rec Args {
+    directive: *Directive;
+    layer:     *Layer;
+    statement: *source.Statement;
+    reader:    *spelling.Reader;
+    items:     *Operand;
+    count:     u32;
+}
+
+# a directive's row
+# ---
+# name:     its name, its dot included, read without regard to ascii case as the gnu assembler reads it
+# operands: the syntax of its operands
+# handler:  what it does, or the refusal of its operands at their column
+# param:    a number the handler reads, as a data directive's width
+pub rec Directive {
+    name:     str;
+    operands: Shape;
+    handler:  fun(*Assembler, *Args) err[diagnostic.Diagnostic];
+    param:    u64;
+}
+
+# directive rows as a pointer to rows and a count
+pub rec Directives {
+    at:  *Directive;
+    len: u32;
+}
+
+# a layer of directives, as the core set, call frame information or line numbers
+# ---
+# name:       what it is
+# directives: its rows
+# context:    its state, which its handlers reach through their args
+# finish:     what it writes once every statement is read, as a layer of call frame information writes its tables
+pub rec Layer {
+    name:       str;
+    directives: Directives;
+    context:    ptr;
+    finish:     fun(ptr, *Assembler) err[Refusal];
+}
+
+# layers as a pointer to layer pointers and a count
+pub rec Layers {
+    at:  **Layer;
+    len: u32;
+}
+
+# no layers beyond the assembler's own
+pub val NO_LAYERS: Layers = Layers{at: nil, len: 0};
+
+# the finish of a layer that writes nothing at the end
+pub fun finished(context: ptr, a: *Assembler) err[Refusal] {
+    ret err[Refusal].ok{};
+}
+
+# what the assembler is asked to make
+# ---
+# arch:    the architecture of the object
+# syntax:  the index of the set's syntax the instructions are read in
+# traits:  the traits the set requires of its caller (`set.Set.supplied`), as the float abi `-mabi` states, with no default
+# private: the spelling that starts the names the object's format keeps out of its symbol table, as elf's `.L`
+# layers:  the directive layers beyond the core rows and the set's data rows
+pub rec Options {
+    arch:    *mink.arch.Arch;
+    syntax:  u32;
+    traits:  set.Traits;
+    private: str;
+    layers:  Layers;
+}
+
+# why assembly stopped
+# ---
+# diagnostic: what was refused and where
+# site:       where the file being assembled states it, for a refusal in an expansion
+pub rec Refusal {
+    diagnostic: diagnostic.Diagnostic;
+    site:       diagnostic.Position;
+}
+
+# what the source declared of one label
+# ---
+# binding:    the binding a directive declared
+# visibility: the visibility a directive declared
+# kind:       the type `.type` declared
+# size:       the size `.size` declared
+# equated:    the value `.set` or `.equ` gave it
+# fixed:      whether `.equ` gave it, so nothing may redefine it
+# used:       where a statement first referred to it by its handle
+pub rec Facts {
+    binding:    opt[*mink.symbol.Binding];
+    visibility: opt[*mink.symbol.Visibility];
+    kind:       opt[*mink.symbol.Kind];
+    size:       build.Size;
+    equated:    opt[expr.Expr];
+    fixed:      bool;
+    used:       opt[diagnostic.Position];
+}
+
+# a numbered label's state: the label `nb` names, and the label `nf` names until the next definition places it
+rec Numbered {
+    last: opt[build.Label];
+    next: opt[build.Label];
+}
+
+# a saved section state of the section stack
+rec Frame {
+    current:  opt[build.Section];
+    previous: opt[build.Section];
+}
+
+# a directive by name
+rec Entry {
+    directive: *Directive;
+    layer:     *Layer;
+}
+
+# how many operand values, list members and literal bytes one instruction reads, and how many requirements a refusal names
+val POOL:       u32 = 64;
+val LITERAL:    u32 = 256;
+val ADMISSIONS: u32 = 16;
+
+# the assembler of one object
+# ---
+# a:          the allocator
+# set:        the instruction set
+# available:  the selection's view of the register file
+# syntax:     the syntax instructions are read in
+# private:    the private spelling of names
+# b:          the builder everything is written through
+# layers:     every layer, the core first
+# rows:       the set's integer data rows, made from its widths
+# own:        the layer of those rows
+# index:      every row by name, in ascending order of folded name
+# facts:      per label, label id less one, what the source declared of it
+# numbered:   the numbered labels by number
+# stack:      the section stack
+# previous:   the section `.previous` returns to
+# items:      the operands of the directive being read
+# strings:    the bytes of its strings
+# spelled:    a name copied to be handed to the builder
+# names:      the symbols the syntax resolves names through
+# pool:       an instruction's operand values
+# literal:    an instruction's literal bytes
+# admissions: the requirements a refused instruction names
+pub rec Assembler {
+    a:          *A.Allocator;
+    set:        *set.Set;
+    available:  *register.Available;
+    syntax:     *spelling.Syntax;
+    private:    str;
+    b:          build.Builder;
+    layers:     vector.Vector[*Layer];
+    rows:       vector.Vector[Directive];
+    own:        vector.Vector[Layer];
+    index:      vector.Vector[Entry];
+    facts:      vector.Vector[Facts];
+    numbered:   map.Map[u64, Numbered];
+    stack:      vector.Vector[Frame];
+    previous:   opt[build.Section];
+    items:      vector.Vector[Operand];
+    strings:    vector.Vector[u8];
+    spelled:    vector.Vector[u8];
+    names:      spelling.Symbols;
+    pool:       [POOL]operand.Value;
+    literal:    [LITERAL]u8;
+    admissions: [ADMISSIONS]requirement.Ids;
+}
+
+fun nowhere(message: str) Refusal {
+    ret Refusal{diagnostic: diagnostic.Diagnostic{message: message, span: diagnostic.Span{start: diagnostic.START, len: 0}, requires: requirement.NONE}, site: diagnostic.START};
+}
+
+fun at_position(message: str, p: diagnostic.Position, len: usize) diagnostic.Diagnostic {
+    ret diagnostic.Diagnostic{message: message, span: diagnostic.Span{start: p, len: len}, requires: requirement.NONE};
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# `c` in lower case when it is an ascii capital
+fun lower(c: u8) u8 {
+    ret spelling.lower(c);
+}
+
+# how name `a` orders against `b`, without regard to ascii case
+fun order(a: View, b: View) i64 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        val x: u8 = lower(a.data[i]);
+        val y: u8 = lower(b.data[i]);
+        if (x < y) { ret -1; }
+        if (x > y) { ret 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+fun named(s: str) View {
+    ret View{data: s, len: str_len(s)};
+}
+
+fun by_name(x: *Entry, y: *Entry) i64 {
+    ret order(named(x.directive.name), named(y.directive.name));
+}
+
+# an assembler of an object for `options.arch` over `s`, under the selection `available` views, reading the rows of
+# `core`, a row per integer data directive of the set handled by `integers`, and the caller's layers
+pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, options: Options, core: *Layer, integers: fun(*Assembler, *Args) err[diagnostic.Diagnostic]) res[Assembler, Refusal] {
+    if (options.syntax >= s.syntaxes.len) { ret res[Assembler, Refusal].err{nowhere(NO_SYNTAX)}; }
+    val built: res[build.Builder, build.Refusal] = build.make(a, s, available, options.arch, options.traits);
+    if (sel built.err) { ret res[Assembler, Refusal].err{nowhere(built.err.message)}; }
+    var m: Assembler = Assembler{
+        a:         a,
+        set:       s,
+        available: available,
+        syntax:    ?s.syntaxes.at[options.syntax],
+        private:   options.private,
+        b:         built.ok,
+        layers:    vector.init[*Layer](a),
+        rows:      vector.init[Directive](a),
+        own:       vector.init[Layer](a),
+        index:     vector.init[Entry](a),
+        facts:     vector.init[Facts](a),
+        numbered:  map.init[u64, Numbered](a),
+        stack:     vector.init[Frame](a),
+        previous:  opt[build.Section].none{},
+        items:     vector.init[Operand](a),
+        strings:   vector.init[u8](a),
+        spelled:   vector.init[u8](a),
+        names:     spelling.Symbols{context: nil, resolve: resolve, name: name_of},
+    };
+    val widths: set.Widths = s.source.widths;
+    var ok:     bool       = held(vector.reserve[Directive](?m.rows, widths.len::usize)) && held(vector.reserve[Layer](?m.own, 1));
+    var i:      u32        = 0;
+    for (ok && i < widths.len) {
+        vector.push[Directive](?m.rows, Directive{name: widths.at[i].name, operands: EXPRESSIONS, handler: integers, param: widths.at[i].width::u64});
+        i = i + 1;
+    }
+    if (ok) {
+        vector.push[Layer](?m.own, Layer{name: "data", directives: Directives{at: m.rows.data, len: m.rows.len::u32}, context: nil, finish: finished});
+        ok = held(vector.push[*Layer](?m.layers, core)) && held(vector.push[*Layer](?m.layers, ?m.own.data[0]));
+    }
+    i = 0;
+    for (ok && i < options.layers.len) {
+        ok = held(vector.push[*Layer](?m.layers, options.layers.at[i]));
+        i  = i + 1;
+    }
+    var k: usize = 0;
+    for (ok && k < m.layers.len) {
+        val l: *Layer = m.layers.data[k];
+        var j: u32    = 0;
+        for (ok && j < l.directives.len) {
+            ok = held(vector.push[Entry](?m.index, Entry{directive: ?l.directives.at[j], layer: l}));
+            j  = j + 1;
+        }
+        k = k + 1;
+    }
+    if (!ok) {
+        release(?m);
+        ret res[Assembler, Refusal].err{nowhere(field.MEMORY)};
+    }
+    sort.sort_by[Entry](m.index.data, m.index.len, by_name);
+    k = 1;
+    for (k < m.index.len) {
+        if (by_name(?m.index.data[k - 1], ?m.index.data[k]) == 0) {
+            release(?m);
+            ret res[Assembler, Refusal].err{nowhere(DUPLICATE)};
+        }
+        k = k + 1;
+    }
+    ret res[Assembler, Refusal].ok{m};
+}
+
+# give back everything the assembler owns, the builder with it
+pub fun release(m: *Assembler) {
+    build.release(?m.b);
+    vector.dnit[*Layer](?m.layers);
+    vector.dnit[Directive](?m.rows);
+    vector.dnit[Layer](?m.own);
+    vector.dnit[Entry](?m.index);
+    vector.dnit[Facts](?m.facts);
+    map.dnit[u64, Numbered](?m.numbered);
+    vector.dnit[Frame](?m.stack);
+    vector.dnit[Operand](?m.items);
+    vector.dnit[u8](?m.strings);
+    vector.dnit[u8](?m.spelled);
+}
+
+# the builder the assembler writes through, for a layer's handlers
+pub fun builder(m: *Assembler) *build.Builder {
+    ret ?m.b;
+}
+
+# the row named `name`, a binary search of the index, none when no row has it
+fun find(m: *Assembler, name: View) opt[*Entry] {
+    var lo: usize = 0;
+    var hi: usize = m.index.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = order(named(m.index.data[mid].directive.name), name);
+        if (c == 0) { ret opt[*Entry].some{?m.index.data[mid]}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[*Entry].none{};
+}
+
+# the facts of label `l`, the table grown to hold it
+fun facts_of(m: *Assembler, l: build.Label) res[*Facts, Refusal] {
+    val need: usize = l.id::usize;
+    if (m.facts.len < need) {
+        if (!held(vector.reserve[Facts](?m.facts, need - m.facts.len))) { ret res[*Facts, Refusal].err{nowhere(field.MEMORY)}; }
+        for (m.facts.len < need) {
+            m.facts.data[m.facts.len] = Facts{};
+            m.facts.len               = m.facts.len + 1;
+        }
+    }
+    ret res[*Facts, Refusal].ok{?m.facts.data[need - 1]};
+}
+
+# what the source declared of label `l`, nothing when it declared nothing
+fun declared(m: *Assembler, id: u32) Facts {
+    if (id == operand.NO_SYMBOL || id::usize > m.facts.len) { ret Facts{}; }
+    ret m.facts.data[id::usize - 1];
+}
+
+# `v` with a nul after it, as the builder takes a name
+fun spelled(m: *Assembler, v: View) res[str, str] {
+    m.spelled.len = 0;
+    if (!held(vector.reserve[u8](?m.spelled, v.len + 1))) { ret res[str, str].err{field.MEMORY}; }
+    var i: usize = 0;
+    for (i < v.len) {
+        m.spelled.data[i] = v.data[i];
+        i                 = i + 1;
+    }
+    m.spelled.data[v.len] = 0;
+    m.spelled.len         = v.len + 1;
+    ret res[str, str].ok{m.spelled.data};
+}
+
+# the label named `v`, made when it is new
+pub fun label_named(m: *Assembler, v: View) res[build.Label, str] {
+    val text: res[str, str] = spelled(m, v);
+    if (sel text.err) { ret res[build.Label, str].err{text.err}; }
+    val l: res[build.Label, build.Refusal] = build.label(?m.b, text.ok);
+    if (sel l.err) { ret res[build.Label, str].err{l.err.message}; }
+    ret res[build.Label, str].ok{l.ok};
+}
+
+# whether the `len` bytes of `v` are a numbered label's reference, its number into `n` and whether it looks back into `back`
+fun numbered_reference(v: View, n: *u64, back: *bool) bool {
+    if (v.len < 2) { ret false; }
+    val last: u8 = v.data[v.len - 1];
+    if (last != 'b' && last != 'f') { ret false; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < v.len - 1) {
+        val c: u8 = v.data[i];
+        if (c < '0' || c > '9')         { ret false; }
+        if (value > (~0::u64 - 9) / 10) { ret false; }
+        value = value * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    @n    = value;
+    @back = last == 'b';
+    ret true;
+}
+
+# the number a numbered label's definition spells, none when `v` is not all digits
+fun number_of(v: View) opt[u64] {
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < v.len) {
+        val c: u8 = v.data[i];
+        if (c < '0' || c > '9')         { ret opt[u64].none{}; }
+        if (value > (~0::u64 - 9) / 10) { ret opt[u64].none{}; }
+        value = value * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    ret opt[u64].some{value};
+}
+
+# the state of numbered label `n`, made when it is new
+fun numbered_state(m: *Assembler, n: u64) res[*Numbered, str] {
+    var key: u64            = n;
+    val got: opt[*Numbered] = map.get[u64, Numbered](?m.numbered, ?key);
+    if (sel got.some) { ret res[*Numbered, str].ok{got.some}; }
+    val put: res[bool, A.Error] = map.insert[u64, Numbered](?m.numbered, n, Numbered{last: opt[build.Label].none{}, next: opt[build.Label].none{}});
+    if (sel put.err) { ret res[*Numbered, str].err{field.MEMORY}; }
+    val made: opt[*Numbered] = map.get[u64, Numbered](?m.numbered, ?key);
+    if (sel made.none) { ret res[*Numbered, str].err{field.MEMORY}; }
+    ret res[*Numbered, str].ok{made.some};
+}
+
+# what an equated value stands for in an expression
+fun stands_for(e: expr.Expr) spelling.Resolved {
+    if (sel e.constant)   { ret spelling.Resolved.constant{e.constant}; }
+    if (sel e.symbol)     { ret spelling.Resolved.equated{spelling.Equated{plus: e.symbol.id, minus: operand.NO_SYMBOL, addend: e.symbol.addend}}; }
+    if (sel e.difference) { ret spelling.Resolved.equated{spelling.Equated{plus: e.difference.plus, minus: e.difference.minus, addend: e.difference.addend}}; }
+    ret spelling.Resolved.constant{0};
+}
+
+# a name in an operand: `.`, a numbered label's reference, or a label, standing for what `.set` equated it to
+fun resolve(context: ptr, name: View) res[spelling.Resolved, str] {
+    val m: *Assembler = context::*Assembler;
+    if (name.len == 1 && name.data[0] == '.') { ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{HERE}}; }
+    var n:    u64  = 0;
+    var back: bool = false;
+    if (numbered_reference(name, ?n, ?back)) {
+        val state: res[*Numbered, str] = numbered_state(m, n);
+        if (sel state.err) { ret res[spelling.Resolved, str].err{state.err}; }
+        val st: *Numbered = state.ok;
+        if (back) {
+            if (sel st.last.none) { ret res[spelling.Resolved, str].err{NO_BEFORE}; }
+            ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{st.last.some.id}};
+        }
+        var ahead: u32 = operand.NO_SYMBOL;
+        if (sel st.next.some)           { ahead = st.next.some.id; }
+        if (ahead != operand.NO_SYMBOL) { ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{ahead}}; }
+        val made: res[build.Label, build.Refusal] = build.anonymous(?m.b);
+        if (sel made.err) { ret res[spelling.Resolved, str].err{made.err.message}; }
+        st.next = opt[build.Label].some{made.ok};
+        ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{made.ok.id}};
+    }
+    val l: res[build.Label, str] = label_named(m, name);
+    if (sel l.err) { ret res[spelling.Resolved, str].err{l.err}; }
+    val f: Facts = declared(m, l.ok.id);
+    if (sel f.equated.some) { ret res[spelling.Resolved, str].ok{stands_for(f.equated.some)}; }
+    ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{l.ok.id}};
+}
+
+fun name_of(context: ptr, id: u32) View {
+    val m:   *Assembler = context::*Assembler;
+    val own: opt[View]  = build.label_name(?m.b, build.Label{id: id});
+    if (sel own.some) { ret own.some; }
+    ret View{data: "", len: 0};
+}
+
+# a new label placed at the cursor, which `.` names where an operand is written
+pub fun here(m: *Assembler) res[build.Label, str] {
+    val made: res[build.Label, build.Refusal] = build.anonymous(?m.b);
+    if (sel made.err) { ret res[build.Label, str].err{made.err.message}; }
+    val placed: err[build.Refusal] = build.define(?m.b, made.ok);
+    if (sel placed.err) { ret res[build.Label, str].err{placed.err.message}; }
+    ret res[build.Label, str].ok{made.ok};
+}
+
+# label `id` noted as referred to at `at`, the first reference kept
+fun note(m: *Assembler, id: u32, at: diagnostic.Position) err[str] {
+    if (id == operand.NO_SYMBOL || id == HERE) { ret err[str].ok{}; }
+    val f: res[*Facts, Refusal] = facts_of(m, build.Label{id: id});
+    if (sel f.err) { ret err[str].err{field.MEMORY}; }
+    val first: bool = sel f.ok.used.none;
+    if (first) { f.ok.used = opt[diagnostic.Position].some{at}; }
+    ret err[str].ok{};
+}
+
+# `id` with HERE bound to `here`, a label made at the cursor the first time it is needed
+fun bound_here(m: *Assembler, id: u32, here_: *u32) res[u32, str] {
+    if (id != HERE) { ret res[u32, str].ok{id}; }
+    if (@here_ == operand.NO_SYMBOL) {
+        val l: res[build.Label, str] = here(m);
+        if (sel l.err) { ret res[u32, str].err{l.err}; }
+        @here_ = l.ok.id;
+    }
+    ret res[u32, str].ok{@here_};
+}
+
+# `e` with `.` bound to the cursor and its labels noted as referred to at `at`
+pub fun bind(m: *Assembler, e: *expr.Expr, at: diagnostic.Position) err[str] {
+    var here_: u32 = operand.NO_SYMBOL;
+    if (sel e.symbol) {
+        val id: res[u32, str] = bound_here(m, e.symbol.id, ?here_);
+        if (sel id.err) { ret err[str].err{id.err}; }
+        e.symbol.id = id.ok;
+        ret note(m, id.ok, at);
+    }
+    if (sel e.difference) {
+        val plus: res[u32, str] = bound_here(m, e.difference.plus, ?here_);
+        if (sel plus.err) { ret err[str].err{plus.err}; }
+        val minus: res[u32, str] = bound_here(m, e.difference.minus, ?here_);
+        if (sel minus.err) { ret err[str].err{minus.err}; }
+        e.difference.plus  = plus.ok;
+        e.difference.minus = minus.ok;
+        val noted: err[str] = note(m, plus.ok, at);
+        if (sel noted.err) { ret noted; }
+        ret note(m, minus.ok, at);
+    }
+    ret err[str].ok{};
+}
+
+# a refusal of `message` at operand `k` of `args`, or at the operands' start when there is no such operand
+pub fun refuse(args: *Args, k: u32, message: str) diagnostic.Diagnostic {
+    if (k < args.count) { ret read.refuse(args.reader, message, args.items[k].at, args.items[k].len); }
+    ret read.refuse(args.reader, message, args.reader.start, 0);
+}
+
+# the position of operand `k` of `args`
+pub fun position(args: *Args, k: u32) diagnostic.Position {
+    ret refuse(args, k, "").span.start;
+}
+
+# whether operand `k` of `args` is given
+pub fun given(args: *Args, k: u32) bool {
+    ret k < args.count && !sel args.items[k].value.absent;
+}
+
+# operand `k` of `args` as a constant
+pub fun constant(args: *Args, k: u32) res[i64, diagnostic.Diagnostic] {
+    if (k >= args.count) { ret res[i64, diagnostic.Diagnostic].err{refuse(args, k, read.EXPECTED)}; }
+    val v: Argument = args.items[k].value;
+    if (sel v.expression) {
+        if (sel v.expression.constant) { ret res[i64, diagnostic.Diagnostic].ok{v.expression.constant}; }
+    }
+    ret res[i64, diagnostic.Diagnostic].err{refuse(args, k, NOT_CONSTANT)};
+}
+
+# operand `k` of `args` as a constant, `otherwise` when it is not given
+pub fun constant_or(args: *Args, k: u32, otherwise: i64) res[i64, diagnostic.Diagnostic] {
+    if (!given(args, k)) { ret res[i64, diagnostic.Diagnostic].ok{otherwise}; }
+    ret constant(args, k);
+}
+
+# whether `v` fits `width` bytes, read as signed or unsigned
+fun fits(v: i64, width: u64) bool {
+    if (width >= 8) { ret true; }
+    val half: i64 = 1::i64 << (width * 8 - 1)::i64;
+    ret v >= -half && v < half * 2;
+}
+
+# a builder refusal as a diagnostic at operand `k`
+fun wrote(args: *Args, k: u32, e: err[build.Refusal]) err[diagnostic.Diagnostic] {
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{refuse(args, k, e.err.message)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# operand `k` of `args` written as a datum of `width` bytes: a constant in the set's byte order, a symbol's address,
+# or a difference of labels, each `.` the place it is written
+pub fun datum(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Diagnostic] {
+    if (k >= args.count) { ret err[diagnostic.Diagnostic].err{refuse(args, k, read.EXPECTED)}; }
+    val v: Argument = args.items[k].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{refuse(args, k, NOT_CONSTANT)}; }
+    var e: expr.Expr = v.expression;
+    if (sel e.constant) {
+        if (!fits(e.constant, width)) { ret err[diagnostic.Diagnostic].err{refuse(args, k, RANGE)}; }
+        ret wrote(args, k, build.integer(?m.b, e.constant:~u64, width::u8));
+    }
+    val bound_: err[str] = bind(m, ?e, position(args, k));
+    if (sel bound_.err) { ret err[diagnostic.Diagnostic].err{refuse(args, k, bound_.err)}; }
+    if (sel e.symbol) {
+        if (e.symbol.fixup != operand.NO_FIXUP) { ret err[diagnostic.Diagnostic].err{refuse(args, k, SPECIFIED)}; }
+        ret wrote(args, k, build.datum(?m.b, build.Reference{target: build.Label{id: e.symbol.id}, addend: e.symbol.addend, width: width::u8, basis: set.ABSOLUTE}));
+    }
+    if (sel e.difference) {
+        val d: build.Difference = build.Difference{plus: build.Label{id: e.difference.plus}, minus: build.Label{id: e.difference.minus}, addend: e.difference.addend};
+        ret wrote(args, k, build.difference(?m.b, d, width::u8));
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the label operand `k` of `args` names
+pub fun symbol(m: *Assembler, args: *Args, k: u32) res[build.Label, diagnostic.Diagnostic] {
+    if (k >= args.count) { ret res[build.Label, diagnostic.Diagnostic].err{refuse(args, k, NOT_A_NAME)}; }
+    val v: Argument = args.items[k].value;
+    if (!sel v.name) { ret res[build.Label, diagnostic.Diagnostic].err{refuse(args, k, NOT_A_NAME)}; }
+    val l: res[build.Label, str] = label_named(m, v.name);
+    if (sel l.err) { ret res[build.Label, diagnostic.Diagnostic].err{refuse(args, k, l.err)}; }
+    ret res[build.Label, diagnostic.Diagnostic].ok{l.ok};
+}
+
+# label `l` declared to bind as `binding`, refused when another binding was declared
+pub fun declare_binding(m: *Assembler, l: build.Label, binding: *mink.symbol.Binding) err[str] {
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err)                                             { ret err[str].err{field.MEMORY}; }
+    if (sel f.ok.binding.some && f.ok.binding.some != binding) { ret err[str].err{TWO_BINDINGS}; }
+    f.ok.binding = opt[*mink.symbol.Binding].some{binding};
+    ret err[str].ok{};
+}
+
+# label `l` declared to be visible as `visibility`, refused when another visibility was declared
+pub fun declare_visibility(m: *Assembler, l: build.Label, visibility: *mink.symbol.Visibility) err[str] {
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err)                                                      { ret err[str].err{field.MEMORY}; }
+    if (sel f.ok.visibility.some && f.ok.visibility.some != visibility) { ret err[str].err{TWO_VISIBILITIES}; }
+    f.ok.visibility = opt[*mink.symbol.Visibility].some{visibility};
+    ret err[str].ok{};
+}
+
+# label `l` declared to name a `kind`, refused when another type was declared
+pub fun declare_kind(m: *Assembler, l: build.Label, kind: *mink.symbol.Kind) err[str] {
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err)                                    { ret err[str].err{field.MEMORY}; }
+    if (sel f.ok.kind.some && f.ok.kind.some != kind) { ret err[str].err{TWO_TYPES}; }
+    f.ok.kind = opt[*mink.symbol.Kind].some{kind};
+    ret err[str].ok{};
+}
+
+# label `l` declared to be `size` bytes
+pub fun declare_size(m: *Assembler, l: build.Label, size: build.Size) err[str] {
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err) { ret err[str].err{field.MEMORY}; }
+    f.ok.size = size;
+    ret err[str].ok{};
+}
+
+# the type declared of label `l`, none when no directive declared one
+pub fun kind_declared(m: *Assembler, l: build.Label) opt[*mink.symbol.Kind] {
+    ret declared(m, l.id).kind;
+}
+
+# the binding declared of label `l`, none when no directive declared one
+pub fun binding_of(m: *Assembler, l: build.Label) opt[*mink.symbol.Binding] {
+    ret declared(m, l.id).binding;
+}
+
+# label `l` equated to `e`, its `.` bound to the cursor: `.set` when `fixed` is false, which may redefine it, and `.equ`
+# when true, which may not, and neither may redefine a label placed
+pub fun equate(m: *Assembler, l: build.Label, e: expr.Expr, fixed: bool, at: diagnostic.Position) err[str] {
+    if (build.bound(?m.b, l)) { ret err[str].err{LABELLED}; }
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err)                      { ret err[str].err{field.MEMORY}; }
+    if (f.ok.fixed)                     { ret err[str].err{FIXED}; }
+    if (fixed && sel f.ok.equated.some) { ret err[str].err{FIXED}; }
+    var v: expr.Expr = e;
+    if (sel v.symbol) {
+        if (v.symbol.fixup != operand.NO_FIXUP) { ret err[str].err{SPECIFIED}; }
+    }
+    val bound_: err[str] = bind(m, ?v, at);
+    if (sel bound_.err) { ret bound_; }
+    # the table may have grown while `.` was bound
+    val g: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel g.err) { ret err[str].err{field.MEMORY}; }
+    g.ok.equated = opt[expr.Expr].some{v};
+    g.ok.fixed   = fixed;
+    ret err[str].ok{};
+}
+
+# the section named `name`, opened as `spec` when it is new and refused when `stated` and it was opened otherwise, made
+# current with the section before it the previous
+pub fun enter(m: *Assembler, name: View, spec: build.Spec, stated: bool) err[str] {
+    val found: opt[build.Section] = build.section_named(?m.b, name);
+    var s:     build.Section      = build.Section{index: 0};
+    if (sel found.some) {
+        if (stated && !build.matches(?m.b, found.some, ?spec)) { ret err[str].err{CHANGED}; }
+        s = found.some;
+    }
+    or {
+        val text: res[str, str] = spelled(m, name);
+        if (sel text.err) { ret err[str].err{text.err}; }
+        var named_: build.Spec = spec;
+        named_.name = text.ok;
+        val opened: res[build.Section, build.Refusal] = build.open(?m.b, named_);
+        if (sel opened.err) { ret err[str].err{opened.err.message}; }
+        s = opened.ok;
+    }
+    ret switch_to(m, s);
+}
+
+# section `s` made current, the current one becoming the previous
+pub fun switch_to(m: *Assembler, s: build.Section) err[str] {
+    val was:      opt[build.Section] = build.current(?m.b);
+    val switched: err[build.Refusal] = build.switch(?m.b, s);
+    if (sel switched.err) { ret err[str].err{switched.err.message}; }
+    if (sel was.some) {
+        if (was.some.index != s.index) { m.previous = was; }
+    }
+    ret err[str].ok{};
+}
+
+# the current and previous sections pushed onto the section stack
+pub fun push_section(m: *Assembler) err[str] {
+    if (!held(vector.push[Frame](?m.stack, Frame{current: build.current(?m.b), previous: m.previous}))) { ret err[str].err{field.MEMORY}; }
+    ret err[str].ok{};
+}
+
+# the sections the last push saved made current and previous again
+pub fun pop_section(m: *Assembler) err[str] {
+    val top: opt[Frame] = vector.pop[Frame](?m.stack);
+    if (sel top.none) { ret err[str].err{EMPTY_STACK}; }
+    if (sel top.some.current.some) {
+        val switched: err[build.Refusal] = build.switch(?m.b, top.some.current.some);
+        if (sel switched.err) { ret err[str].err{switched.err.message}; }
+    }
+    m.previous = top.some.previous;
+    ret err[str].ok{};
+}
+
+# the previous section and the current one swapped
+pub fun swap_previous(m: *Assembler) err[str] {
+    if (sel m.previous.none) { ret err[str].err{NO_PREVIOUS}; }
+    ret switch_to(m, m.previous.some);
+}
+
+# the previous section, to restore after a directive that writes elsewhere
+pub fun previous_of(m: *Assembler) opt[build.Section] {
+    ret m.previous;
+}
+
+# the previous section set back to `p`
+pub fun restore_previous(m: *Assembler, p: opt[build.Section]) {
+    m.previous = p;
+}
+
+# a reader over `len` bytes of statement `st` from `at`, positioned at `origin`
+fun reader(m: *Assembler, st: *source.Statement, at: usize, len: usize, origin: diagnostic.Position) spelling.Reader {
+    m.names.context = m::ptr;
+    ret spelling.Reader{
+        text:      st.text,
+        start:     at,
+        at:        at,
+        end:       at + len,
+        origin:    origin,
+        codec:     m.set.codec,
+        available: m.available,
+        syntax:    m.syntax,
+        symbols:   ?m.names,
+        context:   nil,
+        row:       nil,
+        pool:      ?m.pool[0],
+        cap:       POOL,
+        used:      0,
+        bytes:     ?m.literal[0],
+        room:      LITERAL,
+        taken:     0,
+        refused:   field.Admissions{at: ?m.admissions[0], cap: ADMISSIONS, used: 0},
+    };
+}
+
+# whether `c` is one of the set's type prefixes
+fun prefix(m: *Assembler, c: u8) bool {
+    val types: str   = m.set.source.types;
+    var i:     usize = 0;
+    for (types[i] != 0) {
+        if (types[i] == c) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a string read at the reader's position, its escapes read into the assembler's strings, which hold room for the
+# statement's every byte so a string read earlier does not move
+pub fun string(m: *Assembler, rd: *spelling.Reader) res[View, diagnostic.Diagnostic] {
+    val at: usize = rd.at;
+    if (!read.take(rd, "\"")) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_STRING, at, read.token(rd, at))}; }
+    val start: usize = m.strings.len;
+    for (read.peek(rd) != '"') {
+        if (read.peek(rd) == 0) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, source.UNCLOSED_STRING, at, 1)}; }
+        var c: u8 = read.peek(rd);
+        rd.at = rd.at + 1;
+        if (c == '\\') {
+            val e: u8 = read.peek(rd);
+            rd.at = rd.at + 1;
+            if (e == 'n') { c = '\n'; }
+            or (e == 't') { c = '\t'; }
+            or (e == 'r') { c = '\r'; }
+            or (e == 'b') { c = 8; }
+            or (e == 'f') { c = 12; }
+            or (e == 'x' || e == 'X') {
+                var v: u32 = 0;
+                for (read.word(read.peek(rd)) && hexit(read.peek(rd)) < 16) {
+                    v     = (v * 16 + hexit(read.peek(rd))) & 0xFF;
+                    rd.at = rd.at + 1;
+                }
+                c = v::u8;
+            }
+            or (e >= '0' && e <= '7') {
+                var v: u32 = (e - '0')::u32;
+                var k: u32 = 1;
+                for (k < 3 && read.peek(rd) >= '0' && read.peek(rd) <= '7') {
+                    v     = v * 8 + (read.peek(rd) - '0')::u32;
+                    rd.at = rd.at + 1;
+                    k     = k + 1;
+                }
+                c = (v & 0xFF)::u8;
+            }
+            or { c = e; }
+        }
+        m.strings.data[m.strings.len] = c;
+        m.strings.len                 = m.strings.len + 1;
+    }
+    rd.at = rd.at + 1;
+    ret res[View, diagnostic.Diagnostic].ok{View{data: ?m.strings.data[start], len: m.strings.len - start}};
+}
+
+fun hexit(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::u32 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::u32 + 10; }
+    ret 16;
+}
+
+# the length of a decimal floating point number at `at`: a sign, digits with a point, and an exponent, or inf and nan
+fun float_len(rd: *spelling.Reader, at: usize) usize {
+    var i: usize = at;
+    if (i < rd.end && (rd.text[i] == '-' || rd.text[i] == '+'))       { i = i + 1; }
+    if (read.starts(rd, i, "inf", 3) || read.starts(rd, i, "nan", 3)) { ret i + 3 - at; }
+    val digits: usize = i;
+    for (i < rd.end && ((rd.text[i] >= '0' && rd.text[i] <= '9') || rd.text[i] == '.')) {
+        i = i + 1;
+    }
+    if (i == digits) { ret 0; }
+    if (i < rd.end && (rd.text[i] == 'e' || rd.text[i] == 'E')) {
+        var j: usize = i + 1;
+        if (j < rd.end && (rd.text[j] == '-' || rd.text[j] == '+')) { j = j + 1; }
+        val exp: usize = j;
+        for (j < rd.end && rd.text[j] >= '0' && rd.text[j] <= '9') {
+            j = j + 1;
+        }
+        if (j > exp) { i = j; }
+    }
+    ret i - at;
+}
+
+# one operand of kind `kind` read at the reader's position, for a row that reads its operands itself
+pub fun read_item(m: *Assembler, rd: *spelling.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
+    ret item(m, rd, kind);
+}
+
+# one operand of kind `kind` read at the reader's position
+fun item(m: *Assembler, rd: *spelling.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
+    val at: usize = rd.at;
+    if (kind == NAME) {
+        val len: usize = read.name(rd);
+        if (len == 0) { ret res[Argument, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NAME, at, read.token(rd, at))}; }
+        rd.at = at + len;
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.name{read.span(rd, at, len)}};
+    }
+    if (kind == EXPRESSION) {
+        val e: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+        if (sel e.err) { ret res[Argument, diagnostic.Diagnostic].err{e.err}; }
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.expression{e.ok}};
+    }
+    if (kind == STRING) {
+        val s: res[View, diagnostic.Diagnostic] = string(m, rd);
+        if (sel s.err) { ret res[Argument, diagnostic.Diagnostic].err{s.err}; }
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.string{s.ok}};
+    }
+    if (kind == REGISTER) {
+        val r: res[register.Id, diagnostic.Diagnostic] = read.register_value(rd);
+        if (sel r.err) { ret res[Argument, diagnostic.Diagnostic].err{r.err}; }
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.register{r.ok}};
+    }
+    if (kind == WORD) {
+        if (prefix(m, read.peek(rd))) { rd.at = rd.at + 1; }
+        val from: usize = rd.at;
+        val len:  usize = read.name(rd);
+        if (len == 0) { ret res[Argument, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NAME, at, read.token(rd, at))}; }
+        rd.at = from + len;
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.word{read.span(rd, from, len)}};
+    }
+    val len: usize = float_len(rd, at);
+    if (len == 0) { ret res[Argument, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NUMBER, at, read.token(rd, at))}; }
+    val f: res[f64, number.ParseError] = number.parse_f64_len(?rd.text[at], len);
+    if (sel f.err) { ret res[Argument, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NUMBER, at, len)}; }
+    rd.at = at + len;
+    ret res[Argument, diagnostic.Diagnostic].ok{Argument.float{f.ok}};
+}
+
+# the operands of `shape` read over the reader into the assembler's items, an empty one absent where it is optional
+fun operands(m: *Assembler, rd: *spelling.Reader, shape: *Shape) err[diagnostic.Diagnostic] {
+    m.items.len = 0;
+    read.skip(rd);
+    if (shape.text)     { ret err[diagnostic.Diagnostic].ok{}; }
+    if (shape.len == 0) { ret ended(rd); }
+    if (read.peek(rd) == 0) {
+        if (shape.least > 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.EXPECTED, rd.at, 0)}; }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    var k: u32 = 0;
+    for {
+        var kind: Item = shape.items[shape.len - 1];
+        if (k < shape.len) { kind = shape.items[k]; }
+        val at:    usize    = rd.at;
+        val c:     u8       = read.peek(rd);
+        var item_: Argument = Argument.absent{};
+        if (c == ',' || c == 0) {
+            if (k < shape.least) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.EXPECTED, at, 0)}; }
+        }
+        or {
+            val got: res[Argument, diagnostic.Diagnostic] = item(m, rd, kind);
+            if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+            item_ = got.ok;
+        }
+        if (!held(vector.push[Operand](?m.items, Operand{at: at, len: rd.at - at, value: item_}))) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, field.MEMORY, at, 0)}; }
+        k = k + 1;
+        read.skip(rd);
+        if (!shape.repeat && k >= shape.len) { brk; }
+        if (!read.take(rd, ","))             { brk; }
+        read.skip(rd);
+    }
+    if (m.items.len < shape.least::usize) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.EXPECTED, rd.at, 0)}; }
+    ret ended(rd);
+}
+
+# the refusal of text left after a statement's operands, at its column
+pub fun ended(rd: *spelling.Reader) err[diagnostic.Diagnostic] {
+    read.skip(rd);
+    if (rd.at < rd.end) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.UNEXPECTED, rd.at, read.token(rd, rd.at))}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun stop(st: *source.Statement, d: diagnostic.Diagnostic) err[Refusal] {
+    ret err[Refusal].err{Refusal{diagnostic: d, site: st.site}};
+}
+
+fun stop_at(st: *source.Statement, message: str, t: source.Token) err[Refusal] {
+    ret stop(st, at_position(message, t.position, t.len));
+}
+
+# a label statement: a numbered label placed as the next definition of its number, or a named one
+fun label_statement(m: *Assembler, st: *source.Statement) err[Refusal] {
+    val name:   View     = source.bytes(st, st.head);
+    val number: opt[u64] = number_of(name);
+    if (sel number.some) {
+        val state: res[*Numbered, str] = numbered_state(m, number.some);
+        if (sel state.err) { ret stop_at(st, state.err, st.head); }
+        val n:    *Numbered   = state.ok;
+        var next: build.Label = build.Label{id: operand.NO_SYMBOL};
+        if (sel n.next.some) { next = n.next.some; }
+        if (next.id == operand.NO_SYMBOL) {
+            val made: res[build.Label, build.Refusal] = build.anonymous(?m.b);
+            if (sel made.err) { ret stop_at(st, made.err.message, st.head); }
+            next = made.ok;
+        }
+        val placed: err[build.Refusal] = build.define(?m.b, next);
+        if (sel placed.err) { ret stop_at(st, placed.err.message, st.head); }
+        n.last = opt[build.Label].some{next};
+        n.next = opt[build.Label].none{};
+        ret err[Refusal].ok{};
+    }
+    val l: res[build.Label, str] = label_named(m, name);
+    if (sel l.err) { ret stop_at(st, l.err, st.head); }
+    val f: Facts = declared(m, l.ok.id);
+    if (sel f.equated.some) { ret stop_at(st, EQUATED, st.head); }
+    val placed: err[build.Refusal] = build.define(?m.b, l.ok);
+    if (sel placed.err) { ret stop_at(st, placed.err.message, st.head); }
+    ret err[Refusal].ok{};
+}
+
+# a symbolic operand value with `.` bound to the instruction's place and its label noted
+fun claim(m: *Assembler, v: *operand.Value, at: diagnostic.Position, here_: *u32) err[str] {
+    if (sel v.symbol) {
+        val id: res[u32, str] = bound_here(m, v.symbol.id, here_);
+        if (sel id.err) { ret err[str].err{id.err}; }
+        v.symbol.id = id.ok;
+        ret note(m, id.ok, at);
+    }
+    if (sel v.memory) {
+        if (v.memory.symbol.id != operand.NO_SYMBOL) {
+            val id: res[u32, str] = bound_here(m, v.memory.symbol.id, here_);
+            if (sel id.err) { ret err[str].err{id.err}; }
+            v.memory.symbol.id = id.ok;
+            ret note(m, id.ok, at);
+        }
+    }
+    if (sel v.list) {
+        var i: u32 = 0;
+        for (i < v.list.len) {
+            val done: err[str] = claim(m, ?v.list.at[i], at, here_);
+            if (sel done.err) { ret done; }
+            i = i + 1;
+        }
+    }
+    ret err[str].ok{};
+}
+
+# an instruction statement read in the set's syntax and written, its `.` the place it is written at
+fun instruction_statement(m: *Assembler, st: *source.Statement) err[Refusal] {
+    var len: usize = st.head.len;
+    if (st.body.len > 0) { len = st.body.at + st.body.len - st.head.at; }
+    var rd:  spelling.Reader            = reader(m, st, st.head.at, len, st.head.position);
+    var ex:  relax.Expansion;
+    val got: err[diagnostic.Diagnostic] = parse.statement(?rd, ?ex);
+    if (sel got.err) { ret stop(st, got.err); }
+    var here_: u32 = operand.NO_SYMBOL;
+    var i:     u32 = 0;
+    for (i < ex.count) {
+        var k: u32 = 0;
+        for (k < ex.steps[i].row.operands.len) {
+            val claimed: err[str] = claim(m, ?ex.steps[i].values[k], st.head.position, ?here_);
+            if (sel claimed.err) { ret stop_at(st, claimed.err, st.head); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val written: err[build.Refusal] = build.expansion(?m.b, ?ex);
+    if (sel written.err) {
+        var d: diagnostic.Diagnostic = at_position(written.err.message, st.head.position, st.head.len);
+        if (sel written.err.encode.some) { d.requires = written.err.encode.some.requires; }
+        ret stop(st, d);
+    }
+    ret err[Refusal].ok{};
+}
+
+# a directive statement: its row found by name, its operands read by the row's syntax, and its handler run
+fun directive_statement(m: *Assembler, st: *source.Statement) err[Refusal] {
+    val found: opt[*Entry] = find(m, source.bytes(st, st.head));
+    if (sel found.none) { ret stop_at(st, UNKNOWN_DIRECTIVE, st.head); }
+    val row: *Directive = found.some.directive;
+    m.strings.len = 0;
+    if (!held(vector.reserve[u8](?m.strings, st.body.len))) { ret stop_at(st, field.MEMORY, st.head); }
+    var rd:    spelling.Reader            = reader(m, st, st.body.at, st.body.len, st.body.position);
+    val read_: err[diagnostic.Diagnostic] = operands(m, ?rd, ?row.operands);
+    if (sel read_.err) { ret stop(st, read_.err); }
+    var args: Args                       = Args{directive: row, layer: found.some.layer, statement: st, reader: ?rd, items: m.items.data, count: m.items.len::u32};
+    val done: err[diagnostic.Diagnostic] = row.handler(m, ?args);
+    if (sel done.err) { ret stop(st, done.err); }
+    if (row.operands.text) {
+        val rest: err[diagnostic.Diagnostic] = ended(?rd);
+        if (sel rest.err) { ret stop(st, rest.err); }
+    }
+    ret err[Refusal].ok{};
+}
+
+# one statement read and written
+pub fun statement(m: *Assembler, st: *source.Statement) err[Refusal] {
+    m.names.context = m::ptr;
+    if (st.kind == source.LABEL)     { ret label_statement(m, st); }
+    if (st.kind == source.DIRECTIVE) { ret directive_statement(m, st); }
+    ret instruction_statement(m, st);
+}
+
+# every statement of `feed` read and written, to its end or the first refusal
+pub fun run(m: *Assembler, feed: *source.Feed) err[Refusal] {
+    var st: source.Statement;
+    for {
+        val more: res[bool, diagnostic.Diagnostic] = feed.next(feed.context, ?st);
+        if (sel more.err) { ret err[Refusal].err{Refusal{diagnostic: more.err, site: more.err.span.start}}; }
+        if (!more.ok)     { brk; }
+        val done: err[Refusal] = statement(m, ?st);
+        if (sel done.err) { ret done; }
+    }
+    ret err[Refusal].ok{};
+}
+
+fun refused_at(message: str, f: Facts) Refusal {
+    var p: diagnostic.Position = diagnostic.START;
+    if (sel f.used.some) { p = f.used.some; }
+    ret Refusal{diagnostic: at_position(message, p, 0), site: p};
+}
+
+# whether `v` starts with `prefix`
+fun starts_with(v: View, prefix: str) bool {
+    val n: usize = str_len(prefix);
+    if (n == 0 || v.len < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every label given its value and made a symbol as the gnu assembler makes one
+fun symbols(m: *Assembler) err[Refusal] {
+    var it: map.Iter = map.iter[u64, Numbered](?m.numbered);
+    var e:  map.Entry[u64, Numbered];
+    for (map.next[u64, Numbered](?m.numbered, ?it, ?e)) {
+        if (sel e.value.next.some) {
+            val f: Facts = declared(m, e.value.next.some.id);
+            if (sel f.used.some) { ret err[Refusal].err{refused_at(NEVER_AFTER, f)}; }
+        }
+    }
+    val count: usize = m.b.labels.len;
+    var id:    usize = 1;
+    for (id <= count) {
+        val l:     build.Label = build.Label{id: id::u32};
+        val f:     Facts       = declared(m, l.id);
+        val label: opt[View]   = build.label_name(?m.b, l);
+        id = id + 1;
+        if (sel f.equated.some) {
+            val v: expr.Expr = f.equated.some;
+            if (sel v.difference) {
+                if (sel f.used.some)                                            { ret err[Refusal].err{refused_at(LATE_DIFFERENCE, f)}; }
+                if (sel f.binding.some && f.binding.some != ?mink.symbol.LOCAL) { ret err[Refusal].err{refused_at(SHOWN_DIFFERENCE, f)}; }
+                cnt;
+            }
+            var given_: err[build.Refusal] = err[build.Refusal].ok{};
+            if (sel v.constant) { given_ = build.absolute(?m.b, l, v.constant:~u64); }
+            if (sel v.symbol)   { given_ = build.equate(?m.b, l, build.Label{id: v.symbol.id}, v.symbol.addend); }
+            if (sel given_.err) { ret err[Refusal].err{refused_at(given_.err.message, f)}; }
+        }
+        val bound_:  bool                 = build.bound(?m.b, l);
+        var binding: *mink.symbol.Binding = ?mink.symbol.LOCAL;
+        if (sel f.binding.some) { binding = f.binding.some; }
+        or (!bound_) {
+            # a name only referred to is another object's
+            if (sel f.used.none) { cnt; }
+            binding = ?mink.symbol.GLOBAL;
+        }
+        if (binding == ?mink.symbol.LOCAL) {
+            if (!bound_) {
+                if (sel f.used.some) { ret err[Refusal].err{refused_at(LOCAL_UNDEFINED, f)}; }
+                cnt;
+            }
+            if (sel label.none)                     { cnt; }
+            if (starts_with(label.some, m.private)) { cnt; }
+        }
+        var shown: build.Exposure = build.Exposure{binding: binding, visibility: ?mink.symbol.DEFAULT, kind: ?mink.symbol.NOTYPE, size: f.size};
+        if (sel f.visibility.some) { shown.visibility = f.visibility.some; }
+        if (sel f.kind.some)       { shown.kind = f.kind.some; }
+        val exposed: err[build.Refusal] = build.expose(?m.b, l, shown);
+        if (sel exposed.err) { ret err[Refusal].err{refused_at(exposed.err.message, f)}; }
+    }
+    ret err[Refusal].ok{};
+}
+
+# what every layer writes at the end, every label made a symbol, and mink's neutral object handed over, which the
+# caller releases. a builder refusal about a label is placed where the source first referred to it
+pub fun finish(m: *Assembler) res[mink.object.Object, Refusal] {
+    m.names.context = m::ptr;
+    var i: usize = 0;
+    for (i < m.layers.len) {
+        val l:    *Layer       = m.layers.data[i];
+        val done: err[Refusal] = l.finish(l.context, m);
+        if (sel done.err) { ret res[mink.object.Object, Refusal].err{done.err}; }
+        i = i + 1;
+    }
+    val made: err[Refusal] = symbols(m);
+    if (sel made.err) { ret res[mink.object.Object, Refusal].err{made.err}; }
+    val o: res[mink.object.Object, build.Refusal] = build.finish(?m.b);
+    if (sel o.err) { ret res[mink.object.Object, Refusal].err{refused_at(o.err.message, declared(m, o.err.label))}; }
+    ret res[mink.object.Object, Refusal].ok{o.ok};
+}
+
+# no operands
+pub val NONE: Shape = Shape{items: nil, len: 0, least: 0, repeat: false, text: false};
+
+# operands the handler reads itself
+pub val TEXT: Shape = Shape{items: nil, len: 0, least: 0, repeat: false, text: true};
+
+val ONE_NAME:       [1]Item = [1]Item{NAME};
+val ONE_EXPRESSION: [1]Item = [1]Item{EXPRESSION};
+val ONE_STRING:     [1]Item = [1]Item{STRING};
+val ONE_FLOAT:      [1]Item = [1]Item{FLOAT};
+
+# a list of names, as `.globl a, b`
+pub val NAMES: Shape = Shape{items: ?ONE_NAME[0], len: 1, least: 1, repeat: true, text: false};
+
+# a list of expressions, as `.long 1, x`
+pub val EXPRESSIONS: Shape = Shape{items: ?ONE_EXPRESSION[0], len: 1, least: 1, repeat: true, text: false};
+
+# a list of strings, as `.ascii "a", "b"`
+pub val STRINGS: Shape = Shape{items: ?ONE_STRING[0], len: 1, least: 1, repeat: true, text: false};
+
+# a list of floating point numbers, as `.double 1.5`
+pub val FLOATS: Shape = Shape{items: ?ONE_FLOAT[0], len: 1, least: 1, repeat: true, text: false};

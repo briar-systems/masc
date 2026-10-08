@@ -1,0 +1,650 @@
+# the core directives of the gnu assembler, as rows of the source model's directive table
+#
+# sections and the section stack, symbol bindings, visibilities, types and
+# sizes, data, strings, leb128 and floating point values, alignment, fills,
+# equates and common storage, each a row over the model's operand syntaxes.
+# what differs per target is the set's: the integer data directives and
+# their widths, how `.align` reads, and the type prefixes. a section with no
+# stated attributes takes the gnu assembler's convention for its name on
+# elf. a section group, a link order and an exclusion are refused, since the
+# builder states none.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.encoding.leb128;
+
+use mink;
+
+use masc.asm.model;
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.set;
+use masc.core.spelling;
+use masc.syntax.expr;
+use masc.syntax.read;
+
+pub val UNKNOWN_TYPE: str = "unknown type";
+pub val UNKNOWN_FLAG: str = "section flag not supported";
+pub val FLAGS_KIND:   str = "section flags its type cannot carry";
+pub val NO_ENTSIZE:   str = "section of entries to merge states no entry size";
+pub val NEGATIVE:     str = "count is negative";
+pub val SECTION_NAME: str = "expected a section name";
+
+# a section's attributes by the gnu assembler's convention for its name on elf, which the name or a prefix of it
+# followed by a dot takes, the longer prefix before the shorter it starts with
+# ---
+# prefix: the name
+# kind:   its kind
+# flags:  its flags
+rec Convention {
+    prefix: str;
+    kind:   *mink.section.Kind;
+    flags:  mink.section.Flags;
+}
+
+val CONVENTIONS: [13]Convention = [13]Convention{
+    Convention{prefix: ".text", kind: ?mink.section.TEXT, flags: mink.section.ALLOC | mink.section.EXEC},
+    Convention{prefix: ".data.rel.ro", kind: ?mink.section.RELRO_DATA, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".data", kind: ?mink.section.DATA, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".bss", kind: ?mink.section.BSS, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".rodata", kind: ?mink.section.RODATA, flags: mink.section.ALLOC},
+    Convention{prefix: ".tdata", kind: ?mink.section.TLS_DATA, flags: mink.section.ALLOC | mink.section.WRITE | mink.section.TLS},
+    Convention{prefix: ".tbss", kind: ?mink.section.TLS_BSS, flags: mink.section.ALLOC | mink.section.WRITE | mink.section.TLS},
+    Convention{prefix: ".init_array", kind: ?mink.section.INIT_ARRAY, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".fini_array", kind: ?mink.section.FINI_ARRAY, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".preinit_array", kind: ?mink.section.PREINIT_ARRAY, flags: mink.section.ALLOC | mink.section.WRITE},
+    Convention{prefix: ".note", kind: ?mink.section.NOTE_INFO, flags: mink.section.ALLOC},
+    Convention{prefix: ".debug", kind: ?mink.section.DEBUG_INFO, flags: 0},
+    Convention{prefix: ".eh_frame", kind: ?mink.section.UNWIND_INFO, flags: mink.section.ALLOC},
+};
+
+# the convention of the section named `name`, nil for none
+fun convention(name: View) *Convention {
+    var i: usize = 0;
+    for (i < 13) {
+        val c: *Convention = ?CONVENTIONS[i];
+        val n: usize       = str_len(c.prefix);
+        if (name.len >= n) {
+            var k: usize = 0;
+            for (k < n && name.data[k] == c.prefix[k]) {
+                k = k + 1;
+            }
+            if (k == n && (name.len == n || name.data[n] == '.')) { ret c; }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the section type a `.section` states
+# ---
+# role: the roles of the kinds it admits
+# bits: whether it holds bytes
+rec Type {
+    name: str;
+    bits: bool;
+    role: mink.section.Roles;
+}
+
+val TYPES: [6]Type = [6]Type{
+    Type{name: "progbits", bits: true, role: 0},
+    Type{name: "nobits", bits: false, role: 0},
+    Type{name: "note", bits: true, role: mink.section.NOTE},
+    Type{name: "init_array", bits: true, role: mink.section.INIT},
+    Type{name: "fini_array", bits: true, role: mink.section.FINI},
+    Type{name: "preinit_array", bits: true, role: mink.section.PREINIT},
+};
+
+fun same(v: View, s: str) bool {
+    val n: usize = str_len(s);
+    if (v.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun type_named(v: View) *Type {
+    var i: usize = 0;
+    for (i < 6) {
+        if (same(v, TYPES[i].name)) { ret ?TYPES[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the roles that set a kind apart from plain bytes
+val SPECIAL: mink.section.Roles = mink.section.NOTE | mink.section.INIT | mink.section.FINI | mink.section.PREINIT;
+
+# whether `kind` is of type `t`
+fun of_type(kind: *mink.section.Kind, t: *Type) bool {
+    if (mink.section.has(kind, mink.section.BITS) != t.bits) { ret false; }
+    ret (kind.roles & SPECIAL) == t.role;
+}
+
+# the kind a section of type `t` and flags `flags` is, when no convention of its name gives one
+fun kind_for(t: *Type, flags: mink.section.Flags) *mink.section.Kind {
+    val tls: bool = (flags & mink.section.TLS) != 0;
+    if (t.role == mink.section.NOTE)    { ret ?mink.section.NOTE_INFO; }
+    if (t.role == mink.section.INIT)    { ret ?mink.section.INIT_ARRAY; }
+    if (t.role == mink.section.FINI)    { ret ?mink.section.FINI_ARRAY; }
+    if (t.role == mink.section.PREINIT) { ret ?mink.section.PREINIT_ARRAY; }
+    if (!t.bits) {
+        if (tls) { ret ?mink.section.TLS_BSS; }
+        ret ?mink.section.BSS;
+    }
+    if ((flags & mink.section.EXEC) != 0)  { ret ?mink.section.TEXT; }
+    if (tls)                               { ret ?mink.section.TLS_DATA; }
+    if ((flags & mink.section.WRITE) != 0) { ret ?mink.section.DATA; }
+    if ((flags & mink.section.ALLOC) != 0) { ret ?mink.section.RODATA; }
+    ret ?mink.section.METADATA;
+}
+
+# the attributes of a section named `name` with none stated: its convention's, or bytes with no flags
+fun conventional(name: View) build.Spec {
+    val c: *Convention = convention(name);
+    if (c == nil) { ret build.Spec{name: "", kind: ?mink.section.METADATA, flags: 0, disposition: ?mink.section.WHOLE, entsize: 0}; }
+    ret build.Spec{name: "", kind: c.kind, flags: c.flags, disposition: ?mink.section.WHOLE, entsize: 0};
+}
+
+# the flags spelled by a `.section` flag string, refused at the letter it does not support
+fun flags_of(args: *model.Args, rd: *spelling.Reader, spelled: View, at: usize) res[mink.section.Flags, diagnostic.Diagnostic] {
+    var f: mink.section.Flags = 0;
+    var i: usize              = 0;
+    for (i < spelled.len) {
+        val c: u8 = spelled.data[i];
+        if (c == 'a') { f = f | mink.section.ALLOC; }
+        or (c == 'w') { f = f | mink.section.WRITE; }
+        or (c == 'x') { f = f | mink.section.EXEC; }
+        or (c == 'M') { f = f | mink.section.MERGE; }
+        or (c == 'S') { f = f | mink.section.STRINGS; }
+        or (c == 'T') { f = f | mink.section.TLS; }
+        or (c == 'R') { f = f | mink.section.RETAIN; }
+        or            { ret res[mink.section.Flags, diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FLAG, at + 1 + i, 1)}; }
+        i = i + 1;
+    }
+    ret res[mink.section.Flags, diagnostic.Diagnostic].ok{f};
+}
+
+# a section's name, in quotes or as the text up to a comma or white space
+fun section_name(m: *model.Assembler, rd: *spelling.Reader) res[View, diagnostic.Diagnostic] {
+    if (read.peek(rd) == '"') { ret model.string(m, rd); }
+    val at: usize = rd.at;
+    for (rd.at < rd.end && rd.text[rd.at] != ',' && !read.blank(rd.text[rd.at])) {
+        rd.at = rd.at + 1;
+    }
+    if (rd.at == at) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, SECTION_NAME, at, 0)}; }
+    ret res[View, diagnostic.Diagnostic].ok{read.span(rd, at, rd.at - at)};
+}
+
+# `.section name[, "flags"[, @type[, entsize]]]` read and entered, after a push when `push`
+fun section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd:   *spelling.Reader                 = args.reader;
+    val at:   usize                            = rd.at;
+    val name: res[View, diagnostic.Diagnostic] = section_name(m, rd);
+    if (sel name.err) { ret err[diagnostic.Diagnostic].err{name.err}; }
+    var spec:   build.Spec = conventional(name.ok);
+    var stated: bool       = false;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        stated = true;
+        val flags_at: usize                            = rd.at;
+        val spelled:  res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel spelled.err) { ret err[diagnostic.Diagnostic].err{spelled.err}; }
+        val flags: res[mink.section.Flags, diagnostic.Diagnostic] = flags_of(args, rd, spelled.ok, flags_at);
+        if (sel flags.err) { ret err[diagnostic.Diagnostic].err{flags.err}; }
+        # the type the name's convention takes, bytes or none, until one is stated
+        var t: *Type = ?TYPES[0];
+        if (!mink.section.has(spec.kind, mink.section.BITS)) { t = ?TYPES[1]; }
+        read.skip(rd);
+        if (read.take(rd, ",")) {
+            read.skip(rd);
+            val type_at: usize                                      = rd.at;
+            val word:    res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.WORD);
+            if (sel word.err)      { ret err[diagnostic.Diagnostic].err{word.err}; }
+            if (!sel word.ok.word) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+            t = type_named(word.ok.word);
+            if (t == nil) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+            read.skip(rd);
+            if (read.take(rd, ",")) {
+                read.skip(rd);
+                val size_at: usize                                 = rd.at;
+                val size:    res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+                if (sel size.err)          { ret err[diagnostic.Diagnostic].err{size.err}; }
+                if (!sel size.ok.constant) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_CONSTANT, size_at, rd.at - size_at)}; }
+                if (size.ok.constant < 0)  { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NEGATIVE, size_at, rd.at - size_at)}; }
+                spec.entsize = size.ok.constant:~u64;
+            }
+        }
+        if ((flags.ok & mink.section.MERGE) != 0 && spec.entsize == 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_ENTSIZE, flags_at, rd.at - flags_at)}; }
+        # the convention's kind where the stated type and flags admit it, else the kind they spell
+        if (!(of_type(spec.kind, t) && (spec.kind.flags & flags.ok) == spec.kind.flags && convention(name.ok) != nil)) { spec.kind = kind_for(t, flags.ok); }
+        if ((spec.kind.flags & flags.ok) != spec.kind.flags)                                                           { ret err[diagnostic.Diagnostic].err{read.refuse(rd, FLAGS_KIND, flags_at, rd.at - flags_at)}; }
+        spec.flags = flags.ok;
+    }
+    val rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel rest.err) { ret rest; }
+    if (push) {
+        val pushed: err[str] = model.push_section(m);
+        if (sel pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, pushed.err, at, 0)}; }
+    }
+    val entered: err[str] = model.enter(m, name.ok, spec, stated);
+    if (sel entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, entered.err, at, name.ok.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun failed(args: *model.Args, k: u32, e: err[str]) err[diagnostic.Diagnostic] {
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, e.err)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun built(args: *model.Args, k: u32, e: err[build.Refusal]) err[diagnostic.Diagnostic] {
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, e.err.message)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the section a directive names by its own name, as `.text`
+fun named_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val name: View = View{data: args.directive.name, len: str_len(args.directive.name)};
+    ret failed(args, 0, model.enter(m, name, conventional(name), false));
+}
+
+fun do_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret section(m, args, false);
+}
+
+fun do_pushsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret section(m, args, true);
+}
+
+fun do_popsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret failed(args, 0, model.pop_section(m));
+}
+
+fun do_previous(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret failed(args, 0, model.swap_previous(m));
+}
+
+# each named symbol given the binding the row's parameter indexes
+val BINDINGS: [3]*mink.symbol.Binding = [3]*mink.symbol.Binding{?mink.symbol.GLOBAL, ?mink.symbol.LOCAL, ?mink.symbol.WEAKLY};
+
+fun do_binding(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+        val done: err[diagnostic.Diagnostic] = failed(args, k, model.declare_binding(m, l.ok, BINDINGS[args.directive.param]));
+        if (sel done.err) { ret done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each named symbol given the visibility the row's parameter indexes
+val VISIBILITIES: [3]*mink.symbol.Visibility = [3]*mink.symbol.Visibility{?mink.symbol.HIDDEN, ?mink.symbol.PROTECTED, ?mink.symbol.INTERNAL};
+
+fun do_visibility(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+        val done: err[diagnostic.Diagnostic] = failed(args, k, model.declare_visibility(m, l.ok, VISIBILITIES[args.directive.param]));
+        if (sel done.err) { ret done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a `.type` spelling and the kind of symbol it names (gas manual, ".type", elf version)
+rec Kind {
+    name: str;
+    kind: *mink.symbol.Kind;
+}
+
+val KINDS: [12]Kind = [12]Kind{
+    Kind{name: "function", kind: ?mink.symbol.FUNCTION},
+    Kind{name: "object", kind: ?mink.symbol.DATA},
+    Kind{name: "notype", kind: ?mink.symbol.NOTYPE},
+    Kind{name: "tls_object", kind: ?mink.symbol.TLS},
+    Kind{name: "common", kind: ?mink.symbol.COMMONS},
+    Kind{name: "gnu_indirect_function", kind: ?mink.symbol.IFUNC},
+    Kind{name: "STT_FUNC", kind: ?mink.symbol.FUNCTION},
+    Kind{name: "STT_OBJECT", kind: ?mink.symbol.DATA},
+    Kind{name: "STT_NOTYPE", kind: ?mink.symbol.NOTYPE},
+    Kind{name: "STT_TLS", kind: ?mink.symbol.TLS},
+    Kind{name: "STT_COMMON", kind: ?mink.symbol.COMMONS},
+    Kind{name: "STT_GNU_IFUNC", kind: ?mink.symbol.IFUNC},
+};
+
+fun do_type(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+    val w: model.Argument = args.items[1].value;
+    if (!sel w.word) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, UNKNOWN_TYPE)}; }
+    var i: usize = 0;
+    for (i < 12) {
+        if (same(w.word, KINDS[i].name)) { ret failed(args, 1, model.declare_kind(m, l.ok, KINDS[i].kind)); }
+        i = i + 1;
+    }
+    ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, UNKNOWN_TYPE)};
+}
+
+fun do_size(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+    val v: model.Argument = args.items[1].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    var e: expr.Expr = v.expression;
+    if (sel e.constant) {
+        if (e.constant < 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, NEGATIVE)}; }
+        ret failed(args, 1, model.declare_size(m, l.ok, build.Size.fixed{e.constant:~u64}));
+    }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    val bound_: err[str] = model.bind(m, ?e, model.position(args, 1));
+    if (sel bound_.err)    { ret failed(args, 1, bound_); }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    val d: build.Difference = build.Difference{plus: build.Label{id: e.difference.plus}, minus: build.Label{id: e.difference.minus}, addend: e.difference.addend};
+    ret failed(args, 1, model.declare_size(m, l.ok, build.Size.measured{d}));
+}
+
+# each value of an integer data directive at the row's width, which the set states
+pub fun integers(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val done: err[diagnostic.Diagnostic] = model.datum(m, args, k, args.directive.param);
+        if (sel done.err) { ret done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each string's bytes, a nul after each when the row's parameter is 1
+fun do_strings(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val v: model.Argument = args.items[k].value;
+        if (!sel v.string) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_A_STRING)}; }
+        val bytes: err[diagnostic.Diagnostic] = built(args, k, build.data(model.builder(m), v.string.data, v.string.len));
+        if (sel bytes.err) { ret bytes; }
+        if (args.directive.param == 1) {
+            val nul: err[diagnostic.Diagnostic] = built(args, k, build.integer(model.builder(m), 0, 1));
+            if (sel nul.err) { ret nul; }
+        }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each constant as a leb128, signed when the row's parameter is 1
+fun do_leb128(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val n: res[i64, diagnostic.Diagnostic] = model.constant(args, k);
+        if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+        var bytes: [10]u8;
+        var len:   usize = 0;
+        if (args.directive.param == 1) { len = leb128.put_signed(?bytes[0], n.ok); }
+        or                             { len = leb128.put_unsigned(?bytes[0], n.ok:~u64); }
+        val done: err[diagnostic.Diagnostic] = built(args, k, build.data(model.builder(m), ?bytes[0], len));
+        if (sel done.err) { ret done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each number in ieee 754 binary32 or binary64, the row's parameter its width
+fun do_floats(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val v: model.Argument = args.items[k].value;
+        if (!sel v.float) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_A_NUMBER)}; }
+        var bits: u64 = v.float:~u64;
+        if (args.directive.param == 4) {
+            val single: f32 = v.float::f32;
+            bits = (single:~u32)::u64;
+        }
+        val done: err[diagnostic.Diagnostic] = built(args, k, build.integer(model.builder(m), bits, args.directive.param::u8));
+        if (sel done.err) { ret done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# an alignment: its boundary in bytes, or as a power of two when `power`, then an optional fill byte and limit
+fun aligned(m: *model.Assembler, args: *model.Args, power: bool) err[diagnostic.Diagnostic] {
+    val n: res[i64, diagnostic.Diagnostic] = model.constant(args, 0);
+    if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+    var boundary: u64 = n.ok:~u64;
+    if (power) {
+        if (n.ok < 0 || n.ok >= 64) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, model.RANGE)}; }
+        boundary = 1::u64 << n.ok::u64;
+    }
+    or (n.ok <= 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, build.BOUNDARY)}; }
+    var al: build.Align = build.Align{boundary: boundary, fill: opt[u8].none{}, max: opt[u64].none{}};
+    if (model.given(args, 1)) {
+        val fill: res[i64, diagnostic.Diagnostic] = model.constant(args, 1);
+        if (sel fill.err)                    { ret err[diagnostic.Diagnostic].err{fill.err}; }
+        if (fill.ok < -128 || fill.ok > 255) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+        al.fill = opt[u8].some{(fill.ok & 0xFF)::u8};
+    }
+    if (model.given(args, 2)) {
+        val max: res[i64, diagnostic.Diagnostic] = model.constant(args, 2);
+        if (sel max.err) { ret err[diagnostic.Diagnostic].err{max.err}; }
+        if (max.ok < 0)  { ret err[diagnostic.Diagnostic].err{model.refuse(args, 2, NEGATIVE)}; }
+        al.max = opt[u64].some{max.ok:~u64};
+    }
+    ret built(args, 0, build.align(model.builder(m), al));
+}
+
+# `.align`, which reads its boundary as the set states
+fun do_align(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, model.builder(m).set.source.align == set.ALIGN_POWER);
+}
+
+fun do_p2align(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, true);
+}
+
+fun do_balign(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, false);
+}
+
+# `count` copies of the `size` low bytes of `value` in the set's byte order, zeros as a zero fill
+fun repeated(m: *model.Assembler, args: *model.Args, count: u64, size: u64, value: u64) err[diagnostic.Diagnostic] {
+    if (count == 0 || size == 0) { ret err[diagnostic.Diagnostic].ok{}; }
+    if (value == 0)              { ret built(args, 0, build.zero(model.builder(m), count * size)); }
+    var pattern: [8]u8;
+    build.ordered(model.builder(m), value, size::usize, ?pattern[0]);
+    var bytes: vector.Vector[u8]   = vector.init[u8](m.a);
+    val room:  res[usize, A.Error] = vector.reserve[u8](?bytes, (count * size)::usize);
+    if (sel room.err) {
+        vector.dnit[u8](?bytes);
+        ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, field.MEMORY)};
+    }
+    var i: u64 = 0;
+    for (i < count * size) {
+        bytes.data[i::usize] = pattern[(i % size)::usize];
+        i                    = i + 1;
+    }
+    val done: err[diagnostic.Diagnostic] = built(args, 0, build.data(model.builder(m), bytes.data, (count * size)::usize));
+    vector.dnit[u8](?bytes);
+    ret done;
+}
+
+# a count operand, refused when negative
+fun count(args: *model.Args, k: u32, otherwise: i64) res[u64, diagnostic.Diagnostic] {
+    val n: res[i64, diagnostic.Diagnostic] = model.constant_or(args, k, otherwise);
+    if (sel n.err) { ret res[u64, diagnostic.Diagnostic].err{n.err}; }
+    if (n.ok < 0)  { ret res[u64, diagnostic.Diagnostic].err{model.refuse(args, k, NEGATIVE)}; }
+    ret res[u64, diagnostic.Diagnostic].ok{n.ok:~u64};
+}
+
+# `.skip size[, fill]`: size bytes of the fill byte
+fun do_skip(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val n: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+    val fill: res[i64, diagnostic.Diagnostic] = model.constant_or(args, 1, 0);
+    if (sel fill.err)                    { ret err[diagnostic.Diagnostic].err{fill.err}; }
+    if (fill.ok < -128 || fill.ok > 255) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+    ret repeated(m, args, n.ok, 1, (fill.ok & 0xFF):~u64);
+}
+
+# `.zero size`: size zero bytes
+fun do_zero(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val n: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+    ret repeated(m, args, n.ok, 1, 0);
+}
+
+# `.fill repeat[, size[, value]]`: repeat copies of size bytes, of an eight byte number whose high four bytes are zero
+# and whose low four are the value's (gas manual, ".fill")
+fun do_fill(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val n: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+    val size: res[u64, diagnostic.Diagnostic] = count(args, 1, 1);
+    if (sel size.err) { ret err[diagnostic.Diagnostic].err{size.err}; }
+    if (size.ok > 8)  { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+    val value: res[i64, diagnostic.Diagnostic] = model.constant_or(args, 2, 0);
+    if (sel value.err) { ret err[diagnostic.Diagnostic].err{value.err}; }
+    ret repeated(m, args, n.ok, size.ok, value.ok:~u64 & 0xFFFF_FFFF);
+}
+
+# `.set name, value` when the row's parameter is 0, which may redefine it, and `.equ` when 1, which may not
+fun do_equate(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+    val v: model.Argument = args.items[1].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    ret failed(args, 0, model.equate(m, l.ok, v.expression, args.directive.param == 1, model.position(args, 1)));
+}
+
+# the alignment storage of `size` bytes takes when none is stated: the largest power of two not above it, at most 16
+fun natural(size: u64) u64 {
+    var a: u64 = 1;
+    for (a * 2 <= size && a < 16) {
+        a = a * 2;
+    }
+    ret a;
+}
+
+# `size` bytes at a boundary of `align` reserved for label `l` in `.bss`, the sections as they were after
+fun local_storage(m: *model.Assembler, args: *model.Args, l: build.Label, size: u64, align: u64) err[diagnostic.Diagnostic] {
+    val b:        *build.Builder             = model.builder(m);
+    val was:      opt[build.Section]         = build.current(b);
+    val previous: opt[build.Section]         = model.previous_of(m);
+    val name:     View                       = View{data: ".bss", len: 4};
+    val entered:  err[diagnostic.Diagnostic] = failed(args, 0, model.enter(m, name, conventional(name), false));
+    if (sel entered.err) { ret entered; }
+    val al: err[diagnostic.Diagnostic] = built(args, 2, build.align(b, build.Align{boundary: align, fill: opt[u8].none{}, max: opt[u64].none{}}));
+    if (sel al.err) { ret al; }
+    val placed: err[diagnostic.Diagnostic] = built(args, 0, build.define(b, l));
+    if (sel placed.err) { ret placed; }
+    val zeros: err[diagnostic.Diagnostic] = built(args, 1, build.zero(b, size));
+    if (sel zeros.err) { ret zeros; }
+    if (sel was.some) {
+        val back: err[diagnostic.Diagnostic] = built(args, 0, build.switch(b, was.some));
+        if (sel back.err) { ret back; }
+    }
+    model.restore_previous(m, previous);
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `.comm name, size[, align]`, common storage, or local storage in `.bss` for a name declared local, as `.lcomm`
+# always is when the row's parameter is 1
+fun do_common(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val l: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel l.err) { ret err[diagnostic.Diagnostic].err{l.err}; }
+    val size: res[u64, diagnostic.Diagnostic] = count(args, 1, 0);
+    if (sel size.err) { ret err[diagnostic.Diagnostic].err{size.err}; }
+    val align: res[u64, diagnostic.Diagnostic] = count(args, 2, natural(size.ok)::i64);
+    if (sel align.err)                                     { ret err[diagnostic.Diagnostic].err{align.err}; }
+    if (align.ok == 0 || (align.ok & (align.ok - 1)) != 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 2, build.BOUNDARY)}; }
+    val binding: opt[*mink.symbol.Binding] = model.binding_of(m, l.ok);
+    var local:   bool                      = args.directive.param == 1;
+    if (sel binding.some) { local = local || binding.some == ?mink.symbol.LOCAL; }
+    if (local)            { ret local_storage(m, args, l.ok, size.ok, align.ok); }
+    if (sel binding.none) {
+        val declared: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_binding(m, l.ok, ?mink.symbol.GLOBAL));
+        if (sel declared.err) { ret declared; }
+    }
+    val kind: opt[*mink.symbol.Kind] = model.kind_declared(m, l.ok);
+    if (sel kind.none) {
+        val typed: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_kind(m, l.ok, ?mink.symbol.DATA));
+        if (sel typed.err) { ret typed; }
+    }
+    ret built(args, 0, build.common(model.builder(m), l.ok, size.ok, align.ok));
+}
+
+val TYPE_ITEMS:   [2]model.Item = [2]model.Item{model.NAME, model.WORD};
+val NAMED_VALUE:  [2]model.Item = [2]model.Item{model.NAME, model.EXPRESSION};
+val THREE_VALUES: [3]model.Item = [3]model.Item{model.EXPRESSION, model.EXPRESSION, model.EXPRESSION};
+val STORAGE:      [3]model.Item = [3]model.Item{model.NAME, model.EXPRESSION, model.EXPRESSION};
+
+val TYPED:  model.Shape = model.Shape{items: ?TYPE_ITEMS[0], len: 2, least: 2, repeat: false, text: false};
+val VALUED: model.Shape = model.Shape{items: ?NAMED_VALUE[0], len: 2, least: 2, repeat: false, text: false};
+val ALIGN:  model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 3, least: 1, repeat: false, text: false};
+val SKIP:   model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 2, least: 1, repeat: false, text: false};
+val ZERO:   model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 1, least: 1, repeat: false, text: false};
+val COMMON: model.Shape = model.Shape{items: ?STORAGE[0], len: 3, least: 2, repeat: false, text: false};
+
+# the core rows (gas manual, "Assembler Directives")
+val ROWS: [33]model.Directive = [33]model.Directive{
+    model.Directive{name: ".text", operands: model.NONE, handler: named_section, param: 0},
+    model.Directive{name: ".data", operands: model.NONE, handler: named_section, param: 0},
+    model.Directive{name: ".bss", operands: model.NONE, handler: named_section, param: 0},
+    model.Directive{name: ".section", operands: model.TEXT, handler: do_section, param: 0},
+    model.Directive{name: ".pushsection", operands: model.TEXT, handler: do_pushsection, param: 0},
+    model.Directive{name: ".popsection", operands: model.NONE, handler: do_popsection, param: 0},
+    model.Directive{name: ".previous", operands: model.NONE, handler: do_previous, param: 0},
+    model.Directive{name: ".globl", operands: model.NAMES, handler: do_binding, param: 0},
+    model.Directive{name: ".global", operands: model.NAMES, handler: do_binding, param: 0},
+    model.Directive{name: ".local", operands: model.NAMES, handler: do_binding, param: 1},
+    model.Directive{name: ".weak", operands: model.NAMES, handler: do_binding, param: 2},
+    model.Directive{name: ".hidden", operands: model.NAMES, handler: do_visibility, param: 0},
+    model.Directive{name: ".protected", operands: model.NAMES, handler: do_visibility, param: 1},
+    model.Directive{name: ".internal", operands: model.NAMES, handler: do_visibility, param: 2},
+    model.Directive{name: ".type", operands: TYPED, handler: do_type, param: 0},
+    model.Directive{name: ".size", operands: VALUED, handler: do_size, param: 0},
+    model.Directive{name: ".ascii", operands: model.STRINGS, handler: do_strings, param: 0},
+    model.Directive{name: ".asciz", operands: model.STRINGS, handler: do_strings, param: 1},
+    model.Directive{name: ".string", operands: model.STRINGS, handler: do_strings, param: 1},
+    model.Directive{name: ".uleb128", operands: model.EXPRESSIONS, handler: do_leb128, param: 0},
+    model.Directive{name: ".sleb128", operands: model.EXPRESSIONS, handler: do_leb128, param: 1},
+    model.Directive{name: ".float", operands: model.FLOATS, handler: do_floats, param: 4},
+    model.Directive{name: ".double", operands: model.FLOATS, handler: do_floats, param: 8},
+    model.Directive{name: ".align", operands: ALIGN, handler: do_align, param: 0},
+    model.Directive{name: ".p2align", operands: ALIGN, handler: do_p2align, param: 0},
+    model.Directive{name: ".balign", operands: ALIGN, handler: do_balign, param: 0},
+    model.Directive{name: ".skip", operands: SKIP, handler: do_skip, param: 0},
+    model.Directive{name: ".zero", operands: ZERO, handler: do_zero, param: 0},
+    model.Directive{name: ".fill", operands: ALIGN, handler: do_fill, param: 0},
+    model.Directive{name: ".set", operands: VALUED, handler: do_equate, param: 0},
+    model.Directive{name: ".equ", operands: VALUED, handler: do_equate, param: 1},
+    model.Directive{name: ".comm", operands: COMMON, handler: do_common, param: 0},
+    model.Directive{name: ".lcomm", operands: COMMON, handler: do_common, param: 1},
+};
+
+# the layer of the core rows
+pub val LAYER: model.Layer = model.Layer{name: "core", directives: model.Directives{at: ?ROWS[0], len: 33}, context: nil, finish: model.finished};
+
+# the section an assembly starts in, as the gnu assembler starts in `.text`
+pub fun begin(m: *model.Assembler) err[str] {
+    val name: View = View{data: ".text", len: 5};
+    ret model.enter(m, name, conventional(name), false);
+}

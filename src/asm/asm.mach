@@ -1,1 +1,465 @@
 # assembling source text into objects through the builder
+#
+# the file-level assembler: a .s file read through the source model of
+# `masc.asm.model` with the core directives of `masc.asm.core`, the set's
+# integer data directives, and any layers the caller adds, into mink's
+# neutral object in memory.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.testing;
+
+use mink;
+
+use masc.asm.core;
+use masc.asm.model;
+use masc.asm.source;
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.register;
+use masc.core.set;
+use masc.syntax.read;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_set:       masc.isa.riscv.set;
+
+# an assembler over `s` with the core directives, the set's integer data directives and `options.layers`, its
+# current section `.text`
+pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, options: model.Options) res[model.Assembler, model.Refusal] {
+    val made: res[model.Assembler, model.Refusal] = model.make(a, s, available, options, ?core.LAYER, core.integers);
+    if (sel made.err) { ret made; }
+    var m:     model.Assembler = made.ok;
+    val begun: err[str]        = core.begin(?m);
+    if (sel begun.err) {
+        model.release(?m);
+        ret res[model.Assembler, model.Refusal].err{model.Refusal{diagnostic: diagnostic.Diagnostic{message: begun.err, span: diagnostic.Span{start: diagnostic.START, len: 0}}, site: diagnostic.START}};
+    }
+    ret res[model.Assembler, model.Refusal].ok{m};
+}
+
+# the `len` bytes of `text`, whose first byte is at `origin`, assembled into mink's neutral object, which the caller
+# releases
+pub fun assemble(a: *A.Allocator, s: *set.Set, available: *register.Available, options: model.Options, text: *u8, len: usize, origin: diagnostic.Position) res[mink.object.Object, model.Refusal] {
+    val made: res[model.Assembler, model.Refusal] = make(a, s, available, options);
+    if (sel made.err) { ret res[mink.object.Object, model.Refusal].err{made.err}; }
+    var m:     model.Assembler    = made.ok;
+    var lexer: source.Lexer       = source.lexer(text, len, origin, ?s.source);
+    var feed:  source.Feed        = source.feed(?lexer);
+    val ran:   err[model.Refusal] = model.run(?m, ?feed);
+    if (sel ran.err) {
+        model.release(?m);
+        ret res[mink.object.Object, model.Refusal].err{ran.err};
+    }
+    val o: res[mink.object.Object, model.Refusal] = model.finish(?m);
+    model.release(?m);
+    ret o;
+}
+
+# a test's allocator, selection and register view
+#[testing]
+rec T {
+    t: testing.Testing;
+    s: extension.Selection;
+    v: register.Available;
+}
+
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[register.Available, register.Error] = register.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    ret true;
+}
+
+# the double float abi, as `-mabi=lp64d` states it
+#[testing]
+val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?mink.arch.RISCV_FLOAT_ABI, setting: mink.trait.Setting.choice{?mink.arch.RISCV_DOUBLE}}};
+
+#[testing]
+fun t_options() model.Options {
+    ret model.Options{arch: ?mink.arch.RISCV64, syntax: 0, traits: set.Traits{at: ?T_DOUBLE[0], len: 1}, private: ".L", layers: model.NO_LAYERS};
+}
+
+#[testing]
+fun t_assemble(t: *T, text: str) res[mink.object.Object, model.Refusal] {
+    ret assemble(testing.allocator_of(?t.t), ?riscv_set.SET, ?t.v, t_options(), text, str_len(text), diagnostic.START);
+}
+
+# everything the test made given back, and whether nothing is left live
+#[testing]
+fun t_release(t: *T) bool {
+    register.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+#[testing]
+fun t_done(t: *T, o: *mink.object.Object) bool {
+    mink.object.release(o);
+    ret t_release(t);
+}
+
+#[testing]
+fun t_is(v: View, s: str) bool {
+    if (v.len != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the index of the section of `o` named `name`, the section count for none
+#[testing]
+fun t_index(o: *mink.object.Object, name: str) u32 {
+    var i: usize = 0;
+    for (i < o.sections.count) {
+        if (t_is(mink.object.name_of(o, o.sections.items[i].name), name)) { ret i::u32; }
+        i = i + 1;
+    }
+    ret o.sections.count::u32;
+}
+
+# the section of `o` named `name`, nil for none
+#[testing]
+fun t_section(o: *mink.object.Object, name: str) *mink.object.Section {
+    val i: u32 = t_index(o, name);
+    if (i::usize >= o.sections.count) { ret nil; }
+    ret ?o.sections.items[i];
+}
+
+# the symbol of `o` named `name`, nil for none
+#[testing]
+fun t_symbol(o: *mink.object.Object, name: str) *mink.object.Symbol {
+    var i: usize = 0;
+    for (i < o.symbols.count) {
+        if (t_is(mink.object.name_of(o, o.symbols.items[i].name), name)) { ret ?o.symbols.items[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether section `name` of `o` holds exactly the `n` bytes at `want`
+#[testing]
+fun t_holds(o: *mink.object.Object, name: str, want: *u8, n: usize) bool {
+    val s: *mink.object.Section = t_section(o, name);
+    if (s == nil) { ret false; }
+    val got: mink.store.Bytes = mink.object.bytes(o, ?s.contents);
+    if (got.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (got.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `got` was refused with `message` at `line` and `column`, an object it made released
+#[testing]
+fun t_refused(got: *res[mink.object.Object, model.Refusal], message: str, line: u32, column: u32) bool {
+    if (sel got.ok) {
+        mink.object.release(?got.ok);
+        ret false;
+    }
+    val d: diagnostic.Diagnostic = got.err.diagnostic;
+    ret str_equals(d.message, message) && d.span.start.line == line && d.span.start.column == column;
+}
+
+test asm__a_label_difference_in_one_section_folds_to_a_constant {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, "a: addi a0, a0, 1\n addi a0, a0, 2\nb:\n.data\n.long b - a\n.text\nc: call f\nd:\n.data\n.long d - c\n");
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    # two instructions apart, and across a call the linker may relax, which only the linker measures
+    val want: [8]u8 = [8]u8{8, 0, 0, 0, 0, 0, 0, 0};
+    if (!t_holds(?o, ".data", ?want[0], 8)) { ret 3; }
+    val data: u32   = t_index(?o, ".data");
+    var add:  bool  = false;
+    var sub:  bool  = false;
+    var i:    usize = 0;
+    for (i < o.relocs.count) {
+        val r: *mink.object.Reloc = ?o.relocs.items[i];
+        if (r.section.index == data && r.offset == 4 && r.kind == ?mink.reloc.ADD32) { add = true; }
+        if (r.section.index == data && r.offset == 4 && r.kind == ?mink.reloc.SUB32) { sub = true; }
+        if (r.section.index == data && r.offset == 0)                                { ret 4; }
+        i = i + 1;
+    }
+    if (!add || !sub)    { ret 5; }
+    if (!t_done(?t, ?o)) { ret 6; }
+    ret 0;
+}
+
+test asm__a_label_difference_across_sections_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, "a: nop\n.data\nb: .long 0\n.long b - a\n");
+    if (!t_refused(?got, build.ACROSS, 4, 7)) { ret 2; }
+    if (!t_release(?t))                       { ret 3; }
+    ret 0;
+}
+
+test asm__a_numbered_local_label_resolves_forward_and_backward {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, "1: nop\n j 1f\n j 1b\n1: nop\n j 1b\n");
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    # jal x0 forward 8, back 8 to the first 1, and back 4 to the second
+    val want: [20]u8 = [20]u8{0x13, 0, 0, 0, 0x6f, 0, 0x80, 0, 0x6f, 0xf0, 0x9f, 0xff, 0x13, 0, 0, 0, 0x6f, 0xf0, 0xdf, 0xff};
+    if (!t_holds(?o, ".text", ?want[0], 20)) { ret 3; }
+    if (!t_done(?t, ?o))                     { ret 4; }
+    # a forward reference no definition follows is refused where it is made
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 5; }
+    var never: res[mink.object.Object, model.Refusal] = t_assemble(?u, "nop\n j 2f\n");
+    if (!t_refused(?never, model.NEVER_AFTER, 2, 2)) { ret 6; }
+    if (!t_release(?u))                              { ret 7; }
+    ret 0;
+}
+
+test asm__a_symbol_given_two_bindings_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".globl f\n.global f\n.local f\n");
+    if (!t_refused(?got, model.TWO_BINDINGS, 3, 8)) { ret 2; }
+    if (!t_release(?t))                             { ret 3; }
+    ret 0;
+}
+
+test asm__section_flags_and_type_are_set_from_the_directive {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".section .rodata.str1.1,\"aMS\",@progbits,1\n.asciz \"x\"\n.section .tbss,\"awT\",@nobits\n.zero 8\n.section .note.GNU-stack,\"\",@progbits\n.section .init_array,\"aw\",@init_array\n.section .misc,\"ax\",%progbits\n");
+    if (sel got.err) { ret 2; }
+    var o:       mink.object.Object   = got.ok;
+    val strings: *mink.object.Section = t_section(?o, ".rodata.str1.1");
+    if (strings == nil || strings.kind != ?mink.section.RODATA)                                                    { ret 3; }
+    if (strings.flags != (mink.section.ALLOC | mink.section.MERGE | mink.section.STRINGS) || strings.entsize != 1) { ret 4; }
+    val tbss: *mink.object.Section = t_section(?o, ".tbss");
+    if (tbss == nil || tbss.kind != ?mink.section.TLS_BSS || tbss.flags != (mink.section.ALLOC | mink.section.WRITE | mink.section.TLS)) { ret 5; }
+    val stack: *mink.object.Section = t_section(?o, ".note.GNU-stack");
+    if (stack == nil || stack.kind != ?mink.section.METADATA || stack.flags != 0) { ret 6; }
+    val init: *mink.object.Section = t_section(?o, ".init_array");
+    if (init == nil || init.kind != ?mink.section.INIT_ARRAY) { ret 7; }
+    val misc: *mink.object.Section = t_section(?o, ".misc");
+    if (misc == nil || misc.kind != ?mink.section.TEXT || misc.flags != (mink.section.ALLOC | mink.section.EXEC)) { ret 8; }
+    if (!t_done(?t, ?o))                                                                                          { ret 9; }
+    ret 0;
+}
+
+test asm__the_section_stack_restores_the_previous_section {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".text\n.pushsection .data\n.byte 1\n.popsection\nnop\n.data\n.byte 2\n.previous\nnop\n.section .rodata\n.byte 3\n.previous\nnop\n");
+    if (sel got.err) { ret 2; }
+    var o:    mink.object.Object = got.ok;
+    val code: [12]u8             = [12]u8{0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0};
+    val data: [2]u8              = [2]u8{1, 2};
+    if (!t_holds(?o, ".text", ?code[0], 12)) { ret 3; }
+    if (!t_holds(?o, ".data", ?data[0], 2))  { ret 4; }
+    if (!t_done(?t, ?o))                     { ret 5; }
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 6; }
+    var empty: res[mink.object.Object, model.Refusal] = t_assemble(?u, "nop\n.popsection\n");
+    if (!t_refused(?empty, model.EMPTY_STACK, 2, 12)) { ret 7; }
+    if (!t_release(?u))                               { ret 8; }
+    ret 0;
+}
+
+test asm__each_data_directive_writes_its_width_and_order {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".data\n.byte 1, -1\n.short 0x0203\n.word 0x04050607\n.long -2\n.quad 0x0102030405060708\n.float 1.5\n.double 1.5\n.ascii \"ab\"\n.asciz \"c\"\n.string \"d\\n\"\n");
+    if (sel got.err) { ret 2; }
+    var o:    mink.object.Object = got.ok;
+    val want: [39]u8             = [39]u8{
+        1, 0xff,
+        0x03, 0x02,
+        0x07, 0x06, 0x05, 0x04,
+        0xfe, 0xff, 0xff, 0xff,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x00, 0x00, 0xc0, 0x3f,
+        0, 0, 0, 0, 0, 0, 0xf8, 0x3f,
+        'a', 'b',
+        'c', 0,
+        'd', '\n', 0,
+    };
+    if (!t_holds(?o, ".data", ?want[0], 39)) { ret 3; }
+    if (!t_done(?t, ?o))                     { ret 4; }
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 5; }
+    var wide: res[mink.object.Object, model.Refusal] = t_assemble(?u, ".data\n.byte 256\n");
+    if (!t_refused(?wide, model.RANGE, 2, 7)) { ret 6; }
+    if (!t_release(?u))                       { ret 7; }
+    ret 0;
+}
+
+test asm__uleb128_and_sleb128_encode_their_boundary_values {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".data\n.uleb128 0, 127, 128, 0xffffffffffffffff\n.sleb128 63, 64, -64, -65\n");
+    if (sel got.err) { ret 2; }
+    var o:    mink.object.Object = got.ok;
+    val want: [20]u8             = [20]u8{0x00, 0x7f, 0x80, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x3f, 0xc0, 0x00, 0x40, 0xbf, 0x7f};
+    if (!t_holds(?o, ".data", ?want[0], 20)) { ret 3; }
+    if (!t_done(?t, ?o))                     { ret 4; }
+    ret 0;
+}
+
+test asm__set_redefines_a_symbol_and_equ_refuses_a_redefinition {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".data\n.set x, 1\n.byte x\n.set x, x + 1\n.byte x\n.equ y, 3\n.byte y\n");
+    if (sel got.err) { ret 2; }
+    var o:    mink.object.Object = got.ok;
+    val want: [3]u8              = [3]u8{1, 2, 3};
+    if (!t_holds(?o, ".data", ?want[0], 3)) { ret 3; }
+    # a local symbol of its last value
+    val x: *mink.object.Symbol = t_symbol(?o, "x");
+    if (x == nil || x.binding != ?mink.symbol.LOCAL)  { ret 4; }
+    if (!(sel x.def.absolute && x.def.absolute == 2)) { ret 4; }
+    if (!t_done(?t, ?o))                              { ret 5; }
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 6; }
+    var again: res[mink.object.Object, model.Refusal] = t_assemble(?u, ".equ y, 3\n.equ y, 4\n");
+    if (!t_refused(?again, model.FIXED, 2, 6)) { ret 7; }
+    if (!t_release(?u))                        { ret 8; }
+    ret 0;
+}
+
+test asm__comm_and_lcomm_declare_common_and_local_storage {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".comm buf, 64, 16\n.lcomm tmp, 8, 8\nnop\n");
+    if (sel got.err) { ret 2; }
+    var o:   mink.object.Object  = got.ok;
+    val buf: *mink.object.Symbol = t_symbol(?o, "buf");
+    if (buf == nil || buf.binding != ?mink.symbol.GLOBAL)        { ret 3; }
+    if (!sel buf.def.common)                                     { ret 4; }
+    if (buf.def.common.size != 64 || buf.def.common.align != 16) { ret 4; }
+    val tmp: *mink.object.Symbol = t_symbol(?o, "tmp");
+    if (tmp == nil || tmp.binding != ?mink.symbol.LOCAL)                                   { ret 5; }
+    if (!sel tmp.def.placed)                                                               { ret 6; }
+    if (tmp.def.placed.section.index != t_index(?o, ".bss") || tmp.def.placed.offset != 0) { ret 6; }
+    val bss: *mink.object.Section = t_section(?o, ".bss");
+    if (bss == nil)                                         { ret 7; }
+    if (!(sel bss.contents.zero && bss.contents.zero == 8)) { ret 7; }
+    # the code after it is still in .text
+    val nop: [4]u8 = [4]u8{0x13, 0, 0, 0};
+    if (!t_holds(?o, ".text", ?nop[0], 4)) { ret 8; }
+    if (!t_done(?t, ?o))                   { ret 9; }
+    ret 0;
+}
+
+test asm__alignment_directives_pad_to_their_boundary {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".data\n.byte 1\n.balign 4\n.byte 2\n.p2align 3\n.byte 3\n.align 2\n.byte 4\n.balign 8, 0xaa\n.byte 5\n.p2align 4,,2\n.byte 6\n");
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    # risc-v's .align is a power of two, and a gap past the limit pads nothing
+    val want: [18]u8 = [18]u8{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0xaa, 0xaa, 0xaa, 5, 6};
+    if (!t_holds(?o, ".data", ?want[0], 18)) { ret 3; }
+    if (!t_done(?t, ?o))                     { ret 4; }
+    ret 0;
+}
+
+test asm__a_malformed_line_is_refused_at_its_column {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".data\n  .long 1 +* 2\n");
+    if (!t_refused(?got, read.UNEXPECTED, 2, 11)) { ret 2; }
+    if (!t_release(?t))                           { ret 3; }
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 4; }
+    var head: res[mink.object.Object, model.Refusal] = t_assemble(?u, "nop\n , x\n");
+    if (!t_refused(?head, source.MALFORMED, 2, 2)) { ret 5; }
+    if (!t_release(?u))                            { ret 6; }
+    ret 0;
+}
+
+test asm__an_unknown_directive_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, "nop # .bogus\n.frobnicate 1\n");
+    if (!t_refused(?got, model.UNKNOWN_DIRECTIVE, 2, 1)) { ret 2; }
+    if (!t_release(?t))                                  { ret 3; }
+    ret 0;
+}
+
+test asm__type_and_size_are_recorded_on_the_symbol {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".globl f\n.type f, @function\nf: addi a0, a0, 1\n ret\n.size f, . - f\n.data\n.type obj, %object\nobj: .long 0\n.size obj, 4\n");
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object  = got.ok;
+    val f: *mink.object.Symbol = t_symbol(?o, "f");
+    if (f == nil || f.kind != ?mink.symbol.FUNCTION || f.binding != ?mink.symbol.GLOBAL) { ret 3; }
+    if (!(sel f.size.some && f.size.some == 8))                                          { ret 4; }
+    val obj: *mink.object.Symbol = t_symbol(?o, "obj");
+    if (obj == nil || obj.kind != ?mink.symbol.DATA || obj.binding != ?mink.symbol.LOCAL) { ret 5; }
+    if (!(sel obj.size.some && obj.size.some == 4))                                       { ret 6; }
+    if (!t_done(?t, ?o))                                                                  { ret 7; }
+    ret 0;
+}
+
+# a file of every core directive
+#[testing]
+val T_EVERY: str = "\t.text\n\t.globl main, helper\n\t.weak weakling\n\t.hidden helper\n\t.protected main\n\t.internal quiet\n\t.local quiet\n\t.type main, @function\nmain:\n\tcall helper\n\tcall weakling\n\tret\n\t.size main, . - main\n\t.p2align 2\nhelper: ret\nquiet: nop\n\t.balign 8\n\t.align 3\n\t.section .rodata, \"a\", @progbits\nmsg:\t.string \"hi\"\n\t.ascii \"x\"\n\t.asciz \"y\"\n\t.pushsection .data\n\t.byte 1\n\t.short 2\n\t.word 3\n\t.long main - .\n\t.quad msg + 1\n\t.uleb128 300\n\t.sleb128 -300\n\t.float 2.5\n\t.double -0.5\n\t.popsection\n\t.data\n\t.skip 3, 7\n\t.zero 2\n\t.fill 2, 2, 0x1234\n\t.set n, 4\n\t.equ m, n * 2\n\t.long m\n\t.previous\n\t.bss\n\t.zero 4\n\t.comm shared, 16, 8\n\t.lcomm own, 4\n\t.section .note.GNU-stack, \"\", @progbits\n";
+
+test asm__a_file_of_every_core_directive_assembles_to_an_object_mink_reads {
+    var t: T;
+    if (!t_make(?t, "rv64imac")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, T_EVERY);
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    # the abi `-mabi=lp64d` spells is the one the object carries
+    val abi: opt[mink.trait.Trait] = set.stated(?riscv_set.SET, "-mabi", "lp64d");
+    if (sel abi.none) { ret 3; }
+    val carried: opt[mink.trait.Setting] = mink.object.stated(?o, ?mink.arch.RISCV_FLOAT_ABI);
+    if (sel carried.none)                                                             { ret 4; }
+    if (!(sel carried.some.choice && carried.some.choice == ?mink.arch.RISCV_DOUBLE)) { ret 4; }
+    val main: *mink.object.Symbol = t_symbol(?o, "main");
+    if (main == nil || main.visibility != ?mink.symbol.PROTECTED)                                                                       { ret 5; }
+    if (sel main.size.none)                                                                                                             { ret 5; }
+    if (t_symbol(?o, "quiet") == nil || t_symbol(?o, "weakling") == nil || t_symbol(?o, "shared") == nil || t_symbol(?o, "own") == nil) { ret 6; }
+    # mink's elf relocations for the object's architecture take each of its relocations
+    val relocations: res[mink.row.Registry, mink.fail.Fail] = mink.builtin.registry(testing.allocator_of(?t.t));
+    if (sel relocations.err) { ret 7; }
+    var registry: mink.row.Registry                     = relocations.ok;
+    val elf:      res[*mink.row.Lookup, mink.fail.Fail] = mink.row.find(?registry, ?mink.format.ELF, o.arch);
+    var taken:    bool                                  = false;
+    if (sel elf.ok) {
+        taken = o.relocs.count > 0;
+        var r: usize = 0;
+        for (taken && r < o.relocs.count) {
+            val row_: res[*mink.row.Row, mink.fail.Fail] = mink.row.by_kind(elf.ok, o.relocs.items[r].kind);
+            taken = sel row_.ok;
+            r     = r + 1;
+        }
+    }
+    mink.row.release(?registry);
+    if (!taken)          { ret 8; }
+    if (!t_done(?t, ?o)) { ret 9; }
+    ret 0;
+}
