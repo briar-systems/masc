@@ -56,20 +56,33 @@ use masc.syntax.read;
 # held:     whether one is kept
 # complete: whether its candidate read the whole text, so it outranks any that did not
 # refusal:  the refusal
+# unmet:    whether the refusal is a candidate refused for admission, whose requirement becomes that of every such candidate
+# full:     whether the reader had no room for the requirement of a candidate refused for admission
 rec Best {
     held:     bool;
     complete: bool;
     refusal:  diagnostic.Diagnostic;
+    unmet:    bool;
+    full:     bool;
 }
 
-fun keep(best: *Best, d: diagnostic.Diagnostic, complete: bool) {
+# whether `d` was kept
+fun keep(best: *Best, d: diagnostic.Diagnostic, complete: bool) bool {
     if (best.held) {
-        if (best.complete && !complete)                                                         { ret; }
-        if (best.complete == complete && d.span.start.offset <= best.refusal.span.start.offset) { ret; }
+        if (best.complete && !complete)                                                         { ret false; }
+        if (best.complete == complete && d.span.start.offset <= best.refusal.span.start.offset) { ret false; }
     }
     best.held     = true;
     best.complete = complete;
     best.refusal  = d;
+    best.unmet    = false;
+    ret true;
+}
+
+# the candidate starting at the instruction refused for want of `required`, whose alternatives join those of every other
+fun keep_unmet(rd: *spelling.Reader, best: *Best, required: extension.Requirement, at: usize, len: usize) {
+    if (!field.note(?rd.refused, required))                         { best.full = true; }
+    if (keep(best, read.refuse_unmet(rd, required, at, len), true)) { best.unmet = true; }
 }
 
 # one value of `desc` read at the position
@@ -229,7 +242,7 @@ fun written(template: str, op: u8) bool {
 # spans: the offset each base operand was read at, the instruction's start for one the text does not hold
 fun admit(rd: *spelling.Reader, r: *row.Row, values: *operand.Value, spans: *usize, best: *Best) opt[inst.Inst] {
     if (!extension.admits(rd.available.selection, r.requires)) {
-        keep(best, read.refuse(rd, field.NOT_ADMITTED, rd.start, read.token(rd, rd.start)), true);
+        keep_unmet(rd, best, r.requires, rd.start, read.token(rd, rd.start));
         ret opt[inst.Inst].none{};
     }
     var ins:      inst.Inst          = inst.Inst{row: r, values: values, count: r.operands.len};
@@ -237,7 +250,8 @@ fun admit(rd: *spelling.Reader, r: *row.Row, values: *operand.Value, spans: *usi
     if (sel admitted.err) {
         var at: usize = rd.start;
         if (admitted.err.operand::u32 < r.operands.len) { at = spans[admitted.err.operand]; }
-        keep(best, read.refuse(rd, admitted.err.message, at, read.token(rd, at)), true);
+        if (admitted.err.requires.len != 0)             { keep_unmet(rd, best, admitted.err.requires, at, read.token(rd, at)); }
+        or                                              { keep(best, read.refuse(rd, admitted.err.message, at, read.token(rd, at)), true); }
         ret opt[inst.Inst].none{};
     }
     var i: u32 = 0;
@@ -301,7 +315,7 @@ fun by_alias(rd: *spelling.Reader, a: *spelling.Alias, best: *Best) opt[inst.Ins
     }
     # an alias the selection does not hold the extensions of is refused, and the next candidate is tried
     if (!extension.admits(rd.available.selection, a.requires)) {
-        keep(best, read.refuse(rd, field.NOT_ADMITTED, rd.start, read.token(rd, rd.start)), true);
+        keep_unmet(rd, best, a.requires, rd.start, read.token(rd, rd.start));
         ret opt[inst.Inst].none{};
     }
     var base:  [row.MAX_OPERANDS]operand.Value;
@@ -397,9 +411,10 @@ fun next(rd: *spelling.Reader, head: usize, started: bool, last: spelling.Candid
 # rd:  the reader over the instruction's text, its pool holding the values first and then list members
 # ret: the instruction, its values in the pool, or the refusal at its column
 pub fun instruction(rd: *spelling.Reader) res[inst.Inst, diagnostic.Diagnostic] {
-    var best:      Best = Best{held: false, complete: false, refusal: diagnostic.Diagnostic{message: read.UNKNOWN_MNEMONIC, span: diagnostic.Span{start: rd.origin, len: 0}}};
+    var best:      Best = Best{held: false, complete: false, refusal: diagnostic.Diagnostic{message: read.UNKNOWN_MNEMONIC, span: diagnostic.Span{start: rd.origin, len: 0}, requires: extension.NONE}, unmet: false, full: false};
     var keyed_any: bool = false;
-    rd.at = rd.start;
+    rd.at           = rd.start;
+    rd.refused.used = 0;
     read.skip(rd);
     val head:    usize = rd.at;
     var last:    spelling.Candidate;
@@ -425,17 +440,20 @@ pub fun instruction(rd: *spelling.Reader) res[inst.Inst, diagnostic.Diagnostic] 
         }
     }
     if (!keyed_any) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, read.UNKNOWN_MNEMONIC, head, read.token(rd, head))}; }
+    if (best.full)  { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)}; }
+    if (best.unmet) { best.refusal.requires = field.noted(?rd.refused); }
     ret res[inst.Inst, diagnostic.Diagnostic].err{best.refusal};
 }
 
 # a test's selection, its register view, the parser's storage and its output
 #[testing]
 rec T {
-    t:     testing.Testing;
-    s:     extension.Selection;
-    v:     register.Available;
-    store: [16]operand.Value;
-    out:   vector.Vector[u8];
+    t:          testing.Testing;
+    s:          extension.Selection;
+    v:          register.Available;
+    store:      [16]operand.Value;
+    admissions: [8]extension.Ids;
+    out:        vector.Vector[u8];
 }
 
 # a test over the selection the risc-v `isa` string spells
@@ -529,6 +547,7 @@ fun t_reader(t: *T, text: str, origin: diagnostic.Position) spelling.Reader {
         bytes:     nil,
         room:      0,
         taken:     0,
+        refused:   field.Admissions{at: ?t.admissions[0], cap: 8, used: 0},
     };
 }
 
@@ -767,6 +786,17 @@ test instruction__a_register_list_and_its_adjustment_read_back {
     if (!t_make(?t, "rv64i_zcmp"))                                                { ret 1; }
     if (!t_prints_as(?t, "cm.push {ra, s0-s2}, -64", "cm.push {ra, s0-s2}, -64")) { ret 2; }
     if (!t_prints_as(?t, "cm.mva01s s0, s1", "cm.mva01s s0, s1"))                 { ret 3; }
+    ret 0;
+}
+
+test instruction__a_mnemonic_refused_for_admission_names_every_alternative {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val refused: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "andn a0, a1, a2", diagnostic.START);
+    if (!sel refused.err) { ret 2; }
+    var d:      diagnostic.Diagnostic = refused.err;
+    val worded: err[A.Error]          = extension.spell_diagnostic(?t.s, ?d, ?t.out);
+    if (sel worded.err || !extension.t_spelled(?t.out, "instruction not admitted by the selection: needs zbb, or zbkb")) { ret 3; }
     ret 0;
 }
 
