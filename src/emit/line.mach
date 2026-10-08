@@ -349,6 +349,7 @@ val SET_COLUMN:       u8 = 5;
 val NEGATE_STMT:      u8 = 6;
 val SET_BASIC_BLOCK:  u8 = 7;
 val CONST_ADD_PC:     u8 = 8;
+val FIXED_ADVANCE_PC: u8 = 9;
 val SET_PROLOGUE_END: u8 = 10;
 val SET_EPILOGUE:     u8 = 11;
 val SET_ISA:          u8 = 12;
@@ -493,10 +494,21 @@ fun write_row(o: *Sink, m: *Machine, loc: *Location, addr: u64) {
     m.line = loc.line;
 }
 
-# where the sequence address of a run is to be relocated
+# what a relocated slot of the program holds
+# ---
+# ADDRESS:  the address of a label, a sequence's start or a move too far for a 16 bit advance
+# DISTANCE: the 16 bit distance from one label to another, which the linker resolves after it has resized code
+def SlotKind: u8;
+
+val ADDRESS:  SlotKind = 0;
+val DISTANCE: SlotKind = 1;
+
+# where the program holds an address or a distance to be relocated
 rec Slot {
     at:    usize;
+    kind:  SlotKind;
     label: build.Label;
+    from:  build.Label;
 }
 
 fun same(l: *Lines, x: Span, y: Span) bool {
@@ -601,6 +613,42 @@ fun patch(o: *Sink, at: usize, v: u64, width: usize) {
     build.ordered(o.b, v, width, ?o.bytes.data[at]);
 }
 
+# a label at the end of section `s`, which closes its sequence
+fun end_of(b: *build.Builder, s: build.Section) res[build.Label, build.Refusal] {
+    val switched: err[build.Refusal] = build.switch(b, s);
+    if (sel switched.err) { ret res[build.Label, build.Refusal].err{switched.err}; }
+    ret build.position(b);
+}
+
+# a slot of the program, at its next byte
+fun slot(o: *Sink, slots: *vector.Vector[Slot], kind: SlotKind, to: build.Label, from: build.Label) {
+    if (!held(vector.push[Slot](slots, Slot{at: o.bytes.len, kind: kind, label: to, from: from}))) { o.ok = false; }
+}
+
+# `DW_LNE_set_address` of label `to`, relocated by an absolute address
+fun put_address(o: *Sink, slots: *vector.Vector[Slot], to: build.Label, address: usize) {
+    byte(o, 0);
+    uleb(o, 1 + address::u64);
+    byte(o, SET_ADDRESS);
+    slot(o, slots, ADDRESS, to, to);
+    word(o, 0, address);
+}
+
+# the address register moved from place `from` to place `to`, `step` bytes in this layout, across code the linker may
+# resize, so no byte of the program may state the distance: a `fixed_advance_pc` whose operand is the difference of the
+# two places, relocated by the set's pair, and for a move a 16 bit operand cannot hold the absolute address of `to`
+fun travel(o: *Sink, slots: *vector.Vector[Slot], b: *build.Builder, from: build.Label, to: build.Label, step: u64, address: usize) err[build.Refusal] {
+    if (step > 0xFFFF) {
+        put_address(o, slots, to, address);
+        ret err[build.Refusal].ok{};
+    }
+    if (!build.has_pair(b, 2)) { ret err[build.Refusal].err{refusal(build.NO_PAIR)}; }
+    byte(o, FIXED_ADVANCE_PC);
+    slot(o, slots, DISTANCE, to, from);
+    word(o, 0, 2);
+    ret err[build.Refusal].ok{};
+}
+
 # the line program, built from the final places of the locations and written into `.debug_line`
 fun write(context: ptr, b: *build.Builder) err[build.Refusal] {
     val l: *Lines = context::*Lines;
@@ -616,47 +664,67 @@ fun write(context: ptr, b: *build.Builder) err[build.Refusal] {
     val address: usize               = b.arch.pointer_bytes::usize;
     val head:    err[build.Refusal]  = header(l, ?o, address);
     var made:    err[build.Refusal]  = head;
-    if (sel head.ok) {
+    var go:      bool                = sel head.ok;
+    if (go) {
         val program: usize = o.bytes.len;
         var i:       usize = 0;
-        for (i < found.len) {
-            var m: Machine = RESET;
-            byte(?o, 0);
-            uleb(?o, 1 + address::u64);
-            byte(?o, SET_ADDRESS);
-            if (!held(vector.push[Slot](?slots, Slot{at: o.bytes.len, label: l.marks.data[found.data[i].index].at}))) { o.ok = false; }
-            word(?o, 0, address);
-            val first: u64   = found.data[i].start;
-            var last:  u64   = first;
-            var j:     usize = i;
-            for (j < found.len && found.data[j].section.index == found.data[i].section.index) {
-                write_row(?o, ?m, ?l.marks.data[found.data[j].index].loc, found.data[j].start - last);
-                last = found.data[j].start;
-                j    = j + 1;
+        for (i < found.len && go) {
+            var m:    Machine                         = RESET;
+            val self: u32                             = found.data[i].section.index;
+            val ends: res[build.Label, build.Refusal] = end_of(b, found.data[i].section);
+            if (sel ends.err) {
+                made = err[build.Refusal].err{ends.err};
+                go   = false;
+                brk;
             }
-            val stop: u64 = found.data[j - 1].end - last;
-            if (stop == CONST_ADVANCE) { byte(?o, CONST_ADD_PC); }
-            or (stop != 0) {
-                byte(?o, ADVANCE_PC);
-                uleb(?o, stop);
+            put_address(?o, ?slots, l.marks.data[found.data[i].index].at, address);
+            var last:  u64         = found.data[i].start;
+            var there: build.Label = l.marks.data[found.data[i].index].at;
+            var j:     usize       = i;
+            for (j < found.len && go && found.data[j].section.index == self) {
+                val here: build.Label = l.marks.data[found.data[j].index].at;
+                var step: u64         = found.data[j].start - last;
+                if (!build.span_settled(b, there, here)) {
+                    made = travel(?o, ?slots, b, there, here, step, address);
+                    go   = sel made.ok;
+                    step = 0;
+                }
+                write_row(?o, ?m, ?l.marks.data[found.data[j].index].loc, step);
+                last  = found.data[j].start;
+                there = here;
+                j     = j + 1;
             }
-            byte(?o, 0);
-            byte(?o, 1);
-            byte(?o, END_SEQUENCE);
+            if (go) {
+                val stop: u64 = found.data[j - 1].end - last;
+                if (!build.span_settled(b, there, ends.ok)) {
+                    made = travel(?o, ?slots, b, there, ends.ok, stop, address);
+                    go   = sel made.ok;
+                }
+                or (stop == CONST_ADVANCE) { byte(?o, CONST_ADD_PC); }
+                or (stop != 0) {
+                    byte(?o, ADVANCE_PC);
+                    uleb(?o, stop);
+                }
+                byte(?o, 0);
+                byte(?o, 1);
+                byte(?o, END_SEQUENCE);
+            }
             i = j;
         }
-        patch(?o, 0, (o.bytes.len - 4)::u64, 4);
-        patch(?o, 8, (program - 12)::u64, 4);
-        made = flush(l, b, ?o, ?slots, address);
+        if (go) {
+            patch(?o, 0, (o.bytes.len - 4)::u64, 4);
+            patch(?o, 8, (program - 12)::u64, 4);
+            made = flush(l, b, ?o, ?slots, address);
+        }
     }
-    if (!o.ok && sel made.ok) { made = err[build.Refusal].err{refusal(field.MEMORY)}; }
+    if (!o.ok && go) { made = err[build.Refusal].err{refusal(field.MEMORY)}; }
     vector.dnit[u8](?o.bytes);
     vector.dnit[Slot](?slots);
     vector.dnit[Run](?found);
     ret made;
 }
 
-# the program's bytes into the builder's `.debug_line`, an address slot a datum of the label that places it
+# the program's bytes into the builder's `.debug_line`, a slot a datum of the label that places it or of the difference of two
 fun flush(l: *Lines, b: *build.Builder, o: *Sink, slots: *vector.Vector[Slot], address: usize) err[build.Refusal] {
     if (!o.ok) { ret err[build.Refusal].err{refusal(field.MEMORY)}; }
     var section: build.Section      = build.Section{index: 0};
@@ -677,9 +745,15 @@ fun flush(l: *Lines, b: *build.Builder, o: *Sink, slots: *vector.Vector[Slot], a
             val chunk: err[build.Refusal] = build.data(b, ?o.bytes.data[at], s.at - at);
             if (sel chunk.err) { ret chunk; }
         }
-        val placed: err[build.Refusal] = build.datum(b, build.Reference{target: s.label, addend: 0, width: address::u8, basis: set.ABSOLUTE});
+        var placed: err[build.Refusal];
+        var width:  usize = address;
+        if (s.kind == ADDRESS) { placed = build.datum(b, build.Reference{target: s.label, addend: 0, width: address::u8, basis: set.ABSOLUTE}); }
+        or {
+            width  = 2;
+            placed = build.difference(b, build.Difference{plus: s.label, minus: s.from, addend: 0}, 2);
+        }
         if (sel placed.err) { ret placed; }
-        at = s.at + address;
+        at = s.at + width;
         i  = i + 1;
     }
     if (o.bytes.len > at) { ret build.data(b, ?o.bytes.data[at], o.bytes.len - at); }
