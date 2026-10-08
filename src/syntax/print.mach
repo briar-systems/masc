@@ -1,0 +1,261 @@
+# the instruction printer: an encoded instruction value written in a syntax
+#
+# the printer writes a value by the preferred alias of its row that applies
+# to it, or by its row's template when none does, so `masc.syntax.parse`
+# reads the text back to the same value.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.spelling;
+use masc.core.walk;
+use masc.syntax.alias;
+use masc.syntax.expr;
+use masc.syntax.write;
+
+# the index of `r` among the codec's rows
+pub fun row_index(w: *spelling.Writer, r: *row.Row) u32 {
+    ret ((r:~u64 - w.codec.rows.at:~u64) / $size_of(row.Row)::u64)::u32;
+}
+
+# one value of `desc`, a member of a variadic operand or the whole of any other
+fun one(w: *spelling.Writer, desc: *operand.Operand, format: View, value: *operand.Value, op: u8) err[field.Refusal] {
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel shape.register) {
+        if (!sel value.register) { ret write.refuse(w, write.NO_SPELLING, op); }
+        ret write.register_name(w, value.register, op);
+    }
+    if (sel shape.enumerant) {
+        if (!sel value.enumerant) { ret write.refuse(w, write.NO_SPELLING, op); }
+        ret write.enumeration(w, ?shape.enumerant, value.enumerant, op);
+    }
+    if (sel shape.condition) {
+        if (!sel value.condition) { ret write.refuse(w, write.NO_SPELLING, op); }
+        ret write.enumeration(w, ?shape.condition, value.condition, op);
+    }
+    val h: *spelling.Hook = spelling.hook(w.syntax, shape);
+    if (h == nil) { ret write.refuse(w, write.NO_SPELLING, op); }
+    val done: err[field.Refusal] = h.print(w, desc, format, value);
+    if (sel done.err) {
+        var refused: field.Refusal = done.err;
+        if (refused.operand == field.NO_OPERAND) { refused.operand = op; }
+        ret err[field.Refusal].err{refused};
+    }
+    ret done;
+}
+
+# operand `op`'s value written by its hole
+fun hole(w: *spelling.Writer, desc: *operand.Operand, format: View, value: *operand.Value, op: u8) err[field.Refusal] {
+    if (desc.quantity != operand.VARIADIC) { ret one(w, desc, format, value, op); }
+    if (!sel value.list)                   { ret write.refuse(w, write.NO_SPELLING, op); }
+    val members: operand.Values = value.list;
+    var i:       u32            = 0;
+    for (i < members.len) {
+        if (i > 0) {
+            val joined: err[field.Refusal] = write.text(w, w.syntax.variadic);
+            if (sel joined.err) { ret joined; }
+        }
+        val spelled: err[field.Refusal] = one(w, desc, format, ?members.at[i], op);
+        if (sel spelled.err) { ret spelled; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# whether every operand of the group opening at `at` is present
+fun present(template: str, at: usize, values: *operand.Value) bool {
+    var p: spelling.Piece = spelling.piece(template, at);
+    for (p.kind != spelling.CLOSE && p.kind != spelling.END) {
+        if (p.kind == spelling.HOLE) {
+            val v: *operand.Value = ?values[p.operand];
+            if (sel v.none) { ret false; }
+        }
+        p = spelling.piece(template, p.at + p.len);
+    }
+    ret true;
+}
+
+# the offset just past the group opening at `at`
+fun past(template: str, at: usize) usize {
+    var p: spelling.Piece = spelling.piece(template, at);
+    for (p.kind != spelling.CLOSE && p.kind != spelling.END) {
+        p = spelling.piece(template, p.at + p.len);
+    }
+    ret p.at + p.len;
+}
+
+# `template` written over `values`, hole n read by `descs[n]`
+fun spell(w: *spelling.Writer, template: str, descs: **operand.Operand, values: *operand.Value) err[field.Refusal] {
+    var at: usize = 0;
+    for {
+        val p: spelling.Piece = spelling.piece(template, at);
+        if (p.kind == spelling.END) { brk; }
+        at = p.at + p.len;
+        if (p.kind == spelling.OPEN && !present(template, p.at + p.len, values)) {
+            at = past(template, p.at + p.len);
+        }
+        or (p.kind == spelling.TEXT || p.kind == spelling.SPACE) {
+            val wrote: err[field.Refusal] = write.bytes(w, ?template[p.at], 1);
+            if (sel wrote.err) { ret wrote; }
+        }
+        or (p.kind == spelling.HOLE) {
+            val spelled: err[field.Refusal] = hole(w, descs[p.operand], p.format, ?values[p.operand], p.operand);
+            if (sel spelled.err) { ret spelled; }
+        }
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# `ins` appended to the writer's output in its syntax, by the preferred alias that applies or by its row
+# ---
+# ret: ok, or the refusal of a value nothing spells, with the output left as it was
+pub fun instruction(w: *spelling.Writer, ins: *inst.Inst) err[field.Refusal] {
+    val r:      *row.Row        = ins.row;
+    val index:  u32             = row_index(w, r);
+    val start:  usize           = w.out.len;
+    var chosen: *spelling.Alias = nil;
+    var values: [row.MAX_OPERANDS]operand.Value;
+    var i:      u32             = 0;
+    for (i < w.syntax.aliases.len) {
+        val a: *spelling.Alias = ?w.syntax.aliases.at[i];
+        if (a.row == index && a.preference > 0 && (chosen == nil || a.preference > chosen.preference)) {
+            var held: [row.MAX_OPERANDS]operand.Value;
+            if (alias.applies(w.codec, a, ins.values, ?held[0])) {
+                chosen = a;
+                values = held;
+            }
+        }
+        i = i + 1;
+    }
+    var descs:    [row.MAX_OPERANDS]*operand.Operand;
+    var template: str = w.syntax.forms.at[index];
+    var k:        u32 = 0;
+    for (k < row.MAX_OPERANDS) {
+        if (chosen != nil) {
+            descs[k] = spelling.alias_operand(chosen, r, k::u8);
+        }
+        or (k < r.operands.len) {
+            descs[k]  = ?r.operands.at[k];
+            values[k] = ins.values[k];
+        }
+        k = k + 1;
+    }
+    if (chosen != nil) { template = chosen.template; }
+    w.row = r;
+    val spelled: err[field.Refusal] = spell(w, template, ?descs[0], ?values[0]);
+    if (sel spelled.err) {
+        w.out.len = start;
+        ret spelled;
+    }
+    for (w.out.len > start && w.out.data[w.out.len - 1] == ' ') {
+        w.out.len = w.out.len - 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# a syntax over the minimal table of the walks for the tests: addi, beq, c.li,
+# const, shl with its count fixed to x5, c.not, c.lui and c.addi16sp
+#[testing]
+val T_FORMS: [8]str = [8]str{"addi <0>, <1>, <2>", "beq <0>, <1>, <2>", "c.li <0>, <1>", "const <0>", "shl <0>", "c.not <0>", "c.lui <0>, <1>", "c.addi16sp <0>"};
+
+#[testing]
+val T_NOP: [3]spelling.Source = [3]spelling.Source{spelling.Source.register{0}, spelling.Source.register{0}, spelling.Source.value{operand.Value.immediate{0}}};
+
+#[testing]
+val T_MV: [3]spelling.Source = [3]spelling.Source{spelling.Source.operand{0}, spelling.Source.operand{1}, spelling.Source.value{operand.Value.immediate{0}}};
+
+#[testing]
+val T_LI: [3]spelling.Source = [3]spelling.Source{spelling.Source.operand{0}, spelling.Source.register{0}, spelling.Source.operand{1}};
+
+#[testing]
+val T_SET_CLI: [2]spelling.Source = [2]spelling.Source{spelling.Source.register{5}, spelling.Source.operand{0}};
+
+#[testing]
+val T_SET_CONST: [1]spelling.Source = [1]spelling.Source{spelling.Source.operand{0}};
+
+# `set` is only read, as c.li to x5 when its value fits and as const when it does not
+#[testing]
+pub val T_ALIASES: [5]spelling.Alias = [5]spelling.Alias{
+    spelling.Alias{row: 0, template: "nop", count: 0, sources: spelling.Sources{at: ?T_NOP[0], len: 3}, derive: nil, preference: 3},
+    spelling.Alias{row: 0, template: "mv <0>, <1>", count: 2, sources: spelling.Sources{at: ?T_MV[0], len: 3}, derive: nil, preference: 2},
+    spelling.Alias{row: 0, template: "li <0>, <1>", count: 2, sources: spelling.Sources{at: ?T_LI[0], len: 3}, derive: nil, preference: 1},
+    spelling.Alias{row: 2, template: "set <0>", count: 1, sources: spelling.Sources{at: ?T_SET_CLI[0], len: 2}, derive: nil, preference: 0},
+    spelling.Alias{row: 3, template: "set <0>", count: 1, sources: spelling.Sources{at: ?T_SET_CONST[0], len: 1}, derive: nil, preference: 0},
+};
+
+# beq's target takes fixup kind 1 by default, and 2 under %plt
+#[testing]
+val T_SPECIFIERS: [1]spelling.Specifier = [1]spelling.Specifier{spelling.Specifier{template: "%plt(<0>)", operand: 1, fixup: 2, fold: nil}};
+
+#[testing]
+pub val T_SYNTAX: spelling.Syntax = spelling.Syntax{
+    name:       "test",
+    forms:      spelling.Forms{at: ?T_FORMS[0], len: 8},
+    aliases:    spelling.Aliases{at: ?T_ALIASES[0], len: 5},
+    specifiers: spelling.Specifiers{at: ?T_SPECIFIERS[0], len: 1},
+    hooks:      spelling.Hooks{immediate: ?expr.IMMEDIATE, memory: nil, list: nil, id: nil, literal: nil},
+    register:   "",
+    join:       "",
+    variadic:   " ",
+    fold:       false,
+};
+
+# the one symbol of the tests, `far`, is handle 1
+#[testing]
+fun t_resolve(context: ptr, name: View) res[spelling.Resolved, str] {
+    if (view_eq_str(name, "far")) { ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{1}}; }
+    ret res[spelling.Resolved, str].err{"unknown symbol"};
+}
+
+#[testing]
+fun t_name(context: ptr, id: u32) View {
+    ret view("far", 3);
+}
+
+#[testing]
+pub val T_SYMBOLS: spelling.Symbols = spelling.Symbols{context: nil, resolve: t_resolve, name: t_name};
+
+# whether `ins` prints as exactly `want`
+#[testing]
+pub fun t_prints(out: *vector.Vector[u8], ins: *inst.Inst, want: str) bool {
+    out.len = 0;
+    var w:       spelling.Writer    = spelling.Writer{out: out, codec: ?walk.T_CODEC, syntax: ?T_SYNTAX, symbols: ?T_SYMBOLS, context: nil, row: nil};
+    val printed: err[field.Refusal] = instruction(?w, ins);
+    if (sel printed.err) { ret false; }
+    ret view_eq_str(view(out.data, out.len), want);
+}
+
+test instruction__an_alias_prints_only_when_its_condition_holds {
+    var t: testing.Testing;
+    testing.make(?t);
+    var out:  vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t));
+    val rd:   [5]u16            = [5]u16{5, 5, 0, 5, 5};
+    val rs:   [5]u16            = [5]u16{5, 5, 0, 0, 0};
+    val imm:  [5]i64            = [5]i64{0, 1, 0, 3, 0};
+    val want: [5]str            = [5]str{"mv x5, x5", "addi x5, x5, 1", "nop", "li x5, 3", "mv x5, x0"};
+    var i:    u32               = 0;
+    for (i < 5) {
+        var values: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(0, rd[i])}, operand.Value.register{register.make(0, rs[i])}, operand.Value.immediate{imm[i]}};
+        var ins:    inst.Inst        = inst.Inst{row: ?walk.T_CODEC.rows.at[0], values: ?values[0], count: 3};
+        if (!t_prints(?out, ?ins, want[i])) { ret 1 + i::i32; }
+        i = i + 1;
+    }
+    vector.dnit[u8](?out);
+    ret 0;
+}
