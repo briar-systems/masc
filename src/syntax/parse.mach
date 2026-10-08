@@ -1,7 +1,8 @@
 # the instruction parser: instruction text read into an encoded instruction value
 #
-# the parser tries each row's template and then each alias of that row, in
-# row order, the order of the encoder's preference, and takes the first whose
+# the parser finds the candidates for the text's mnemonic in the syntax's
+# index and tries them in row order, a row's template and then each alias of
+# that row, the order of the encoder's preference, and takes the first whose
 # text matches and whose values the row admits under the selection. an alias
 # resolves to its base row's value. when no candidate takes the text, the
 # refusal is the one of the candidate that read it whole, or else of the one
@@ -301,6 +302,76 @@ fun by_alias(rd: *spelling.Reader, a: *spelling.Alias, best: *Best) opt[inst.Ins
     ret admit(rd, r, ?base[0], ?where[0], best);
 }
 
+# whether candidate `a` is tried after candidate `b`
+fun later(a: spelling.Candidate, b: spelling.Candidate) bool {
+    ret a.row > b.row || (a.row == b.row && a.alias > b.alias);
+}
+
+# byte `depth` of the key of entry `i`, in lower case when the syntax folds
+fun key_byte(rd: *spelling.Reader, i: u32, depth: usize) u8 {
+    val c: u8 = rd.syntax.index.at[i].key[depth];
+    if (rd.syntax.fold) { ret spelling.lower(c); }
+    ret c;
+}
+
+# the first entry of `lo` up to `hi` whose key byte `depth` is `c` or above, or above when `above`
+fun narrow(rd: *spelling.Reader, lo: u32, hi: u32, depth: usize, c: u8, above: bool) u32 {
+    var l: u32 = lo;
+    var h: u32 = hi;
+    for (l < h) {
+        val mid: u32 = l + (h - l) / 2;
+        val k:   u8  = key_byte(rd, mid, depth);
+        if (k < c || (above && k == c)) { l = mid + 1; }
+        or                              { h = mid; }
+    }
+    ret l;
+}
+
+# the first candidate of entry `e` after `last`, or its first when none has been tried
+fun within(ix: *spelling.Index, e: *spelling.Entry, started: bool, last: spelling.Candidate, out: *spelling.Candidate) bool {
+    var lo: u32 = 0;
+    var hi: u32 = e.len;
+    for (started && lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (later(ix.candidates[e.first + mid], last)) { hi = mid; }
+        or                                             { lo = mid + 1; }
+    }
+    if (lo >= e.len) { ret false; }
+    @out = ix.candidates[e.first + lo];
+    ret true;
+}
+
+# the next candidate to try for the text at `head`, the earliest after `last` of every entry whose key starts the text
+# ---
+# started: whether `last` is set, false for the first candidate
+# ret:     whether there is one, then in `out`
+fun next(rd: *spelling.Reader, head: usize, started: bool, last: spelling.Candidate, out: *spelling.Candidate) bool {
+    val ix:    *spelling.Index = ?rd.syntax.index;
+    var lo:    u32             = 0;
+    var hi:    u32             = ix.len;
+    var depth: usize           = 0;
+    var found: bool            = false;
+    for (lo < hi) {
+        # the entry whose key ends here sorts before every longer key
+        if (ix.at[lo].key[depth] == 0) {
+            var c: spelling.Candidate;
+            if (within(ix, ?ix.at[lo], started, last, ?c) && (!found || later(@out, c))) {
+                @out  = c;
+                found = true;
+            }
+            lo = lo + 1;
+        }
+        if (lo >= hi || head + depth >= rd.end) { brk; }
+        var b: u8 = rd.text[head + depth];
+        if (rd.syntax.fold) { b = spelling.lower(b); }
+        val first: u32 = narrow(rd, lo, hi, depth, b, false);
+        hi    = narrow(rd, first, hi, depth, b, true);
+        lo    = first;
+        depth = depth + 1;
+    }
+    ret found;
+}
+
 # the instruction at the reader's text, read in its syntax
 # ---
 # rd:  the reader over the instruction's text, its pool holding the values first and then list members
@@ -310,27 +381,28 @@ pub fun instruction(rd: *spelling.Reader) res[inst.Inst, diagnostic.Diagnostic] 
     var keyed_any: bool = false;
     rd.at = rd.start;
     read.skip(rd);
-    val head: usize = rd.at;
-    var next: u32   = 0;
-    var i:    u32   = 0;
-    for (i < rd.codec.rows.len) {
-        val r: *row.Row = ?rd.codec.rows.at[i];
+    val head:    usize = rd.at;
+    var last:    spelling.Candidate;
+    var current: spelling.Candidate;
+    var started: bool  = false;
+    for (next(rd, head, started, last, ?current)) {
+        started = true;
+        last    = current;
+        val r: *row.Row = ?rd.codec.rows.at[current.row];
         if (rd.cap < r.operands.len) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)}; }
-        if ((r.flags & row.DECODE_ONLY) == 0 && keyed(rd, rd.syntax.forms.at[i], head)) {
+        if (current.alias == 0) {
+            if ((r.flags & row.DECODE_ONLY) != 0 || !keyed(rd, rd.syntax.forms.at[current.row], head)) { cnt; }
             keyed_any = true;
-            val got: opt[inst.Inst] = by_row(rd, i, ?best);
+            val got: opt[inst.Inst] = by_row(rd, current.row, ?best);
             if (sel got.some) { ret res[inst.Inst, diagnostic.Diagnostic].ok{got.some}; }
         }
-        for (next < rd.syntax.aliases.len && rd.syntax.aliases.at[next].row == i) {
-            val a: *spelling.Alias = ?rd.syntax.aliases.at[next];
-            if (keyed(rd, a.template, head)) {
-                keyed_any = true;
-                val got: opt[inst.Inst] = by_alias(rd, a, ?best);
-                if (sel got.some) { ret res[inst.Inst, diagnostic.Diagnostic].ok{got.some}; }
-            }
-            next = next + 1;
+        or {
+            val a: *spelling.Alias = ?rd.syntax.aliases.at[current.alias - 1];
+            if (!keyed(rd, a.template, head)) { cnt; }
+            keyed_any = true;
+            val got: opt[inst.Inst] = by_alias(rd, a, ?best);
+            if (sel got.some) { ret res[inst.Inst, diagnostic.Diagnostic].ok{got.some}; }
         }
-        i = i + 1;
     }
     if (!keyed_any) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, read.UNKNOWN_MNEMONIC, head, read.token(rd, head))}; }
     ret res[inst.Inst, diagnostic.Diagnostic].err{best.refusal};
@@ -399,6 +471,47 @@ test instruction__every_alias_form_parses_to_its_base_row {
     ret 0;
 }
 
+test index__a_shared_mnemonic_yields_every_candidate_in_order {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val text: str             = "set 3";
+    var rd:   spelling.Reader = spelling.Reader{
+        text:      text,
+        start:     0,
+        at:        0,
+        end:       str_len(text),
+        origin:    diagnostic.START,
+        codec:     ?walk.T_CODEC,
+        available: ?t.v,
+        syntax:    ?print.T_SYNTAX,
+        symbols:   ?print.T_SYMBOLS,
+        context:   nil,
+        row:       nil,
+        pool:      ?t.store[0],
+        cap:       8,
+        used:      0,
+        bytes:     nil,
+        room:      0,
+        taken:     0,
+    };
+    # alias set of c.li, then the const row spelled set, then alias set of const
+    val rows:    [3]u32 = [3]u32{2, 3, 3};
+    val aliases: [3]u32 = [3]u32{4, 0, 5};
+    var last:    spelling.Candidate;
+    var got:     spelling.Candidate;
+    var started: bool   = false;
+    var i:       u32    = 0;
+    for (i < 3) {
+        if (!next(?rd, 0, started, last, ?got))            { ret 2; }
+        if (got.row != rows[i] || got.alias != aliases[i]) { ret 3; }
+        started = true;
+        last    = got;
+        i       = i + 1;
+    }
+    if (next(?rd, 0, started, last, ?got)) { ret 4; }
+    ret 0;
+}
+
 test instruction__a_specifier_parses_into_a_symbolic_operand {
     var t: T;
     if (!t_make(?t)) { ret 1; }
@@ -412,7 +525,7 @@ test instruction__a_specifier_parses_into_a_symbolic_operand {
 test instruction__an_ambiguous_operand_resolves_to_the_preferred_row {
     var t: T;
     if (!t_make(?t)) { ret 1; }
-    # const admits 3 as well, but c.li comes first in the encoder's order
+    # the const row admits 3 as well, but c.li comes first in the encoder's order
     var three:    [1]operand.Value   = [1]operand.Value{operand.Value.immediate{3}};
     var later:    inst.Inst          = inst.Inst{row: ?walk.T_CODEC.rows.at[3], values: ?three[0], count: 1};
     val admitted: err[field.Refusal] = walk.admits(?walk.T_CODEC, ?t.v, ?later);
