@@ -361,6 +361,18 @@ tag Aim: u8 {
     nothing;
 }
 
+# something that writes more of the object once the layout of the rest is settled, as the line program, which is made of
+# the final addresses of the places facts were attached to
+# ---
+# name:    what it writes
+# context: its state, which the caller owns and keeps until the builder is released
+# write:   what it writes, at the cursor of the sections it opens or switches to, after the layout is settled
+pub rec Writer {
+    name:    str;
+    context: ptr;
+    write:   fun(ptr, *Builder) err[Refusal];
+}
+
 # a relocation found by the last encode, before the object exists
 rec Pending {
     section: u32;
@@ -408,6 +420,8 @@ rec Entry {
 # entries:   the listing of the last encode
 # listed:    the values of the listing
 # traits:    the traits the caller stated, which the object states as given
+# writers:   what writes more of the object after the layout, in the order they were added
+# written:   how many writers have run
 # finished:  whether the object was handed over
 pub rec Builder {
     a:         *A.Allocator;
@@ -435,6 +449,8 @@ pub rec Builder {
     entries:   vector.Vector[Entry];
     listed:    vector.Vector[operand.Value];
     traits:    vector.Vector[mink.trait.Trait];
+    writers:   vector.Vector[Writer];
+    written:   usize;
     finished:  bool;
 }
 
@@ -542,6 +558,8 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, arch:
         entries:   vector.init[Entry](a),
         listed:    vector.init[operand.Value](a),
         traits:    vector.init[mink.trait.Trait](a),
+        writers:   vector.init[Writer](a),
+        written:   0,
         finished:  false,
     };
     # the bindings indexed by fixup kind, so a relocation's kind is one load
@@ -632,6 +650,7 @@ pub fun release(b: *Builder) {
     vector.dnit[Entry](?b.entries);
     vector.dnit[operand.Value](?b.listed);
     vector.dnit[mink.trait.Trait](?b.traits);
+    vector.dnit[Writer](?b.writers);
 }
 
 # the id of `s`'s bytes among the builder's names, a new name interned, and every name given its label and section slots
@@ -721,6 +740,23 @@ pub fun anonymous(b: *Builder) res[Label, Refusal] {
     if (b.finished)                                  { ret res[Label, Refusal].err{refuse(FINISHED)}; }
     if (!held(vector.push[Mark](?b.labels, Mark{}))) { ret res[Label, Refusal].err{memory()}; }
     ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# a new label placed at the cursor of the current section, which is how a fact is attached to a place: the label is
+# the place, and once the layout is settled `place_of` states where it finally lies, after relaxation and compression
+pub fun position(b: *Builder) res[Label, Refusal] {
+    val made: res[Label, Refusal] = anonymous(b);
+    if (sel made.err) { ret made; }
+    val placed: err[Refusal] = define(b, made.ok);
+    if (sel placed.err) { ret res[Label, Refusal].err{placed.err}; }
+    ret made;
+}
+
+# `w` added to what writes after the layout is settled, run once by `finish`
+pub fun writer(b: *Builder, w: Writer) err[Refusal] {
+    if (b.finished)                                { ret refused(FINISHED); }
+    if (!held(vector.push[Writer](?b.writers, w))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
 }
 
 # whether `name` starts with the spelling a syntax of the set reserves for anonymous labels, a set having a syntax or two
@@ -1991,11 +2027,11 @@ fun state_traits(b: *Builder, o: *mink.object.Object) err[mink.fail.Fail] {
     ret err[mink.fail.Fail].ok{};
 }
 
-# the builder laid out to a fixed point and encoded, handed over as mink's neutral object, which the caller releases.
-# a refused finish leaves the builder as it was, to be emitted into and finished again
-pub fun finish(b: *Builder) res[mink.object.Object, Refusal] {
-    if (b.finished) { ret res[mink.object.Object, Refusal].err{refuse(FINISHED)}; }
-    # a finish starts from what was emitted, so a refused one leaves no growth behind
+# every section laid out to a fixed point from what was emitted, so the places of labels and the sizes of sections are
+# final until something more is emitted. it starts from the instructions as emitted, so a refused layout leaves no growth
+# behind
+pub fun layout(b: *Builder) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
     var s: usize = 0;
     for (s < b.areas.len) {
         val area: *Area = ?b.areas.data[s];
@@ -2016,8 +2052,48 @@ pub fun finish(b: *Builder) res[mink.object.Object, Refusal] {
         b.labels.data[i].symbol = opt[mink.table.Id[mink.object.Symbol]].none{};
         i                       = i + 1;
     }
-    val laid: err[Refusal] = lay(b);
+    ret lay(b);
+}
+
+# the distance in bytes from place `from` to place `to` once the layout is settled, none when the assembler cannot know
+# it: a label is not placed, they lie in two sections, or code the linker may resize lies between, so the distance is the
+# linker's and a writer relocates it with `difference`
+pub fun distance_of(b: *Builder, from: Label, to: Label) opt[i64] {
+    val p: opt[*Mark] = mark_of(b, from);
+    if (sel p.none) { ret opt[i64].none{}; }
+    val q: opt[*Mark] = mark_of(b, to);
+    if (sel q.none) { ret opt[i64].none{}; }
+    val a: *Mark = p.some;
+    val c: *Mark = q.some;
+    if (!a.defined || !c.defined || a.section != c.section) { ret opt[i64].none{}; }
+    val home: *Area = ?b.areas.data[a.section::usize];
+    if (!settled(home, a.fragment, c.fragment)) { ret opt[i64].none{}; }
+    ret opt[i64].some{offset_at(home, c.fragment):~i64 - offset_at(home, a.fragment):~i64};
+}
+
+# the length of section `s` in the last layout
+pub fun size_of(b: *Builder, s: Section) u64 {
+    if (s.index::usize >= b.areas.len) { ret 0; }
+    ret b.areas.data[s.index::usize].size;
+}
+
+# the builder laid out to a fixed point and encoded, handed over as mink's neutral object, which the caller releases.
+# once the layout is settled the writers run, once, each writing from the final places, and the sections they added are
+# laid out with the rest. a refused finish leaves the builder as it was, to be emitted into and finished again
+pub fun finish(b: *Builder) res[mink.object.Object, Refusal] {
+    if (b.finished) { ret res[mink.object.Object, Refusal].err{refuse(FINISHED)}; }
+    val laid: err[Refusal] = layout(b);
     if (sel laid.err) { ret res[mink.object.Object, Refusal].err{laid.err}; }
+    if (b.written < b.writers.len) {
+        for (b.written < b.writers.len) {
+            val w:     *Writer      = ?b.writers.data[b.written];
+            val wrote: err[Refusal] = w.write(w.context, b);
+            if (sel wrote.err) { ret res[mink.object.Object, Refusal].err{wrote.err}; }
+            b.written = b.written + 1;
+        }
+        val again: err[Refusal] = layout(b);
+        if (sel again.err) { ret res[mink.object.Object, Refusal].err{again.err}; }
+    }
     val encoded: err[Refusal] = encode_all(b);
     if (sel encoded.err) { ret res[mink.object.Object, Refusal].err{encoded.err}; }
     val settled_: err[Refusal] = checked_labels(b);
@@ -2043,7 +2119,7 @@ pub fun line(b: *Builder, i: usize) Line {
     ret Line{section: Section{index: e.section}, offset: e.offset, length: e.length, inst: inst.Inst{row: e.row, values: ?b.listed.data[e.values], count: e.count}, run: e.run};
 }
 
-# where `l` lies in the finished object, none for a label never defined
+# where `l` lies once the layout is settled, in the finished object or after `layout`, none for a label never defined
 pub fun place_of(b: *Builder, l: Label) opt[mink.object.Place] {
     val m: opt[*Mark] = mark_of(b, l);
     if (sel m.none) { ret opt[mink.object.Place].none{}; }
