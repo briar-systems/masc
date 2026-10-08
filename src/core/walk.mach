@@ -1,0 +1,936 @@
+# the encode and decode walks over a row's fields, and decode dispatch
+#
+# encoding admits each operand value into its encoded parts, refusing what
+# the row does not admit, then walks the fields in order and lets each kind
+# write its piece. decoding walks the same fields reading, then turns the
+# deposited parts back into values. both read one description, so they agree
+# by construction. a refused encode leaves the stream and the fixups as they
+# were, so a builder can try a mnemonic's rows in preference order.
+#
+# decode finds its row through a static dispatch: a tree of nodes, each
+# reading one set-supplied key from the stream and searching its sorted
+# entries for a child node or a short list of candidate rows.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+
+# a set-supplied dispatch key: a value read from the instruction at the offset given, without consuming it
+pub rec Key {
+    name:    str;
+    extract: fun(*field.Stream, usize) res[u64, field.Refusal];
+}
+
+# a node of a dispatch tree
+# ---
+# key:   the key it reads
+# first: its first entry
+# count: how many entries it has, sorted by value
+pub rec Node {
+    key:   u16;
+    first: u32;
+    count: u32;
+}
+
+# one key value of a node
+# ---
+# value: the key value
+# node:  the child node's index plus one, or 0 for a leaf
+# first: a leaf's first candidate
+# count: how many candidates a leaf has, tried in preference order
+pub rec Entry {
+    value: u64;
+    node:  u32;
+    first: u32;
+    count: u32;
+}
+
+# a set's decode dispatch, its root at node 0
+# ---
+# keys:       the keys nodes read
+# nodes:      the nodes
+# entries:    every node's entries
+# candidates: row indices the leaves name
+# rows:       the rows candidates index
+pub rec Dispatch {
+    keys:       *Key;
+    nodes:      *Node;
+    entries:    *Entry;
+    candidates: *u32;
+    rows:       *row.Row;
+}
+
+# what a set's walks read
+# ---
+# fields:    the field table
+# registers: the register file operands name registers of
+# dispatch:  the decode dispatch
+pub rec Codec {
+    fields:    *field.Table;
+    registers: *register.File;
+    dispatch:  *Dispatch;
+}
+
+# a decoded instruction and the bytes it took
+pub rec Decoded {
+    inst: inst.Inst;
+    len:  usize;
+}
+
+fun refuse(message: str, op: u8) err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(message, op, 0)};
+}
+
+fun mark(p: *field.Parts, part: field.Part, bits: u64) {
+    p.bits[part] = bits;
+    p.present    = p.present | (1::u8 << part);
+}
+
+# `v` admitted as `imm` into `part`
+fun admit_immediate(imm: *operand.Immediate, v: i64, p: *field.Parts, part: field.Part, op: u8) err[field.Refusal] {
+    # a float is admitted when it is a bit pattern of its width, and its encoding kind refuses what it cannot represent
+    if (imm.format == operand.FLOAT) {
+        if (imm.bits < 64 && (v:~u64 & ~field.ones(imm.bits)) != 0) { ret refuse(field.OUT_OF_RANGE, op); }
+        mark(p, part, v:~u64);
+        ret err[field.Refusal].ok{};
+    }
+    val d: i64 = v - imm.bias;
+    if (imm.scale > 0 && (d & field.ones(imm.scale)::i64) != 0) { ret refuse(field.MISALIGNED, op); }
+    if (imm.bits < 64) {
+        if (imm.signed) {
+            val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+            if (d < -half || d >= half) { ret refuse(field.OUT_OF_RANGE, op); }
+        }
+        or (d < 0 || d::u64 > field.ones(imm.bits)) {
+            ret refuse(field.OUT_OF_RANGE, op);
+        }
+    }
+    mark(p, part, d:~u64 & field.ones(imm.bits));
+    ret err[field.Refusal].ok{};
+}
+
+# symbol `sym` admitted into `part` of an operand whose default fixup kind is `fixup`
+fun admit_symbol(fixup: operand.FixupKind, sym: operand.Symbol, p: *field.Parts, part: field.Part, op: u8) err[field.Refusal] {
+    if (fixup == operand.NO_FIXUP)   { ret refuse(field.NO_SYMBOL, op); }
+    if (sym.id == operand.NO_SYMBOL) { ret refuse(field.WRONG_KIND, op); }
+    p.symbolic = true;
+    p.symbol   = sym;
+    p.fixup    = fixup;
+    if (sym.fixup != operand.NO_FIXUP) { p.fixup = sym.fixup; }
+    mark(p, part, 0);
+    ret err[field.Refusal].ok{};
+}
+
+# register `id` admitted as a member of one of `classes`, its number into `number` and its class's position into `class`
+fun admit_register(codec: *Codec, classes: operand.Classes, id: register.Id, p: *field.Parts, number: field.Part, class: field.Part, op: u8) err[field.Refusal] {
+    if (id == register.NONE) { ret refuse(field.WRONG_KIND, op); }
+    val c: u16 = register.class_of(id);
+    if (c::u32 >= codec.registers.class_count) { ret refuse(field.NO_REGISTER, op); }
+    val at: i64 = operand.find(classes, c);
+    if (at < 0)                                                          { ret refuse(field.WRONG_CLASS, op); }
+    if (register.number_of(id)::u32 >= codec.registers.classes[c].count) { ret refuse(field.NO_REGISTER, op); }
+    mark(p, number, register.number_of(id)::u64);
+    mark(p, class, at::u64);
+    ret err[field.Refusal].ok{};
+}
+
+fun admit_memory(codec: *Codec, m: *operand.Memory, a: *operand.Address, p: *field.Parts, op: u8) err[field.Refusal] {
+    if ((a.mode == operand.RELATIVE_PC && (m.forms & operand.PCREL) == 0) || (a.mode == operand.PREINDEX && (m.forms & operand.PRE) == 0) || (a.mode == operand.POSTINDEX && (m.forms & operand.POST) == 0) || a.mode > operand.POSTINDEX) {
+        ret refuse(field.FORM, op);
+    }
+    if (a.base == register.NONE) {
+        if (!(a.mode == operand.RELATIVE_PC || (a.mode == operand.OFFSET && (m.forms & operand.ABSOLUTE) != 0))) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.mode == operand.RELATIVE_PC) { ret refuse(field.FORM, op); }
+        val based: err[field.Refusal] = admit_register(codec, m.base, a.base, p, field.NUMBER, field.CLASS, op);
+        if (sel based.err) { ret based; }
+    }
+    if (a.index == register.NONE) {
+        if (a.scale != 0) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.scale >= 8 || ((m.scales >> a.scale) & 1) == 0) { ret refuse(field.FORM, op); }
+        val indexed: err[field.Refusal] = admit_register(codec, m.index, a.index, p, field.INDEX, field.INDEX_CLASS, op);
+        if (sel indexed.err) { ret indexed; }
+        mark(p, field.SCALE, a.scale::u64);
+    }
+    if (a.segment != register.NONE) {
+        var scratch:   field.Parts;
+        val segmented: err[field.Refusal] = admit_register(codec, m.segment, a.segment, ?scratch, field.SEGMENT, field.CLASS, op);
+        if (sel segmented.err) { ret segmented; }
+        mark(p, field.SEGMENT, scratch.bits[field.SEGMENT]);
+    }
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        # a symbolic displacement carries its addend in the symbol
+        if (a.disp != 0) { ret refuse(field.FORM, op); }
+        val placed: err[field.Refusal] = admit_symbol(m.disp.fixup, a.symbol, p, field.DISP, op);
+        if (sel placed.err) { ret placed; }
+    }
+    or {
+        val placed: err[field.Refusal] = admit_immediate(?m.disp, a.disp, p, field.DISP, op);
+        if (sel placed.err) { ret placed; }
+    }
+    mark(p, field.MODE, a.mode::u64);
+    ret err[field.Refusal].ok{};
+}
+
+fun admit_list(codec: *Codec, l: *operand.List, members: operand.Values, p: *field.Parts, op: u8) err[field.Refusal] {
+    if (members.len < l.min::u32 || members.len > l.max::u32) { ret refuse(field.LIST_LENGTH, op); }
+    var first: register.Id = register.NONE;
+    var i:     u32         = 0;
+    for (i < members.len) {
+        val member: *operand.Value = ?members.at[i];
+        if (!sel member.register) { ret refuse(field.WRONG_KIND, op); }
+        var scratch:  field.Parts;
+        val admitted: err[field.Refusal] = admit_register(codec, l.classes, member.register, ?scratch, field.NUMBER, field.CLASS, op);
+        if (sel admitted.err) { ret admitted; }
+        if (i == 0) {
+            mark(p, field.NUMBER, scratch.bits[field.NUMBER]);
+            mark(p, field.CLASS, scratch.bits[field.CLASS]);
+            first = member.register;
+        }
+        or (l.consecutive) {
+            val count: u32 = codec.registers.classes[register.class_of(first)].count;
+            if (register.class_of(member.register) != register.class_of(first) || register.number_of(member.register)::u32 != (register.number_of(first)::u32 + i) % count) {
+                ret refuse(field.NOT_ADJACENT, op);
+            }
+        }
+        i = i + 1;
+    }
+    mark(p, field.COUNT, members.len::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# one value admitted against `shape` into its parts
+fun admit_one(codec: *Codec, shape: *operand.Shape, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+    if (sel shape.register) {
+        if (!sel value.register) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_register(codec, shape.register.classes, value.register, p, field.NUMBER, field.CLASS, op);
+    }
+    if (sel shape.immediate) {
+        if (sel value.symbol)     { ret admit_symbol(shape.immediate.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.immediate) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_immediate(?shape.immediate, value.immediate, p, field.NUMBER, op);
+    }
+    if (sel shape.relative) {
+        if (sel value.symbol)    { ret admit_symbol(shape.relative.offset.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.relative) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_immediate(?shape.relative.offset, value.relative, p, field.NUMBER, op);
+    }
+    if (sel shape.memory) {
+        if (!sel value.memory) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_memory(codec, ?shape.memory, ?value.memory, p, op);
+    }
+    if (sel shape.enumerant) {
+        if (!sel value.enumerant)                               { ret refuse(field.WRONG_KIND, op); }
+        if (!operand.member(?shape.enumerant, value.enumerant)) { ret refuse(field.NOT_A_MEMBER, op); }
+        mark(p, field.NUMBER, value.enumerant::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.condition) {
+        if (!sel value.condition)                               { ret refuse(field.WRONG_KIND, op); }
+        if (!operand.member(?shape.condition, value.condition)) { ret refuse(field.NOT_A_MEMBER, op); }
+        mark(p, field.NUMBER, value.condition::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.list) {
+        if (!sel value.list) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_list(codec, ?shape.list, value.list, p, op);
+    }
+    if (sel shape.id) {
+        if (sel value.symbol)                          { ret admit_symbol(shape.id.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.id)                             { ret refuse(field.WRONG_KIND, op); }
+        if (value.id::u64 > field.ones(shape.id.bits)) { ret refuse(field.OUT_OF_RANGE, op); }
+        mark(p, field.NUMBER, value.id::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.literal) {
+        if (!sel value.literal) { ret refuse(field.WRONG_KIND, op); }
+        val bytes: operand.Bytes = value.literal;
+        if (bytes.len > shape.literal.max || (shape.literal.content == operand.NUMBER && bytes.len == 0)) { ret refuse(field.LITERAL_LENGTH, op); }
+        if (shape.literal.content == operand.STRING) {
+            var i: u32 = 0;
+            for (i < bytes.len) {
+                if (bytes.at[i] == 0) { ret refuse(field.NUL_IN_STRING, op); }
+                i = i + 1;
+            }
+        }
+        mark(p, field.COUNT, bytes.len::u64);
+        ret err[field.Refusal].ok{};
+    }
+    ret refuse(field.WRONG_KIND, op);
+}
+
+# operand `op`'s value admitted against its row operand into its parts
+fun admit(codec: *Codec, desc: *operand.Operand, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+    if (sel value.none) {
+        if (desc.quantity == operand.OPTIONAL) { ret err[field.Refusal].ok{}; }
+        ret refuse(field.WRONG_KIND, op);
+    }
+    if (desc.quantity != operand.VARIADIC) { ret admit_one(codec, ?desc.shape, value, p, op); }
+    if (!sel value.list)                   { ret refuse(field.WRONG_KIND, op); }
+    val members: operand.Values = value.list;
+    var i:       u32            = 0;
+    for (i < members.len) {
+        var scratch:  field.Parts;
+        val admitted: err[field.Refusal] = admit_one(codec, ?desc.shape, ?members.at[i], ?scratch, op);
+        if (sel admitted.err) { ret admitted; }
+        i = i + 1;
+    }
+    mark(p, field.COUNT, members.len::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# `inst` encoded onto `out`, its symbolic operands appended to `fixups`
+# ---
+# s:   the selection that must admit the row
+# ret: the instruction's length, or the refusal with out and fixups left as they were
+pub fun encode(codec: *Codec, s: *extension.Selection, ins: *inst.Inst, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) res[usize, field.Refusal] {
+    val r: *row.Row = ins.row;
+    if ((r.flags & row.DECODE_ONLY) != 0) { ret res[usize, field.Refusal].err{field.refusal(field.DECODE_ONLY, field.NO_OPERAND, 0)}; }
+    if (!extension.admits(s, r.requires)) { ret res[usize, field.Refusal].err{field.refusal(field.NOT_ADMITTED, field.NO_OPERAND, 0)}; }
+    if (ins.count != r.operands.len)      { ret res[usize, field.Refusal].err{field.refusal(field.OPERAND_COUNT, field.NO_OPERAND, 0)}; }
+    var parts: [row.MAX_OPERANDS]field.Parts;
+    var i:     u32 = 0;
+    for (i < r.operands.len) {
+        val admitted: err[field.Refusal] = admit(codec, ?r.operands.at[i], ?ins.values[i], ?parts[i], i::u8);
+        if (sel admitted.err) { ret res[usize, field.Refusal].err{admitted.err}; }
+        i = i + 1;
+    }
+    var enc: field.Encoder = field.Encoder{
+        table:    codec.fields,
+        operands: r.operands.at,
+        values:   ins.values,
+        parts:    ?parts[0],
+        count:    r.operands.len,
+        out:      out,
+        fixups:   fixups,
+        start:    out.len,
+        field:    0,
+    };
+    val marked:  usize              = fixups.len;
+    var offsets: [row.MAX_FIELDS]usize;
+    var failed:  opt[field.Refusal] = opt[field.Refusal].none{};
+    var j:       u32                = 0;
+    for (j < r.encoding.len && sel failed.none) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        enc.field  = j;
+        offsets[j] = out.len;
+        val done: err[field.Refusal] = kind.encode(?enc, f);
+        if (sel done.err) { failed = opt[field.Refusal].some{done.err}; }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < r.encoding.len && sel failed.none) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.finish != nil) {
+            enc.field = j;
+            val done: err[field.Refusal] = kind.finish(?enc, f, offsets[j]);
+            if (sel done.err) { failed = opt[field.Refusal].some{done.err}; }
+        }
+        j = j + 1;
+    }
+    if (sel failed.some) {
+        out.len    = enc.start;
+        fixups.len = marked;
+        ret res[usize, field.Refusal].err{failed.some};
+    }
+    ret res[usize, field.Refusal].ok{out.len - enc.start};
+}
+
+# the register at `number` in the class at position `at` of `classes`
+fun settle_register(codec: *Codec, classes: operand.Classes, at: u64, number: u64, op: u8, offset: usize) res[register.Id, field.Refusal] {
+    if (at >= classes.len::u64) { ret res[register.Id, field.Refusal].err{field.refusal(field.NO_REGISTER, op, offset)}; }
+    val c: u16 = classes.at[at];
+    if (number >= codec.registers.classes[c].count::u64) { ret res[register.Id, field.Refusal].err{field.refusal(field.NO_REGISTER, op, offset)}; }
+    ret res[register.Id, field.Refusal].ok{register.make(c, number::u16)};
+}
+
+# the value of the encoded bits `bits` of `imm`
+fun settle_immediate(imm: *operand.Immediate, bits: u64) i64 {
+    var raw: u64 = bits & field.ones(imm.bits);
+    if (imm.format == operand.FLOAT)                                                            { ret raw:~i64; }
+    if (imm.signed && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
+    ret raw:~i64 + imm.bias;
+}
+
+# operand `op`'s decoded parts turned into its value
+fun settle(codec: *Codec, dec: *field.Decoder, op: u8) err[field.Refusal] {
+    val p:    *field.Parts     = ?dec.parts[op];
+    val desc: *operand.Operand = ?dec.operands[op];
+    val at:   usize            = dec.start;
+    # an operand no field holds is implicit, an absent optional one is none, and kinds place literals and variadic operands themselves
+    if (p.direct || p.present == 0 || desc.quantity == operand.VARIADIC || sel desc.shape.literal) { ret err[field.Refusal].ok{}; }
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel shape.register) {
+        val reg: res[register.Id, field.Refusal] = settle_register(codec, shape.register.classes, p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+        if (sel reg.err) { ret err[field.Refusal].err{reg.err}; }
+        dec.values[op] = operand.Value.register{reg.ok};
+    }
+    or (sel shape.immediate) {
+        dec.values[op] = operand.Value.immediate{settle_immediate(?shape.immediate, p.bits[field.NUMBER])};
+    }
+    or (sel shape.relative) {
+        dec.values[op] = operand.Value.relative{settle_immediate(?shape.relative.offset, p.bits[field.NUMBER])};
+    }
+    or (sel shape.memory) {
+        var a: operand.Address;
+        if (field.has(p, field.NUMBER)) {
+            val base: res[register.Id, field.Refusal] = settle_register(codec, shape.memory.base, p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+            if (sel base.err) { ret err[field.Refusal].err{base.err}; }
+            a.base = base.ok;
+        }
+        if (field.has(p, field.INDEX)) {
+            val index: res[register.Id, field.Refusal] = settle_register(codec, shape.memory.index, p.bits[field.INDEX_CLASS], p.bits[field.INDEX], op, at);
+            if (sel index.err) { ret err[field.Refusal].err{index.err}; }
+            a.index = index.ok;
+            a.scale = p.bits[field.SCALE]::u8;
+        }
+        if (field.has(p, field.SEGMENT)) {
+            val segment: res[register.Id, field.Refusal] = settle_register(codec, shape.memory.segment, 0, p.bits[field.SEGMENT], op, at);
+            if (sel segment.err) { ret err[field.Refusal].err{segment.err}; }
+            a.segment = segment.ok;
+        }
+        a.disp         = settle_immediate(?shape.memory.disp, p.bits[field.DISP]);
+        a.mode         = p.bits[field.MODE]::u8;
+        dec.values[op] = operand.Value.memory{a};
+    }
+    or (sel shape.enumerant) {
+        if (!operand.member(?shape.enumerant, p.bits[field.NUMBER]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+        dec.values[op] = operand.Value.enumerant{p.bits[field.NUMBER]::u32};
+    }
+    or (sel shape.condition) {
+        if (!operand.member(?shape.condition, p.bits[field.NUMBER]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+        dec.values[op] = operand.Value.condition{p.bits[field.NUMBER]::u32};
+    }
+    or (sel shape.list) {
+        # a list held by slices is consecutive from its first member
+        val first: res[register.Id, field.Refusal] = settle_register(codec, shape.list.classes, p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+        if (sel first.err) { ret err[field.Refusal].err{first.err}; }
+        val class: u16 = register.class_of(first.ok);
+        val count: u64 = codec.registers.classes[class].count::u64;
+        val len:   u32 = p.bits[field.COUNT]::u32;
+        if (len < shape.list.min::u32 || len > shape.list.max::u32) { ret err[field.Refusal].err{field.refusal(field.LIST_LENGTH, op, at)}; }
+        var members: *operand.Value = nil;
+        var i:       u32            = 0;
+        for (i < len) {
+            val number: u64                                = (p.bits[field.NUMBER] + i::u64) % count;
+            val slot:   res[*operand.Value, field.Refusal] = field.push(dec, operand.Value.register{register.make(class, number::u16)});
+            if (sel slot.err) { ret err[field.Refusal].err{slot.err}; }
+            if (i == 0)       { members = slot.ok; }
+            i = i + 1;
+        }
+        dec.values[op] = operand.Value.list{operand.Values{at: members, len: len}};
+    }
+    or (sel shape.id) {
+        dec.values[op] = operand.Value.id{p.bits[field.NUMBER]::u32};
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# one instruction of row `r` decoded from `data[at..len]`
+# ---
+# s:     the selection that must admit the row
+# store: storage for the operand values, then for list members
+# cap:   how many values store holds
+# ret:   the instruction, its values in store, and its length, or the refusal
+pub fun decode_row(codec: *Codec, s: *extension.Selection, r: *row.Row, data: *u8, len: usize, at: usize, store: *operand.Value, cap: u32) res[Decoded, field.Refusal] {
+    if (!extension.admits(s, r.requires)) { ret res[Decoded, field.Refusal].err{field.refusal(field.NOT_ADMITTED, field.NO_OPERAND, at)}; }
+    val count: u32 = r.operands.len;
+    if (cap < count) { ret res[Decoded, field.Refusal].err{field.refusal(field.STORAGE, field.NO_OPERAND, at)}; }
+    var parts: [row.MAX_OPERANDS]field.Parts;
+    var i:     u32 = 0;
+    for (i < count) {
+        store[i] = operand.Value.none{};
+        i        = i + 1;
+    }
+    var dec: field.Decoder = field.Decoder{
+        table:    codec.fields,
+        operands: r.operands.at,
+        values:   store,
+        parts:    ?parts[0],
+        count:    count,
+        in:       field.Stream{data: data, len: len, order: codec.fields.order},
+        start:    at,
+        at:       at,
+        end:      len,
+        declared: false,
+        pool:     ?store[count],
+        used:     0,
+        cap:      cap - count,
+    };
+    var j: u32 = 0;
+    for (j < r.encoding.len) {
+        val f:    *field.Field       = ?r.encoding.at[j];
+        val done: err[field.Refusal] = codec.fields.kinds[f.kind].decode(?dec, f);
+        if (sel done.err) { ret res[Decoded, field.Refusal].err{done.err}; }
+        j = j + 1;
+    }
+    if (dec.declared && dec.at != dec.end) { ret res[Decoded, field.Refusal].err{field.refusal(field.LENGTH, field.NO_OPERAND, dec.at)}; }
+    i = 0;
+    for (i < count) {
+        val settled: err[field.Refusal] = settle(codec, ?dec, i::u8);
+        if (sel settled.err) { ret res[Decoded, field.Refusal].err{settled.err}; }
+        i = i + 1;
+    }
+    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count}, len: dec.at - at}};
+}
+
+# the entry of `node` whose value is `key`
+fun search(d: *Dispatch, node: *Node, key: u64) opt[*Entry] {
+    var lo: u32 = node.first;
+    var hi: u32 = node.first + node.count;
+    for (lo < hi) {
+        val mid: u32    = lo + (hi - lo) / 2;
+        val e:   *Entry = ?d.entries[mid];
+        if (e.value == key) { ret opt[*Entry].some{e}; }
+        if (e.value < key)  { lo = mid + 1; }
+        or                  { hi = mid; }
+    }
+    ret opt[*Entry].none{};
+}
+
+# one instruction decoded from `data[at..len]`, its row found by the codec's dispatch
+# ---
+# s:     the selection whose admitted rows are candidates
+# store: storage for the operand values, then for list members
+# cap:   how many values store holds
+# ret:   the first admitted candidate that decodes, or the first admitted candidate's refusal
+pub fun decode(codec: *Codec, s: *extension.Selection, data: *u8, len: usize, at: usize, store: *operand.Value, cap: u32) res[Decoded, field.Refusal] {
+    val d:      *Dispatch    = codec.dispatch;
+    var stream: field.Stream = field.Stream{data: data, len: len, order: codec.fields.order};
+    var node:   *Node        = ?d.nodes[0];
+    for {
+        val key: res[u64, field.Refusal] = d.keys[node.key].extract(?stream, at);
+        if (sel key.err) { ret res[Decoded, field.Refusal].err{key.err}; }
+        val found: opt[*Entry] = search(d, node, key.ok);
+        if (sel found.none) { ret res[Decoded, field.Refusal].err{field.refusal(field.NO_ROW, field.NO_OPERAND, at)}; }
+        val e: *Entry = found.some;
+        if (e.node != 0) {
+            node = ?d.nodes[e.node - 1];
+            cnt;
+        }
+        var first: opt[field.Refusal] = opt[field.Refusal].none{};
+        var i:     u32                = 0;
+        for (i < e.count) {
+            val r: *row.Row = ?d.rows[d.candidates[e.first + i]];
+            if (extension.admits(s, r.requires)) {
+                val got: res[Decoded, field.Refusal] = decode_row(codec, s, r, data, len, at, store, cap);
+                if (sel got.ok)                    { ret got; }
+                if (sel first.none && sel got.err) { first = opt[field.Refusal].some{got.err}; }
+            }
+            i = i + 1;
+        }
+        if (sel first.some) { ret res[Decoded, field.Refusal].err{first.some}; }
+        ret res[Decoded, field.Refusal].err{field.refusal(field.NOT_ADMITTED, field.NO_OPERAND, at)};
+    }
+}
+
+# a minimal table for the tests below: risc-v-like words and a compressed
+# halfword, and a wasm-like opcode byte with a leb128 immediate
+#[testing]
+val T_REGISTER_CLASSES: [2]register.Class = [2]register.Class{
+    register.Class{kind: register.GENERAL, width: register.Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
+    register.Class{kind: register.FLOAT, width: register.Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
+};
+
+#[testing]
+val T_REGISTERS: register.File = register.File{
+    scales:         nil,
+    scale_count:    0,
+    classes:        ?T_REGISTER_CLASSES[0],
+    class_count:    2,
+    registers:      nil,
+    register_count: 0,
+    aliases:        nil,
+    alias_count:    0,
+    columns:        nil,
+    column_count:   0,
+};
+
+#[testing]
+val T_GPR: [1]u16 = [1]u16{0};
+
+# unsigned leb128 of the field's operand
+#[testing]
+fun t_leb_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    var v: u64 = enc.parts[f.operand].bits[field.NUMBER];
+    for {
+        var b: u64 = v & 0x7F;
+        v = v >> 7;
+        if (v != 0) { b = b | 0x80; }
+        val put: err[field.Refusal] = field.put(enc, b, 1);
+        if (sel put.err) { ret put; }
+        if (v == 0)      { ret put; }
+    }
+}
+
+#[testing]
+fun t_leb_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    var shift: u8 = 0;
+    for (shift < 64) {
+        val b: res[u64, field.Refusal] = field.get(dec, 1);
+        if (sel b.err) { ret err[field.Refusal].err{b.err}; }
+        field.deposit(dec, f.operand, field.NUMBER, b.ok & 0x7F, shift);
+        if ((b.ok & 0x80) == 0) { ret err[field.Refusal].ok{}; }
+        shift = shift + 7;
+    }
+    ret err[field.Refusal].err{field.refusal(field.OUT_OF_RANGE, f.operand, dec.at)};
+}
+
+#[testing]
+val T_LEB: field.Kind = field.Kind{name: "leb128", encode: t_leb_encode, decode: t_leb_decode, finish: nil};
+
+#[testing]
+val T_KINDS: [2]*field.Kind = [2]*field.Kind{?field.UNIT, ?T_LEB};
+
+#[testing]
+val T_FIELDS: field.Table = field.Table{kinds: ?T_KINDS[0], count: 2, order: field.LITTLE};
+
+#[testing]
+val T_ADDI_OPERANDS: [3]operand.Operand = [3]operand.Operand{
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}}}, role: operand.WRITE, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}}}, role: operand.READ, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.immediate{operand.Immediate{bits: 12, signed: true, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER}}, role: operand.READ, width: 64, quantity: operand.ONE},
+};
+
+#[testing]
+val T_ADDI_SLICES: [3]field.Slice = [3]field.Slice{
+    field.Slice{operand: 0, part: field.NUMBER, lo: 0, len: 5, at: 7, invert: false},
+    field.Slice{operand: 1, part: field.NUMBER, lo: 0, len: 5, at: 15, invert: false},
+    field.Slice{operand: 2, part: field.NUMBER, lo: 0, len: 12, at: 20, invert: false},
+};
+
+#[testing]
+val T_ADDI_FIELDS: [1]field.Field = [1]field.Field{
+    field.Field{kind: 0, width: 32, fixed: 0x13, mask: 0x707F, slices: field.Slices{at: ?T_ADDI_SLICES[0], len: 3}, operand: field.NO_OPERAND, param: 0},
+};
+
+#[testing]
+val T_BEQ_OPERANDS: [3]operand.Operand = [3]operand.Operand{
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}}}, role: operand.READ, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}}}, role: operand.READ, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.relative{operand.Relative{offset: operand.Immediate{bits: 13, signed: true, scale: 1, bias: 0, fixup: 1, format: operand.INTEGER}, anchor: operand.START}}, role: operand.NONE, width: 0, quantity: operand.ONE},
+};
+
+# the b immediate: offset bits 12, 10 to 5, 4 to 1 and 11
+#[testing]
+val T_BEQ_SLICES: [6]field.Slice = [6]field.Slice{
+    field.Slice{operand: 0, part: field.NUMBER, lo: 0, len: 5, at: 15, invert: false},
+    field.Slice{operand: 1, part: field.NUMBER, lo: 0, len: 5, at: 20, invert: false},
+    field.Slice{operand: 2, part: field.NUMBER, lo: 12, len: 1, at: 31, invert: false},
+    field.Slice{operand: 2, part: field.NUMBER, lo: 5, len: 6, at: 25, invert: false},
+    field.Slice{operand: 2, part: field.NUMBER, lo: 1, len: 4, at: 8, invert: false},
+    field.Slice{operand: 2, part: field.NUMBER, lo: 11, len: 1, at: 7, invert: false},
+};
+
+#[testing]
+val T_BEQ_FIELDS: [1]field.Field = [1]field.Field{
+    field.Field{kind: 0, width: 32, fixed: 0x63, mask: 0x707F, slices: field.Slices{at: ?T_BEQ_SLICES[0], len: 6}, operand: field.NO_OPERAND, param: 0},
+};
+
+#[testing]
+val T_CLI_OPERANDS: [2]operand.Operand = [2]operand.Operand{
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}}}, role: operand.WRITE, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.immediate{operand.Immediate{bits: 6, signed: true, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER}}, role: operand.READ, width: 64, quantity: operand.ONE},
+};
+
+#[testing]
+val T_CLI_SLICES: [3]field.Slice = [3]field.Slice{
+    field.Slice{operand: 0, part: field.NUMBER, lo: 0, len: 5, at: 7, invert: false},
+    field.Slice{operand: 1, part: field.NUMBER, lo: 0, len: 5, at: 2, invert: false},
+    field.Slice{operand: 1, part: field.NUMBER, lo: 5, len: 1, at: 12, invert: false},
+};
+
+#[testing]
+val T_CLI_FIELDS: [1]field.Field = [1]field.Field{
+    field.Field{kind: 0, width: 16, fixed: 0x4001, mask: 0xE003, slices: field.Slices{at: ?T_CLI_SLICES[0], len: 3}, operand: field.NO_OPERAND, param: 0},
+};
+
+#[testing]
+val T_CONST_OPERANDS: [1]operand.Operand = [1]operand.Operand{
+    operand.Operand{shape: operand.Shape.immediate{operand.Immediate{bits: 32, signed: false, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER}}, role: operand.READ, width: 32, quantity: operand.ONE},
+};
+
+#[testing]
+val T_CONST_FIELDS: [2]field.Field = [2]field.Field{
+    field.Field{kind: 0, width: 8, fixed: 0x41, mask: 0xFF, slices: field.Slices{at: nil, len: 0}, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 1, width: 0, fixed: 0, mask: 0, slices: field.Slices{at: nil, len: 0}, operand: 0, param: 0},
+};
+
+#[testing]
+val T_C: [1]extension.Id = [1]extension.Id{1};
+
+#[testing]
+val T_ROWS: [4]row.Row = [4]row.Row{
+    row.Row{mnemonic: "addi", operands: row.Operands{at: ?T_ADDI_OPERANDS[0], len: 3}, encoding: field.Fields{at: ?T_ADDI_FIELDS[0], len: 1}, requires: extension.Ids{at: nil, len: 0}, flags: 0},
+    row.Row{mnemonic: "beq", operands: row.Operands{at: ?T_BEQ_OPERANDS[0], len: 3}, encoding: field.Fields{at: ?T_BEQ_FIELDS[0], len: 1}, requires: extension.Ids{at: nil, len: 0}, flags: 0},
+    row.Row{mnemonic: "c.li", operands: row.Operands{at: ?T_CLI_OPERANDS[0], len: 2}, encoding: field.Fields{at: ?T_CLI_FIELDS[0], len: 1}, requires: extension.Ids{at: ?T_C[0], len: 1}, flags: 0},
+    row.Row{mnemonic: "const", operands: row.Operands{at: ?T_CONST_OPERANDS[0], len: 1}, encoding: field.Fields{at: ?T_CONST_FIELDS[0], len: 2}, requires: extension.Ids{at: nil, len: 0}, flags: 0},
+};
+
+# the length class of a risc-v instruction, from its low two bits
+#[testing]
+fun t_key_length(s: *field.Stream, at: usize) res[u64, field.Refusal] {
+    val half: res[u64, field.Refusal] = field.read(s, at, 2);
+    if (sel half.err) { ret half; }
+    ret res[u64, field.Refusal].ok{half.ok & 3};
+}
+
+#[testing]
+fun t_key_opcode(s: *field.Stream, at: usize) res[u64, field.Refusal] {
+    val word: res[u64, field.Refusal] = field.read(s, at, 4);
+    if (sel word.err) { ret word; }
+    ret res[u64, field.Refusal].ok{word.ok & 0x7F};
+}
+
+#[testing]
+fun t_key_funct3(s: *field.Stream, at: usize) res[u64, field.Refusal] {
+    val half: res[u64, field.Refusal] = field.read(s, at, 2);
+    if (sel half.err) { ret half; }
+    ret res[u64, field.Refusal].ok{(half.ok >> 13) & 7};
+}
+
+#[testing]
+val T_KEYS: [3]Key = [3]Key{
+    Key{name: "length", extract: t_key_length},
+    Key{name: "opcode", extract: t_key_opcode},
+    Key{name: "funct3", extract: t_key_funct3},
+};
+
+# the root splits halfwords from words, then each reads its own key
+#[testing]
+val T_NODES: [3]Node = [3]Node{
+    Node{key: 0, first: 0, count: 2},
+    Node{key: 2, first: 2, count: 1},
+    Node{key: 1, first: 3, count: 2},
+};
+
+#[testing]
+val T_ENTRIES: [5]Entry = [5]Entry{
+    Entry{value: 1, node: 2, first: 0, count: 0},
+    Entry{value: 3, node: 3, first: 0, count: 0},
+    Entry{value: 2, node: 0, first: 0, count: 1},
+    Entry{value: 0x13, node: 0, first: 1, count: 1},
+    Entry{value: 0x63, node: 0, first: 2, count: 1},
+};
+
+#[testing]
+val T_CANDIDATES: [3]u32 = [3]u32{2, 0, 1};
+
+#[testing]
+val T_DISPATCH: Dispatch = Dispatch{keys: ?T_KEYS[0], nodes: ?T_NODES[0], entries: ?T_ENTRIES[0], candidates: ?T_CANDIDATES[0], rows: ?T_ROWS[0]};
+
+#[testing]
+val T_CODEC: Codec = Codec{fields: ?T_FIELDS, registers: ?T_REGISTERS, dispatch: ?T_DISPATCH};
+
+#[testing]
+val T_EXTENSIONS: [2]extension.Extension = [2]extension.Extension{
+    extension.Extension{name: "i", implies: extension.Ids{at: nil, len: 0}, revision: "2.1"},
+    extension.Extension{name: "c", implies: extension.Ids{at: nil, len: 0}, revision: "2.0"},
+};
+
+#[testing]
+val T_CATALOG: extension.Catalog = extension.Catalog{extensions: ?T_EXTENSIONS[0], count: 2, levels: nil, level_count: 0, conflicts: nil, conflict_count: 0, syntax: ?extension.LIST};
+
+# a test's selection and output buffers
+#[testing]
+rec T {
+    t:      testing.Testing;
+    s:      extension.Selection;
+    out:    vector.Vector[u8];
+    fixups: vector.Vector[field.Fixup];
+}
+
+#[testing]
+fun t_make(t: *T) bool {
+    testing.make(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t.t), ?T_CATALOG, "i,c");
+    if (sel made.err) { ret false; }
+    t.s      = made.ok;
+    t.out    = vector.init[u8](testing.allocator_of(?t.t));
+    t.fixups = vector.init[field.Fixup](testing.allocator_of(?t.t));
+    ret true;
+}
+
+#[testing]
+fun t_encode(t: *T, r: u32, values: *operand.Value, count: u32) res[usize, field.Refusal] {
+    var ins: inst.Inst = inst.Inst{row: ?T_ROWS[r], values: values, count: count};
+    ret encode(?T_CODEC, ?t.s, ?ins, ?t.out, ?t.fixups);
+}
+
+# whether the output is exactly `want`
+#[testing]
+fun t_wrote(t: *T, want: *u8, len: usize) bool {
+    if (t.out.len != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (t.out.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_refused(got: res[usize, field.Refusal], message: str, op: u8) bool {
+    ret sel got.err && (got.err.message == message && got.err.operand == op);
+}
+
+test encode__an_immediate_out_of_range_is_refused {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    var values: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(0, 1)}, operand.Value.register{register.make(0, 2)}, operand.Value.immediate{2048}};
+    if (!t_refused(t_encode(?t, 0, ?values[0], 3), field.OUT_OF_RANGE, 2)) { ret 2; }
+    values[2] = operand.Value.immediate{-2049};
+    if (!t_refused(t_encode(?t, 0, ?values[0], 3), field.OUT_OF_RANGE, 2)) { ret 3; }
+    if (t.out.len != 0)                                                    { ret 4; }
+    ret 0;
+}
+
+test encode__a_misaligned_scaled_immediate_is_refused {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val values: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(0, 1)}, operand.Value.register{register.make(0, 2)}, operand.Value.relative{3}};
+    if (!t_refused(t_encode(?t, 1, ?values[0], 3), field.MISALIGNED, 2)) { ret 2; }
+    ret 0;
+}
+
+test encode__a_register_of_the_wrong_class_is_refused {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val values: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(1, 1)}, operand.Value.register{register.make(0, 2)}, operand.Value.immediate{0}};
+    if (!t_refused(t_encode(?t, 0, ?values[0], 3), field.WRONG_CLASS, 0)) { ret 2; }
+    ret 0;
+}
+
+test walk__signed_boundary_values_encode_and_decode {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val bounds: [2]i64 = [2]i64{-2048, 2047};
+    val want:   [8]u8  = [8]u8{0x93, 0x00, 0x01, 0x80, 0x93, 0x00, 0xF1, 0x7F};
+    var i:      u32    = 0;
+    for (i < 2) {
+        val values: [3]operand.Value          = [3]operand.Value{operand.Value.register{register.make(0, 1)}, operand.Value.register{register.make(0, 2)}, operand.Value.immediate{bounds[i]}};
+        val wrote:  res[usize, field.Refusal] = t_encode(?t, 0, ?values[0], 3);
+        if (!(sel wrote.ok && wrote.ok == 4)) { ret 2; }
+        i = i + 1;
+    }
+    if (!t_wrote(?t, ?want[0], 8)) { ret 3; }
+    var store: [3]operand.Value;
+    i = 0;
+    for (i < 2) {
+        val got: res[Decoded, field.Refusal] = decode_row(?T_CODEC, ?t.s, ?T_ROWS[0], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        if (sel got.err)                                                          { ret 4; }
+        if (!(sel store[2].immediate && store[2].immediate == bounds[i]))         { ret 5; }
+        if (!(sel store[0].register && store[0].register == register.make(0, 1))) { ret 6; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test walk__a_split_immediate_reassembles {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val offsets: [2]i64 = [2]i64{2730, -4096};
+    val want:    [8]u8  = [8]u8{0xE3, 0x85, 0x20, 0x2A, 0x63, 0x80, 0x20, 0x80};
+    var i:       u32    = 0;
+    for (i < 2) {
+        val values: [3]operand.Value          = [3]operand.Value{operand.Value.register{register.make(0, 1)}, operand.Value.register{register.make(0, 2)}, operand.Value.relative{offsets[i]}};
+        val wrote:  res[usize, field.Refusal] = t_encode(?t, 1, ?values[0], 3);
+        if (sel wrote.err) { ret 2; }
+        i = i + 1;
+    }
+    if (!t_wrote(?t, ?want[0], 8)) { ret 3; }
+    var store: [3]operand.Value;
+    i = 0;
+    for (i < 2) {
+        val got: res[Decoded, field.Refusal] = decode_row(?T_CODEC, ?t.s, ?T_ROWS[1], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        if (sel got.err)                                                 { ret 4; }
+        if (!(sel store[2].relative && store[2].relative == offsets[i])) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test decode_row__fixed_bits_that_do_not_match_refuse {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val beq:   [4]u8                       = [4]u8{0xE3, 0x85, 0x20, 0x2A};
+    var store: [3]operand.Value;
+    val got:   res[Decoded, field.Refusal] = decode_row(?T_CODEC, ?t.s, ?T_ROWS[0], ?beq[0], 4, 0, ?store[0], 3);
+    if (!(sel got.err && got.err.message == field.MISMATCH)) { ret 2; }
+    ret 0;
+}
+
+test decode__a_truncated_stream_is_refused {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val addi:  [3]u8                       = [3]u8{0x93, 0x00, 0x01};
+    var store: [3]operand.Value;
+    val got:   res[Decoded, field.Refusal] = decode(?T_CODEC, ?t.s, ?addi[0], 3, 0, ?store[0], 3);
+    if (!(sel got.err && got.err.message == field.TRUNCATED)) { ret 2; }
+    val row: res[Decoded, field.Refusal] = decode_row(?T_CODEC, ?t.s, ?T_ROWS[0], ?addi[0], 3, 0, ?store[0], 3);
+    if (!(sel row.err && row.err.message == field.TRUNCATED)) { ret 3; }
+    ret 0;
+}
+
+test walk__a_variable_length_field_reports_its_length {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    val consts: [2]i64   = [2]i64{5, 300};
+    val lens:   [2]usize = [2]usize{2, 3};
+    var i:      u32      = 0;
+    for (i < 2) {
+        val values: [1]operand.Value          = [1]operand.Value{operand.Value.immediate{consts[i]}};
+        val wrote:  res[usize, field.Refusal] = t_encode(?t, 3, ?values[0], 1);
+        if (!(sel wrote.ok && wrote.ok == lens[i])) { ret 2; }
+        i = i + 1;
+    }
+    val want: [5]u8 = [5]u8{0x41, 0x05, 0x41, 0xAC, 0x02};
+    if (!t_wrote(?t, ?want[0], 5)) { ret 3; }
+    var store: [1]operand.Value;
+    val got:   res[Decoded, field.Refusal] = decode_row(?T_CODEC, ?t.s, ?T_ROWS[3], t.out.data, t.out.len, 2, ?store[0], 1);
+    if (!(sel got.ok && got.ok.len == 3))                       { ret 4; }
+    if (!(sel store[0].immediate && store[0].immediate == 300)) { ret 5; }
+    ret 0;
+}
+
+test decode__dispatch_selects_the_row_whose_fixed_bits_match {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    # c.li a0, -1, then addi x1, x2, 2047, then beq x1, x2, 2730
+    val stream: [10]u8 = [10]u8{0x7D, 0x55, 0x93, 0x00, 0xF1, 0x7F, 0xE3, 0x85, 0x20, 0x2A};
+    val rows:   [3]u32 = [3]u32{2, 0, 1};
+    var store:  [3]operand.Value;
+    var at:     usize  = 0;
+    var i:      u32    = 0;
+    for (i < 3) {
+        val got: res[Decoded, field.Refusal] = decode(?T_CODEC, ?t.s, ?stream[0], 10, at, ?store[0], 3);
+        if (sel got.err)                         { ret 2; }
+        if (got.ok.inst.row != ?T_ROWS[rows[i]]) { ret 3; }
+        at = at + got.ok.len;
+        i  = i + 1;
+    }
+    if (at != 10)                                                             { ret 4; }
+    if (!(sel store[0].register && store[0].register == register.make(0, 1))) { ret 5; }
+    ret 0;
+}
