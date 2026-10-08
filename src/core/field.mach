@@ -1,0 +1,414 @@
+# the field-kind contract every instruction set fills in
+#
+# a row's encoding is a sequence of fields, each a use of one kind from its
+# set's field table. a kind writes its piece of the instruction into a byte
+# stream and reads it back, reporting its length by how far it moves. most
+# fields are units: a fixed width of bits holding fixed bits and slices of
+# operands, which `UNIT` and the `pack` and `unpack` helpers serve. a kind
+# whose length or presence depends on values, such as an x86 memory operand,
+# a legacy prefix run or a leb128, owns that logic itself. kinds read and
+# deposit operand parts, so fields can be walked in any order on decode.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.operand;
+
+# the byte order units are written in
+pub def Order: u8;
+
+pub val LITTLE: Order = 0;
+pub val BIG:    Order = 1;
+
+# the operand index that names no operand
+pub val NO_OPERAND: u8 = 0xFF;
+
+# a part of an operand a slice addresses
+# ---
+# NUMBER:      a register's number, the encoded bits of an immediate, relative target, enumerant, condition or id, a memory base's number, or a list's first member's number
+# CLASS:       the position of a register's class in its operand's class list, or a memory base's
+# INDEX:       a memory index's number
+# COUNT:       a list's length, sharing INDEX's slot as no list has an index
+# INDEX_CLASS: the position of a memory index's class in its list
+# SCALE:       a memory index's scale as a power of two
+# DISP:        a memory displacement's encoded bits
+# SEGMENT:     a memory segment override's number
+# MODE:        a memory operand's addressing mode
+pub def Part: u8;
+
+pub val NUMBER:      Part = 0;
+pub val CLASS:       Part = 1;
+pub val INDEX:       Part = 2;
+pub val COUNT:       Part = 2;
+pub val INDEX_CLASS: Part = 3;
+pub val SCALE:       Part = 4;
+pub val DISP:        Part = 5;
+pub val SEGMENT:     Part = 6;
+pub val MODE:        Part = 7;
+
+pub val PARTS: u32 = 8;
+
+# bits `lo` to `lo + len - 1` of an operand's part at bits `at` up of a unit
+# ---
+# operand: the operand index in the row
+# part:    the part of the operand
+# lo:      the lowest bit of the part taken
+# len:     how many bits are taken
+# at:      the bit of the unit the lowest bit lands on
+# invert:  whether the bits are stored inverted, as x86's vvvv and evex r'
+pub rec Slice {
+    operand: u8;
+    part:    Part;
+    lo:      u8;
+    len:     u8;
+    at:      u8;
+    invert:  bool;
+}
+
+# slices as a pointer to static slices and a count
+pub rec Slices {
+    at:  *Slice;
+    len: u32;
+}
+
+# one field of a row's encoding
+# ---
+# kind:    the kind's row in the set's field table
+# width:   the bits of the unit a unit kind packs, a multiple of 8 up to 64
+# fixed:   the bits the row fixes, under mask
+# mask:    which bits of the unit are fixed
+# slices:  where operand parts land in the unit
+# operand: the operand a compound kind encodes whole, NO_OPERAND when none
+# param:   a parameter the kind defines, such as an evex disp8 scale
+pub rec Field {
+    kind:    u16;
+    width:   u8;
+    fixed:   u64;
+    mask:    u64;
+    slices:  Slices;
+    operand: u8;
+    param:   u64;
+}
+
+# fields as a pointer to static fields and a count
+pub rec Fields {
+    at:  *Field;
+    len: u32;
+}
+
+# why an encode or decode was refused
+# ---
+# message: the diagnostic, one of the wordings below or a set's own
+# operand: the operand refused, NO_OPERAND when the refusal is not about one
+# at:      the byte offset in the stream the refusal is at
+pub rec Refusal {
+    message: str;
+    operand: u8;
+    at:      usize;
+}
+
+pub val OUT_OF_RANGE:  str = "value out of range";
+pub val MISALIGNED:    str = "value is not a multiple of the operand's scale";
+pub val WRONG_CLASS:   str = "register of the wrong class";
+pub val WRONG_KIND:    str = "operand of the wrong kind";
+pub val NO_REGISTER:   str = "no register has this number in its class";
+pub val NOT_A_MEMBER:  str = "value is not one the operand names";
+pub val FORM:          str = "addressing form not admitted";
+pub val NO_SYMBOL:     str = "operand admits no symbol";
+pub val LIST_LENGTH:   str = "list length out of range";
+pub val NOT_ADJACENT:  str = "list members are not consecutive";
+pub val OPERAND_COUNT: str = "wrong number of operands";
+pub val MISMATCH:      str = "fixed bits do not match";
+pub val TRUNCATED:     str = "stream ends inside the instruction";
+pub val LENGTH:        str = "instruction length disagrees with its fields";
+pub val NO_ROW:        str = "no row encodes these bytes";
+pub val NOT_ADMITTED:  str = "instruction not admitted by the selection";
+pub val DECODE_ONLY:   str = "row is decode-only";
+pub val STORAGE:       str = "operand storage exhausted";
+pub val MEMORY:        str = "out of memory";
+
+# a set's field kind: how one piece of an instruction is written and read
+# ---
+# name:   the name diagnostics and generators spell
+# encode: writes the field for the instruction's operands
+# decode: reads the field and deposits its operand parts
+# finish: nil, or patches the field at the given offset once the instruction's length is known
+pub rec Kind {
+    name:   str;
+    encode: fun(*Encoder, *Field) err[Refusal];
+    decode: fun(*Decoder, *Field) err[Refusal];
+    finish: fun(*Encoder, *Field, usize) err[Refusal];
+}
+
+# a set's field table
+# ---
+# kinds: the kinds, each field naming one by its index, held by pointer so a table can hold another module's kind
+# count: how many kinds there are
+# order: the byte order of its units
+pub rec Table {
+    kinds: **Kind;
+    count: u32;
+    order: Order;
+}
+
+# bytes to decode from
+pub rec Stream {
+    data:  *u8;
+    len:   usize;
+    order: Order;
+}
+
+# the encoded parts of one operand during a walk
+# ---
+# bits:     each part's bits
+# present:  one bit per part a value or a field set
+# symbolic: whether the value is a symbol, encoded as zero and left to a fixup
+# recorded: whether its fixup has been recorded
+# direct:   whether a kind wrote the decoded value itself
+# fixup:    the fixup kind a symbolic value takes
+# symbol:   the symbol a symbolic value refers to
+pub rec Parts {
+    bits:     [8]u64;
+    present:  u8;
+    symbolic: bool;
+    recorded: bool;
+    direct:   bool;
+    fixup:    operand.FixupKind;
+    symbol:   operand.Symbol;
+}
+
+# a symbolic operand left for the builder to resolve or relocate
+# ---
+# kind:    the set-local fixup kind
+# operand: the operand it fills
+# field:   the field holding it
+# offset:  the byte offset of the bytes it patches, from the instruction's start
+# symbol:  the symbol
+# addend:  added to the symbol's value
+pub rec Fixup {
+    kind:    operand.FixupKind;
+    operand: u8;
+    field:   u32;
+    offset:  usize;
+    symbol:  u32;
+    addend:  i64;
+}
+
+# the state an encode walk hands each kind
+# ---
+# table:    the set's field table
+# operands: the row's operands
+# values:   the instruction's values, one per operand
+# parts:    the encoded parts, one per operand
+# count:    how many operands there are
+# out:      the stream written to
+# fixups:   where symbolic operands are recorded
+# start:    the instruction's offset in out
+# field:    the index of the field being encoded
+pub rec Encoder {
+    table:    *Table;
+    operands: *operand.Operand;
+    values:   *operand.Value;
+    parts:    *Parts;
+    count:    u32;
+    out:      *vector.Vector[u8];
+    fixups:   *vector.Vector[Fixup];
+    start:    usize;
+    field:    u32;
+}
+
+# the state a decode walk hands each kind
+# ---
+# table:    the set's field table
+# operands: the row's operands
+# values:   the decoded values, one per operand
+# parts:    the decoded parts, one per operand
+# count:    how many operands there are
+# in:       the stream read from
+# start:    the instruction's offset in the stream
+# at:       the offset of the next byte to read
+# end:      the offset reads stop at, the stream's end until a field declares the length
+# declared: whether a field declared the instruction's length
+# pool:     storage for list members, after the operand values
+# used:     how many pool slots are taken
+# cap:      how many pool slots there are
+pub rec Decoder {
+    table:    *Table;
+    operands: *operand.Operand;
+    values:   *operand.Value;
+    parts:    *Parts;
+    count:    u32;
+    in:       Stream;
+    start:    usize;
+    at:       usize;
+    end:      usize;
+    declared: bool;
+    pool:     *operand.Value;
+    used:     u32;
+    cap:      u32;
+}
+
+# a refusal of `message` about `op` at byte `at`
+pub fun refusal(message: str, op: u8, at: usize) Refusal {
+    ret Refusal{message: message, operand: op, at: at};
+}
+
+# the low `len` bits set
+pub fun ones(len: u8) u64 {
+    if (len >= 64) { ret ~0::u64; }
+    ret (1::u64 << len) - 1;
+}
+
+# whether `p` holds part `part`
+pub fun has(p: *Parts, part: Part) bool {
+    ret ((p.present >> part) & 1) != 0;
+}
+
+# the `bytes` bytes at `at` of `s` as one unit in its order
+pub fun read(s: *Stream, at: usize, bytes: u8) res[u64, Refusal] {
+    if (at > s.len || s.len - at < bytes::usize) { ret res[u64, Refusal].err{refusal(TRUNCATED, NO_OPERAND, s.len)}; }
+    var unit: u64 = 0;
+    var i:    u8  = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (s.order == BIG) { k = bytes - 1 - i; }
+        unit = unit | (s.data[at + i::usize]::u64 << (k::u64 * 8));
+        i    = i + 1;
+    }
+    ret res[u64, Refusal].ok{unit};
+}
+
+# the low `bytes` bytes of `unit` appended in the table's order
+pub fun put(enc: *Encoder, unit: u64, bytes: u8) err[Refusal] {
+    var i: u8 = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (enc.table.order == BIG) { k = bytes - 1 - i; }
+        val pushed: res[usize, A.Error] = vector.push[u8](enc.out, ((unit >> (k::u64 * 8)) & 0xFF)::u8);
+        if (sel pushed.err) { ret err[Refusal].err{refusal(MEMORY, NO_OPERAND, enc.out.len)}; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the `bytes` bytes at `offset` of the output overwritten with `unit` in the table's order
+pub fun patch(enc: *Encoder, offset: usize, unit: u64, bytes: u8) {
+    var i: u8 = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (enc.table.order == BIG) { k = bytes - 1 - i; }
+        enc.out.data[offset + i::usize] = ((unit >> (k::u64 * 8)) & 0xFF)::u8;
+        i                               = i + 1;
+    }
+}
+
+# the next `bytes` bytes as one unit, without consuming them
+pub fun peek(dec: *Decoder, bytes: u8) res[u64, Refusal] {
+    var bounded: Stream = dec.in;
+    bounded.len = dec.end;
+    ret read(?bounded, dec.at, bytes);
+}
+
+# the next `bytes` bytes as one unit, consumed
+pub fun get(dec: *Decoder, bytes: u8) res[u64, Refusal] {
+    val got: res[u64, Refusal] = peek(dec, bytes);
+    if (sel got.ok) { dec.at = dec.at + bytes::usize; }
+    ret got;
+}
+
+# the fixup of symbolic operand `op` recorded at `offset` from the instruction's start, once per operand
+pub fun fixup(enc: *Encoder, op: u8, offset: usize) err[Refusal] {
+    val p: *Parts = ?enc.parts[op];
+    if (!p.symbolic || p.recorded) { ret err[Refusal].ok{}; }
+    val site:   Fixup               = Fixup{kind: p.fixup, operand: op, field: enc.field, offset: offset, symbol: p.symbol.id, addend: p.symbol.addend};
+    val pushed: res[usize, A.Error] = vector.push[Fixup](enc.fixups, site);
+    if (sel pushed.err) { ret err[Refusal].err{refusal(MEMORY, op, enc.out.len)}; }
+    p.recorded = true;
+    ret err[Refusal].ok{};
+}
+
+# the unit of `f`: its fixed bits and its slices of the operands' parts. a
+# symbolic operand a slice takes is recorded as a fixup at the current offset
+pub fun pack(enc: *Encoder, f: *Field) res[u64, Refusal] {
+    var unit: u64 = f.fixed & f.mask;
+    var i:    u32 = 0;
+    for (i < f.slices.len) {
+        val s:    *Slice = ?f.slices.at[i];
+        val p:    *Parts = ?enc.parts[s.operand];
+        var bits: u64    = (p.bits[s.part] >> s.lo) & ones(s.len);
+        if (s.invert) { bits = bits ^ ones(s.len); }
+        unit = unit | (bits << s.at);
+        val noted: err[Refusal] = fixup(enc, s.operand, enc.out.len - enc.start);
+        if (sel noted.err) { ret res[u64, Refusal].err{noted.err}; }
+        i = i + 1;
+    }
+    ret res[u64, Refusal].ok{unit};
+}
+
+# `bits` deposited into part `part` of operand `op` at bit `lo`
+pub fun deposit(dec: *Decoder, op: u8, part: Part, bits: u64, lo: u8) {
+    val p: *Parts = ?dec.parts[op];
+    p.bits[part] = p.bits[part] | (bits << lo);
+    p.present    = p.present | (1::u8 << part);
+}
+
+# the unit of `f` read at `at`: its fixed bits checked and its slices deposited
+pub fun unpack(dec: *Decoder, f: *Field, unit: u64, at: usize) err[Refusal] {
+    if ((unit & f.mask) != (f.fixed & f.mask)) { ret err[Refusal].err{refusal(MISMATCH, NO_OPERAND, at)}; }
+    var i: u32 = 0;
+    for (i < f.slices.len) {
+        val s:    *Slice = ?f.slices.at[i];
+        var bits: u64    = (unit >> s.at) & ones(s.len);
+        if (s.invert) { bits = bits ^ ones(s.len); }
+        deposit(dec, s.operand, s.part, bits, s.lo);
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the instruction's end declared at `end`, as a spir-v word count declares it
+pub fun limit(dec: *Decoder, end: usize) err[Refusal] {
+    if (end > dec.in.len) { ret err[Refusal].err{refusal(TRUNCATED, NO_OPERAND, dec.in.len)}; }
+    if (end < dec.at)     { ret err[Refusal].err{refusal(LENGTH, NO_OPERAND, dec.at)}; }
+    dec.end      = end;
+    dec.declared = true;
+    ret err[Refusal].ok{};
+}
+
+# operand `op` decoded as `value` by a kind itself, as a list or a variadic operand is
+pub fun place(dec: *Decoder, op: u8, value: operand.Value) {
+    dec.values[op]       = value;
+    dec.parts[op].direct = true;
+}
+
+# a pool slot holding `value`, for the members of a list a kind decodes
+pub fun push(dec: *Decoder, value: operand.Value) res[*operand.Value, Refusal] {
+    if (dec.used >= dec.cap) { ret res[*operand.Value, Refusal].err{refusal(STORAGE, NO_OPERAND, dec.at)}; }
+    val slot: *operand.Value = ?dec.pool[dec.used];
+    @slot    = value;
+    dec.used = dec.used + 1;
+    ret res[*operand.Value, Refusal].ok{slot};
+}
+
+fun unit_encode(enc: *Encoder, f: *Field) err[Refusal] {
+    val unit: res[u64, Refusal] = pack(enc, f);
+    if (sel unit.err) { ret err[Refusal].err{unit.err}; }
+    ret put(enc, unit.ok, f.width / 8);
+}
+
+fun unit_decode(dec: *Decoder, f: *Field) err[Refusal] {
+    val at:   usize             = dec.at;
+    val unit: res[u64, Refusal] = get(dec, f.width / 8);
+    if (sel unit.err) { ret err[Refusal].err{unit.err}; }
+    ret unpack(dec, f, unit.ok, at);
+}
+
+# the kind of a fixed-width unit of fixed bits and slices, which every set's table can hold
+pub val UNIT: Kind = Kind{name: "unit", encode: unit_encode, decode: unit_decode, finish: nil};
