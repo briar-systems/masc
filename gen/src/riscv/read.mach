@@ -1,0 +1,578 @@
+# the reader of riscv-opcodes
+#
+# riscv-opcodes states each instruction as one line of an extension file: its
+# name, its argument fields and its fixed bit ranges. a `$import` line puts an
+# instruction of another file into this file's extension as well, and a
+# `$pseudo_op` line states another encoding over a base instruction of some
+# file. arg_lut.csv names each argument's bit range, and the two csr tables
+# name every csr, the second those that exist only at rv32. the reader turns
+# these into records and refuses a malformed line naming its file and line.
+# it gives the records no meaning: which become rows is the mapping's.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.view.View;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+
+use gen.diag;
+use gen.lines;
+use gen.source;
+
+# what a record is
+# ---
+# STANDARD: an instruction this file defines
+# IMPORT:   an instruction of another file this file's extension holds too
+# PSEUDO:   another encoding over a base instruction of some file
+pub def Kind: u8;
+
+pub val STANDARD: Kind = 0;
+pub val IMPORT:   Kind = 1;
+pub val PSEUDO:   Kind = 2;
+
+# one argument field and its bits
+pub rec Arg {
+    name: str;
+    hi:   u8;
+    lo:   u8;
+}
+
+# one record of an extension file
+# ---
+# kind:  what it is
+# file:  the extension file it is in, by its name, as `rv64_zbb`
+# path:  the file's path in the tree
+# line:  its line
+# name:  the instruction it names, as written
+# args:  its argument fields in the order written
+# match: its fixed bits
+# mask:  which bits are fixed
+# from:  the file of its base, for an import or a pseudo op
+# base:  the name of its base, for an import or a pseudo op
+pub rec Record {
+    kind:  Kind;
+    file:  str;
+    path:  str;
+    line:  u32;
+    name:  str;
+    args:  vector.Vector[str];
+    match: u64;
+    mask:  u64;
+    from:  str;
+    base:  str;
+}
+
+# one named csr
+# ---
+# rv32: whether it exists only at rv32
+pub rec Csr {
+    name:   str;
+    number: u32;
+    rv32:   bool;
+}
+
+# everything the generator reads, each table sorted for search
+# ---
+# args:    every argument field, sorted by name
+# records: every record, in file then line order
+# csrs:    every named csr, in file then line order
+pub rec Source {
+    args:    vector.Vector[Arg];
+    records: vector.Vector[Record];
+    csrs:    vector.Vector[Csr];
+}
+
+pub val ARGS:       str = "arg_lut.csv";
+pub val CSRS:       str = "csrs.csv";
+pub val CSRS32:     str = "csrs32.csv";
+pub val EXTENSIONS: str = "extensions/";
+
+pub val NO_FILE:      str = "file not in the copy";
+pub val MALFORMED:    str = "malformed record";
+pub val NUMBER:       str = "malformed number";
+pub val RANGE:        str = "bit range outside the instruction or reversed";
+pub val TOO_WIDE:     str = "value does not fit its bit range";
+pub val OVERLAP:      str = "bits given twice";
+pub val UNKNOWN_ARG:  str = "argument not in arg_lut.csv";
+pub val ARG_TWICE:    str = "argument named twice in arg_lut.csv";
+pub val UNNAMED_FILE: str = "extension file named outside the copy";
+
+# the argument fields riscv-opcodes adds in its parser rather than in
+# arg_lut.csv (src/riscv_opcodes/constants.py), for the may-be-operations
+val EXTRA: [6]Arg = [6]Arg{
+    Arg{name: "c_mop_t", hi: 10, lo: 8},
+    Arg{name: "mop_r_t_21_20", hi: 21, lo: 20},
+    Arg{name: "mop_r_t_27_26", hi: 27, lo: 26},
+    Arg{name: "mop_r_t_30", hi: 30, lo: 30},
+    Arg{name: "mop_rr_t_27_26", hi: 27, lo: 26},
+    Arg{name: "mop_rr_t_30", hi: 30, lo: 30},
+};
+
+# whether a push was given its storage
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun memory(l: *lines.Line) diag.Refusal {
+    ret lines.refuse(l, diag.MEMORY, nil);
+}
+
+fun owned(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    val got: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel got.err) { ret res[str, diag.Refusal].err{memory(l)}; }
+    ret res[str, diag.Refusal].ok{got.ok};
+}
+
+fun digit(c: u8, radix: u64) opt[u64] {
+    var d: u64 = 99;
+    if (c >= '0' && c <= '9') { d = (c - '0')::u64; }
+    or (c >= 'a' && c <= 'f') { d = (c - 'a')::u64 + 10; }
+    or (c >= 'A' && c <= 'F') { d = (c - 'A')::u64 + 10; }
+    if (d >= radix)           { ret opt[u64].none{}; }
+    ret opt[u64].some{d};
+}
+
+# the number `v` spells in decimal, or in hex or binary after `0x` or `0b`
+pub fun number(v: View) opt[u64] {
+    var radix: u64   = 10;
+    var at:    usize = 0;
+    if (v.len > 2 && v.data[0] == '0' && (v.data[1] == 'x' || v.data[1] == 'X')) {
+        radix = 16;
+        at    = 2;
+    }
+    or (v.len > 2 && v.data[0] == '0' && (v.data[1] == 'b' || v.data[1] == 'B')) {
+        radix = 2;
+        at    = 2;
+    }
+    if (at >= v.len) { ret opt[u64].none{}; }
+    var n: u64 = 0;
+    for (at < v.len) {
+        val d: opt[u64] = digit(v.data[at], radix);
+        if (sel d.none)                     { ret opt[u64].none{}; }
+        if (n > (~0::u64 - d.some) / radix) { ret opt[u64].none{}; }
+        n  = n * radix + d.some;
+        at = at + 1;
+    }
+    ret opt[u64].some{n};
+}
+
+fun by_name(x: *Arg, y: *Arg) i64 {
+    ret str_compare(x.name, y.name);
+}
+
+# the argument `name` of `args`, sorted by name
+pub fun arg(args: *vector.Vector[Arg], name: str) opt[*Arg] {
+    var lo: usize = 0;
+    var hi: usize = args.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = str_compare(args.data[mid].name, name);
+        if (c == 0) { ret opt[*Arg].some{?args.data[mid]}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[*Arg].none{};
+}
+
+fun ones(len: u64) u64 {
+    if (len >= 64) { ret ~0::u64; }
+    ret (1::u64 << len) - 1;
+}
+
+# the view of `v` from `at` for `len` bytes
+fun part(v: View, at: usize, len: usize) View {
+    ret view(?v.data[at], len);
+}
+
+# the position of the first `c` in `v`, none when it has none
+fun find(v: View, c: u8) opt[usize] {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == c) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the fixed bits `token` states into `r`, or none when it is an argument
+fun fixed(l: *lines.Line, token: View, r: *Record) res[bool, diag.Refusal] {
+    val eq: opt[usize] = find(token, '=');
+    if (sel eq.none) { ret res[bool, diag.Refusal].ok{false}; }
+    val left:  View       = part(token, 0, eq.some);
+    val right: View       = part(token, eq.some + 1, token.len - eq.some - 1);
+    val value: opt[u64]   = number(right);
+    var hi:    u64        = 0;
+    var lo:    u64        = 0;
+    val dots:  opt[usize] = find(left, '.');
+    if (sel dots.some) {
+        if (dots.some + 1 >= left.len || left.data[dots.some + 1] != '.') { ret res[bool, diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+        val top: opt[u64] = number(part(left, 0, dots.some));
+        val low: opt[u64] = number(part(left, dots.some + 2, left.len - dots.some - 2));
+        if (sel top.none) { ret res[bool, diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+        if (sel low.none) { ret res[bool, diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+        hi = top.some;
+        lo = low.some;
+    }
+    or {
+        val bit: opt[u64] = number(left);
+        # a token such as rs2=rs1 binds one argument to another, which only a pseudo op writes
+        if (sel bit.none) { ret res[bool, diag.Refusal].ok{false}; }
+        hi = bit.some;
+        lo = bit.some;
+    }
+    if (sel value.none)     { ret res[bool, diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+    if (hi < lo || hi > 31) { ret res[bool, diag.Refusal].err{lines.refuse(l, RANGE, nil)}; }
+    val width: u64 = hi - lo + 1;
+    if (value.some > ones(width)) { ret res[bool, diag.Refusal].err{lines.refuse(l, TOO_WIDE, nil)}; }
+    val bits: u64 = ones(width) << lo;
+    if ((r.mask & bits) != 0) { ret res[bool, diag.Refusal].err{lines.refuse(l, OVERLAP, nil)}; }
+    r.mask  = r.mask | bits;
+    r.match = r.match | (value.some << lo);
+    ret res[bool, diag.Refusal].ok{true};
+}
+
+# the fields and fixed bits of `tokens`, from `first`, into `r`, every argument checked against `args`
+fun fields(a: *A.Allocator, l: *lines.Line, args: *vector.Vector[Arg], tokens: *vector.Vector[View], first: usize, r: *Record) err[diag.Refusal] {
+    var taken: u64   = 0;
+    var i:     usize = first;
+    for (i < tokens.len) {
+        val token: View                    = tokens.data[i];
+        val bits:  res[bool, diag.Refusal] = fixed(l, token, r);
+        if (sel bits.err) { ret err[diag.Refusal].err{bits.err}; }
+        if (!bits.ok) {
+            val name: res[str, diag.Refusal] = owned(a, l, token);
+            if (sel name.err) { ret err[diag.Refusal].err{name.err}; }
+            # an argument bound to another, as rs2=rs1, takes the bits of the first
+            var looked: str        = name.ok;
+            val eq:     opt[usize] = find(token, '=');
+            if (sel eq.some) {
+                val left: res[str, diag.Refusal] = owned(a, l, part(token, 0, eq.some));
+                if (sel left.err) { ret err[diag.Refusal].err{left.err}; }
+                looked = left.ok;
+            }
+            val found: opt[*Arg] = arg(args, looked);
+            if (sel found.none) { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN_ARG, name.ok)}; }
+            val bits_of: u64 = ones((found.some.hi - found.some.lo + 1)::u64) << found.some.lo::u64;
+            if (sel eq.none) {
+                if ((taken & bits_of) != 0 || (r.mask & bits_of) != 0) { ret err[diag.Refusal].err{lines.refuse(l, OVERLAP, name.ok)}; }
+                taken = taken | bits_of;
+            }
+            if (!pushed(vector.push[str](?r.args, name.ok))) { ret err[diag.Refusal].err{memory(l)}; }
+        }
+        i = i + 1;
+    }
+    if ((taken & r.mask) != 0) { ret err[diag.Refusal].err{lines.refuse(l, OVERLAP, nil)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the file and name of `token`, written `file::name`
+fun qualified(a: *A.Allocator, l: *lines.Line, token: View, r: *Record) err[diag.Refusal] {
+    var at: usize = 0;
+    for (at + 1 < token.len && !(token.data[at] == ':' && token.data[at + 1] == ':')) {
+        at = at + 1;
+    }
+    if (at == 0 || at + 2 >= token.len) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+    val from: res[str, diag.Refusal] = owned(a, l, part(token, 0, at));
+    if (sel from.err) { ret err[diag.Refusal].err{from.err}; }
+    val base: res[str, diag.Refusal] = owned(a, l, part(token, at + 2, token.len - at - 2));
+    if (sel base.err) { ret err[diag.Refusal].err{base.err}; }
+    r.from = from.ok;
+    r.base = base.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+# the record on line `l` of extension file `file`, its arguments checked against `args`
+pub fun parse(a: *A.Allocator, args: *vector.Vector[Arg], l: *lines.Line, file: str) res[Record, diag.Refusal] {
+    var r:   Record                                 = Record{kind: STANDARD, file: file, path: l.file, line: l.number, name: nil, args: vector.init[str](a), match: 0, mask: 0, from: nil, base: nil};
+    val got: res[vector.Vector[View], diag.Refusal] = lines.tokens(a, l);
+    if (sel got.err) { ret res[Record, diag.Refusal].err{got.err}; }
+    var tokens: vector.Vector[View] = got.ok;
+    var first:  usize               = 1;
+    if (view_eq_str(tokens.data[0], "$import")) {
+        if (tokens.len != 2) { ret res[Record, diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+        r.kind = IMPORT;
+        val q: err[diag.Refusal] = qualified(a, l, tokens.data[1], ?r);
+        if (sel q.err) { ret res[Record, diag.Refusal].err{q.err}; }
+        r.name = r.base;
+        ret res[Record, diag.Refusal].ok{r};
+    }
+    if (view_eq_str(tokens.data[0], "$pseudo_op")) {
+        if (tokens.len < 3) { ret res[Record, diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+        r.kind = PSEUDO;
+        val q: err[diag.Refusal] = qualified(a, l, tokens.data[1], ?r);
+        if (sel q.err) { ret res[Record, diag.Refusal].err{q.err}; }
+        first = 3;
+    }
+    or (tokens.data[0].data[0] == '$') {
+        ret res[Record, diag.Refusal].err{lines.refuse(l, MALFORMED, nil)};
+    }
+    val name: res[str, diag.Refusal] = owned(a, l, tokens.data[first - 1]);
+    if (sel name.err) { ret res[Record, diag.Refusal].err{name.err}; }
+    r.name = name.ok;
+    val laid: err[diag.Refusal] = fields(a, l, args, ?tokens, first, ?r);
+    if (sel laid.err) { ret res[Record, diag.Refusal].err{laid.err}; }
+    ret res[Record, diag.Refusal].ok{r};
+}
+
+# the quoted text `v`, its quotes dropped
+fun unquoted(v: View) View {
+    if (v.len >= 2 && v.data[0] == '"' && v.data[v.len - 1] == '"') { ret part(v, 1, v.len - 2); }
+    ret v;
+}
+
+# the comma separated cells of `l`, each trimmed and unquoted
+fun cells(l: *lines.Line, out: *vector.Vector[View]) err[diag.Refusal] {
+    var at: usize = 0;
+    for (at <= l.text.len) {
+        var end: usize = at;
+        for (end < l.text.len && l.text.data[end] != ',') {
+            end = end + 1;
+        }
+        var s: usize = at;
+        var e: usize = end;
+        for (s < e && (l.text.data[s] == ' ' || l.text.data[s] == '\t')) {
+            s = s + 1;
+        }
+        for (e > s && (l.text.data[e - 1] == ' ' || l.text.data[e - 1] == '\t')) {
+            e = e - 1;
+        }
+        if (!pushed(vector.push[View](out, unquoted(view(?l.text.data[s], e - s))))) { ret err[diag.Refusal].err{memory(l)}; }
+        at = end + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun file_of(t: *source.Tree, path: str) res[*source.File, diag.Refusal] {
+    val f: opt[*source.File] = source.find(t, path);
+    if (sel f.none) { ret res[*source.File, diag.Refusal].err{diag.refusal(path, 0, NO_FILE, nil)}; }
+    ret res[*source.File, diag.Refusal].ok{f.some};
+}
+
+fun read_args(a: *A.Allocator, t: *source.Tree, out: *vector.Vector[Arg]) err[diag.Refusal] {
+    val f: res[*source.File, diag.Refusal] = file_of(t, ARGS);
+    if (sel f.err) { ret err[diag.Refusal].err{f.err}; }
+    val got: res[vector.Vector[lines.Line], diag.Refusal] = lines.read(a, f.ok, '#');
+    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+    var i: usize = 0;
+    for (i < got.ok.len) {
+        val l:     *lines.Line         = ?got.ok.data[i];
+        var cs:    vector.Vector[View] = vector.init[View](a);
+        val split: err[diag.Refusal]   = cells(l, ?cs);
+        if (sel split.err) { ret split; }
+        if (cs.len != 3)   { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+        val hi: opt[u64] = number(cs.data[1]);
+        val lo: opt[u64] = number(cs.data[2]);
+        if (sel hi.none)                       { ret err[diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+        if (sel lo.none)                       { ret err[diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+        if (hi.some < lo.some || hi.some > 31) { ret err[diag.Refusal].err{lines.refuse(l, RANGE, nil)}; }
+        val name: res[str, diag.Refusal] = owned(a, l, cs.data[0]);
+        if (sel name.err)                                                                         { ret err[diag.Refusal].err{name.err}; }
+        if (!pushed(vector.push[Arg](out, Arg{name: name.ok, hi: hi.some::u8, lo: lo.some::u8}))) { ret err[diag.Refusal].err{memory(l)}; }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < 6) {
+        if (!pushed(vector.push[Arg](out, EXTRA[k]))) { ret err[diag.Refusal].err{diag.refusal(ARGS, 0, diag.MEMORY, nil)}; }
+        k = k + 1;
+    }
+    sort.sort_by[Arg](out.data, out.len, by_name);
+    i = 1;
+    for (i < out.len) {
+        if (str_equals(out.data[i - 1].name, out.data[i].name)) { ret err[diag.Refusal].err{diag.refusal(ARGS, 0, ARG_TWICE, out.data[i].name)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun read_csrs(a: *A.Allocator, t: *source.Tree, path: str, rv32: bool, out: *vector.Vector[Csr]) err[diag.Refusal] {
+    val f: res[*source.File, diag.Refusal] = file_of(t, path);
+    if (sel f.err) { ret err[diag.Refusal].err{f.err}; }
+    val got: res[vector.Vector[lines.Line], diag.Refusal] = lines.read(a, f.ok, '#');
+    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+    var i: usize = 0;
+    for (i < got.ok.len) {
+        val l:     *lines.Line         = ?got.ok.data[i];
+        var cs:    vector.Vector[View] = vector.init[View](a);
+        val split: err[diag.Refusal]   = cells(l, ?cs);
+        if (sel split.err) { ret split; }
+        if (cs.len != 2)   { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+        val n: opt[u64] = number(cs.data[0]);
+        if (sel n.none)     { ret err[diag.Refusal].err{lines.refuse(l, NUMBER, nil)}; }
+        if (n.some > 0xFFF) { ret err[diag.Refusal].err{lines.refuse(l, TOO_WIDE, nil)}; }
+        val name: res[str, diag.Refusal] = owned(a, l, cs.data[1]);
+        if (sel name.err)                                                                        { ret err[diag.Refusal].err{name.err}; }
+        if (!pushed(vector.push[Csr](out, Csr{name: name.ok, number: n.some::u32, rv32: rv32}))) { ret err[diag.Refusal].err{memory(l)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# whether tree path `path` is an extension file of the copy, and its name past the directory
+fun extension_name(path: str) opt[str] {
+    if (!str_starts_with(path, EXTENSIONS)) { ret opt[str].none{}; }
+    val name: str   = ?path[str_len(EXTENSIONS)];
+    var i:    usize = 0;
+    for (name[i] != 0) {
+        if (name[i] == '/') { ret opt[str].none{}; }
+        i = i + 1;
+    }
+    if (i == 0) { ret opt[str].none{}; }
+    ret opt[str].some{name};
+}
+
+# the vector segment form of `name` for `nf` fields, riscv-opcodes' own
+# expansion: `seg` and the count go before the name's first `e`
+fun segment(a: *A.Allocator, name: str, nf: u64) res[str, StrError] {
+    var e: usize = 0;
+    for (name[e] != 0 && name[e] != 'e') {
+        e = e + 1;
+    }
+    val head: res[str, StrError] = str_copy_slice(a, name, 0, e);
+    if (sel head.err) { ret head; }
+    var count: [2]u8 = [2]u8{('0' + (nf + 1)::u8), 0};
+    ret str_join(a, head.ok, "seg", ?count[0], ?name[e]);
+}
+
+# a segmented vector memory record, which names nf, as the eight records it stands for
+fun expand(a: *A.Allocator, l: *lines.Line, r: *Record, out: *vector.Vector[Record]) err[diag.Refusal] {
+    var nf: u64 = 0;
+    for (nf < 8) {
+        var each: Record = @r;
+        each.args = vector.init[str](a);
+        var k: usize = 0;
+        for (k < r.args.len) {
+            if (!str_equals(r.args.data[k], "nf")) {
+                if (!pushed(vector.push[str](?each.args, r.args.data[k]))) { ret err[diag.Refusal].err{memory(l)}; }
+            }
+            k = k + 1;
+        }
+        each.mask  = r.mask | (7::u64 << 29);
+        each.match = r.match | (nf << 29);
+        if (nf > 0) {
+            val named: res[str, StrError] = segment(a, r.name, nf);
+            if (sel named.err) { ret err[diag.Refusal].err{memory(l)}; }
+            each.name = named.ok;
+        }
+        if (!pushed(vector.push[Record](out, each))) { ret err[diag.Refusal].err{memory(l)}; }
+        nf = nf + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun names(r: *Record, arg: str) bool {
+    var k: usize = 0;
+    for (k < r.args.len) {
+        if (str_equals(r.args.data[k], arg)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the copy's arguments, extension records and csrs
+pub fun read(a: *A.Allocator, t: *source.Tree) res[Source, diag.Refusal] {
+    var s:    Source            = Source{args: vector.init[Arg](a), records: vector.init[Record](a), csrs: vector.init[Csr](a)};
+    val args: err[diag.Refusal] = read_args(a, t, ?s.args);
+    if (sel args.err) { ret res[Source, diag.Refusal].err{args.err}; }
+    var i: usize = 0;
+    for (i < t.files.len) {
+        val f:    *source.File = ?t.files.data[i];
+        val name: opt[str]     = extension_name(f.path);
+        if (sel name.some) {
+            val got: res[vector.Vector[lines.Line], diag.Refusal] = lines.read(a, f, '#');
+            if (sel got.err) { ret res[Source, diag.Refusal].err{got.err}; }
+            var k: usize = 0;
+            for (k < got.ok.len) {
+                val l: *lines.Line               = ?got.ok.data[k];
+                val r: res[Record, diag.Refusal] = parse(a, ?s.args, l, name.some);
+                if (sel r.err) { ret res[Source, diag.Refusal].err{r.err}; }
+                var record: Record = r.ok;
+                if (record.kind == STANDARD && names(?record, "nf")) {
+                    val expanded: err[diag.Refusal] = expand(a, l, ?record, ?s.records);
+                    if (sel expanded.err) { ret res[Source, diag.Refusal].err{expanded.err}; }
+                }
+                or (!pushed(vector.push[Record](?s.records, record))) {
+                    ret res[Source, diag.Refusal].err{memory(l)};
+                }
+                k = k + 1;
+            }
+        }
+        or (str_starts_with(f.path, EXTENSIONS) && !str_starts_with(f.path, "extensions/unratified/")) {
+            ret res[Source, diag.Refusal].err{diag.refusal(f.path, 0, UNNAMED_FILE, nil)};
+        }
+        i = i + 1;
+    }
+    val csrs: err[diag.Refusal] = read_csrs(a, t, CSRS, false, ?s.csrs);
+    if (sel csrs.err) { ret res[Source, diag.Refusal].err{csrs.err}; }
+    val csrs32: err[diag.Refusal] = read_csrs(a, t, CSRS32, true, ?s.csrs);
+    if (sel csrs32.err) { ret res[Source, diag.Refusal].err{csrs32.err}; }
+    ret res[Source, diag.Refusal].ok{s};
+}
+
+#[testing]
+val T_ARGS: [5]Arg = [5]Arg{
+    Arg{name: "bimm12hi", hi: 31, lo: 25},
+    Arg{name: "bimm12lo", hi: 11, lo: 7},
+    Arg{name: "rd", hi: 11, lo: 7},
+    Arg{name: "rs1", hi: 19, lo: 15},
+    Arg{name: "rs2", hi: 24, lo: 20},
+};
+
+#[testing]
+fun t_args(a: *A.Allocator) vector.Vector[Arg] {
+    var args: vector.Vector[Arg] = vector.init[Arg](a);
+    var i:    u32                = 0;
+    for (i < 5) {
+        vector.push[Arg](?args, T_ARGS[i]);
+        i = i + 1;
+    }
+    ret args;
+}
+
+#[testing]
+fun t_line(text: str) lines.Line {
+    ret lines.Line{file: "extensions/rv_i", number: 7, text: view(text, str_len(text))};
+}
+
+test parse__an_extension_line_reads_into_its_fields_and_fixed_bits {
+    var t: testing.Testing;
+    testing.make(?t);
+    var args: vector.Vector[Arg]        = t_args(testing.allocator_of(?t));
+    var line: lines.Line                = t_line("beq     bimm12hi rs1 rs2 bimm12lo 14..12=0 6..2=0x18 1..0=3");
+    val got:  res[Record, diag.Refusal] = parse(testing.allocator_of(?t), ?args, ?line, "rv_i");
+    if (sel got.err) { ret 1; }
+    val r: Record = got.ok;
+    if (r.kind != STANDARD || !str_equals(r.name, "beq") || r.match != 0x63 || r.mask != 0x707F) { ret 2; }
+    val want: [4]str = [4]str{"bimm12hi", "rs1", "rs2", "bimm12lo"};
+    if (r.args.len != 4) { ret 3; }
+    var i: u32 = 0;
+    for (i < 4) {
+        if (!str_equals(r.args.data[i], want[i])) { ret 4; }
+        i = i + 1;
+    }
+    # a fixed range given twice, and a value wider than its range, are refused at the line
+    var twice: lines.Line                = t_line("beq bimm12hi rs1 rs2 bimm12lo 14..12=0 13=1 1..0=3");
+    val again: res[Record, diag.Refusal] = parse(testing.allocator_of(?t), ?args, ?twice, "rv_i");
+    if (!(sel again.err && (again.err.message == OVERLAP && again.err.line == 7))) { ret 5; }
+    var wide: lines.Line                = t_line("beq bimm12hi rs1 rs2 bimm12lo 14..12=8 1..0=3");
+    val over: res[Record, diag.Refusal] = parse(testing.allocator_of(?t), ?args, ?wide, "rv_i");
+    if (!(sel over.err && over.err.message == TOO_WIDE)) { ret 6; }
+    ret 0;
+}

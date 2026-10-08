@@ -1,0 +1,1324 @@
+# the mapping of riscv-opcodes records onto rows
+#
+# every record of a ratified file is an encoding of an instruction under the
+# file's extension. a standard record and an import are the instruction under
+# that extension, and records of one mnemonic, one encoding and one argument
+# list merge into one row admitted by any of their extensions, kept at their
+# minimal alternatives under the catalog's implications. a pseudo op is a
+# respelling of its base when its own extension already admits the base, and
+# then it is no row: its spelling is the syntax's. otherwise it states the
+# instruction under another extension or width, as slli at rv32 or zext.h
+# under zbb, and is a row of its own. a row's operands, encoding and effect
+# are built from masc's riscv layouts and the reviewed overlays, and what
+# neither states is refused naming the record.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+
+use masc.core.diagnostic;
+use masc.core.effect;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.register;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_field:     masc.isa.riscv.field;
+use riscv_register:  masc.isa.riscv.register;
+
+use gen.diag;
+use gen.lines;
+use gen.riscv.effects;
+use gen.riscv.overlay;
+use gen.riscv.read;
+
+pub val UNLISTED_FILE: str = "extension file not in the overlay";
+pub val UNKNOWN_NAME:  str = "extension or register name not in the catalog or the register file";
+pub val NO_BASE:       str = "base instruction not in its file";
+pub val LOOSE_ARG:     str = "argument no group takes";
+pub val LAYOUT_BITS:   str = "layout's bits differ from its arguments'";
+pub val UNNAMED_ARRAY: str = "layout points at an array the overlay does not name";
+pub val UNKNOWN_CLASS: str = "register class not in the register file";
+pub val NO_ADDRESS:    str = "memory access with no address register";
+pub val NO_TARGET:     str = "control transfer's argument not in the row";
+pub val WIDE_MASK:     str = "fixed bits outside the instruction's unit";
+pub val ROWS_TWICE:    str = "two rows of one mnemonic, encoding and arguments";
+pub val CONFLICTING:   str = "requirement holds conflicting extensions";
+pub val NO_ROW:        str = "overlay names a row that does not exist";
+pub val NO_STACK_LIST: str = "stack adjustment with no register list";
+pub val LAST_OPERAND:  str = "row has more operands than an operand index holds";
+
+# one extension alternative: the ids it names and its closure under the catalog
+pub rec Alternative {
+    ids:    vector.Vector[extension.Id];
+    closed: extension.Selection;
+}
+
+# a requirement as alternatives, none for every selection
+pub rec Requirement {
+    alternatives: vector.Vector[*Alternative];
+}
+
+# what an operand of a row is
+# ---
+# IMPLICIT: the stack pointer a compressed stack form holds in its fixed bits
+pub val IMPLICIT: overlay.Use = 0x80;
+
+# one operand of a row
+# ---
+# arg:      the first argument it is formed from, or the register it is fixed to
+# use:      what it is
+# layout:   its layout, for an immediate or a csr
+# position: its position, for a register or an s register
+# choice:   its choice, for an enumerant
+# adjust:   its shape, for zcmp's stack adjustment
+# class:    its register class, for a register
+# role:     how the row uses it
+# relative: whether an immediate is a target relative to the row
+# fixup:    the path of its default fixup kind, nil when it takes no symbol
+# rank:     where it stands among the row's operands
+# order:    its argument's position in the record, for ties
+pub rec Operand {
+    arg:      str;
+    use:      overlay.Use;
+    layout:   *riscv_field.Layout;
+    position: *riscv_field.Position;
+    choice:   *riscv_field.Choice;
+    adjust:   *operand.Immediate;
+    class:    u16;
+    role:     operand.Role;
+    relative: bool;
+    fixup:    str;
+    rank:     u8;
+    order:    u32;
+}
+
+# one access a row's effect states
+# ---
+# role:     read, written or both
+# address:  the operand holding the address, field.NO_OPERAND when a register no operand names does
+# base:     the register row holding the address when no operand does, effect.NO_ROW otherwise
+# forming:  the further operands forming the address
+# element:  the bits of each element
+# one:      whether it covers one element, its count otherwise unstated
+# governor: the operand deciding which elements it touches, field.NO_OPERAND when none
+pub rec Access {
+    role:     operand.Role;
+    address:  u8;
+    base:     u32;
+    forming:  operand.Positions;
+    element:  register.Scaled;
+    one:      bool;
+    governor: u8;
+}
+
+# what a row does beyond its operands
+pub rec Effect {
+    read:     vector.Vector[u32];
+    written:  vector.Vector[u32];
+    accesses: vector.Vector[Access];
+    control:  effect.Control;
+    delta:    u8;
+    latency:  effect.Latency;
+    fixed:    vector.Vector[effect.Fixed];
+}
+
+# a row of the catalog
+# ---
+# mnemonic:     its mnemonic
+# match:        its fixed bits
+# mask:         which bits are fixed
+# width:        the bits of its unit, 16 or 32
+# record:       the record it was first built from
+# args:         its arguments as written
+# requirement:  the alternatives that admit it, any one fully
+# operands:     its operands in order
+# kind:         the field kind of its one field
+# param:        that field's parameter
+# whole:        the operand that field encodes whole, field.NO_OPERAND when none
+# effect:       what it does beyond its operands
+# context:      its bits of the dispatch's context word, one per catalog conflict
+# context_mask: which of those bits it fixes
+# every:        whether some file states it with no requirement, so every selection admits it
+# serial:       the order it was made in, which orders rows of one mnemonic
+pub rec Row {
+    mnemonic:     str;
+    match:        u64;
+    mask:         u64;
+    width:        u8;
+    record:       *read.Record;
+    args:         *vector.Vector[str];
+    requirement:  Requirement;
+    operands:     vector.Vector[Operand];
+    kind:         u16;
+    param:        u64;
+    whole:        u8;
+    effect:       Effect;
+    context:      u64;
+    context_mask: u64;
+    every:        bool;
+    serial:       u32;
+}
+
+# a pseudo op that respells its base under an extension the base already admits, which the syntax spells
+pub rec Respelling {
+    name: str;
+    base: str;
+    file: str;
+}
+
+# the catalog the mapping builds
+pub rec Catalog {
+    rows:        vector.Vector[*Row];
+    respellings: vector.Vector[Respelling];
+}
+
+# the state of one mapping
+rec Mapper {
+    alloc:    *A.Allocator;
+    source:   *read.Source;
+    catalog:  *extension.Catalog;
+    file:     *register.File;
+    required: map.Map[str, *Requirement];
+    standard: map.Map[str, u32];
+    rows:     map.Map[str, u32];
+    out:      *Catalog;
+}
+
+fun refuse(r: *read.Record, message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(r.path, r.line, message, subject)};
+}
+
+fun memory() diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun join(a: *A.Allocator, x: str, y: str, z: str) opt[str] {
+    val r: res[str, StrError] = str_join(a, x, y, z);
+    if (sel r.err) { ret opt[str].none{}; }
+    ret opt[str].some{r.ok};
+}
+
+# `name` without the `_rv32` or `.rv32` riscv-opcodes appends to tell a width's form apart
+pub fun mnemonic(a: *A.Allocator, name: str) res[str, StrError] {
+    val len: usize = str_len(name);
+    if (str_ends_with(name, "_rv32") || str_ends_with(name, ".rv32")) { ret str_copy_slice(a, name, 0, len - 5); }
+    ret res[str, StrError].ok{name};
+}
+
+# the ids `text` names from `at` for `len` bytes, split by spaces, into `out`
+fun names(m: *Mapper, text: str, at: usize, len: usize, out: *vector.Vector[extension.Id]) err[diag.Refusal] {
+    var i: usize = at;
+    for (i < at + len) {
+        if (text[i] == ' ') {
+            i = i + 1;
+            cnt;
+        }
+        var end: usize = i;
+        for (end < at + len && text[end] != ' ') {
+            end = end + 1;
+        }
+        val id: opt[extension.Id] = extension.lookup(m.catalog, text, i, end - i);
+        if (sel id.none)                                      { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNKNOWN_NAME, text)}; }
+        if (!pushed(vector.push[extension.Id](out, id.some))) { ret err[diag.Refusal].err{memory()}; }
+        i = end;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the closure of `ids` under the catalog
+fun closure(m: *Mapper, ids: *vector.Vector[extension.Id]) res[extension.Selection, diag.Refusal] {
+    val made: res[extension.Request, extension.Error] = extension.request(m.alloc, m.catalog, "", diagnostic.START);
+    if (sel made.err) { ret res[extension.Selection, diag.Refusal].err{memory()}; }
+    var r: extension.Request = made.ok;
+    var i: usize             = 0;
+    for (i < ids.len) {
+        extension.request_add(?r, ids.data[i]);
+        i = i + 1;
+    }
+    val closed: res[extension.Selection, extension.Error] = extension.close(r);
+    if (sel closed.err) { ret res[extension.Selection, diag.Refusal].err{diag.refusal(nil, 0, CONFLICTING, nil)}; }
+    ret res[extension.Selection, diag.Refusal].ok{closed.ok};
+}
+
+# the requirement `text` spells, parsed once and kept for every record that names it
+fun requirement(m: *Mapper, text: str) res[*Requirement, diag.Refusal] {
+    val known: opt[**Requirement] = map.get[str, *Requirement](?m.required, ?text);
+    if (sel known.some) { ret res[*Requirement, diag.Refusal].ok{@known.some}; }
+    val got: res[*Requirement, A.Error] = A.allocate[Requirement](m.alloc, 1);
+    if (sel got.err) { ret res[*Requirement, diag.Refusal].err{memory()}; }
+    val req: *Requirement = got.ok;
+    req.alternatives = vector.init[*Alternative](m.alloc);
+    val len: usize = str_len(text);
+    var at:  usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && text[end] != '|') {
+            end = end + 1;
+        }
+        val alt: res[*Alternative, A.Error] = A.allocate[Alternative](m.alloc, 1);
+        if (sel alt.err) { ret res[*Requirement, diag.Refusal].err{memory()}; }
+        alt.ok.ids = vector.init[extension.Id](m.alloc);
+        val named: err[diag.Refusal] = names(m, text, at, end - at, ?alt.ok.ids);
+        if (sel named.err) { ret res[*Requirement, diag.Refusal].err{named.err}; }
+        val closed: res[extension.Selection, diag.Refusal] = closure(m, ?alt.ok.ids);
+        if (sel closed.err) { ret res[*Requirement, diag.Refusal].err{closed.err}; }
+        alt.ok.closed = closed.ok;
+        if (!pushed(vector.push[*Alternative](?req.alternatives, alt.ok))) { ret res[*Requirement, diag.Refusal].err{memory()}; }
+        at = end + 1;
+    }
+    val inserted: res[bool, A.Error] = map.insert[str, *Requirement](?m.required, text, req);
+    if (sel inserted.err) { ret res[*Requirement, diag.Refusal].err{memory()}; }
+    ret res[*Requirement, diag.Refusal].ok{req};
+}
+
+# the overlay's row for file `file`
+fun file_of(file: str) opt[*overlay.File] {
+    var lo: usize = 0;
+    var hi: usize = overlay.FILES_COUNT::usize;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = str_compare(overlay.FILES[mid].name, file);
+        if (c == 0) { ret opt[*overlay.File].some{?overlay.FILES[mid]}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[*overlay.File].none{};
+}
+
+# the requirement of mnemonic `name` in file `file`: a member's when one names it, else the file's
+fun required(m: *Mapper, r: *read.Record, file: str, name: str) res[*Requirement, diag.Refusal] {
+    var i: u32 = 0;
+    for (i < overlay.MEMBERS_COUNT) {
+        val member: *overlay.Member = ?overlay.MEMBERS[i];
+        if (str_equals(member.file, file) && overlay.matches(member.mnemonic, name)) { ret requirement(m, member.requires); }
+        i = i + 1;
+    }
+    val f: opt[*overlay.File] = file_of(file);
+    if (sel f.none) { ret res[*Requirement, diag.Refusal].err{diag.refusal(r.path, r.line, UNLISTED_FILE, file)}; }
+    ret requirement(m, f.some.requires);
+}
+
+# whether every alternative of `of` holds some alternative of `base`, so a selection admitting `of` admits `base`
+fun admits(of: *Requirement, base: *Requirement) bool {
+    if (base.alternatives.len == 0) { ret true; }
+    if (of.alternatives.len == 0)   { ret false; }
+    var i: usize = 0;
+    for (i < of.alternatives.len) {
+        var held: bool  = false;
+        var k:    usize = 0;
+        for (k < base.alternatives.len && !held) {
+            val alt: *Alternative = base.alternatives.data[k];
+            var all: bool         = true;
+            var n:   usize        = 0;
+            for (n < alt.ids.len) {
+                if (!extension.has(?of.alternatives.data[i].closed, alt.ids.data[n])) { all = false; }
+                n = n + 1;
+            }
+            held = all;
+            k    = k + 1;
+        }
+        if (!held) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun decimal(a: *A.Allocator, n: u64) str {
+    var digits: [24]u8;
+    val len:    usize              = format.put_u64(?digits[0], n);
+    val got:    res[str, StrError] = str_copy_slice(a, ?digits[0], 0, len);
+    if (sel got.err) { ret ""; }
+    ret got.ok;
+}
+
+# the key rows of one mnemonic, encoding and argument list share
+fun key(m: *Mapper, name: str, r: *read.Record, args: *vector.Vector[str]) opt[str] {
+    val head: opt[str] = join(m.alloc, name, " ", decimal(m.alloc, r.match));
+    if (sel head.none) { ret head; }
+    val bits: opt[str] = join(m.alloc, head.some, " ", decimal(m.alloc, r.mask));
+    if (sel bits.none) { ret bits; }
+    var acc: str   = bits.some;
+    var i:   usize = 0;
+    for (i < args.len) {
+        val next: opt[str] = join(m.alloc, acc, " ", args.data[i]);
+        if (sel next.none) { ret next; }
+        acc = next.some;
+        i   = i + 1;
+    }
+    ret opt[str].some{acc};
+}
+
+# the row of `name` over the bits and arguments of `r`, admitted as well by `req`
+fun admit_row(m: *Mapper, name: str, r: *read.Record, req: *Requirement) err[diag.Refusal] {
+    val k: opt[str] = key(m, name, r, ?r.args);
+    if (sel k.none) { ret err[diag.Refusal].err{memory()}; }
+    val known: opt[*u32] = map.get[str, u32](?m.rows, ?k.some);
+    var row:   *Row      = nil;
+    if (sel known.some) { row = m.out.rows.data[@known.some]; }
+    or {
+        val got: res[*Row, A.Error] = A.zallocate[Row](m.alloc, 1);
+        if (sel got.err) { ret err[diag.Refusal].err{memory()}; }
+        row                          = got.ok;
+        row.mnemonic                 = name;
+        row.match                    = r.match;
+        row.mask                     = r.mask;
+        row.record                   = r;
+        row.args                     = ?r.args;
+        row.requirement.alternatives = vector.init[*Alternative](m.alloc);
+        row.operands                 = vector.init[Operand](m.alloc);
+        row.serial                   = m.out.rows.len::u32;
+        val inserted: res[bool, A.Error] = map.insert[str, u32](?m.rows, k.some, m.out.rows.len::u32);
+        if (sel inserted.err)                             { ret err[diag.Refusal].err{memory()}; }
+        if (!pushed(vector.push[*Row](?m.out.rows, row))) { ret err[diag.Refusal].err{memory()}; }
+    }
+    var i: usize = 0;
+    for (i < req.alternatives.len) {
+        if (!pushed(vector.push[*Alternative](?row.requirement.alternatives, req.alternatives.data[i]))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    # a row an alternative-free file states is admitted by every selection, whatever else admits it
+    if (req.alternatives.len == 0) { row.every = true; }
+    ret err[diag.Refusal].ok{};
+}
+
+# whether alternative `x` holds every id of alternative `y`
+fun implies(x: *Alternative, y: *Alternative) bool {
+    var n: usize = 0;
+    for (n < y.ids.len) {
+        if (!extension.has(?x.closed, y.ids.data[n])) { ret false; }
+        n = n + 1;
+    }
+    ret true;
+}
+
+# `req` kept at its minimal alternatives: one that implies another is dropped, the first of two equivalent ones kept
+fun minimal(m: *Mapper, req: *Requirement, every: bool) err[diag.Refusal] {
+    if (every) {
+        req.alternatives.len = 0;
+        ret err[diag.Refusal].ok{};
+    }
+    var kept: vector.Vector[*Alternative] = vector.init[*Alternative](m.alloc);
+    var i:    usize                       = 0;
+    for (i < req.alternatives.len) {
+        val x:    *Alternative = req.alternatives.data[i];
+        var drop: bool         = false;
+        var j:    usize        = 0;
+        for (j < req.alternatives.len && !drop) {
+            val y: *Alternative = req.alternatives.data[j];
+            if (j != i && implies(x, y) && (!implies(y, x) || j < i)) { drop = true; }
+            j = j + 1;
+        }
+        if (!drop) {
+            if (!pushed(vector.push[*Alternative](?kept, x))) { ret err[diag.Refusal].err{memory()}; }
+        }
+        i = i + 1;
+    }
+    req.alternatives = kept;
+    ret err[diag.Refusal].ok{};
+}
+
+fun standard_key(m: *Mapper, file: str, name: str) opt[str] {
+    ret join(m.alloc, file, "::", name);
+}
+
+# the standard record `name` of `file`
+fun base_of(m: *Mapper, r: *read.Record) opt[*read.Record] {
+    val k: opt[str] = standard_key(m, r.from, r.base);
+    if (sel k.none) { ret opt[*read.Record].none{}; }
+    val at: opt[*u32] = map.get[str, u32](?m.standard, ?k.some);
+    if (sel at.none) { ret opt[*read.Record].none{}; }
+    ret opt[*read.Record].some{?m.source.records.data[@at.some]};
+}
+
+# every record placed as a row or a respelling
+fun place(m: *Mapper) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < m.source.records.len) {
+        val r: *read.Record = ?m.source.records.data[i];
+        if (r.kind == read.STANDARD) {
+            val k: opt[str] = standard_key(m, r.file, r.name);
+            if (sel k.none) { ret err[diag.Refusal].err{memory()}; }
+            # a segmented record expands to eight of one name only at nf zero, so the first is kept
+            if (!map.contains[str, u32](?m.standard, ?k.some)) {
+                val inserted: res[bool, A.Error] = map.insert[str, u32](?m.standard, k.some, i::u32);
+                if (sel inserted.err) { ret err[diag.Refusal].err{memory()}; }
+            }
+        }
+        i = i + 1;
+    }
+    var every: vector.Vector[bool] = vector.init[bool](m.alloc);
+    i = 0;
+    for (i < m.source.records.len) {
+        val r: *read.Record       = ?m.source.records.data[i];
+        val f: opt[*overlay.File] = file_of(r.file);
+        if (sel f.none) { ret refuse(r, UNLISTED_FILE, r.file); }
+        if (f.some.skip == nil) {
+            val placed: err[diag.Refusal] = place_one(m, r);
+            if (sel placed.err) { ret placed; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.out.rows.len) {
+        val row:  *Row              = m.out.rows.data[i];
+        val kept: err[diag.Refusal] = minimal(m, ?row.requirement, row.every);
+        if (sel kept.err) { ret kept; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the name of `r`, as the overlay corrects it
+fun renamed(r: *read.Record) str {
+    var i: u32 = 0;
+    for (i < overlay.RENAMES_COUNT) {
+        val x: *overlay.Rename = ?overlay.RENAMES[i];
+        if (str_equals(x.file, r.file) && str_equals(x.name, r.name) && (r.match & 0x7F) == x.major) { ret x.to; }
+        i = i + 1;
+    }
+    ret r.name;
+}
+
+fun place_one(m: *Mapper, r: *read.Record) err[diag.Refusal] {
+    if (r.kind == read.STANDARD) {
+        val name: res[str, StrError] = mnemonic(m.alloc, r.name);
+        if (sel name.err) { ret err[diag.Refusal].err{memory()}; }
+        val req: res[*Requirement, diag.Refusal] = required(m, r, r.file, name.ok);
+        if (sel req.err) { ret err[diag.Refusal].err{req.err}; }
+        ret admit_row(m, name.ok, r, req.ok);
+    }
+    val base: opt[*read.Record] = base_of(m, r);
+    if (sel base.none) { ret refuse(r, NO_BASE, r.base); }
+    val base_name: res[str, StrError] = mnemonic(m.alloc, base.some.name);
+    if (sel base_name.err) { ret err[diag.Refusal].err{memory()}; }
+    if (r.kind == read.IMPORT) {
+        val req: res[*Requirement, diag.Refusal] = required(m, r, r.file, base_name.ok);
+        if (sel req.err) { ret err[diag.Refusal].err{req.err}; }
+        ret admit_row(m, base_name.ok, base.some, req.ok);
+    }
+    val name: res[str, StrError] = mnemonic(m.alloc, renamed(r));
+    if (sel name.err) { ret err[diag.Refusal].err{memory()}; }
+    val own: res[*Requirement, diag.Refusal] = required(m, r, r.file, name.ok);
+    if (sel own.err) { ret err[diag.Refusal].err{own.err}; }
+    val under: res[*Requirement, diag.Refusal] = required(m, base.some, base.some.file, base_name.ok);
+    if (sel under.err) { ret err[diag.Refusal].err{under.err}; }
+    if (admits(own.ok, under.ok)) {
+        # the base itself under an extension that implies the base's adds nothing
+        if (str_equals(name.ok, base_name.ok) && r.match == base.some.match && r.mask == base.some.mask)                       { ret err[diag.Refusal].ok{}; }
+        if (!pushed(vector.push[Respelling](?m.out.respellings, Respelling{name: name.ok, base: base_name.ok, file: r.file}))) { ret err[diag.Refusal].err{memory()}; }
+        ret err[diag.Refusal].ok{};
+    }
+    ret admit_row(m, name.ok, r, own.ok);
+}
+
+# the overlay's group named by `args`
+fun group_named(args: str) opt[*overlay.Group] {
+    var i: u32 = 0;
+    for (i < overlay.GROUPS_COUNT) {
+        if (str_equals(overlay.GROUPS[i].args, args)) { ret opt[*overlay.Group].some{?overlay.GROUPS[i]}; }
+        i = i + 1;
+    }
+    ret opt[*overlay.Group].none{};
+}
+
+# the position of argument `arg` in `args`, -1 when it is not there
+fun index_of(args: *vector.Vector[str], arg: str, from: usize, len: usize) i64 {
+    var i: usize = 0;
+    for (i < args.len) {
+        if (str_len(args.data[i]) == len && str_compare_region(args.data[i], arg, from, len)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun str_compare_region(a: str, b: str, from: usize, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (a[i] != b[from + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the argument positions of `group`'s names in `args`, all of them or none
+fun group_args(args: *vector.Vector[str], group: str, out: *i64) u32 {
+    val len:   usize = str_len(group);
+    var count: u32   = 0;
+    var at:    usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && group[end] != ' ') {
+            end = end + 1;
+        }
+        val found: i64 = index_of(args, group, at, end - at);
+        if (found < 0 || count >= 4) { ret 0; }
+        out[count] = found;
+        count      = count + 1;
+        at         = end + 1;
+    }
+    ret count;
+}
+
+# the rank of `arg` among a row's operands
+fun rank_of(arg: str, use: overlay.Use) u8 {
+    var i: u32 = 0;
+    for (i < overlay.RANKS_COUNT) {
+        if (str_equals(overlay.RANKS[i].arg, arg)) { ret overlay.RANKS[i].rank; }
+        i = i + 1;
+    }
+    if (use == overlay.CHOICE) { ret overlay.CHOICE_RANK; }
+    ret overlay.IMMEDIATE_RANK;
+}
+
+fun listed(names: *str, count: u32, name: str) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (str_equals(names[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun word_listed(text: str, name: str) bool {
+    val len: usize = str_len(text);
+    val nl:  usize = str_len(name);
+    var at:  usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && text[end] != ' ') {
+            end = end + 1;
+        }
+        if (end - at == nl && str_compare_region(name, text, at, nl)) { ret true; }
+        at = end + 1;
+    }
+    ret false;
+}
+
+# the register class argument `arg` of `row` names
+fun class_of(row: *Row, arg: str) overlay.Class {
+    val file: str = row.record.file;
+    if (listed(?overlay.VECTOR_FILES[0], overlay.VECTOR_FILES_COUNT, file)) {
+        if (str_starts_with(arg, "vd") || str_starts_with(arg, "vs")) { ret overlay.VECTOR; }
+        val float: bool = (overlay.matches(overlay.FLOAT_SCALARS[0], row.mnemonic) || overlay.matches(overlay.FLOAT_SCALARS[1], row.mnemonic)) && !str_equals(row.mnemonic, overlay.NOT_FLOAT);
+        if (float && (str_equals(arg, "rd") || str_equals(arg, "rs1"))) { ret overlay.FLOAT; }
+        ret overlay.INTEGER;
+    }
+    if (listed(?overlay.COMPRESSED_FLOAT_FILES[0], overlay.COMPRESSED_FLOAT_FILES_COUNT, file)) {
+        if (listed(?overlay.COMPRESSED_FLOAT_ARGS[0], overlay.COMPRESSED_FLOAT_ARGS_COUNT, arg)) { ret overlay.FLOAT; }
+        ret overlay.INTEGER;
+    }
+    if (listed(?overlay.FLOAT_FILES[0], overlay.FLOAT_FILES_COUNT, file)) {
+        val major: u64 = row.match & 0x7F;
+        if ((major == effects.LOAD_FP || major == effects.STORE_FP) && str_equals(arg, "rs1")) { ret overlay.INTEGER; }
+        var i: u32 = 0;
+        for (i < overlay.INTEGERS_COUNT) {
+            val entry: *overlay.Integer = ?overlay.INTEGERS[i];
+            if (overlay.matches(entry.mnemonic, row.mnemonic)) {
+                if (word_listed(entry.args, arg)) { ret overlay.INTEGER; }
+                ret overlay.FLOAT;
+            }
+            i = i + 1;
+        }
+        ret overlay.FLOAT;
+    }
+    ret overlay.INTEGER;
+}
+
+# the register file's class of `kind`
+fun class_index(m: *Mapper, c: overlay.Class) opt[u16] {
+    var want: register.Kind = register.GENERAL;
+    if (c == overlay.FLOAT)  { want = register.FLOAT; }
+    if (c == overlay.VECTOR) { want = register.VECTOR; }
+    var i: u32 = 0;
+    for (i < m.file.class_count) {
+        if (m.file.classes[i].kind == want) { ret opt[u16].some{i::u16}; }
+        i = i + 1;
+    }
+    ret opt[u16].none{};
+}
+
+# the row of the register file named `name`
+pub fun register_row(file: *register.File, name: str) opt[u32] {
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        if (str_equals(file.registers[i].name, name)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun default_role(arg: str) operand.Role {
+    var i: u32 = 0;
+    for (i < effects.ROLES_COUNT) {
+        if (str_equals(effects.ROLES[i].arg, arg)) { ret effects.ROLES[i].role; }
+        i = i + 1;
+    }
+    ret operand.READ;
+}
+
+fun role_of(row: *Row, arg: str) operand.Role {
+    var i: u32 = 0;
+    for (i < effects.RECASTS_COUNT) {
+        val c: *effects.Recast = ?effects.RECASTS[i];
+        if (str_equals(c.arg, arg) && overlay.matches(c.mnemonic, row.mnemonic)) { ret c.role; }
+        i = i + 1;
+    }
+    ret default_role(arg);
+}
+
+fun fixup_of(row: *Row) str {
+    var i: u32 = 0;
+    for (i < effects.FIXUPS_COUNT) {
+        if (str_equals(effects.FIXUPS[i].mnemonic, row.mnemonic)) { ret effects.FIXUPS[i].kind; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun ones(len: u64) u64 {
+    if (len >= 64) { ret ~0::u64; }
+    ret (1::u64 << len) - 1;
+}
+
+# the bits of the unit argument `name` covers
+fun arg_bits(m: *Mapper, name: str) opt[u64] {
+    val found: opt[*read.Arg] = read.arg(?m.source.args, name);
+    if (sel found.none) { ret opt[u64].none{}; }
+    ret opt[u64].some{ones((found.some.hi - found.some.lo + 1)::u64) << found.some.lo::u64};
+}
+
+# the unit bits of a layout's pieces
+fun layout_bits(l: *riscv_field.Layout) u64 {
+    var bits: u64 = 0;
+    var i:    u32 = 0;
+    for (i < l.pieces.len) {
+        bits = bits | (ones(l.pieces.at[i].len::u64) << l.pieces.at[i].at::u64);
+        i    = i + 1;
+    }
+    ret bits;
+}
+
+fun piece_bits(pieces: riscv_field.Pieces) u64 {
+    var bits: u64 = 0;
+    var i:    u32 = 0;
+    for (i < pieces.len) {
+        bits = bits | (ones(pieces.at[i].len::u64) << pieces.at[i].at::u64);
+        i    = i + 1;
+    }
+    ret bits;
+}
+
+# whether `layout` covers exactly the bits its arguments do, or more only where the row fixes them, as an even register's low bit
+fun same_bits(row: *Row, layout: u64, args: u64) bool {
+    if (layout == args) { ret true; }
+    ret (args & ~layout) == 0 && ((layout & ~args) & ~row.mask) == 0;
+}
+
+# the operands of `row`, from its arguments, the overlay's groups and its implicit stack pointer
+fun operands(m: *Mapper, row: *Row) err[diag.Refusal] {
+    val r:     *read.Record = row.record;
+    var taken: u64          = 0;
+    var g:     u32          = 0;
+    for (g < overlay.GROUPS_COUNT) {
+        var group: *overlay.Group = ?overlay.GROUPS[g];
+        var at:    [4]i64;
+        val count: u32            = group_args(row.args, group.args, ?at[0]);
+        var free:  bool           = count > 0;
+        var k:     u32            = 0;
+        for (k < count) {
+            if (((taken >> at[k]::u64) & 1) != 0) { free = false; }
+            k = k + 1;
+        }
+        if (free) {
+            var bits: u64 = 0;
+            k = 0;
+            for (k < count) {
+                taken = taken | (1::u64 << at[k]::u64);
+                val b: opt[u64] = arg_bits(m, row.args.data[at[k]]);
+                if (sel b.none) { ret refuse(r, read.UNKNOWN_ARG, row.args.data[at[k]]); }
+                bits = bits | b.some;
+                k    = k + 1;
+            }
+            val first: str     = row.args.data[at[0]];
+            var op:    Operand = Operand{arg: first, use: group.use, layout: group.layout, position: group.position, choice: group.choice, adjust: nil, class: 0, role: role_of(row, first), relative: false, fixup: nil, rank: rank_of(first, group.use), order: at[0]::u32};
+            var o:     u32     = 0;
+            for (o < overlay.OVERRIDES_COUNT) {
+                if (str_equals(overlay.OVERRIDES[o].args, group.args) && overlay.matches(overlay.OVERRIDES[o].mnemonic, row.mnemonic)) {
+                    op.use    = overlay.IMMEDIATE;
+                    op.layout = overlay.OVERRIDES[o].layout;
+                    op.rank   = overlay.IMMEDIATE_RANK;
+                }
+                o = o + 1;
+            }
+            if (op.use == overlay.IMMEDIATE || op.use == overlay.CSR) {
+                if (!same_bits(row, layout_bits(op.layout), bits)) { ret refuse(r, LAYOUT_BITS, group.args); }
+                val l: *riscv_field.Layout = op.layout;
+                op.relative = l == ?riscv_field.B13 || l == ?riscv_field.J21 || l == ?riscv_field.CJ12 || l == ?riscv_field.CB9;
+                op.fixup    = fixup_of(row);
+            }
+            or (op.use == overlay.CHOICE) {
+                if (!same_bits(row, piece_bits(op.choice.pieces), bits)) { ret refuse(r, LAYOUT_BITS, group.args); }
+            }
+            or (op.use == overlay.REGISTER || op.use == overlay.SREG) {
+                var a: u32 = 0;
+                for (a < overlay.ALIGNS_COUNT) {
+                    val al: *overlay.Align = ?overlay.ALIGNS[a];
+                    if (str_equals(al.arg, first) && overlay.matches(al.mnemonic, row.mnemonic) && (str_len(al.width) == 0 || holds(m, row, al.width))) { op.position = al.position; }
+                    a = a + 1;
+                }
+                val pos: *riscv_field.Position = op.position;
+                if (!same_bits(row, ones(pos.len::u64) << pos.at::u64, bits)) { ret refuse(r, LAYOUT_BITS, group.args); }
+                val c: opt[u16] = class_index(m, class_of(row, first));
+                if (sel c.none) { ret refuse(r, UNKNOWN_CLASS, first); }
+                op.class = c.some;
+            }
+            or (op.use == overlay.ADJUST) {
+                if (!same_bits(row, 3::u64 << 2, bits)) { ret refuse(r, LAYOUT_BITS, group.args); }
+            }
+            if (!pushed(vector.push[Operand](?row.operands, op))) { ret err[diag.Refusal].err{memory()}; }
+        }
+        g = g + 1;
+    }
+    var a: usize = 0;
+    for (a < row.args.len) {
+        if (((taken >> a::u64) & 1) == 0) { ret refuse(r, LOOSE_ARG, row.args.data[a]); }
+        a = a + 1;
+    }
+    sort.sort_by[Operand](row.operands.data, row.operands.len, by_rank);
+    var i: u32 = 0;
+    for (i < effects.IMPLICITS_COUNT) {
+        val imp: *effects.Implicit = ?effects.IMPLICITS[i];
+        if (str_equals(imp.mnemonic, row.mnemonic)) {
+            val c: opt[u16] = class_index(m, overlay.INTEGER);
+            if (sel c.none) { ret refuse(r, UNKNOWN_CLASS, effects.STACK_POINTER); }
+            val sp: Operand = Operand{arg: effects.STACK_POINTER, use: IMPLICIT, layout: nil, position: nil, choice: nil, adjust: nil, class: c.some, role: imp.role, relative: false, fixup: nil, rank: 0, order: 0};
+            var at: usize   = row.operands.len;
+            if (imp.at != effects.LAST && imp.at::usize < at)     { at = imp.at::usize; }
+            if (!pushed(vector.push[Operand](?row.operands, sp))) { ret err[diag.Refusal].err{memory()}; }
+            var k: usize = row.operands.len - 1;
+            for (k > at) {
+                row.operands.data[k] = row.operands.data[k - 1];
+                k                    = k - 1;
+            }
+            row.operands.data[at] = sp;
+        }
+        i = i + 1;
+    }
+    if (row.operands.len > 16) { ret refuse(r, LAST_OPERAND, row.mnemonic); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun by_rank(x: *Operand, y: *Operand) i64 {
+    if (x.rank != y.rank) { ret x.rank::i64 - y.rank::i64; }
+    ret x.order::i64 - y.order::i64;
+}
+
+# the index of the operand formed from argument `arg`, field.NO_OPERAND when the row has none
+pub fun operand_of(row: *Row, arg: str) u8 {
+    var i: usize = 0;
+    for (i < row.operands.len) {
+        if (str_equals(row.operands.data[i].arg, arg)) { ret i::u8; }
+        i = i + 1;
+    }
+    ret field.NO_OPERAND;
+}
+
+fun scale_index(file: *register.File, name: str) opt[u8] {
+    var i: u32 = 0;
+    for (i < file.scale_count) {
+        if (str_equals(file.scales[i].name, name)) { ret opt[u8].some{i::u8}; }
+        i = i + 1;
+    }
+    ret opt[u8].none{};
+}
+
+# the width a mnemonic's last part names: b, h, w, d or q
+fun suffix_bits(name: str) u32 {
+    val len: usize = str_len(name);
+    if (len < 2 || name[len - 2] != '.') { ret 0; }
+    val c: u8 = name[len - 1];
+    if (c == 'b') { ret 8; }
+    if (c == 'h') { ret 16; }
+    if (c == 'w') { ret 32; }
+    if (c == 'd') { ret 64; }
+    if (c == 'q') { ret 128; }
+    ret 0;
+}
+
+# the digits of `name` from `at`, and where they end
+fun digits(name: str, at: usize, value: *u32) usize {
+    var i: usize = at;
+    var n: u32   = 0;
+    for (name[i] >= '0' && name[i] <= '9') {
+        n = n * 10 + (name[i] - '0')::u32;
+        i = i + 1;
+    }
+    @value = n;
+    ret i;
+}
+
+# a vector access's element, and whether it is one element: a whole register
+# move of n registers is one element of n vector lengths, a unit stride or
+# strided access of eew N is N bits, a mask access is bytes, and an indexed
+# access's data element is the selected element width, which no operand states
+fun vector_element(m: *Mapper, name: str, element: *register.Scaled, one: *bool) err[diag.Refusal] {
+    @one     = false;
+    @element = register.Scaled{fixed: 0, per: 0, scale: 0};
+    if (str_starts_with(name, "vlm.") || str_starts_with(name, "vsm.")) {
+        element.fixed = 8;
+        ret err[diag.Refusal].ok{};
+    }
+    if (name[2] >= '1' && name[2] <= '8') {
+        var n:   u32     = 0;
+        val end: usize   = digits(name, 2, ?n);
+        val vl:  opt[u8] = scale_index(m.file, "vlen");
+        if (sel vl.none)      { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNKNOWN_CLASS, name)}; }
+        if (name[end] != 'r') { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNKNOWN_CLASS, name)}; }
+        @element = register.Scaled{fixed: 0, per: 32 * n, scale: vl.some};
+        @one     = true;
+        ret err[diag.Refusal].ok{};
+    }
+    var i: usize = 0;
+    for (name[i] != 0) {
+        if (name[i] == 'e' && name[i + 1] == 'i') { ret err[diag.Refusal].ok{}; }
+        if (name[i] == 'e' && name[i + 1] >= '0' && name[i + 1] <= '9') {
+            var n: u32 = 0;
+            digits(name, i + 1, ?n);
+            element.fixed = n;
+            ret err[diag.Refusal].ok{};
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the address register of a scalar access: rs1, its compressed forms or the implicit stack pointer
+fun address_of(row: *Row) u8 {
+    val names: [5]str = [5]str{"rs1", "rs1_p", "rd_rs1_p", effects.STACK_POINTER, "rs1_n0"};
+    var i:     u32    = 0;
+    for (i < 5) {
+        val at: u8 = operand_of(row, names[i]);
+        if (at != field.NO_OPERAND) { ret at; }
+        i = i + 1;
+    }
+    ret field.NO_OPERAND;
+}
+
+fun bit(op: u8) operand.Positions {
+    if (op == field.NO_OPERAND) { ret operand.NO_POSITIONS; }
+    ret 1::u32 << op::u32;
+}
+
+# the memory accesses of `row`
+fun accesses(m: *Mapper, row: *Row) err[diag.Refusal] {
+    var i: u32 = 0;
+    for (i < effects.MEMORIES_COUNT) {
+        val mem: *effects.Memory = ?effects.MEMORIES[i];
+        if (overlay.matches(mem.mnemonic, row.mnemonic)) {
+            val major:    u64  = row.match & 0x7F;
+            val vectored: bool = str_starts_with(mem.mnemonic, "vl") || str_starts_with(mem.mnemonic, "vs");
+            if (vectored && !((major == effects.LOAD_FP && mem.role == operand.READ) || (major == effects.STORE_FP && mem.role == operand.WRITE))) { ret err[diag.Refusal].ok{}; }
+            var a: Access = Access{role: mem.role, address: address_of(row), base: effect.NO_ROW, forming: operand.NO_POSITIONS, element: register.Scaled{fixed: mem.bits, per: 0, scale: 0}, one: true, governor: field.NO_OPERAND};
+            if (mem.element == effects.SUFFIX) { a.element.fixed = suffix_bits(row.mnemonic); }
+            if (mem.element == effects.BLOCK)  { a.one = false; }
+            if (mem.element == effects.XLEN) {
+                val x: opt[u8] = scale_index(m.file, "xlen");
+                if (sel x.none) { ret refuse(row.record, UNKNOWN_CLASS, "xlen"); }
+                a.element = register.Scaled{fixed: 0, per: 32, scale: x.some};
+                a.one     = false;
+                a.address = field.NO_OPERAND;
+                val sp: opt[u32] = register_row(m.file, effects.STACK_POINTER);
+                if (sel sp.none) { ret refuse(row.record, UNKNOWN_NAME, effects.STACK_POINTER); }
+                a.base = sp.some;
+            }
+            if (vectored) {
+                val got: err[diag.Refusal] = vector_element(m, row.mnemonic, ?a.element, ?a.one);
+                if (sel got.err) { ret got; }
+                a.forming  = bit(operand_of(row, "rs2")) | bit(operand_of(row, "vs2"));
+                a.governor = operand_of(row, "vm");
+            }
+            or {
+                var k: usize = 0;
+                for (k < row.operands.len) {
+                    val op: *Operand = ?row.operands.data[k];
+                    if (op.use == overlay.IMMEDIATE) { a.forming = a.forming | bit(k::u8); }
+                    k = k + 1;
+                }
+            }
+            if (a.address == field.NO_OPERAND && a.base == effect.NO_ROW) { ret refuse(row.record, NO_ADDRESS, row.mnemonic); }
+            if (!pushed(vector.push[Access](?row.effect.accesses, a)))    { ret err[diag.Refusal].err{memory()}; }
+            ret err[diag.Refusal].ok{};
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the register rows `names` spells, split by spaces, into `out`
+fun registers(m: *Mapper, row: *Row, names: str, out: *vector.Vector[u32]) err[diag.Refusal] {
+    val len: usize = str_len(names);
+    var at:  usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && names[end] != ' ') {
+            end = end + 1;
+        }
+        val got: res[str, StrError] = str_copy_slice(m.alloc, names, at, end - at);
+        if (sel got.err) { ret err[diag.Refusal].err{memory()}; }
+        val found: opt[u32] = register_row(m.file, got.ok);
+        if (sel found.none)                             { ret refuse(row.record, UNKNOWN_NAME, got.ok); }
+        if (!pushed(vector.push[u32](out, found.some))) { ret err[diag.Refusal].err{memory()}; }
+        at = end + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the effect of `row`
+fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
+    row.effect.read     = vector.init[u32](m.alloc);
+    row.effect.written  = vector.init[u32](m.alloc);
+    row.effect.accesses = vector.init[Access](m.alloc);
+    row.effect.fixed    = vector.init[effect.Fixed](m.alloc);
+    row.effect.control  = effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: field.NO_OPERAND};
+    row.effect.delta    = field.NO_OPERAND;
+    row.effect.latency  = effect.ONE;
+    var i: u32 = 0;
+    for (i < effects.USES_COUNT) {
+        val u: *effects.Uses = ?effects.USES[i];
+        if (str_equals(u.mnemonic, row.mnemonic)) {
+            val read: err[diag.Refusal] = registers(m, row, u.read, ?row.effect.read);
+            if (sel read.err) { ret read; }
+            val written: err[diag.Refusal] = registers(m, row, u.written, ?row.effect.written);
+            if (sel written.err) { ret written; }
+        }
+        i = i + 1;
+    }
+    val accessed: err[diag.Refusal] = accesses(m, row);
+    if (sel accessed.err) { ret accessed; }
+    i = 0;
+    for (i < effects.CONTROLS_COUNT) {
+        val c: *effects.Control = ?effects.CONTROLS[i];
+        if (str_equals(c.mnemonic, row.mnemonic)) {
+            row.effect.control = effect.Control{transfer: c.transfer, target: c.target, conditional: c.conditional, operand: field.NO_OPERAND};
+            if (str_len(c.arg) > 0) {
+                row.effect.control.operand = operand_of(row, c.arg);
+                if (row.effect.control.operand == field.NO_OPERAND) { ret refuse(row.record, NO_TARGET, c.arg); }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < effects.STACKS_COUNT) {
+        if (str_equals(effects.STACKS[i].mnemonic, row.mnemonic)) {
+            row.effect.delta = operand_of(row, effects.STACKS[i].arg);
+            if (row.effect.delta == field.NO_OPERAND) { ret refuse(row.record, NO_TARGET, effects.STACKS[i].arg); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < effects.LATENCIES_COUNT) {
+        if (overlay.matches(effects.LATENCIES[i].mnemonic, row.mnemonic)) {
+            row.effect.latency = effects.LATENCIES[i].latency;
+            brk;
+        }
+        i = i + 1;
+    }
+    val sp_at: u8 = operand_of(row, effects.STACK_POINTER);
+    if (sp_at != field.NO_OPERAND) {
+        val sp: opt[u32] = register_row(m.file, effects.STACK_POINTER);
+        if (sel sp.none)                                                                                            { ret refuse(row.record, UNKNOWN_NAME, effects.STACK_POINTER); }
+        if (!pushed(vector.push[effect.Fixed](?row.effect.fixed, effect.Fixed{operand: sp_at, register: sp.some}))) { ret err[diag.Refusal].err{memory()}; }
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the field of `row`: its unit, and the kind zcmp's stack and s register rows need
+# whether every alternative of `row` holds the extension `name`
+fun holds(m: *Mapper, row: *Row, name: str) bool {
+    val id: opt[extension.Id] = extension.lookup(m.catalog, name, 0, str_len(name));
+    if (sel id.none)                           { ret false; }
+    if (row.requirement.alternatives.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < row.requirement.alternatives.len) {
+        if (!extension.has(?row.requirement.alternatives.data[i].closed, id.some)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the overlay's split of `row`, nil when it is not split by width
+fun split_of(row: *Row) *effects.Split {
+    var s: u32 = 0;
+    for (s < effects.SPLITS_COUNT) {
+        if (str_equals(effects.SPLITS[s].mnemonic, row.mnemonic)) { ret ?effects.SPLITS[s]; }
+        s = s + 1;
+    }
+    ret nil;
+}
+
+fun encoding(m: *Mapper, row: *Row) err[diag.Refusal] {
+    val wide:     bool           = holds(m, row, "rv64");
+    val sp:       *effects.Split = split_of(row);
+    var negative: bool           = false;
+    if (sp != nil) { negative = sp.negative; }
+    row.width = 32;
+    if ((row.match & 3) != 3)                    { row.width = 16; }
+    if ((row.mask & ~ones(row.width::u64)) != 0) { ret refuse(row.record, WIDE_MASK, row.mnemonic); }
+    row.kind  = riscv_field.UNIT_KIND;
+    row.param = 0;
+    row.whole = field.NO_OPERAND;
+    val adjust: u8 = operand_of(row, "c_spimm");
+    if (adjust != field.NO_OPERAND) {
+        val list: u8 = operand_of(row, "c_rlist");
+        if (list == field.NO_OPERAND) { ret refuse(row.record, NO_STACK_LIST, row.mnemonic); }
+        row.kind  = riscv_field.STACK_KIND;
+        row.whole = adjust;
+        row.param = riscv_field.stack_param(list, wide, negative);
+        if (negative) { row.operands.data[adjust].adjust = ?riscv_field.PUSH_ADJUST; }
+        or            { row.operands.data[adjust].adjust = ?riscv_field.POP_ADJUST; }
+    }
+    val first: u8 = operand_of(row, "c_sreg1");
+    if (first != field.NO_OPERAND) {
+        row.kind  = riscv_field.SREGS_KIND;
+        row.param = riscv_field.sreg_param(first, operand_of(row, "c_sreg2"));
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the rows split by width, each a copy at rv32 and at rv64
+fun split(m: *Mapper) err[diag.Refusal] {
+    val count: usize = m.out.rows.len;
+    var i:     usize = 0;
+    for (i < count) {
+        val row: *Row = m.out.rows.data[i];
+        var s:   u32  = 0;
+        for (s < effects.SPLITS_COUNT) {
+            val sp: *effects.Split = ?effects.SPLITS[s];
+            if (str_equals(sp.mnemonic, row.mnemonic)) {
+                val got: res[*Row, A.Error] = A.allocate[Row](m.alloc, 1);
+                if (sel got.err) { ret err[diag.Refusal].err{memory()}; }
+                @got.ok = @row;
+                val narrow: err[diag.Refusal] = widen(m, row, "rv32");
+                if (sel narrow.err) { ret narrow; }
+                val wide: err[diag.Refusal] = widen(m, got.ok, "rv64");
+                if (sel wide.err) { ret wide; }
+                got.ok.operands = vector.init[Operand](m.alloc);
+                got.ok.serial   = m.out.rows.len::u32;
+                if (!pushed(vector.push[*Row](?m.out.rows, got.ok))) { ret err[diag.Refusal].err{memory()}; }
+            }
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# `row`'s alternatives each joined with the width `width`
+fun widen(m: *Mapper, row: *Row, width: str) err[diag.Refusal] {
+    var out: Requirement = Requirement{alternatives: vector.init[*Alternative](m.alloc)};
+    var i:   usize       = 0;
+    for (i < row.requirement.alternatives.len) {
+        val alt: *Alternative               = row.requirement.alternatives.data[i];
+        val got: res[*Alternative, A.Error] = A.allocate[Alternative](m.alloc, 1);
+        if (sel got.err) { ret err[diag.Refusal].err{memory()}; }
+        got.ok.ids = vector.init[extension.Id](m.alloc);
+        var k: usize = 0;
+        for (k < alt.ids.len) {
+            if (!pushed(vector.push[extension.Id](?got.ok.ids, alt.ids.data[k]))) { ret err[diag.Refusal].err{memory()}; }
+            k = k + 1;
+        }
+        val named: err[diag.Refusal] = names(m, width, 0, str_len(width), ?got.ok.ids);
+        if (sel named.err) { ret named; }
+        val closed: res[extension.Selection, diag.Refusal] = closure(m, ?got.ok.ids);
+        if (sel closed.err) { ret err[diag.Refusal].err{closed.err}; }
+        got.ok.closed = closed.ok;
+        if (!pushed(vector.push[*Alternative](?out.alternatives, got.ok))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    row.requirement = out;
+    ret err[diag.Refusal].ok{};
+}
+
+# the dispatch context of `row`: for each conflict of the catalog, the side every alternative of the row holds
+fun context(m: *Mapper, row: *Row) {
+    row.context      = 0;
+    row.context_mask = 0;
+    if (row.requirement.alternatives.len == 0) { ret; }
+    var c: u32 = 0;
+    for (c < m.catalog.conflict_count && c < 64) {
+        val pair: extension.Conflict = m.catalog.conflicts[c];
+        var a:    bool               = true;
+        var b:    bool               = true;
+        var i:    usize              = 0;
+        for (i < row.requirement.alternatives.len) {
+            val closed: *extension.Selection = ?row.requirement.alternatives.data[i].closed;
+            if (!extension.has(closed, pair.a)) { a = false; }
+            if (!extension.has(closed, pair.b)) { b = false; }
+            i = i + 1;
+        }
+        if (a) {
+            row.context      = row.context | (1::u64 << c::u64);
+            row.context_mask = row.context_mask | (1::u64 << c::u64);
+        }
+        or (b) {
+            row.context_mask = row.context_mask | (1::u64 << c::u64);
+        }
+        c = c + 1;
+    }
+}
+
+# rows of one mnemonic stay in the order they were made, which follows the files and lines of the copy
+fun by_mnemonic(x: **Row, y: **Row) i64 {
+    val a: *Row = @x;
+    val b: *Row = @y;
+    val c: i64  = str_compare(a.mnemonic, b.mnemonic);
+    if (c != 0) { ret c; }
+    ret a.serial::i64 - b.serial::i64;
+}
+
+fun by_arg(x: *read.Arg, y: *read.Arg) i64 {
+    ret str_compare(x.name, y.name);
+}
+
+# the records the overlay adds, read as lines of their files, and the argument they name
+fun extras(m: *Mapper) err[diag.Refusal] {
+    var i: u32 = 0;
+    for (i < overlay.EXTRA_ARGS_COUNT) {
+        if (!pushed(vector.push[read.Arg](?m.source.args, overlay.EXTRA_ARGS[i]))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    sort.sort_by[read.Arg](m.source.args.data, m.source.args.len, by_arg);
+    i = 0;
+    for (i < overlay.EXTRAS_COUNT) {
+        val x:    *overlay.Extra                 = ?overlay.EXTRAS[i];
+        var line: lines.Line                     = lines.Line{file: "gen/src/riscv/overlay.mach", number: i + 1, text: view(x.text, str_len(x.text))};
+        val got:  res[read.Record, diag.Refusal] = read.parse(m.alloc, ?m.source.args, ?line, x.file);
+        if (sel got.err)                                                  { ret err[diag.Refusal].err{got.err}; }
+        if (!pushed(vector.push[read.Record](?m.source.records, got.ok))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the catalog the records of `s` map to
+# ---
+# a:       allocator for the catalog, which outlives the run
+# s:       the source as read
+# catalog: masc's riscv extension catalog
+# file:    masc's riscv register file
+pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, file: *register.File, out: *Catalog) err[diag.Refusal] {
+    out.rows        = vector.init[*Row](a);
+    out.respellings = vector.init[Respelling](a);
+    var m:     Mapper            = Mapper{alloc: a, source: s, catalog: catalog, file: file, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), out: out};
+    val extra: err[diag.Refusal] = extras(?m);
+    if (sel extra.err) { ret extra; }
+    val placed: err[diag.Refusal] = place(?m);
+    if (sel placed.err) { ret placed; }
+    val widened: err[diag.Refusal] = split(?m);
+    if (sel widened.err) { ret widened; }
+    var i: usize = 0;
+    for (i < out.rows.len) {
+        val row:  *Row              = out.rows.data[i];
+        val made: err[diag.Refusal] = operands(?m, row);
+        if (sel made.err) { ret made; }
+        val laid: err[diag.Refusal] = encoding(?m, row);
+        if (sel laid.err) { ret laid; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < out.rows.len) {
+        val row:  *Row              = out.rows.data[i];
+        val done: err[diag.Refusal] = effect_of(?m, row);
+        if (sel done.err) { ret done; }
+        context(?m, row);
+        i = i + 1;
+    }
+    sort.sort_by[*Row](out.rows.data, out.rows.len, by_mnemonic);
+    ret err[diag.Refusal].ok{};
+}
+
+#[testing]
+val T_ARGS: [5]read.Arg = [5]read.Arg{
+    read.Arg{name: "imm12", hi: 31, lo: 20},
+    read.Arg{name: "rd", hi: 11, lo: 7},
+    read.Arg{name: "rs1", hi: 19, lo: 15},
+    read.Arg{name: "shamtd", hi: 25, lo: 20},
+    read.Arg{name: "shamtw", hi: 24, lo: 20},
+};
+
+#[testing]
+val T_LINES: [4]str = [4]str{
+    "addi rd rs1 imm12 14..12=0 6..2=0x04 1..0=3",
+    "$pseudo_op rv_i::addi mv rd rs1 31..20=0 14..12=0 6..2=0x04 1..0=3",
+    "slli rd rs1 31..26=0 shamtd 14..12=1 6..2=0x04 1..0=3",
+    "$pseudo_op rv64_i::slli slli rd rs1 shamtw 31..25=0 14..12=1 6..2=0x04 1..0=3",
+};
+
+#[testing]
+val T_FILES: [4]str = [4]str{"rv_i", "rv_i", "rv64_i", "rv32_i"};
+
+test build__a_pseudo_op_its_base_admits_is_a_respelling_and_one_it_does_not_is_a_row {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a: *A.Allocator = testing.allocator_of(?t);
+    var s: read.Source  = read.Source{args: vector.init[read.Arg](a), records: vector.init[read.Record](a), csrs: vector.init[read.Csr](a)};
+    var i: u32          = 0;
+    for (i < 5) {
+        vector.push[read.Arg](?s.args, T_ARGS[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) {
+        var line: lines.Line                     = lines.Line{file: "extensions/t", number: i + 1, text: view(T_LINES[i], str_len(T_LINES[i]))};
+        val got:  res[read.Record, diag.Refusal] = read.parse(a, ?s.args, ?line, T_FILES[i]);
+        if (sel got.err) { ret 1; }
+        vector.push[read.Record](?s.records, got.ok);
+        i = i + 1;
+    }
+    var out:   Catalog;
+    val built: err[diag.Refusal] = build(a, ?s, ?riscv_extension.CATALOG, ?riscv_register.FILE, ?out);
+    if (sel built.err) { ret 2; }
+    # mv respells addi under the extension addi already has
+    if (out.respellings.len != 1)                                                                             { ret 3; }
+    if (!str_equals(out.respellings.data[0].name, "mv") || !str_equals(out.respellings.data[0].base, "addi")) { ret 4; }
+    # rv32's slli is the instruction under a width rv64's does not admit, so it is a row of its own
+    # the overlay's extra records are rows as well
+    if (out.rows.len != 3 + overlay.EXTRAS_COUNT::usize) { ret 5; }
+    var narrow: bool = false;
+    i = 0;
+    for (i < out.rows.len::u32) {
+        val r: *Row = out.rows.data[i];
+        if (str_equals(r.mnemonic, "mv"))                                          { ret 6; }
+        if (str_equals(r.mnemonic, "slli") && str_equals(r.record.file, "rv32_i")) { narrow = true; }
+        i = i + 1;
+    }
+    if (!narrow) { ret 7; }
+    ret 0;
+}
