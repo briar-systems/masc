@@ -1,0 +1,262 @@
+# the record of a generator source, the tree a generator reads, and their check
+#
+# a source is a pinned copy of a third-party table under vendor/<name>, or
+# our own spec-aligned files where third-party data is not cleanly usable,
+# each a directory of the gen project holding its licence file and a
+# REVISION file. a generator reads its source only through the tree, loaded
+# whole and checked against its record before anything reads it, so nothing
+# outside the tree, and nothing changed since it was recorded, reaches a
+# generated table. nothing is ever fetched.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_empty;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use fs: std.filesystem;
+use std.io.error;
+
+use gen.diag;
+
+# one generator source
+# ---
+# name:     its name, as the generated headers and NOTICE spell it
+# upstream: where the copy came from, nil for our own source
+# revision: the exact upstream revision, or the specification revision our own source follows
+# licence:  the licence it is under, as an SPDX expression
+# notice:   the licence file in the copy, relative to it
+# path:     the copy's directory, relative to the gen project
+# checksum: the sha-256 of the copy's tree, as lowercase hex
+pub rec Source {
+    name:     str;
+    upstream: str;
+    revision: str;
+    licence:  str;
+    notice:   str;
+    path:     str;
+    checksum: str;
+}
+
+# the source table, as a pointer to static sources and a count
+pub rec Sources {
+    at:  *Source;
+    len: u32;
+}
+
+# one file of a source's tree
+# ---
+# path: its path in the tree, with `/` between directories
+# data: its bytes
+# len:  how many bytes it holds
+pub rec File {
+    path: str;
+    data: *u8;
+    len:  usize;
+}
+
+# every file of a source's copy, sorted by path
+pub rec Tree {
+    files: vector.Vector[File];
+}
+
+# the file the revision of a copy is written in
+pub val REVISION: str = "REVISION";
+
+pub val NO_LICENCE:  str = "source has no recorded licence";
+pub val NO_NOTICE:   str = "licence file not in the copy";
+pub val NO_REVISION: str = "REVISION file not in the copy";
+pub val REVISED:     str = "REVISION differs from the recorded revision";
+pub val CHECKSUM:    str = "copy differs from its recorded checksum";
+pub val UNREADABLE:  str = "copy cannot be read";
+pub val LINK:        str = "copy holds a link or a special file";
+
+fun refuse(s: *Source, message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(s.path, 0, message, subject)};
+}
+
+fun by_path(a: *File, b: *File) i64 {
+    ret str_compare(a.path, b.path);
+}
+
+fun joined(r: res[str, StrError]) opt[str] {
+    if (sel r.err) { ret opt[str].none{}; }
+    ret opt[str].some{r.ok};
+}
+
+# the files under `dir`, their tree paths prefixed with `prefix`
+fun gather(a: *A.Allocator, dir: str, prefix: str, files: *vector.Vector[File]) err[diag.Refusal] {
+    val listed: res[vector.Vector[str], fs.FsError] = fs.read_dir(a, dir);
+    if (sel listed.err) { ret err[diag.Refusal].err{diag.refusal(dir, 0, UNREADABLE, nil)}; }
+    val names: vector.Vector[str] = listed.ok;
+    var i:     usize              = 0;
+    for (i < names.len) {
+        val name: str      = names.data[i];
+        val full: opt[str] = joined(str_join(a, dir, "/", name));
+        if (sel full.none) { ret err[diag.Refusal].err{diag.refusal(dir, 0, diag.MEMORY, nil)}; }
+        var rel: opt[str] = opt[str].some{name};
+        if (!str_empty(prefix)) { rel = joined(str_join(a, prefix, "/", name)); }
+        if (sel rel.none)       { ret err[diag.Refusal].err{diag.refusal(dir, 0, diag.MEMORY, nil)}; }
+        val meta: res[fs.Metadata, error.Error] = fs.metadata_link(full.some);
+        if (sel meta.err) { ret err[diag.Refusal].err{diag.refusal(full.some, 0, UNREADABLE, nil)}; }
+        var m: fs.Metadata = meta.ok;
+        if (fs.meta_is_dir(?m)) {
+            val inner: err[diag.Refusal] = gather(a, full.some, rel.some, files);
+            if (sel inner.err) { ret inner; }
+        }
+        or (fs.meta_is_file(?m)) {
+            val read: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(a, full.some);
+            if (sel read.err) { ret err[diag.Refusal].err{diag.refusal(full.some, 0, UNREADABLE, nil)}; }
+            val pushed: res[usize, A.Error] = vector.push[File](files, File{path: rel.some, data: read.ok.data, len: read.ok.len});
+            if (sel pushed.err) { ret err[diag.Refusal].err{diag.refusal(dir, 0, diag.MEMORY, nil)}; }
+        }
+        or {
+            ret err[diag.Refusal].err{diag.refusal(full.some, 0, LINK, nil)};
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the tree of the copy at `dir`, every file read whole
+# ---
+# a:   allocator for the tree, which outlives every reader of it
+# dir: the copy's directory
+# ret: the tree, or why it could not be read
+pub fun load(a: *A.Allocator, dir: str) res[Tree, diag.Refusal] {
+    var t:        Tree              = Tree{files: vector.init[File](a)};
+    val gathered: err[diag.Refusal] = gather(a, dir, "", ?t.files);
+    if (sel gathered.err) { ret res[Tree, diag.Refusal].err{gathered.err}; }
+    sort.sort_by[File](t.files.data, t.files.len, by_path);
+    ret res[Tree, diag.Refusal].ok{t};
+}
+
+# the file of `t` at `path`
+pub fun find(t: *Tree, path: str) opt[*File] {
+    var lo: usize = 0;
+    var hi: usize = t.files.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val f:   *File = ?t.files.data[mid];
+        val c:   i64   = str_compare(f.path, path);
+        if (c == 0) { ret opt[*File].some{f}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[*File].none{};
+}
+
+# the checksum of `t` as 64 lowercase hex digits and a nul into `out`, over each file's path, a nul, its length as eight little-endian bytes and its bytes, in path order
+pub fun checksum(t: *Tree, out: *u8) {
+    var s: sha256.State = sha256.init();
+    var i: usize        = 0;
+    for (i < t.files.len) {
+        val f:   *File = ?t.files.data[i];
+        var len: [8]u8;
+        var j:   u32   = 0;
+        for (j < 8) {
+            len[j] = ((f.len::u64 >> (j * 8)::u64) & 0xFF)::u8;
+            j      = j + 1;
+        }
+        var nul: [1]u8;
+        sha256.update(?s, f.path, str_len(f.path));
+        sha256.update(?s, ?nul[0], 1);
+        sha256.update(?s, ?len[0], 8);
+        sha256.update(?s, f.data, f.len);
+        i = i + 1;
+    }
+    var digest: [32]u8;
+    sha256.final(?s, ?digest[0]);
+    val digits: str = "0123456789abcdef";
+    var k:      u32 = 0;
+    for (k < 32) {
+        out[k * 2]     = digits[digest[k] >> 4];
+        out[k * 2 + 1] = digits[digest[k] & 0xF];
+        k              = k + 1;
+    }
+    out[64] = 0;
+}
+
+# whether `f` holds `text`, ignoring trailing whitespace
+fun holds(f: *File, text: str) bool {
+    var len: usize = f.len;
+    for (len > 0 && (f.data[len - 1] == ' ' || f.data[len - 1] == '\n' || f.data[len - 1] == '\r' || f.data[len - 1] == '\t')) {
+        len = len - 1;
+    }
+    if (len != str_len(text)) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (f.data[i] != text[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `t` checked against its record `s`: a recorded licence and its file, the revision and the checksum
+pub fun verify(s: *Source, t: *Tree) err[diag.Refusal] {
+    if (str_empty(s.licence) || str_empty(s.notice)) { ret refuse(s, NO_LICENCE, s.name); }
+    val notice: opt[*File] = find(t, s.notice);
+    if (sel notice.none) { ret refuse(s, NO_NOTICE, s.notice); }
+    val revision: opt[*File] = find(t, REVISION);
+    if (sel revision.none)                 { ret refuse(s, NO_REVISION, s.name); }
+    if (!holds(revision.some, s.revision)) { ret refuse(s, REVISED, s.revision); }
+    var sum: [65]u8;
+    checksum(t, ?sum[0]);
+    if (s.checksum == nil || str_compare(?sum[0], s.checksum) != 0) { ret refuse(s, CHECKSUM, s.name); }
+    ret err[diag.Refusal].ok{};
+}
+
+# a two-file tree and the record that matches it, for the tests below
+#[testing]
+fun t_tree(a: *A.Allocator) Tree {
+    var t: Tree = Tree{files: vector.init[File](a)};
+    vector.push[File](?t.files, File{path: "LICENSE", data: "MIT\n", len: 4});
+    vector.push[File](?t.files, File{path: "REVISION", data: "0123abcd\n", len: 9});
+    ret t;
+}
+
+#[testing]
+fun t_source(t: *Tree, sum: *u8) Source {
+    checksum(t, sum);
+    ret Source{name: "fixture", upstream: "https://example.invalid/fixture", revision: "0123abcd", licence: "MIT", notice: "LICENSE", path: "vendor/fixture", checksum: sum};
+}
+
+test verify__a_source_with_no_recorded_licence_is_refused {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    var t:     Tree              = t_tree(testing.allocator_of(?tt));
+    var sum:   [65]u8;
+    var s:     Source            = t_source(?t, ?sum[0]);
+    val clean: err[diag.Refusal] = verify(?s, ?t);
+    if (sel clean.err) { ret 1; }
+    s.licence = nil;
+    val got: err[diag.Refusal] = verify(?s, ?t);
+    if (!(sel got.err && got.err.message == NO_LICENCE)) { ret 2; }
+    ret 0;
+}
+
+test verify__a_copy_whose_checksum_differs_from_its_record_is_refused {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    var t:   Tree   = t_tree(testing.allocator_of(?tt));
+    var sum: [65]u8;
+    var s:   Source = t_source(?t, ?sum[0]);
+    t.files.data[0].data = "MIT.\n";
+    t.files.data[0].len  = 5;
+    val got: err[diag.Refusal] = verify(?s, ?t);
+    if (!(sel got.err && got.err.message == CHECKSUM)) { ret 1; }
+    ret 0;
+}

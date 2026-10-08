@@ -1,0 +1,252 @@
+# the run of every generator, writing its tables or checking them for drift
+#
+# a run loads every source of the table from the gen project and checks it
+# against its record before any generator reads it, runs each registered
+# generator over its source's tree, and renders what it emitted in memory.
+# then it writes the tables into masc's tree, or in check mode compares each
+# with the committed file and reports every drift, including a generated
+# file no generator emits. neither mode reaches the network: a run reads the
+# tree it is given and nothing else.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_ends_with;
+use std.types.string.str_join;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use fs: std.filesystem;
+use std.io.error;
+
+use gen.diag;
+use gen.emit;
+use gen.set;
+use gen.source;
+
+# a committed table that differs from what its generator emits
+# ---
+# path:    the table, relative to masc's root
+# line:    the first line that differs, 0 when the whole file is missing or stray
+# message: how it differs
+pub rec Drift {
+    path:    str;
+    line:    u32;
+    message: str;
+}
+
+pub val CHANGED:      str = "differs from what its generator emits";
+pub val MISSING:      str = "not committed";
+pub val STRAY:        str = "no generator emits it";
+pub val UNLISTED:     str = "generator reads a source not in the source table";
+pub val SOURCE_TWICE: str = "source listed twice";
+pub val TABLE_TWICE:  str = "table emitted twice";
+pub val UNWRITTEN:    str = "table cannot be written";
+pub val UNREADABLE:   str = "masc's tree cannot be read";
+
+# the drift of committed `got` from emitted `want`, none when they are the same bytes
+pub fun compare(path: str, want: *u8, want_len: usize, got: *u8, got_len: usize) opt[Drift] {
+    var line: u32   = 1;
+    var i:    usize = 0;
+    for (i < want_len && i < got_len) {
+        if (want[i] != got[i]) { ret opt[Drift].some{Drift{path: path, line: line, message: CHANGED}}; }
+        if (want[i] == '\n')   { line = line + 1; }
+        i = i + 1;
+    }
+    if (want_len == got_len) { ret opt[Drift].none{}; }
+    ret opt[Drift].some{Drift{path: path, line: line, message: CHANGED}};
+}
+
+# whether a push was given its storage
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun memory(subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, subject)};
+}
+
+fun join(a: *A.Allocator, x: str, y: str, z: str) opt[str] {
+    val r: res[str, StrError] = str_join(a, x, y, z);
+    if (sel r.err) { ret opt[str].none{}; }
+    ret opt[str].some{r.ok};
+}
+
+# a rendered table and where it goes
+rec Table {
+    path:  str;
+    bytes: vector.Vector[u8];
+}
+
+# whether `path` is a table some generator emitted
+fun emitted(tables: *vector.Vector[Table], path: str) bool {
+    var i: usize = 0;
+    for (i < tables.len) {
+        if (str_compare(tables.data[i].path, path) == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# every generated file under src/isa no generator emitted, as drift
+fun strays(a: *A.Allocator, root: str, tables: *vector.Vector[Table], drift: *vector.Vector[Drift]) err[diag.Refusal] {
+    val isa: opt[str] = join(a, root, "/", "src/isa");
+    if (sel isa.none) { ret memory(root); }
+    val sets: res[vector.Vector[str], fs.FsError] = fs.read_dir(a, isa.some);
+    if (sel sets.err) { ret err[diag.Refusal].err{diag.refusal(isa.some, 0, UNREADABLE, nil)}; }
+    var i: usize = 0;
+    for (i < sets.ok.len) {
+        val dir: opt[str] = join(a, isa.some, "/", sets.ok.data[i]);
+        if (sel dir.none) { ret memory(root); }
+        val is: res[bool, error.Error] = fs.is_dir(dir.some);
+        if (sel is.ok && is.ok) {
+            val files: res[vector.Vector[str], fs.FsError] = fs.read_dir(a, dir.some);
+            if (sel files.err) { ret err[diag.Refusal].err{diag.refusal(dir.some, 0, UNREADABLE, nil)}; }
+            var j: usize = 0;
+            for (j < files.ok.len) {
+                val name: str = files.ok.data[j];
+                if (str_starts_with(name, emit.PREFIX) && str_ends_with(name, ".mach")) {
+                    val set: opt[str] = join(a, "src/isa/", sets.ok.data[i], "/");
+                    if (sel set.none) { ret memory(name); }
+                    val path: opt[str] = join(a, set.some, name, "");
+                    if (sel path.none) { ret memory(name); }
+                    if (!emitted(tables, path.some)) {
+                        if (!pushed(vector.push[Drift](drift, Drift{path: path.some, line: 0, message: STRAY}))) { ret memory(name); }
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# whether `s` is a row of `sources`
+fun listed(sources: *source.Sources, s: *source.Source) bool {
+    var i: u32 = 0;
+    for (i < sources.len) {
+        if (?sources.at[i] == s) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# every generator run over its checked source, its tables written into masc's tree or checked against it
+# ---
+# a:          allocator for the run, which outlives it
+# root:       masc's root, which holds the gen project at gen/
+# sources:    the source table
+# generators: the registered generators
+# check:      whether to compare with the committed tables rather than write them
+# drift:      where every drift is reported
+# ret:        ok, or the refusal of a source, a generator or a table
+pub fun run(a: *A.Allocator, root: str, sources: *source.Sources, generators: *set.Generators, check: bool, drift: *vector.Vector[Drift]) err[diag.Refusal] {
+    var trees: vector.Vector[source.Tree] = vector.init[source.Tree](a);
+    var i:     u32                        = 0;
+    for (i < sources.len) {
+        val s: *source.Source = ?sources.at[i];
+        var j: u32            = 0;
+        for (j < i) {
+            if (str_compare(sources.at[j].name, s.name) == 0) { ret err[diag.Refusal].err{diag.refusal(nil, 0, SOURCE_TWICE, s.name)}; }
+            j = j + 1;
+        }
+        val dir: opt[str] = join(a, root, "/gen/", s.path);
+        if (sel dir.none) { ret memory(s.name); }
+        val tree: res[source.Tree, diag.Refusal] = source.load(a, dir.some);
+        if (sel tree.err) { ret err[diag.Refusal].err{tree.err}; }
+        var t:        source.Tree       = tree.ok;
+        val verified: err[diag.Refusal] = source.verify(s, ?t);
+        if (sel verified.err)                             { ret verified; }
+        if (!pushed(vector.push[source.Tree](?trees, t))) { ret memory(s.name); }
+        i = i + 1;
+    }
+    var tables: vector.Vector[Table] = vector.init[Table](a);
+    i = 0;
+    for (i < generators.len) {
+        val g: *set.Generator = generators.at[i];
+        if (!listed(sources, g.source)) { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNLISTED, g.name)}; }
+        val at:        usize             = (g.source::usize - sources.at::usize) / $size_of(source.Source);
+        var c:         set.Context       = set.Context{alloc: a, generator: g, tree: ?trees.data[at], tables: vector.init[*emit.File](a)};
+        val generated: err[diag.Refusal] = g.generate(?c);
+        if (sel generated.err) { ret generated; }
+        var k: usize = 0;
+        for (k < c.tables.len) {
+            val f:        *emit.File                           = c.tables.data[k];
+            val rendered: res[vector.Vector[u8], diag.Refusal] = emit.render(f);
+            if (sel rendered.err)                                                              { ret err[diag.Refusal].err{rendered.err}; }
+            if (emitted(?tables, f.path))                                                      { ret err[diag.Refusal].err{diag.refusal(f.path, 0, TABLE_TWICE, g.name)}; }
+            if (!pushed(vector.push[Table](?tables, Table{path: f.path, bytes: rendered.ok}))) { ret memory(f.path); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var t: usize = 0;
+    for (t < tables.len) {
+        val table: *Table   = ?tables.data[t];
+        val full:  opt[str] = join(a, root, "/", table.path);
+        if (sel full.none) { ret memory(table.path); }
+        if (check) {
+            val committed: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(a, full.some);
+            if (sel committed.ok) {
+                val d: opt[Drift] = compare(table.path, table.bytes.data, table.bytes.len, committed.ok.data, committed.ok.len);
+                if (sel d.some) {
+                    if (!pushed(vector.push[Drift](drift, d.some))) { ret memory(table.path); }
+                }
+            }
+            or {
+                if (!pushed(vector.push[Drift](drift, Drift{path: table.path, line: 0, message: MISSING}))) { ret memory(table.path); }
+            }
+        }
+        or {
+            val wrote: err[fs.FsError] = fs.write_bytes(full.some, table.bytes.data, table.bytes.len, 0o644);
+            if (sel wrote.err) { ret err[diag.Refusal].err{diag.refusal(table.path, 0, UNWRITTEN, nil)}; }
+        }
+        t = t + 1;
+    }
+    ret strays(a, root, ?tables, drift);
+}
+
+#[testing]
+val T_SOURCE: source.Source = source.Source{name: "fixture", upstream: nil, revision: "1.0", licence: "MIT", notice: "LICENSE", path: "fixture", checksum: nil};
+
+# a three-row table whose row `changed` has its mask moved
+#[testing]
+fun t_table(a: *A.Allocator, changed: u32) res[vector.Vector[u8], diag.Refusal] {
+    var f:    emit.File   = emit.file(a, "fixture", "rows", "fixture", ?T_SOURCE);
+    val rows: *emit.Array = emit.array(?f, "u64");
+    var i:    u32         = 0;
+    for (i < 3) {
+        var mask: u64 = 0x707F;
+        if (i == changed) { mask = 0x7F; }
+        emit.item(?f, rows, emit.Value.hex{mask});
+        i = i + 1;
+    }
+    emit.declare(?f, "MASKS", nil, emit.Value.array{rows});
+    ret emit.render(?f);
+}
+
+test compare__check_mode_reports_a_changed_row {
+    var t: testing.Testing;
+    testing.make(?t);
+    val want: res[vector.Vector[u8], diag.Refusal] = t_table(testing.allocator_of(?t), 3);
+    val got:  res[vector.Vector[u8], diag.Refusal] = t_table(testing.allocator_of(?t), 1);
+    if (sel want.err) { ret 1; }
+    if (sel got.err)  { ret 1; }
+    val same: opt[Drift] = compare("t", want.ok.data, want.ok.len, want.ok.data, want.ok.len);
+    if (sel same.some) { ret 2; }
+    val d: opt[Drift] = compare("t", want.ok.data, want.ok.len, got.ok.data, got.ok.len);
+    if (sel d.none) { ret 3; }
+    # the header, a blank line, the declaration, then the rows
+    if (d.some.line != 5 || d.some.message != CHANGED) { ret 4; }
+    ret 0;
+}

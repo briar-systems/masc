@@ -60,9 +60,10 @@ mach depend on masc.
   analysis, and encoding with real registers after register allocation.
 - **Walks.** Checks over encoded code driven by instruction effects, such as
   secret-dependent timing.
-- **Generators and harness.** The `gen` program builds catalogs from vendored
-  sources, and the `harness` program checks masc against external tools. Both
-  run locally and are never linked into the library.
+- **Generators and harness.** The `gen` program, its own project under
+  `gen/`, builds catalogs from the sources vendored under `gen/vendor`, and the
+  `harness` program checks masc against external tools. Both run locally and
+  are never linked into the library.
 
 
 ## Building
