@@ -1,0 +1,1420 @@
+# call frame information: the rules of a frame, attached to the places of a builder
+#
+# a call frame fact is a call on the builder, shaped like the `.cfi_` directive
+# of the same name, and attaches to the builder's cursor: the place it is made
+# at. nothing here takes an offset the caller computed, since only the builder
+# knows where an instruction lands after relaxation and compression. a
+# register is named by its masc identity and numbered from the register file's
+# debug column, and the call frame facts of the architecture, the alignment
+# factors and the return address column, are mink's, read from the builder's
+# architecture and never restated.
+#
+# an offset is a byte count plus a multiple of a scale of the register file, as
+# the vector length risc-v's vlenb holds. one that scales is written as a
+# DWARF expression over the register that holds the scale: a save slot as
+# DW_CFA_expression, the value of a register as DW_CFA_val_expression and the
+# canonical frame address as DW_CFA_def_cfa_expression.
+#
+# the facts are the state of a caller, attached to a builder once: the builder
+# runs the writer after the layout is settled, so every advance is the distance
+# between two places as laid out. across code the linker may resize, an advance
+# is a fixed width one the builder relocates, so it stays right after the link.
+# the records go to `.eh_frame` and `.debug_frame` as the sections choose, the
+# address of each procedure and its length by the builder's data fixups.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.encoding.leb128;
+
+use mink;
+
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.operand;
+use rf: masc.core.register;
+use masc.core.set;
+
+use riscv_extension: masc.isa.riscv.extension;
+use masc.isa.riscv.gen_register;
+use riscv_register: masc.isa.riscv.register;
+use riscv_set:      masc.isa.riscv.set;
+
+pub val NO_PROCEDURE:   str = "call frame fact outside a procedure";
+pub val STARTED:        str = "procedure started inside another";
+pub val UNBALANCED:     str = "end of a procedure that was never started";
+pub val NEVER_ENDED:    str = "procedure never ended";
+pub val ELSEWHERE:      str = "call frame fact in another section than its procedure";
+pub val NO_UNWIND:      str = "the architecture has no call frame facts";
+pub val NO_SECTION:     str = "no section is current";
+pub val ATTACHED:       str = "call frame facts already attached to a builder";
+pub val NOT_ATTACHED:   str = "call frame facts not attached to a builder";
+pub val NO_NUMBER:      str = "register has no DWARF number";
+pub val NOT_ADMITTED:   str = "register is not one the selection admits";
+pub val NO_SCALE:       str = "offset scales with a scale the register file does not have";
+pub val NO_UNIT:        str = "offset scales with a scale no register holds";
+pub val MIXED_SCALES:   str = "offsets of two scales cannot be combined";
+pub val FACTOR:         str = "offset is not a multiple of the data alignment factor";
+pub val NOT_REMEMBERED: str = "no remembered state to restore";
+pub val ENCODING:       str = "pointer encoding the format cannot write";
+pub val CODE_FACTOR:    str = "advance is not a multiple of the code alignment factor";
+pub val RELOCATED:      str = "advance across code the linker may resize needs a code alignment factor of 1";
+pub val BACKWARDS:      str = "call frame fact placed before the one it follows";
+pub val FAR:            str = "advance wider than 32 bits";
+
+# which sections the records are written to
+pub def Sections: u8;
+
+pub val EH_FRAME:    Sections = 1;
+pub val DEBUG_FRAME: Sections = 2;
+
+# bytes fixed plus a multiple of one scale of the register file
+# ---
+# fixed: the bytes no scale changes
+# per:   the bytes for each unit of the scale's multiplier, 0 when none scales
+# scale: the index of the scale in the register file, read only when per is nonzero
+pub rec Offset {
+    fixed: i64;
+    per:   i64;
+    scale: u8;
+}
+
+# an offset of `n` bytes
+pub fun bytes(n: i64) Offset {
+    ret Offset{fixed: n, per: 0, scale: 0};
+}
+
+# a pointer in a record, written in a DW_EH_PE encoding
+# ---
+# enc:    the encoding: a format in the low four bits, how the value is applied in the next three, and the indirect bit
+# target: the label it points at
+# width:  the bytes of its value
+pub rec Pointer {
+    enc:    u8;
+    target: build.Label;
+    width:  u8;
+}
+
+# a procedure
+# ---
+# section:         the section its code is in
+# start:           where it starts
+# end:             where it ends, set when it is ended
+# first:           its first row in the frames' rows
+# count:           how many rows
+# has_personality: whether it has a personality routine
+# personality:     the routine
+# has_lsda:        whether it has language specific data
+# lsda:            the data
+# signal:          whether it is a signal frame
+# column:          the DWARF number of its return address column
+rec Proc {
+    section:         u32;
+    start:           build.Label;
+    end:             build.Label;
+    first:           usize;
+    count:           usize;
+    has_personality: bool;
+    personality:     Pointer;
+    has_lsda:        bool;
+    lsda:            Pointer;
+    signal:          bool;
+    column:          u32;
+}
+
+# a rule at a place
+# ---
+# at:    the place
+# start: its first byte in the frames' bytes
+# len:   how many bytes
+rec Row {
+    at:    build.Label;
+    start: usize;
+    len:   usize;
+}
+
+# the canonical frame address as a register's DWARF number plus an offset
+rec Cfa {
+    reg: u32;
+    off: Offset;
+}
+
+# the call frame facts of one builder, which the caller owns and keeps until the builder is released
+# ---
+# a:        the allocator
+# unwind:   mink's call frame facts of the builder's architecture
+# attached: whether `attach` made it the builder's
+# sections: which sections the records go to
+# open:     whether the last procedure is not yet ended
+# procs:    the procedures in order
+# rows:     the rules of every procedure in order
+# bytes:    the encoded rules, row by row
+# cfa:      the canonical frame address as the rules so far leave it
+# kept:     the canonical frame addresses `remember_state` kept, innermost last
+pub rec Frames {
+    a:        *A.Allocator;
+    unwind:   mink.arch.Unwind;
+    attached: bool;
+    sections: Sections;
+    open:     bool;
+    procs:    vector.Vector[Proc];
+    rows:     vector.Vector[Row];
+    bytes:    vector.Vector[u8];
+    cfa:      Cfa;
+    kept:     vector.Vector[Cfa];
+}
+
+val DW_CFA_ADVANCE_LOC:        u8 = 0x40;
+val DW_CFA_OFFSET:             u8 = 0x80;
+val DW_CFA_RESTORE:            u8 = 0xC0;
+val DW_CFA_ADVANCE_LOC1:       u8 = 0x02;
+val DW_CFA_ADVANCE_LOC2:       u8 = 0x03;
+val DW_CFA_ADVANCE_LOC4:       u8 = 0x04;
+val DW_CFA_OFFSET_EXTENDED:    u8 = 0x05;
+val DW_CFA_RESTORE_EXTENDED:   u8 = 0x06;
+val DW_CFA_UNDEFINED:          u8 = 0x07;
+val DW_CFA_SAME_VALUE:         u8 = 0x08;
+val DW_CFA_REGISTER:           u8 = 0x09;
+val DW_CFA_REMEMBER_STATE:     u8 = 0x0A;
+val DW_CFA_RESTORE_STATE:      u8 = 0x0B;
+val DW_CFA_DEF_CFA:            u8 = 0x0C;
+val DW_CFA_DEF_CFA_REGISTER:   u8 = 0x0D;
+val DW_CFA_DEF_CFA_OFFSET:     u8 = 0x0E;
+val DW_CFA_DEF_CFA_EXPRESSION: u8 = 0x0F;
+val DW_CFA_EXPRESSION:         u8 = 0x10;
+val DW_CFA_OFFSET_EXTENDED_SF: u8 = 0x11;
+val DW_CFA_DEF_CFA_SF:         u8 = 0x12;
+val DW_CFA_DEF_CFA_OFFSET_SF:  u8 = 0x13;
+val DW_CFA_VAL_OFFSET:         u8 = 0x14;
+val DW_CFA_VAL_OFFSET_SF:      u8 = 0x15;
+val DW_CFA_VAL_EXPRESSION:     u8 = 0x16;
+
+val DW_OP_CONSTS:      u8 = 0x11;
+val DW_OP_DIV:         u8 = 0x1B;
+val DW_OP_MUL:         u8 = 0x1E;
+val DW_OP_PLUS:        u8 = 0x22;
+val DW_OP_PLUS_UCONST: u8 = 0x23;
+val DW_OP_BREGX:       u8 = 0x92;
+
+val DW_EH_PE_ABSPTR: u8 = 0x00;
+val DW_EH_PE_UDATA4: u8 = 0x03;
+val DW_EH_PE_UDATA8: u8 = 0x04;
+val DW_EH_PE_SDATA4: u8 = 0x0B;
+val DW_EH_PE_SDATA8: u8 = 0x0C;
+val DW_EH_PE_PCREL:  u8 = 0x10;
+val DW_EH_PE_FORMAT: u8 = 0x0F;
+val DW_EH_PE_APPLY:  u8 = 0x70;
+
+# the encoding of the procedure addresses in `.eh_frame`: relative to the field, in four bytes
+val FDE_ENCODING: u8 = 0x1B;
+
+# the CIE id of `.debug_frame` in 32-bit DWARF
+val DEBUG_CIE_ID: u64 = 0xFFFF_FFFF;
+
+fun refusal(message: str) build.Refusal {
+    ret build.Refusal{message: message, label: operand.NO_SYMBOL};
+}
+
+fun refused(message: str) err[build.Refusal] {
+    ret err[build.Refusal].err{refusal(message)};
+}
+
+fun memory() build.Refusal {
+    ret refusal(field.MEMORY);
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# up to 127 bytes of one rule, built before it is kept
+rec Buf {
+    data: [128]u8;
+    len:  usize;
+}
+
+fun put(w: *Buf, v: u8) {
+    w.data[w.len] = v;
+    w.len         = w.len + 1;
+}
+
+fun put_u(w: *Buf, v: u64) {
+    w.len = w.len + leb128.put_unsigned(?w.data[w.len], v);
+}
+
+fun put_s(w: *Buf, v: i64) {
+    w.len = w.len + leb128.put_signed(?w.data[w.len], v);
+}
+
+fun put_all(w: *Buf, from: *Buf) {
+    var i: usize = 0;
+    for (i < from.len) {
+        put(w, from.data[i]);
+        i = i + 1;
+    }
+}
+
+# facts over allocator `a`, attached to no builder yet
+pub fun make(a: *A.Allocator) Frames {
+    ret Frames{
+        a:        a,
+        attached: false,
+        sections: EH_FRAME,
+        open:     false,
+        procs:    vector.init[Proc](a),
+        rows:     vector.init[Row](a),
+        bytes:    vector.init[u8](a),
+        kept:     vector.init[Cfa](a),
+    };
+}
+
+# give back the facts. the builder must not be finished after
+pub fun release(f: *Frames) {
+    vector.dnit[Proc](?f.procs);
+    vector.dnit[Row](?f.rows);
+    vector.dnit[u8](?f.bytes);
+    vector.dnit[Cfa](?f.kept);
+}
+
+# `f` made the facts of builder `b`, which writes them once the layout is settled. `f` must stay where it is until the
+# builder is released
+pub fun attach(b: *build.Builder, f: *Frames) err[build.Refusal] {
+    if (f.attached)             { ret refused(ATTACHED); }
+    if (sel b.arch.unwind.none) { ret refused(NO_UNWIND); }
+    f.unwind   = b.arch.unwind.some;
+    f.attached = true;
+    val added: err[build.Refusal] = build.writer(b, build.Writer{name: "call frame information", context: f::ptr, write: write});
+    if (sel added.err) {
+        f.attached = false;
+        ret added;
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# which sections the records are written to, `.eh_frame` until stated
+pub fun sections(f: *Frames, which: Sections) {
+    f.sections = which;
+}
+
+# the open procedure of the facts, refused when none is
+fun procedure(f: *Frames) res[*Proc, build.Refusal] {
+    if (!f.attached) { ret res[*Proc, build.Refusal].err{refusal(NOT_ATTACHED)}; }
+    if (!f.open)     { ret res[*Proc, build.Refusal].err{refusal(NO_PROCEDURE)}; }
+    ret res[*Proc, build.Refusal].ok{?f.procs.data[f.procs.len - 1]};
+}
+
+# whether a procedure is open, for a front end that must refuse the end of its input inside one
+pub fun is_open(f: *Frames) bool {
+    ret f.open;
+}
+
+# a procedure started at the cursor of the current section, its canonical frame address the stack pointer
+pub fun start_proc(b: *build.Builder, f: *Frames) err[build.Refusal] {
+    if (!f.attached)                              { ret refused(NOT_ATTACHED); }
+    if (f.open)                                   { ret refused(STARTED); }
+    if (!held(vector.reserve[Proc](?f.procs, 1))) { ret err[build.Refusal].err{memory()}; }
+    val at: opt[build.Section] = build.current(b);
+    if (sel at.none) { ret refused(NO_SECTION); }
+    val start: res[build.Label, build.Refusal] = build.position(b);
+    if (sel start.err) { ret err[build.Refusal].err{start.err}; }
+    var none: Pointer = Pointer{enc: 0, target: build.Label{id: operand.NO_SYMBOL}, width: 0};
+    vector.push[Proc](?f.procs, Proc{
+        section:         at.some.index,
+        start:           start.ok,
+        end:             build.Label{id: operand.NO_SYMBOL},
+        first:           f.rows.len,
+        count:           0,
+        has_personality: false,
+        personality:     none,
+        has_lsda:        false,
+        lsda:            none,
+        signal:          false,
+        column:          f.unwind.ra::u32,
+    });
+    f.open     = true;
+    f.cfa      = Cfa{reg: f.unwind.sp::u32, off: bytes(0)};
+    f.kept.len = 0;
+    ret err[build.Refusal].ok{};
+}
+
+# the open procedure ended at the cursor, refused when none is open
+pub fun end_proc(b: *build.Builder, f: *Frames) err[build.Refusal] {
+    if (!f.attached) { ret refused(NOT_ATTACHED); }
+    if (!f.open)     { ret refused(UNBALANCED); }
+    val p: *Proc = ?f.procs.data[f.procs.len - 1];
+    if (!here(b, p)) { ret refused(ELSEWHERE); }
+    val end: res[build.Label, build.Refusal] = build.position(b);
+    if (sel end.err) { ret err[build.Refusal].err{end.err}; }
+    p.end  = end.ok;
+    f.open = false;
+    ret err[build.Refusal].ok{};
+}
+
+# whether the current section is the procedure's
+fun here(b: *build.Builder, p: *Proc) bool {
+    val at: opt[build.Section] = build.current(b);
+    if (sel at.none) { ret false; }
+    ret at.some.index == p.section;
+}
+
+# the DWARF number of `reg`, refused when the selection does not admit it or the file does not number it
+fun number(b: *build.Builder, reg: rf.Id) res[u32, build.Refusal] {
+    val file: *rf.File = b.set.codec.registers;
+    if (file == nil) { ret res[u32, build.Refusal].err{refusal(NO_NUMBER)}; }
+    val admitted: err[rf.Absent] = rf.admitted(b.available, reg);
+    if (sel admitted.err) { ret res[u32, build.Refusal].err{refusal(NOT_ADMITTED)}; }
+    val n: opt[u32] = rf.debug_number(file, reg, rf.DWARF);
+    if (sel n.none) { ret res[u32, build.Refusal].err{refusal(NO_NUMBER)}; }
+    ret res[u32, build.Refusal].ok{n.some};
+}
+
+# `a` plus `c`, or less when `minus`
+fun combine(a: Offset, c: Offset, minus: bool) res[Offset, build.Refusal] {
+    var per:   i64 = c.per;
+    var fixed: i64 = c.fixed;
+    if (minus) {
+        per   = -c.per;
+        fixed = -c.fixed;
+    }
+    var out: Offset = Offset{fixed: a.fixed + fixed, per: a.per, scale: a.scale};
+    if (a.per == 0) {
+        out.per   = per;
+        out.scale = c.scale;
+    }
+    or (c.per != 0) {
+        if (a.scale != c.scale) { ret res[Offset, build.Refusal].err{refusal(MIXED_SCALES)}; }
+        out.per = a.per + per;
+    }
+    if (out.per == 0) { out.scale = 0; }
+    ret res[Offset, build.Refusal].ok{out};
+}
+
+# the rule `w` holds kept at the cursor, beside the instruction emitted next
+fun keep(b: *build.Builder, f: *Frames, w: *Buf) err[build.Refusal] {
+    ret keep_bytes(b, f, ?w.data[0], w.len);
+}
+
+fun keep_bytes(b: *build.Builder, f: *Frames, p: *u8, n: usize) err[build.Refusal] {
+    val proc: res[*Proc, build.Refusal] = procedure(f);
+    if (sel proc.err)                                                                     { ret err[build.Refusal].err{proc.err}; }
+    if (!here(b, proc.ok))                                                                { ret refused(ELSEWHERE); }
+    if (!held(vector.reserve[u8](?f.bytes, n)) || !held(vector.reserve[Row](?f.rows, 1))) { ret err[build.Refusal].err{memory()}; }
+    val at: res[build.Label, build.Refusal] = build.position(b);
+    if (sel at.err) { ret err[build.Refusal].err{at.err}; }
+    val start: usize = f.bytes.len;
+    var i:     usize = 0;
+    for (i < n) {
+        f.bytes.data[start + i] = p[i];
+        i                       = i + 1;
+    }
+    f.bytes.len = start + n;
+    vector.push[Row](?f.rows, Row{at: at.ok, start: start, len: n});
+    proc.ok.count = proc.ok.count + 1;
+    ret err[build.Refusal].ok{};
+}
+
+# `off` divided by the data alignment factor, refused when it is not a multiple
+fun factored(f: *Frames, off: i64) res[i64, build.Refusal] {
+    val da: i64 = f.unwind.data_align::i64;
+    if (off % da != 0) { ret res[i64, build.Refusal].err{refusal(FACTOR)}; }
+    ret res[i64, build.Refusal].ok{off / da};
+}
+
+# the terms of the scale of `off`, its multiplier read from the register that holds the scale, onto `w`
+fun scaled(b: *build.Builder, w: *Buf, off: Offset) err[build.Refusal] {
+    val file: *rf.File = b.set.codec.registers;
+    if (file == nil || off.scale::u32 >= file.scale_count) { ret refused(NO_SCALE); }
+    val scale: rf.Scale = file.scales[off.scale];
+    if (scale.unit == rf.NONE || scale.step == 0) { ret refused(NO_UNIT); }
+    val unit: res[u32, build.Refusal] = number(b, scale.unit);
+    if (sel unit.err) { ret err[build.Refusal].err{unit.err}; }
+    put(w, DW_OP_BREGX);
+    put_u(w, unit.ok::u64);
+    put_s(w, 0);
+    val step: i64 = scale.step::i64;
+    put(w, DW_OP_CONSTS);
+    if (off.per % step == 0) { put_s(w, off.per / step); }
+    or                       { put_s(w, off.per); }
+    put(w, DW_OP_MUL);
+    if (off.per % step != 0) {
+        put(w, DW_OP_CONSTS);
+        put_s(w, step);
+        put(w, DW_OP_DIV);
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# the expression for an address or value `off` from the canonical frame address, which starts on the stack
+fun from_cfa(b: *build.Builder, w: *Buf, off: Offset) err[build.Refusal] {
+    val s: err[build.Refusal] = scaled(b, w, off);
+    if (sel s.err) { ret s; }
+    put(w, DW_OP_PLUS);
+    if (off.fixed > 0) {
+        put(w, DW_OP_PLUS_UCONST);
+        put_u(w, off.fixed:~u64);
+    }
+    or (off.fixed < 0) {
+        put(w, DW_OP_CONSTS);
+        put_s(w, off.fixed);
+        put(w, DW_OP_PLUS);
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# an opcode of `body` as a block, after register `n` when `regged`
+fun block(w: *Buf, op: u8, regged: bool, n: u32, body: *Buf) {
+    put(w, op);
+    if (regged) { put_u(w, n::u64); }
+    put_u(w, body.len::u64);
+    put_all(w, body);
+}
+
+# register `n` saved at `off` from the canonical frame address, or holding that address when `value`
+fun saved(b: *build.Builder, f: *Frames, w: *Buf, n: u32, off: Offset, value: bool) err[build.Refusal] {
+    if (off.per != 0) {
+        var ex: Buf;
+        ex.len = 0;
+        val s: err[build.Refusal] = from_cfa(b, ?ex, off);
+        if (sel s.err) { ret s; }
+        if (value)     { block(w, DW_CFA_VAL_EXPRESSION, true, n, ?ex); }
+        or             { block(w, DW_CFA_EXPRESSION, true, n, ?ex); }
+        ret err[build.Refusal].ok{};
+    }
+    val k: res[i64, build.Refusal] = factored(f, off.fixed);
+    if (sel k.err) { ret err[build.Refusal].err{k.err}; }
+    if (value) {
+        if (k.ok >= 0) {
+            put(w, DW_CFA_VAL_OFFSET);
+            put_u(w, n::u64);
+            put_u(w, k.ok:~u64);
+        }
+        or {
+            put(w, DW_CFA_VAL_OFFSET_SF);
+            put_u(w, n::u64);
+            put_s(w, k.ok);
+        }
+        ret err[build.Refusal].ok{};
+    }
+    if (k.ok >= 0) {
+        if (n < 64) { put(w, DW_CFA_OFFSET | n::u8); }
+        or {
+            put(w, DW_CFA_OFFSET_EXTENDED);
+            put_u(w, n::u64);
+        }
+        put_u(w, k.ok:~u64);
+    }
+    or {
+        put(w, DW_CFA_OFFSET_EXTENDED_SF);
+        put_u(w, n::u64);
+        put_s(w, k.ok);
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# how a rule of the canonical frame address is written: whole, as a new register, or as a new offset
+def Change: u8;
+
+val WHOLE:    Change = 0;
+val REGISTER: Change = 1;
+val OFFSET:   Change = 2;
+
+# the canonical frame address made register `n` plus `off`, written as `how` when the rule allows it
+fun set_cfa(b: *build.Builder, f: *Frames, w: *Buf, n: u32, off: Offset, how: Change) err[build.Refusal] {
+    var change: Change = how;
+    if (off.per != 0) {
+        var ex: Buf;
+        ex.len = 0;
+        put(?ex, DW_OP_BREGX);
+        put_u(?ex, n::u64);
+        put_s(?ex, off.fixed);
+        val s: err[build.Refusal] = scaled(b, ?ex, off);
+        if (sel s.err) { ret s; }
+        put(?ex, DW_OP_PLUS);
+        block(w, DW_CFA_DEF_CFA_EXPRESSION, false, 0, ?ex);
+        f.cfa = Cfa{reg: n, off: off};
+        ret err[build.Refusal].ok{};
+    }
+    # a rule made from an expression cannot be patched
+    if (f.cfa.off.per != 0) { change = WHOLE; }
+    if (change == WHOLE) {
+        if (off.fixed >= 0) {
+            put(w, DW_CFA_DEF_CFA);
+            put_u(w, n::u64);
+            put_u(w, off.fixed:~u64);
+        }
+        or {
+            val k: res[i64, build.Refusal] = factored(f, off.fixed);
+            if (sel k.err) { ret err[build.Refusal].err{k.err}; }
+            put(w, DW_CFA_DEF_CFA_SF);
+            put_u(w, n::u64);
+            put_s(w, k.ok);
+        }
+    }
+    or (change == REGISTER) {
+        put(w, DW_CFA_DEF_CFA_REGISTER);
+        put_u(w, n::u64);
+    }
+    or {
+        if (off.fixed >= 0) {
+            put(w, DW_CFA_DEF_CFA_OFFSET);
+            put_u(w, off.fixed:~u64);
+        }
+        or {
+            val k: res[i64, build.Refusal] = factored(f, off.fixed);
+            if (sel k.err) { ret err[build.Refusal].err{k.err}; }
+            put(w, DW_CFA_DEF_CFA_OFFSET_SF);
+            put_s(w, k.ok);
+        }
+    }
+    f.cfa = Cfa{reg: n, off: off};
+    ret err[build.Refusal].ok{};
+}
+
+# the open procedure of `f`, refused when there is none
+fun inside(f: *Frames) err[build.Refusal] {
+    val p: res[*Proc, build.Refusal] = procedure(f);
+    if (sel p.err) { ret err[build.Refusal].err{p.err}; }
+    ret err[build.Refusal].ok{};
+}
+
+# the rule `w` holds, kept when it was made
+fun finish_rule(b: *build.Builder, f: *Frames, w: *Buf, made: err[build.Refusal]) err[build.Refusal] {
+    if (sel made.err) { ret made; }
+    ret keep(b, f, w);
+}
+
+# `.cfi_def_cfa`: the canonical frame address is register `reg` plus `off`
+pub fun def_cfa(b: *build.Builder, f: *Frames, reg: rf.Id, off: Offset) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val n: res[u32, build.Refusal] = number(b, reg);
+    if (sel n.err) { ret err[build.Refusal].err{n.err}; }
+    var w: Buf;
+    w.len = 0;
+    ret finish_rule(b, f, ?w, set_cfa(b, f, ?w, n.ok, off, WHOLE));
+}
+
+# `.cfi_def_cfa_register`: the canonical frame address is register `reg` plus the offset it had
+pub fun def_cfa_register(b: *build.Builder, f: *Frames, reg: rf.Id) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val n: res[u32, build.Refusal] = number(b, reg);
+    if (sel n.err) { ret err[build.Refusal].err{n.err}; }
+    var w: Buf;
+    w.len = 0;
+    ret finish_rule(b, f, ?w, set_cfa(b, f, ?w, n.ok, f.cfa.off, REGISTER));
+}
+
+# `.cfi_def_cfa_offset`: the canonical frame address is the register it had plus `off`
+pub fun def_cfa_offset(b: *build.Builder, f: *Frames, off: Offset) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    var w: Buf;
+    w.len = 0;
+    ret finish_rule(b, f, ?w, set_cfa(b, f, ?w, f.cfa.reg, off, OFFSET));
+}
+
+# `.cfi_adjust_cfa_offset`: the offset of the canonical frame address moved by `delta`
+pub fun adjust_cfa_offset(b: *build.Builder, f: *Frames, delta: Offset) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val moved: res[Offset, build.Refusal] = combine(f.cfa.off, delta, false);
+    if (sel moved.err) { ret err[build.Refusal].err{moved.err}; }
+    var w: Buf;
+    w.len = 0;
+    ret finish_rule(b, f, ?w, set_cfa(b, f, ?w, f.cfa.reg, moved.ok, OFFSET));
+}
+
+fun save(b: *build.Builder, f: *Frames, reg: rf.Id, off: Offset, value: bool) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val n: res[u32, build.Refusal] = number(b, reg);
+    if (sel n.err) { ret err[build.Refusal].err{n.err}; }
+    var w: Buf;
+    w.len = 0;
+    ret finish_rule(b, f, ?w, saved(b, f, ?w, n.ok, off, value));
+}
+
+# `.cfi_offset`: register `reg` is saved at `off` from the canonical frame address
+pub fun offset(b: *build.Builder, f: *Frames, reg: rf.Id, off: Offset) err[build.Refusal] {
+    ret save(b, f, reg, off, false);
+}
+
+# `.cfi_val_offset`: register `reg` holds the canonical frame address plus `off`
+pub fun val_offset(b: *build.Builder, f: *Frames, reg: rf.Id, off: Offset) err[build.Refusal] {
+    ret save(b, f, reg, off, true);
+}
+
+# `.cfi_rel_offset`: register `reg` is saved at `off` from the register the canonical frame address is taken from
+pub fun rel_offset(b: *build.Builder, f: *Frames, reg: rf.Id, off: Offset) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val from: res[Offset, build.Refusal] = combine(off, f.cfa.off, true);
+    if (sel from.err) { ret err[build.Refusal].err{from.err}; }
+    ret save(b, f, reg, from.ok, false);
+}
+
+# a rule of one register and its number alone, or two
+fun simple(b: *build.Builder, f: *Frames, reg: rf.Id, other: rf.Id, op: u8, pair: bool) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val n: res[u32, build.Refusal] = number(b, reg);
+    if (sel n.err) { ret err[build.Refusal].err{n.err}; }
+    var w: Buf;
+    w.len = 0;
+    if (op == DW_CFA_RESTORE) {
+        if (n.ok < 64) { put(?w, DW_CFA_RESTORE | n.ok::u8); }
+        or {
+            put(?w, DW_CFA_RESTORE_EXTENDED);
+            put_u(?w, n.ok::u64);
+        }
+    }
+    or {
+        put(?w, op);
+        put_u(?w, n.ok::u64);
+    }
+    if (pair) {
+        val m: res[u32, build.Refusal] = number(b, other);
+        if (sel m.err) { ret err[build.Refusal].err{m.err}; }
+        put_u(?w, m.ok::u64);
+    }
+    ret keep(b, f, ?w);
+}
+
+# `.cfi_register`: register `reg` is saved in register `other`
+pub fun register(b: *build.Builder, f: *Frames, reg: rf.Id, other: rf.Id) err[build.Refusal] {
+    ret simple(b, f, reg, other, DW_CFA_REGISTER, true);
+}
+
+# `.cfi_restore`: register `reg` holds what it held on entry
+pub fun restore(b: *build.Builder, f: *Frames, reg: rf.Id) err[build.Refusal] {
+    ret simple(b, f, reg, rf.NONE, DW_CFA_RESTORE, false);
+}
+
+# `.cfi_undefined`: register `reg` has no value to restore
+pub fun undefined(b: *build.Builder, f: *Frames, reg: rf.Id) err[build.Refusal] {
+    ret simple(b, f, reg, rf.NONE, DW_CFA_UNDEFINED, false);
+}
+
+# `.cfi_same_value`: register `reg` still holds its value
+pub fun same_value(b: *build.Builder, f: *Frames, reg: rf.Id) err[build.Refusal] {
+    ret simple(b, f, reg, rf.NONE, DW_CFA_SAME_VALUE, false);
+}
+
+# `.cfi_remember_state`: the rules so far kept, to return to
+pub fun remember_state(b: *build.Builder, f: *Frames) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err)                            { ret open; }
+    if (!held(vector.push[Cfa](?f.kept, f.cfa))) { ret err[build.Refusal].err{memory()}; }
+    var w: Buf;
+    w.len = 0;
+    put(?w, DW_CFA_REMEMBER_STATE);
+    ret keep(b, f, ?w);
+}
+
+# `.cfi_restore_state`: the rules kept last are the rules again
+pub fun restore_state(b: *build.Builder, f: *Frames) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val last: opt[Cfa] = vector.pop[Cfa](?f.kept);
+    if (sel last.none) { ret refused(NOT_REMEMBERED); }
+    f.cfa = last.some;
+    var w: Buf;
+    w.len = 0;
+    put(?w, DW_CFA_RESTORE_STATE);
+    ret keep(b, f, ?w);
+}
+
+# `.cfi_escape`: the `n` bytes at `p` as an instruction of their own
+pub fun escape(b: *build.Builder, f: *Frames, p: *u8, n: usize) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    ret keep_bytes(b, f, p, n);
+}
+
+# the width of a value in encoding `enc`, none for a format that cannot be written
+fun width_of(b: *build.Builder, enc: u8) opt[u8] {
+    val format: u8 = enc & DW_EH_PE_FORMAT;
+    if (format == DW_EH_PE_ABSPTR)                              { ret opt[u8].some{b.arch.pointer_bytes}; }
+    if (format == DW_EH_PE_UDATA4 || format == DW_EH_PE_SDATA4) { ret opt[u8].some{4}; }
+    if (format == DW_EH_PE_UDATA8 || format == DW_EH_PE_SDATA8) { ret opt[u8].some{8}; }
+    ret opt[u8].none{};
+}
+
+# the pointer to `target` in encoding `enc`, refused unless it is a format of a fixed width applied absolutely or
+# relative to the field
+fun pointer(b: *build.Builder, enc: u8, target: build.Label) res[Pointer, build.Refusal] {
+    val apply: u8 = enc & DW_EH_PE_APPLY;
+    if (apply != 0 && apply != DW_EH_PE_PCREL) { ret res[Pointer, build.Refusal].err{refusal(ENCODING)}; }
+    val width: opt[u8] = width_of(b, enc);
+    if (sel width.none) { ret res[Pointer, build.Refusal].err{refusal(ENCODING)}; }
+    ret res[Pointer, build.Refusal].ok{Pointer{enc: enc, target: target, width: width.some}};
+}
+
+# `.cfi_personality`: the procedure's personality routine is `target`, a pointer of encoding `enc`
+pub fun personality(b: *build.Builder, f: *Frames, enc: u8, target: build.Label) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val p: res[Pointer, build.Refusal] = pointer(b, enc, target);
+    if (sel p.err) { ret err[build.Refusal].err{p.err}; }
+    val proc: *Proc = ?f.procs.data[f.procs.len - 1];
+    proc.has_personality = true;
+    proc.personality     = p.ok;
+    ret err[build.Refusal].ok{};
+}
+
+# `.cfi_lsda`: the procedure's language specific data is `target`, a pointer of encoding `enc`
+pub fun lsda(b: *build.Builder, f: *Frames, enc: u8, target: build.Label) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val p: res[Pointer, build.Refusal] = pointer(b, enc, target);
+    if (sel p.err) { ret err[build.Refusal].err{p.err}; }
+    val proc: *Proc = ?f.procs.data[f.procs.len - 1];
+    proc.has_lsda = true;
+    proc.lsda     = p.ok;
+    ret err[build.Refusal].ok{};
+}
+
+# `.cfi_signal_frame`: the procedure is invoked by a signal
+pub fun signal_frame(f: *Frames) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    f.procs.data[f.procs.len - 1].signal = true;
+    ret err[build.Refusal].ok{};
+}
+
+# `.cfi_return_column`: the procedure's return address is in register `reg`
+pub fun return_column(b: *build.Builder, f: *Frames, reg: rf.Id) err[build.Refusal] {
+    val open: err[build.Refusal] = inside(f);
+    if (sel open.err) { ret open; }
+    val n: res[u32, build.Refusal] = number(b, reg);
+    if (sel n.err) { ret err[build.Refusal].err{n.err}; }
+    f.procs.data[f.procs.len - 1].column = n.ok;
+    ret err[build.Refusal].ok{};
+}
+
+# a record's bytes counted, or written when `emit`, at `pos` of its section. the first refusal is kept and every
+# later write is skipped
+# ---
+# b:      the builder
+# emit:   whether to write
+# pos:    where the next byte lies in the section
+# failed: whether a write was refused
+# why:    the refusal
+rec Sink {
+    b:      *build.Builder;
+    emit:   bool;
+    pos:    u64;
+    failed: bool;
+    why:    build.Refusal;
+}
+
+fun note(s: *Sink, e: err[build.Refusal]) {
+    if (sel e.err) {
+        if (!s.failed) {
+            s.failed = true;
+            s.why    = e.err;
+        }
+    }
+}
+
+fun refuse_sink(s: *Sink, message: str) {
+    note(s, refused(message));
+}
+
+fun put_bytes(s: *Sink, p: *u8, n: usize) {
+    s.pos = s.pos + n::u64;
+    if (!s.emit || s.failed || n == 0) { ret; }
+    note(s, build.data(s.b, p, n));
+}
+
+fun put_int(s: *Sink, v: u64, width: u8) {
+    s.pos = s.pos + width::u64;
+    if (!s.emit || s.failed) { ret; }
+    note(s, build.integer(s.b, v, width));
+}
+
+fun put_u8(s: *Sink, v: u8) {
+    put_int(s, v::u64, 1);
+}
+
+fun put_uleb(s: *Sink, v: u64) {
+    var tmp: [10]u8;
+    val n:   usize = leb128.put_unsigned(?tmp[0], v);
+    put_bytes(s, ?tmp[0], n);
+}
+
+fun put_sleb(s: *Sink, v: i64) {
+    var tmp: [10]u8;
+    val n:   usize = leb128.put_signed(?tmp[0], v);
+    put_bytes(s, ?tmp[0], n);
+}
+
+fun put_zero(s: *Sink, n: u64) {
+    s.pos = s.pos + n;
+    if (!s.emit || s.failed || n == 0) { ret; }
+    note(s, build.zero(s.b, n));
+}
+
+# a pointer to `target` of `width` bytes, relocated
+fun put_reference(s: *Sink, target: build.Label, width: u8, basis: set.Basis) {
+    s.pos = s.pos + width::u64;
+    if (!s.emit || s.failed) { ret; }
+    note(s, build.datum(s.b, build.Reference{target: target, addend: 0, width: width, basis: basis}));
+}
+
+# the distance from `minus` to `plus` in `width` bytes, folded or relocated
+fun put_difference(s: *Sink, plus: build.Label, minus: build.Label, width: u8) {
+    s.pos = s.pos + width::u64;
+    if (!s.emit || s.failed) { ret; }
+    note(s, build.difference(s.b, build.Difference{plus: plus, minus: minus, addend: 0}, width));
+}
+
+# the pointer `p` in its own encoding
+fun put_pointer(s: *Sink, p: Pointer) {
+    var basis: set.Basis = set.ABSOLUTE;
+    if ((p.enc & DW_EH_PE_APPLY) == DW_EH_PE_PCREL) { basis = set.RELATIVE; }
+    put_reference(s, p.target, p.width, basis);
+}
+
+# the advance of `n` code alignment units
+fun put_advance(s: *Sink, n: u64) {
+    if (n == 0) { ret; }
+    if (n < 64) {
+        put_u8(s, DW_CFA_ADVANCE_LOC | n::u8);
+        ret;
+    }
+    if (n <= 0xFF) {
+        put_u8(s, DW_CFA_ADVANCE_LOC1);
+        put_int(s, n, 1);
+        ret;
+    }
+    if (n <= 0xFFFF) {
+        put_u8(s, DW_CFA_ADVANCE_LOC2);
+        put_int(s, n, 2);
+        ret;
+    }
+    if (n > 0xFFFF_FFFF) {
+        refuse_sink(s, FAR);
+        ret;
+    }
+    put_u8(s, DW_CFA_ADVANCE_LOC4);
+    put_int(s, n, 4);
+}
+
+# a CIE written, and what it holds
+# ---
+# at:              where it starts in the section
+# has_personality: whether it names a personality routine
+# personality:     the routine
+# has_lsda:        whether its procedures have language specific data
+# lsda:            the encoding of that data
+# signal:          whether its procedures are signal frames
+# column:          its return address column
+rec Cie {
+    at:              u64;
+    has_personality: bool;
+    personality:     Pointer;
+    has_lsda:        bool;
+    lsda:            u8;
+    signal:          bool;
+    column:          u32;
+}
+
+# what one format's records are written from
+# ---
+# f:      the facts
+# format: EH_FRAME or DEBUG_FRAME
+# align:  the alignment of a record, the width of an address
+# pos:    where the next record starts in its section
+# cies:   the CIEs written so far
+rec Writer {
+    f:      *Frames;
+    format: Sections;
+    align:  u64;
+    pos:    u64;
+    cies:   vector.Vector[Cie];
+}
+
+# whether CIE `c` is the one procedure `p` needs
+fun serves(c: *Cie, p: *Proc) bool {
+    if (c.has_personality != p.has_personality || c.has_lsda != p.has_lsda) { ret false; }
+    if (c.signal != p.signal || c.column != p.column)                       { ret false; }
+    if (p.has_personality) {
+        if (c.personality.enc != p.personality.enc || c.personality.target.id != p.personality.target.id) { ret false; }
+    }
+    if (p.has_lsda && c.lsda != p.lsda.enc) { ret false; }
+    ret true;
+}
+
+# a CIE after its id: version, augmentation, factors, return column and the initial rule
+fun cie_body(s: *Sink, w: *Writer, c: *Cie) {
+    val eh: bool             = w.format == EH_FRAME;
+    val u:  mink.arch.Unwind = w.f.unwind;
+    if (eh) {
+        put_u8(s, 1);
+        var aug: [6]u8;
+        var n:   usize = 0;
+        aug[n] = 'z';
+        n      = n + 1;
+        if (c.has_personality) {
+            aug[n] = 'P';
+            n      = n + 1;
+        }
+        if (c.has_lsda) {
+            aug[n] = 'L';
+            n      = n + 1;
+        }
+        aug[n] = 'R';
+        n      = n + 1;
+        if (c.signal) {
+            aug[n] = 'S';
+            n      = n + 1;
+        }
+        aug[n] = 0;
+        n      = n + 1;
+        put_bytes(s, ?aug[0], n);
+    }
+    or {
+        put_u8(s, 4);
+        put_u8(s, 0);
+        put_u8(s, s.b.arch.pointer_bytes);
+        put_u8(s, 0);
+    }
+    put_uleb(s, u.code_align::u64);
+    put_sleb(s, u.data_align::i64);
+    if (eh) { put_u8(s, c.column::u8); }
+    or      { put_uleb(s, c.column::u64); }
+    if (eh) {
+        var size: u64 = 1;
+        if (c.has_personality) { size = size + 1 + c.personality.width::u64; }
+        if (c.has_lsda)        { size = size + 1; }
+        put_uleb(s, size);
+        if (c.has_personality) {
+            put_u8(s, c.personality.enc);
+            put_pointer(s, c.personality);
+        }
+        if (c.has_lsda) { put_u8(s, c.lsda); }
+        put_u8(s, FDE_ENCODING);
+    }
+    # the canonical frame address starts as the stack pointer
+    put_u8(s, DW_CFA_DEF_CFA);
+    put_uleb(s, u.sp::u64);
+    put_uleb(s, 0);
+}
+
+# an FDE after its length: its CIE, its range, its language specific data and its rules, each advance the distance
+# between two places of the layout
+fun fde_body(s: *Sink, w: *Writer, c: *Cie, p: *Proc) {
+    val eh: bool             = w.format == EH_FRAME;
+    val u:  mink.arch.Unwind = w.f.unwind;
+    if (eh) { put_int(s, s.pos - c.at, 4); }
+    or      { put_int(s, c.at, 4); }
+    if (eh) {
+        put_reference(s, p.start, 4, set.RELATIVE);
+        put_difference(s, p.end, p.start, 4);
+        var size: u64 = 0;
+        if (p.has_lsda) { size = p.lsda.width::u64; }
+        put_uleb(s, size);
+        if (p.has_lsda) { put_pointer(s, p.lsda); }
+    }
+    or {
+        val width: u8 = s.b.arch.pointer_bytes;
+        put_reference(s, p.start, width, set.ABSOLUTE);
+        put_difference(s, p.end, p.start, width);
+    }
+    var prev: build.Label = p.start;
+    var i:    usize       = 0;
+    for (i < p.count && !s.failed) {
+        val row: *Row     = ?w.f.rows.data[p.first + i];
+        val gap: opt[i64] = build.distance_of(s.b, prev, row.at);
+        if (sel gap.some) {
+            if (gap.some < 0) { refuse_sink(s, BACKWARDS); }
+            or {
+                val d: u64 = gap.some:~u64;
+                if (d % u.code_align::u64 != 0) { refuse_sink(s, CODE_FACTOR); }
+                or                              { put_advance(s, d / u.code_align::u64); }
+            }
+        }
+        or {
+            if (u.code_align != 1) { refuse_sink(s, RELOCATED); }
+            or {
+                put_u8(s, DW_CFA_ADVANCE_LOC4);
+                put_difference(s, row.at, prev, 4);
+            }
+        }
+        put_bytes(s, ?w.f.bytes.data[row.start], row.len);
+        prev = row.at;
+        i    = i + 1;
+    }
+}
+
+# the body of a CIE when `p` is nil, else of the FDE of `p` in CIE `c`, after the length
+fun body(s: *Sink, w: *Writer, c: *Cie, p: *Proc) {
+    if (p != nil) {
+        fde_body(s, w, c, p);
+        ret;
+    }
+    if (w.format == EH_FRAME) { put_int(s, 0, 4); }
+    or                        { put_int(s, DEBUG_CIE_ID, 4); }
+    cie_body(s, w, c);
+}
+
+# one record at `w.pos`: its length, its body and the padding that aligns the next
+fun record(b: *build.Builder, w: *Writer, c: *Cie, p: *Proc) err[build.Refusal] {
+    var counted: Sink = Sink{b: b, emit: false, pos: w.pos + 4, failed: false};
+    body(?counted, w, c, p);
+    if (counted.failed) { ret err[build.Refusal].err{counted.why}; }
+    val used: u64  = counted.pos - (w.pos + 4);
+    val pad:  u64  = (w.align - (used + 4) % w.align) % w.align;
+    var out:  Sink = Sink{b: b, emit: true, pos: w.pos, failed: false};
+    put_int(?out, used + pad, 4);
+    body(?out, w, c, p);
+    put_zero(?out, pad);
+    if (out.failed) { ret err[build.Refusal].err{out.why}; }
+    w.pos = out.pos;
+    ret err[build.Refusal].ok{};
+}
+
+# the CIE procedure `p` needs, written before its FDE when no earlier one serves
+fun cie_for(b: *build.Builder, w: *Writer, p: *Proc) res[*Cie, build.Refusal] {
+    var i: usize = 0;
+    for (i < w.cies.len) {
+        if (serves(?w.cies.data[i], p)) { ret res[*Cie, build.Refusal].ok{?w.cies.data[i]}; }
+        i = i + 1;
+    }
+    if (!held(vector.reserve[Cie](?w.cies, 1))) { ret res[*Cie, build.Refusal].err{memory()}; }
+    vector.push[Cie](?w.cies, Cie{
+        at:              w.pos,
+        has_personality: p.has_personality,
+        personality:     p.personality,
+        has_lsda:        p.has_lsda,
+        lsda:            p.lsda.enc,
+        signal:          p.signal,
+        column:          p.column,
+    });
+    val c:    *Cie               = ?w.cies.data[w.cies.len - 1];
+    val done: err[build.Refusal] = record(b, w, c, nil);
+    if (sel done.err) { ret res[*Cie, build.Refusal].err{done.err}; }
+    ret res[*Cie, build.Refusal].ok{c};
+}
+
+fun name_len(s: str) usize {
+    var n: usize = 0;
+    for (s[n] != 0) {
+        n = n + 1;
+    }
+    ret n;
+}
+
+# the section `spec` names, opened when the builder has none, made current
+fun section_of(b: *build.Builder, spec: build.Spec) res[build.Section, build.Refusal] {
+    val found: opt[build.Section] = build.section_named(b, View{data: spec.name, len: name_len(spec.name)});
+    var s:     build.Section      = build.Section{index: 0};
+    if (sel found.some) { s = found.some; }
+    or {
+        val opened: res[build.Section, build.Refusal] = build.open(b, spec);
+        if (sel opened.err) { ret opened; }
+        s = opened.ok;
+    }
+    val switched: err[build.Refusal] = build.switch(b, s);
+    if (sel switched.err) { ret res[build.Section, build.Refusal].err{switched.err}; }
+    ret res[build.Section, build.Refusal].ok{s};
+}
+
+# every procedure's record of one format, each after the CIE it needs
+fun write_format(b: *build.Builder, f: *Frames, format: Sections) err[build.Refusal] {
+    var spec: build.Spec = build.Spec{name: ".eh_frame", kind: ?mink.section.UNWIND_INFO, flags: mink.section.ALLOC, disposition: ?mink.section.RECORDS, entsize: 0};
+    if (format == DEBUG_FRAME) { spec = build.Spec{name: ".debug_frame", kind: ?mink.section.DEBUG_INFO, flags: 0, disposition: ?mink.section.WHOLE, entsize: 0}; }
+    val opened: res[build.Section, build.Refusal] = section_of(b, spec);
+    if (sel opened.err) { ret err[build.Refusal].err{opened.err}; }
+    val align:   u64                = b.arch.pointer_bytes::u64;
+    val start:   u64                = (build.size_of(b, opened.ok) + align - 1) / align * align;
+    val aligned: err[build.Refusal] = build.align(b, build.Align{boundary: align, fill: opt[u8].none{}, max: opt[u64].none{}});
+    if (sel aligned.err) { ret aligned; }
+    var w:    Writer             = Writer{f: f, format: format, align: align, pos: start, cies: vector.init[Cie](b.a)};
+    var i:    usize              = 0;
+    var done: err[build.Refusal] = err[build.Refusal].ok{};
+    for (i < f.procs.len && sel done.ok) {
+        val p: *Proc                    = ?f.procs.data[i];
+        val c: res[*Cie, build.Refusal] = cie_for(b, ?w, p);
+        if (sel c.err) {
+            done = err[build.Refusal].err{c.err};
+            brk;
+        }
+        val recorded: err[build.Refusal] = record(b, ?w, c.ok, p);
+        if (sel recorded.err) { done = recorded; }
+        i = i + 1;
+    }
+    vector.dnit[Cie](?w.cies);
+    ret done;
+}
+
+# what the builder runs once the layout is settled
+fun write(context: ptr, b: *build.Builder) err[build.Refusal] {
+    val f: *Frames = context::*Frames;
+    if (f.open)           { ret refused(NEVER_ENDED); }
+    if (f.procs.len == 0) { ret err[build.Refusal].ok{}; }
+    if ((f.sections & EH_FRAME) != 0) {
+        val done: err[build.Refusal] = write_format(b, f, EH_FRAME);
+        if (sel done.err) { ret done; }
+    }
+    if ((f.sections & DEBUG_FRAME) != 0) {
+        val done: err[build.Refusal] = write_format(b, f, DEBUG_FRAME);
+        if (sel done.err) { ret done; }
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# a test's allocator, selection, register view, builder and facts
+#[testing]
+rec T {
+    t: testing.Testing;
+    s: extension.Selection;
+    v: rf.Available;
+    b: build.Builder;
+    f: Frames;
+}
+
+#[testing]
+val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?mink.arch.RISCV_FLOAT_ABI, setting: mink.trait.Setting.choice{?mink.arch.RISCV_DOUBLE}}};
+
+# a builder over `isa` with its facts attached and a code section made current
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[rf.Available, rf.Error] = rf.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    val built: res[build.Builder, build.Refusal] = build.make(a, ?riscv_set.SET, ?t.v, ?mink.arch.RISCV64, set.Traits{at: ?T_DOUBLE[0], len: 1});
+    if (sel built.err) { ret false; }
+    t.b = built.ok;
+    t.f = make(a);
+    val attached: err[build.Refusal] = attach(?t.b, ?t.f);
+    if (sel attached.err) { ret false; }
+    val text: res[build.Section, build.Refusal] = build.open(?t.b, build.Spec{name: ".text", kind: ?mink.section.TEXT, flags: mink.section.TEXT.flags, disposition: ?mink.section.WHOLE, entsize: 0});
+    if (sel text.err) { ret false; }
+    val switched: err[build.Refusal] = build.switch(?t.b, text.ok);
+    ret sel switched.ok;
+}
+
+#[testing]
+val T_NOP: [4]u8 = [4]u8{0x13, 0, 0, 0};
+
+# four bytes of code
+#[testing]
+fun t_code(t: *T) bool {
+    val done: err[build.Refusal] = build.data(?t.b, ?T_NOP[0], 4);
+    ret sel done.ok;
+}
+
+#[testing]
+fun t_ok(e: err[build.Refusal]) bool {
+    ret sel e.ok;
+}
+
+# whether `e` was refused with `message`
+#[testing]
+fun t_refused(e: err[build.Refusal], message: str) bool {
+    if (sel e.ok) { ret false; }
+    ret str_equals(e.err.message, message);
+}
+
+# the object finished, false when refused
+#[testing]
+fun t_finish(t: *T, o: *mink.object.Object) bool {
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret false; }
+    @o = done.ok;
+    ret true;
+}
+
+# the section of `o` named `name`, nil for none
+#[testing]
+fun t_section(o: *mink.object.Object, name: str) *mink.object.Section {
+    var i: usize = 0;
+    for (i < o.sections.count) {
+        val got:  View  = mink.object.name_of(o, o.sections.items[i].name);
+        var same: bool  = got.len == name_len(name);
+        var k:    usize = 0;
+        for (same && k < got.len) {
+            same = got.data[k] == name[k];
+            k    = k + 1;
+        }
+        if (same) { ret ?o.sections.items[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether `.eh_frame` of `o` holds the `n` bytes at `want` from `at`, and `total` bytes when `total` is not 0
+#[testing]
+fun t_holds(o: *mink.object.Object, at: usize, want: *u8, n: usize, total: usize) bool {
+    val s: *mink.object.Section = t_section(o, ".eh_frame");
+    if (s == nil) { ret false; }
+    val got: mink.store.Bytes = mink.object.bytes(o, ?s.contents);
+    if (total != 0 && got.len != total) { ret false; }
+    if (at + n > got.len)               { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (got.data[at + i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# everything the test made given back, and whether nothing is left live
+#[testing]
+fun t_done(t: *T, o: *mink.object.Object) bool {
+    mink.object.release(o);
+    release(?t.f);
+    build.release(?t.b);
+    rf.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+# the first instruction of the only FDE after a CIE of 24 bytes, past its length, CIE pointer, range and augmentation
+#[testing]
+val FIRST_RULE: usize = 41;
+
+test cfi__a_cfa_rule_change_writes_its_opcode_after_the_distance_it_follows {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                         { ret 1; }
+    if (!t_ok(start_proc(?t.b, ?t.f)))                { ret 2; }
+    if (!t_code(?t))                                  { ret 3; }
+    if (!t_ok(def_cfa_offset(?t.b, ?t.f, bytes(16)))) { ret 4; }
+    if (!t_code(?t))                                  { ret 5; }
+    if (!t_ok(end_proc(?t.b, ?t.f)))                  { ret 6; }
+    var o: mink.object.Object;
+    if (!t_finish(?t, ?o)) { ret 7; }
+    # a CIE of rv64's factors that starts at sp, then an FDE advancing 4 and setting the offset 16
+    val want: [48]u8 = [48]u8{
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x7a, 0x52, 0x00, 0x01, 0x7c, 0x01, 0x01, 0x1b, 0x0c, 0x02, 0x00, 0, 0, 0, 0,
+        0x14, 0, 0, 0, 0x1c, 0, 0, 0, 0, 0, 0, 0, 0x08, 0, 0, 0, 0x00, 0x44, 0x0e, 0x10, 0, 0, 0, 0,
+    };
+    if (!t_holds(?o, 0, ?want[0], 48, 48)) { ret 8; }
+    # the procedure's address is the one relocation
+    if (o.relocs.count != 1) { ret 9; }
+    if (!t_done(?t, ?o))     { ret 10; }
+    ret 0;
+}
+
+test cfi__remember_and_restore_state_nest {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                         { ret 1; }
+    if (!t_ok(start_proc(?t.b, ?t.f)))                { ret 2; }
+    if (!t_ok(remember_state(?t.b, ?t.f)))            { ret 3; }
+    if (!t_code(?t))                                  { ret 4; }
+    if (!t_ok(remember_state(?t.b, ?t.f)))            { ret 5; }
+    if (!t_code(?t))                                  { ret 6; }
+    if (!t_ok(def_cfa_offset(?t.b, ?t.f, bytes(32)))) { ret 7; }
+    if (!t_ok(restore_state(?t.b, ?t.f)))             { ret 8; }
+    if (!t_ok(restore_state(?t.b, ?t.f)))             { ret 9; }
+    # a third restore has nothing to return to
+    if (!t_refused(restore_state(?t.b, ?t.f), NOT_REMEMBERED)) { ret 10; }
+    if (!t_ok(end_proc(?t.b, ?t.f)))                           { ret 11; }
+    var o: mink.object.Object;
+    if (!t_finish(?t, ?o)) { ret 12; }
+    val want: [8]u8 = [8]u8{0x0a, 0x44, 0x0a, 0x44, 0x0e, 0x20, 0x0b, 0x0b};
+    if (!t_holds(?o, FIRST_RULE, ?want[0], 8, 0)) { ret 13; }
+    if (!t_done(?t, ?o))                          { ret 14; }
+    ret 0;
+}
+
+test cfi__a_register_is_numbered_from_its_row {
+    var t: T;
+    if (!t_make(?t, "rv64gcv"))        { ret 1; }
+    if (!t_ok(start_proc(?t.b, ?t.f))) { ret 2; }
+    # fs0 is f8 and v8 is v8, whose rows number them 40 and 104 where their hardware numbers are 8
+    if (!t_ok(offset(?t.b, ?t.f, gen_register.F8, bytes(-8))))  { ret 3; }
+    if (!t_ok(offset(?t.b, ?t.f, gen_register.V8, bytes(-16)))) { ret 4; }
+    if (!t_code(?t))                                            { ret 5; }
+    if (!t_ok(end_proc(?t.b, ?t.f)))                            { ret 6; }
+    var o: mink.object.Object;
+    if (!t_finish(?t, ?o)) { ret 7; }
+    val want: [5]u8 = [5]u8{0xa8, 0x02, 0x05, 0x68, 0x04};
+    if (!t_holds(?o, FIRST_RULE, ?want[0], 5, 0)) { ret 8; }
+    if (!t_done(?t, ?o))                          { ret 9; }
+    ret 0;
+}
+
+test cfi__personality_and_lsda_are_written_with_their_encodings {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val p: res[build.Label, build.Refusal] = build.position(?t.b);
+    val l: res[build.Label, build.Refusal] = build.position(?t.b);
+    if (sel p.err)                     { ret 2; }
+    if (sel l.err)                     { ret 2; }
+    if (!t_ok(start_proc(?t.b, ?t.f))) { ret 3; }
+    # indirect and relative to the field in four bytes, and relative without the indirection
+    if (!t_ok(personality(?t.b, ?t.f, 0x9b, p.ok))) { ret 4; }
+    if (!t_ok(lsda(?t.b, ?t.f, 0x1b, l.ok)))        { ret 5; }
+    # an encoding applied to the data section is not one the format can write
+    if (!t_refused(lsda(?t.b, ?t.f, 0x3b, l.ok), ENCODING)) { ret 6; }
+    if (!t_code(?t))                                        { ret 7; }
+    if (!t_ok(end_proc(?t.b, ?t.f)))                        { ret 8; }
+    var o: mink.object.Object;
+    if (!t_finish(?t, ?o)) { ret 9; }
+    val want: [56]u8 = [56]u8{
+        0x1c, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x7a, 0x50, 0x4c, 0x52, 0x00, 0x01, 0x7c, 0x01, 0x07, 0x9b, 0, 0, 0, 0, 0x1b, 0x1b, 0x0c, 0x02, 0x00, 0, 0, 0, 0,
+        0x14, 0, 0, 0, 0x24, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x04, 0, 0, 0, 0, 0, 0, 0,
+    };
+    if (!t_holds(?o, 0, ?want[0], 56, 56)) { ret 10; }
+    # the address, the personality and the data are each relocated
+    if (o.relocs.count != 3) { ret 11; }
+    if (!t_done(?t, ?o))     { ret 12; }
+    ret 0;
+}
+
+test cfi__an_unbalanced_end_or_a_fact_outside_a_procedure_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                                            { ret 1; }
+    if (!t_refused(end_proc(?t.b, ?t.f), UNBALANCED))                    { ret 2; }
+    if (!t_refused(def_cfa_offset(?t.b, ?t.f, bytes(16)), NO_PROCEDURE)) { ret 3; }
+    if (!t_ok(start_proc(?t.b, ?t.f)))                                   { ret 4; }
+    if (!t_refused(start_proc(?t.b, ?t.f), STARTED))                     { ret 5; }
+    # a procedure left open is refused when the object is made
+    var o: mink.object.Object;
+    if (t_finish(?t, ?o))            { ret 6; }
+    if (!t_ok(end_proc(?t.b, ?t.f))) { ret 7; }
+    if (!t_finish(?t, ?o))           { ret 8; }
+    if (!t_done(?t, ?o))             { ret 9; }
+    ret 0;
+}
+
+test cfi__a_scaled_save_slot_is_written_as_an_expression_over_vlenb {
+    var t: T;
+    if (!t_make(?t, "rv64gcv"))        { ret 1; }
+    if (!t_ok(start_proc(?t.b, ?t.f))) { ret 2; }
+    # v8 saved one vector register (vlenb bytes, 4 per multiplier of vlen) and 16 bytes below the frame address
+    if (!t_ok(offset(?t.b, ?t.f, gen_register.V8, Offset{fixed: -16, per: -4, scale: 2}))) { ret 3; }
+    # xlen has no register that holds it
+    if (!t_refused(offset(?t.b, ?t.f, gen_register.V8, Offset{fixed: 0, per: 8, scale: 0}), NO_UNIT)) { ret 4; }
+    if (!t_code(?t))                                                                                  { ret 5; }
+    if (!t_ok(end_proc(?t.b, ?t.f)))                                                                  { ret 6; }
+    var o: mink.object.Object;
+    if (!t_finish(?t, ?o)) { ret 7; }
+    # DW_CFA_expression v8: DW_OP_bregx vlenb 0, consts -1, mul, plus, consts -16, plus
+    val want: [14]u8 = [14]u8{0x10, 0x68, 0x0b, 0x92, 0xa2, 0x38, 0x00, 0x11, 0x7f, 0x1e, 0x22, 0x11, 0x70, 0x22};
+    if (!t_holds(?o, FIRST_RULE, ?want[0], 14, 0)) { ret 8; }
+    if (!t_done(?t, ?o))                           { ret 9; }
+    ret 0;
+}
