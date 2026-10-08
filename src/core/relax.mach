@@ -11,8 +11,12 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+
+use std.collections.vector;
 
 use masc.core.field;
 use masc.core.inst;
@@ -120,24 +124,16 @@ pub fun find(all: Relaxations, index: u32) opt[*Relaxation] {
     ret opt[*Relaxation].some{?all.at[lo]};
 }
 
-# how many bytes row `r` encodes to, which holds for rows whose fields have a fixed width
-pub fun length(r: *row.Row) u32 {
-    var bits: u32 = 0;
-    var i:    u32 = 0;
-    for (i < r.encoding.len) {
-        bits = bits + r.encoding.at[i].width::u32;
-        i    = i + 1;
-    }
-    ret bits / 8;
-}
-
 # whether a target `distance` bytes from the start of an instruction of `rx`'s row is past the range of its relative operand
-pub fun far(codec: *walk.Codec, rx: *Relaxation, distance: i64) bool {
+# ---
+# length: the length of the instruction being relaxed, which the caller has from encoding it, since a set's lengths
+#         are the lengths of its encodings and no sum of field widths
+pub fun far(codec: *walk.Codec, rx: *Relaxation, distance: i64, length: usize) bool {
     val r:    *row.Row         = ?codec.rows.at[rx.row];
     val desc: *operand.Operand = ?r.operands.at[rx.operand];
     if (!sel desc.shape.relative) { ret false; }
     var offset: i64 = distance;
-    if (desc.shape.relative.anchor == operand.END) { offset = distance - length(r)::i64; }
+    if (desc.shape.relative.anchor == operand.END) { offset = distance - length::i64; }
     val why: opt[str] = walk.unrepresentable(?desc.shape.relative.offset, offset);
     ret sel why.some && str_equals(why.some, field.OUT_OF_RANGE);
 }
@@ -149,8 +145,21 @@ fun flip(v: *operand.Value, mask: u32) operand.Value {
     ret operand.Value.none{};
 }
 
-# the value of one source of the step of row `step`, which starts `at` bytes into the form of `total`
-fun source_value(codec: *walk.Codec, src: Source, from: *inst.Inst, distance: i64, at: u32, step: *row.Row, k: u32, total: u32, out: *operand.Value) bool {
+# where a step stands in its form
+# ---
+# known: whether the lengths of the steps are known, a target being measured from them
+# at:    the bytes before the step
+# len:   the step's own length
+# total: the length of the whole form
+rec Place {
+    known: bool;
+    at:    usize;
+    len:   usize;
+    total: usize;
+}
+
+# the value of one source of the step of row `step`
+fun source_value(codec: *walk.Codec, src: Source, from: *inst.Inst, distance: i64, place: Place, step: *row.Row, k: u32, out: *operand.Value) bool {
     if (sel src.operand) {
         @out = from.values[src.operand];
         ret true;
@@ -174,42 +183,72 @@ fun source_value(codec: *walk.Codec, src: Source, from: *inst.Inst, distance: i6
     }
     val desc: *operand.Operand = ?step.operands.at[k];
     if (!sel desc.shape.relative) { ret false; }
+    # before the lengths are known a target is provisionally zero, enough to measure a step that does not depend on it
     var from_here: i64 = 0;
-    if (sel src.target)                            { from_here = distance - at::i64; }
-    or                                             { from_here = total::i64 - at::i64; }
-    if (desc.shape.relative.anchor == operand.END) { from_here = from_here - length(step)::i64; }
+    if (place.known) {
+        if (sel src.target)                            { from_here = distance - place.at::i64; }
+        or                                             { from_here = place.total::i64 - place.at::i64; }
+        if (desc.shape.relative.anchor == operand.END) { from_here = from_here - place.len::i64; }
+    }
     @out = operand.Value.relative{from_here};
     ret true;
 }
 
-# the instructions row `from.row` becomes under `rx` for a target `distance` bytes from its start
-# ---
-# out: the steps, each operand's value taken from the row relaxed, a fixed register or immediate, or the target
-# ret: whether every source gave a value
-pub fun expand(codec: *walk.Codec, rx: *Relaxation, from: *inst.Inst, distance: i64, out: *Expansion) bool {
-    if (rx.form.len > MAX_STEPS) { ret false; }
-    var total: u32 = 0;
-    var i:     u32 = 0;
+# every operand of every step of `rx`'s form, the targets measured from `lens`
+fun fill(codec: *walk.Codec, rx: *Relaxation, from: *inst.Inst, distance: i64, lens: *usize, known: bool, out: *Expansion) bool {
+    var total: usize = 0;
+    var i:     u32   = 0;
     for (i < rx.form.len) {
-        total = total + length(?codec.rows.at[rx.form.at[i].row]);
+        total = total + lens[i];
         i     = i + 1;
     }
-    var at: u32 = 0;
-    out.count = 0;
-    i         = 0;
+    var at: usize = 0;
+    i = 0;
     for (i < rx.form.len) {
         val s:    *Step    = ?rx.form.at[i];
         val step: *row.Row = ?codec.rows.at[s.row];
         out.steps[i].row    = step;
         out.steps[i].marker = operand.NO_FIXUP;
-        var k: u32 = 0;
+        val place: Place = Place{known: known, at: at, len: lens[i], total: total};
+        var k:     u32   = 0;
         for (k < step.operands.len) {
-            if (!source_value(codec, s.values.at[k], from, distance, at, step, k, total, ?out.steps[i].values[k])) { ret false; }
+            if (!source_value(codec, s.values.at[k], from, distance, place, step, k, ?out.steps[i].values[k])) { ret false; }
             k = k + 1;
         }
-        at        = at + length(step);
-        out.count = out.count + 1;
-        i         = i + 1;
+        at = at + lens[i];
+        i  = i + 1;
     }
+    out.count = rx.form.len;
     ret true;
+}
+
+# the instructions row `from.row` becomes under `rx` for a target `distance` bytes from its start
+# ---
+# available: the selection's view, which admits every row of the form
+# out:       the steps, each operand's value taken from the row relaxed, a fixed register or immediate, or the target
+# scratch:   room to encode a step in, which is left as it was found
+# fixups:    room for the fixups of that encoding, left as found
+# ret:       whether every source gave a value and every step encoded
+#
+# a step's length is the length of its encoding, found by encoding it. a step
+# whose own length depends on its target, as x86's rel8 and rel32 do, is not
+# settled here: the encoding is measured with the target zero, and the
+# relaxation's layout loop, which repeats until no length changes, owns that.
+pub fun expand(codec: *walk.Codec, available: *register.Available, rx: *Relaxation, from: *inst.Inst, distance: i64, out: *Expansion, scratch: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) bool {
+    if (rx.form.len > MAX_STEPS) { ret false; }
+    var lens: [MAX_STEPS]usize;
+    if (!fill(codec, rx, from, distance, ?lens[0], false, out)) { ret false; }
+    var i: u32 = 0;
+    for (i < rx.form.len) {
+        val start: usize                     = scratch.len;
+        val marks: usize                     = fixups.len;
+        var step:  inst.Inst                 = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
+        val done:  res[usize, field.Refusal] = walk.encode(codec, available, ?step, scratch, fixups);
+        if (sel done.err) { ret false; }
+        lens[i]     = done.ok;
+        scratch.len = start;
+        fixups.len  = marks;
+        i           = i + 1;
+    }
+    ret fill(codec, rx, from, distance, ?lens[0], true, out);
 }
