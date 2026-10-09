@@ -23,8 +23,10 @@ use std.types.bool.true;
 use std.types.option.opt;
 
 use masc.core.effect;
+use masc.core.index;
 use masc.core.operand;
 use masc.core.register;
+use masc.core.requirement;
 
 # which registers of an operand's value a side names
 # ---
@@ -61,9 +63,10 @@ pub val NO_SIDES: Sides = Sides{at: nil, len: 0};
 # what a constraint keeps its side apart from
 # ---
 # sides:    the registers of these operands, as ldp's rt2 apart from rt
-# inputs:   every register an operand of the instruction reads, but the side's own operand:
-#           the register operands it reads, and the base and index of every memory operand,
-#           whose address it reads whatever it does with the memory. an early clobber
+# inputs:   every register the instruction reads, but the side's own operand's: the register
+#           operands it reads, the base and index of every memory operand, whose address it reads
+#           whatever it does with the memory, and the registers it reads that no operand names,
+#           its effect's implicit reads. an early clobber
 # register: the register at this row of the file, as risc-v's v0 mask
 pub tag Against: u8 {
     sides: Sides;
@@ -224,8 +227,64 @@ fun clash_part(file: *register.File, g: Grouping, values: operand.Values, permit
     ret false;
 }
 
-# whether side run `a` overlaps what `c` keeps it from where its permit does not allow it
-fun clash(file: *register.File, c: *Constraint, operands: *operand.Operand, values: operand.Values, g: Grouping, a: *Run) bool {
+# whether the value of the operand `term` tests is unknown: none for an operand that always takes one
+fun unknown(operands: *operand.Operand, values: operand.Values, term: *effect.Term) bool {
+    if (term.operand::u32 >= values.len) { ret true; }
+    val v: operand.Value = values.at[term.operand];
+    ret sel v.none && operands[term.operand].quantity == operand.ONE;
+}
+
+# whether every term of `terms` holds or tests an operand whose value is unknown, so that `terms` may hold
+fun may_meet(file: *register.File, terms: effect.Terms, operands: *operand.Operand, values: operand.Values) bool {
+    var k: u32 = 0;
+    for (k < terms.len) {
+        val term: *effect.Term = ?terms.at[k];
+        if (!unknown(operands, values, term) && !effect.meets(file, effect.Terms{at: term, len: 1}, values)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the registers no operand names that the instruction reads: by its operand values when every value its effect's
+# rules test is known, else every one some values read
+fun implicit_reads(file: *register.File, e: *effect.Effect, operands: *operand.Operand, values: operand.Values) effect.Set {
+    var i: u32 = 0;
+    for (i < e.implicit.rules.len) {
+        val terms: effect.Terms = e.implicit.rules.at[i].terms;
+        var k:     u32          = 0;
+        for (k < terms.len) {
+            if (unknown(operands, values, ?terms.at[k])) { ret effect.may(e).read; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret effect.implicit(file, e, values).read;
+}
+
+# whether side run `a` overlaps a register of `set`, rows of `file`
+fun clash_set(file: *register.File, a: *Run, set: effect.Set) bool {
+    var w: u32 = 0;
+    for (w < set.len) {
+        var bits: u64 = set.words[w];
+        var b:    u32 = 0;
+        for (bits != 0) {
+            if ((bits & 1) != 0) {
+                val at: u32 = w * 64 + b;
+                if (at < file.register_count) {
+                    val other: Run = Run{first: register.id_of(?file.registers[at]), len: 1, whole: true};
+                    if (overlap(file, a, ?other)) { ret true; }
+                }
+            }
+            bits = bits >> 1;
+            b    = b + 1;
+        }
+        w = w + 1;
+    }
+    ret false;
+}
+
+# whether side run `a` overlaps what `c` keeps it from where its permit does not allow it, `reads` the implicit reads
+fun clash(file: *register.File, c: *Constraint, operands: *operand.Operand, values: operand.Values, g: Grouping, reads: effect.Set, a: *Run) bool {
     if (sel c.against.register) {
         val reg: u32 = c.against.register;
         val b:   Run = Run{first: register.id_of(?file.registers[reg]), len: 1, whole: true};
@@ -254,29 +313,116 @@ fun clash(file: *register.File, c: *Constraint, operands: *operand.Operand, valu
         }
         i = i + 1;
     }
-    ret false;
+    ret clash_set(file, a, reads);
 }
 
-# whether the instruction whose operands are `operands`, holding `values`, breaks `c` under `g`
-fun breaks(file: *register.File, c: *Constraint, operands: *operand.Operand, values: operand.Values, g: Grouping) bool {
-    if (!effect.meets(file, c.when, values)) { ret false; }
+# whether the instruction whose operands are `operands` and effect `e`, holding `values`, breaks `c` under `g`
+fun breaks(file: *register.File, c: *Constraint, operands: *operand.Operand, e: *effect.Effect, values: operand.Values, g: Grouping) bool {
+    if (!may_meet(file, c.when, operands, values)) { ret false; }
+    var reads: effect.Set = effect.Set{words: nil, len: 0};
+    if (sel c.against.inputs) { reads = implicit_reads(file, e, operands, values); }
     val count: u32 = runs(values, c.side.operand, c.side.part);
     var i:     u32 = 0;
     for (i < count) {
         val a: Run = run(g, values, c.side.operand, c.side.part, c.side.fields, i);
-        if (a.first != register.NONE && clash(file, c, operands, values, g, ?a)) { ret true; }
+        if (a.first != register.NONE && clash(file, c, operands, values, g, reads, ?a)) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-# the first of `cs` the instruction whose operands are `operands`, holding `values`, breaks under `g`, none when it keeps every one.
-# check guarantees each names operands the instruction has, of a kind its part reads, and a register of the file
-pub fun violated(file: *register.File, cs: Constraints, operands: *operand.Operand, values: operand.Values, g: Grouping) opt[*Constraint] {
+# the first of `cs` the instruction whose operands are `operands` and effect `e`, holding `values`, breaks under `g`,
+# none when it keeps every one. a consumer that has not chosen an operand's value yet leaves it none: a constraint
+# holding under some value of it then holds, and an early clobber stays clear of every register some value reads
+# implicitly. check guarantees each constraint names operands the row has, of a kind its part reads, and a register of the file
+pub fun violated(file: *register.File, cs: Constraints, operands: *operand.Operand, e: *effect.Effect, values: operand.Values, g: Grouping) opt[*Constraint] {
     var i: u32 = 0;
     for (i < cs.len) {
-        if (breaks(file, ?cs.at[i], operands, values, g)) { ret opt[*Constraint].some{?cs.at[i]}; }
+        if (breaks(file, ?cs.at[i], operands, e, values, g)) { ret opt[*Constraint].some{?cs.at[i]}; }
         i = i + 1;
     }
     ret opt[*Constraint].none{};
+}
+
+# a file of four registers in one class and a row of an early clobber output, a mode enumerant and an input, which
+# reads x2 implicitly when its mode is 1
+#[testing]
+val T_CLASSES: [1]register.Class = [1]register.Class{
+    register.Class{name: "x", kind: register.GENERAL, width: register.Scaled{fixed: 64, per: 0, scale: 0}, count: 4},
+};
+
+#[testing]
+val T_REGISTERS: [4]register.Register = [4]register.Register{
+    register.Register{name: "x0", class: 0, number: 0, bank: 0, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    register.Register{name: "x1", class: 0, number: 1, bank: 1, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    register.Register{name: "x2", class: 0, number: 2, bank: 2, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    register.Register{name: "x3", class: 0, number: 3, bank: 3, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+};
+
+#[testing]
+val T_FILE: register.File = register.File{
+    scales:         nil,
+    scale_count:    0,
+    classes:        ?T_CLASSES[0],
+    class_count:    1,
+    class_names:    index.EMPTY,
+    registers:      ?T_REGISTERS[0],
+    register_count: 4,
+    aliases:        nil,
+    alias_count:    0,
+    names:          index.EMPTY,
+    columns:        nil,
+    column_count:   0,
+};
+
+#[testing]
+val T_GPR: [1]u16 = [1]u16{0};
+
+#[testing]
+val T_MODES: [2]operand.Enumerant = [2]operand.Enumerant{operand.Enumerant{name: "", value: 0}, operand.Enumerant{name: ", wide", value: 1}};
+
+#[testing]
+val T_OPERANDS: [3]operand.Operand = [3]operand.Operand{
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}, first: 0, count: 0, excluded: operand.NO_NUMBERS}}, role: operand.WRITE, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.enumerant{operand.Enumeration{members: ?T_MODES[0], count: 2, mask: false, names: index.EMPTY}}, role: operand.READ, width: 0, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.register{operand.Register{classes: operand.Classes{at: ?T_GPR[0], len: 1}, first: 0, count: 0, excluded: operand.NO_NUMBERS}}, role: operand.READ, width: 64, quantity: operand.ONE},
+};
+
+#[testing]
+val T_X2: [1]u64 = [1]u64{0x4};
+
+#[testing]
+val T_WIDE: [1]effect.Term = [1]effect.Term{effect.Term{operand: 1, test: effect.Test.enumerant{1}}};
+
+#[testing]
+val T_RULES: [1]effect.RegisterRule = [1]effect.RegisterRule{
+    effect.RegisterRule{terms: effect.Terms{at: ?T_WIDE[0], len: 1}, touched: effect.Touched{read: effect.Set{words: ?T_X2[0], len: 1}, written: effect.Set{words: nil, len: 0}}},
+};
+
+#[testing]
+val T_CLOBBER: [1]Constraint = [1]Constraint{
+    Constraint{side: Side{operand: 0, part: WHOLE, fields: 1}, against: Against.inputs{}, permit: DISJOINT, when: effect.NO_TERMS},
+};
+
+#[testing]
+fun t_breaks(e: *effect.Effect, out: u16, mode: operand.Value, input: u16) bool {
+    var vals: [3]operand.Value = [3]operand.Value{operand.Value.register{register.make(0, out)}, mode, operand.Value.register{register.make(0, input)}};
+    val got:  opt[*Constraint] = violated(?T_FILE, Constraints{at: ?T_CLOBBER[0], len: 1}, ?T_OPERANDS[0], e, operand.Values{at: ?vals[0], len: 3}, UNIT);
+    ret sel got.some;
+}
+
+test violated__an_early_clobber_stays_clear_of_its_inputs_and_implicit_reads {
+    var e: effect.Effect;
+    e.implicit = effect.Registers{otherwise: effect.NO_TOUCHED, rules: effect.RegisterRules{at: ?T_RULES[0], len: 1}, may: T_RULES[0].touched, must: effect.NO_TOUCHED};
+    val wide:   operand.Value = operand.Value.enumerant{1};
+    val narrow: operand.Value = operand.Value.enumerant{0};
+    # the input operand, and x2 only while the mode reads it
+    if (!t_breaks(?e, 3, narrow, 3)) { ret 1; }
+    if (!t_breaks(?e, 2, wide, 3))   { ret 2; }
+    if (t_breaks(?e, 2, narrow, 3))  { ret 3; }
+    if (t_breaks(?e, 1, wide, 3))    { ret 4; }
+    # a mode not chosen yet may read x2
+    if (!t_breaks(?e, 2, operand.Value.none{}, 3)) { ret 5; }
+    if (t_breaks(?e, 1, operand.Value.none{}, 3))  { ret 6; }
+    ret 0;
 }
