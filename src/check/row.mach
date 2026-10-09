@@ -1,0 +1,484 @@
+# the check of a set's rows, their shapes, fields and constraints, the decode dispatch over them and their
+# relaxations
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.view.View;
+
+use masc.check.check;
+use check_effect:    masc.check.effect;
+use check_extension: masc.check.extension;
+use check_fixup:     masc.check.fixup;
+use check_register:  masc.check.register;
+use masc.codec.walk;
+use masc.core.constraint;
+use core_dispatch: masc.core.dispatch;
+use masc.core.effect;
+use masc.core.field;
+use masc.core.index;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.row;
+use S: masc.core.set;
+
+pub val SHARED_KEY:     str = "row key given to two rows";
+pub val OPERANDS:       str = "row has more operands than a row holds";
+pub val FIELDS:         str = "row has more fields than a row holds";
+pub val UNKNOWN_KIND:   str = "field kind not in the field table";
+pub val UNIT_WIDTH:     str = "unit width not a multiple of 8 up to 64";
+pub val FIELD_OPERAND:  str = "field names an operand the row does not have";
+pub val SLICE:          str = "slice outside its operand, part or unit";
+pub val UNCOVERED:      str = "slices leave bits of an operand unencoded";
+pub val UNKNOWN_CLASS:  str = "operand names a register class not in the register file";
+pub val REGISTER_RANGE: str = "operand's register range reaches past one of its classes";
+pub val EXCLUDED_RANGE: str = "operand excludes a value it never admits";
+pub val KEPT_OPERAND:   str = "register constraint names an operand the row does not have, one holding no register of its part, or nothing to keep apart";
+pub val KEPT_PERMIT:    str = "register constraint permits an unknown overlap, or one by element widths other than between whole register operands stating their widths, of one field where it writes one";
+pub val ELEMENT_WIDTH:  str = "register shape's element width is no power of two, names an operand that is not an enumerant, or its span scales a width it cannot";
+pub val GROUP_FIELDS:   str = "register operand of no fields, or a memory part of more than one";
+pub val OWN_WRITE:      str = "operand states its write's extension but writes no register, or states none or an unknown one";
+pub val MARKER:         str = "marker of no fixup kind, or one a field holds";
+pub val NO_ANCHOR:      str = "relative operand, or memory operand admitting a pc-relative form, states no anchor";
+pub val NO_ROOT:        str = "dispatch has no root node";
+pub val NODE:           str = "node's key or entries out of range";
+pub val UNSORTED:       str = "node's entries not strictly sorted";
+pub val ENTRY:          str = "entry's child node or candidates out of range";
+pub val CANDIDATE:      str = "candidate names no row";
+pub val RELAX_ROW:      str = "relaxation names no row";
+pub val RELAX_OPERAND:  str = "relaxed operand is not a relative operand of its row";
+pub val RELAX_FORM:     str = "longer form is empty or a step's sources do not match its row";
+pub val RELAX_SOURCE:   str = "source names an operand or register that is not there";
+pub val RELAX_TARGET:   str = "longer form does not take the target exactly once";
+pub val RELAX_CYCLE:    str = "relaxation relaxes back into itself";
+pub val RELAX_TWICE:    str = "two relaxations for one row";
+
+fun row_key(s: *S.Set, of: u32, row: u32, scratch: *u8) View {
+    ret check.spelled(s.codec.rows.at[row].key);
+}
+
+# whether the range of `r` lies inside each of its classes, which must be in the file
+fun in_range(s: *S.Set, r: *operand.Register) bool {
+    var i: u32 = 0;
+    for (i < r.classes.len) {
+        val count: u32 = s.codec.registers.classes[r.classes.at[i]].count;
+        if (r.first >= count || (r.count != 0 && r.count > count - r.first)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether every number `r` excludes lies in the range of one of its classes, which must be in the file
+fun excludes_in_range(s: *S.Set, r: *operand.Register) bool {
+    var k: u32 = 0;
+    for (k < r.excluded.len) {
+        var held: bool = false;
+        var i:    u32  = 0;
+        for (i < r.classes.len) {
+            if (operand.within(r, r.excluded.at[k], s.codec.registers.classes[r.classes.at[i]].count)) { held = true; }
+            i = i + 1;
+        }
+        if (!held) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether every value `imm` excludes is one it could hold
+fun excludes_representable(imm: *operand.Immediate) bool {
+    var i: u32 = 0;
+    for (i < imm.excluded.len) {
+        val bad: opt[str] = walk.unrepresentable(imm, imm.excluded.at[i]);
+        if (sel bad.some) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bits that number every register of `r` from its range's first
+fun number_bits(s: *S.Set, r: *operand.Register) u8 {
+    var bits: u8  = 0;
+    var i:    u32 = 0;
+    for (i < r.classes.len) {
+        var top:  u32 = operand.span(r, s.codec.registers.classes[r.classes.at[i]].count);
+        var need: u8  = 0;
+        if (top > 0) { top = top - 1; }
+        for (top != 0) {
+            need = need + 1;
+            top  = top >> 1;
+        }
+        if (need > bits) { bits = need; }
+        i = i + 1;
+    }
+    ret bits;
+}
+
+# whether `taken`, the bits slices take of a part, covers bits `lo` to `hi - 1` when it takes any
+fun covers(taken: u64, lo: u8, hi: u8) bool {
+    if (taken == 0 || hi <= lo) { ret true; }
+    ret ((field.ones(hi) & ~field.ones(lo)) & ~taken) == 0;
+}
+
+fun covers_immediate(taken: u64, imm: *operand.Immediate) bool {
+    ret covers(taken, imm.scale, imm.bits);
+}
+
+# the registers `r` an operand part admits, the slices taking that part `taken`
+fun admits(s: *S.Set, r: *operand.Register, taken: u64) opt[str] {
+    if (!check_register.in_file(s, r))        { ret opt[str].some{UNKNOWN_CLASS}; }
+    if (!in_range(s, r))                      { ret opt[str].some{REGISTER_RANGE}; }
+    if (!excludes_in_range(s, r))             { ret opt[str].some{EXCLUDED_RANGE}; }
+    if (!covers(taken, 0, number_bits(s, r))) { ret opt[str].some{UNCOVERED}; }
+    ret opt[str].none{};
+}
+
+# whether register shape `reg` of a row of `count` operands `operands` states an element width and span its readers can
+# read: a fixed width a power of two, a chosen one an enumerant operand's, and a scaled span over a fixed or state width
+fun element_ok(operands: *operand.Operand, count: u32, reg: *operand.Register) bool {
+    val e: operand.Element = reg.element;
+    if (sel e.fixed && (e.fixed == 0 || (e.fixed & (e.fixed - 1)) != 0)) { ret false; }
+    if (sel e.chosen) {
+        val c: operand.Chosen = e.chosen;
+        if (c.operand::u32 >= count) { ret false; }
+        val named: *operand.Operand = ?operands[c.operand];
+        if (!sel named.shape.enumerant) { ret false; }
+        ret !sel reg.span.scaled;
+    }
+    ret !(sel reg.span.scaled && sel e.none);
+}
+
+# the name index of enumeration `e`: each entry holds its member's own name, the entries ascend by name with the empty name first, none
+# repeats, every member has exactly one, and a set whose syntax folds case names its members in lower case
+fun enumeration(s: *S.Set, e: *operand.Enumeration) opt[str] {
+    val by:   *index.Index = ?e.names;
+    val fold: bool         = check.folds(s);
+    var i:    u32          = 0;
+    for (i < by.len) {
+        val en: *index.Entry = ?by.at[i];
+        if (en.row >= e.count || en.key == nil) { ret opt[str].some{check.NAME_ENTRY}; }
+        val own: View = check.spelled(e.members[en.row].name);
+        if (index.compare(en.key, own, false) != 0) { ret opt[str].some{check.NAME_ENTRY}; }
+        if (fold && check.capitalized(own))         { ret opt[str].some{check.CASED_NAME}; }
+        if (i > 0) {
+            val order: i64 = str_compare(by.at[i - 1].key, en.key);
+            if (order == 0) { ret opt[str].some{check.SHARED_NAME}; }
+            if (order > 0)  { ret opt[str].some{check.NAME_ORDER}; }
+        }
+        i = i + 1;
+    }
+    if (by.len != e.count) { ret opt[str].some{check.NAME_MISSING}; }
+    ret opt[str].none{};
+}
+
+# whether `a` is an anchor a distance is measured from
+fun anchored(a: operand.Anchor) bool {
+    ret a == operand.START || a == operand.END;
+}
+
+# the shape of an operand: its classes in the file, its fixup kinds bound, and the slices taking it covering it, or none
+# taking a marker
+fun shape(s: *S.Set, r: *row.Row, op: u8) opt[str] {
+    var taken: [8]u64;
+    var f:     u32 = 0;
+    for (f < r.encoding.len) {
+        val fl: *field.Field = ?r.encoding.at[f];
+        var k:  u32          = 0;
+        for (k < fl.slices.len) {
+            val sl: *field.Slice = ?fl.slices.at[k];
+            if (sl.operand == op) { taken[sl.part] = taken[sl.part] | (field.ones(sl.len) << sl.lo); }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    val sh:  *operand.Shape = ?r.operands.at[op].shape;
+    val own: register.Write = r.operands.at[op].write;
+    if (sel own.extend) {
+        val register_write: bool = (r.operands.at[op].role & operand.WRITE) != 0 && (sel sh.register || sel sh.list);
+        if (own.extend == register.UNSTATED || own.extend > register.ONES || !register_write) { ret opt[str].some{OWN_WRITE}; }
+    }
+    if (sel sh.register) {
+        if (sh.register.fields == 0)                                  { ret opt[str].some{GROUP_FIELDS}; }
+        if (!element_ok(r.operands.at, r.operands.len, ?sh.register)) { ret opt[str].some{ELEMENT_WIDTH}; }
+        ret admits(s, ?sh.register, taken[field.NUMBER]);
+    }
+    or (sel sh.immediate) {
+        if (!check_fixup.bound(s, sh.immediate.fixup))             { ret opt[str].some{check.UNBOUND_FIXUP}; }
+        if (!covers_immediate(taken[field.NUMBER], ?sh.immediate)) { ret opt[str].some{UNCOVERED}; }
+        if (!excludes_representable(?sh.immediate))                { ret opt[str].some{EXCLUDED_RANGE}; }
+    }
+    or (sel sh.relative) {
+        if (!anchored(sh.relative.anchor))                               { ret opt[str].some{NO_ANCHOR}; }
+        if (!check_fixup.bound(s, sh.relative.offset.fixup))             { ret opt[str].some{check.UNBOUND_FIXUP}; }
+        if (!covers_immediate(taken[field.NUMBER], ?sh.relative.offset)) { ret opt[str].some{UNCOVERED}; }
+        if (!excludes_representable(?sh.relative.offset))                { ret opt[str].some{EXCLUDED_RANGE}; }
+    }
+    or (sel sh.memory) {
+        val m: *operand.Memory = ?sh.memory;
+        if ((m.forms & operand.PCREL) != 0 && !anchored(m.anchor))              { ret opt[str].some{NO_ANCHOR}; }
+        if (m.base.fields != 1 || m.index.fields != 1 || m.segment.fields != 1) { ret opt[str].some{GROUP_FIELDS}; }
+        val n: u32 = r.operands.len;
+        if (!element_ok(r.operands.at, n, ?m.base) || !element_ok(r.operands.at, n, ?m.index) || !element_ok(r.operands.at, n, ?m.segment)) { ret opt[str].some{ELEMENT_WIDTH}; }
+        val base: opt[str] = admits(s, ?m.base, taken[field.NUMBER]);
+        if (sel base.some) { ret base; }
+        val index: opt[str] = admits(s, ?m.index, taken[field.INDEX]);
+        if (sel index.some) { ret index; }
+        val segment: opt[str] = admits(s, ?m.segment, taken[field.SEGMENT]);
+        if (sel segment.some)                              { ret segment; }
+        if (!check_fixup.bound(s, m.disp.fixup))           { ret opt[str].some{check.UNBOUND_FIXUP}; }
+        if (!covers_immediate(taken[field.DISP], ?m.disp)) { ret opt[str].some{UNCOVERED}; }
+        if (!excludes_representable(?m.disp))              { ret opt[str].some{EXCLUDED_RANGE}; }
+    }
+    or (sel sh.list) {
+        if (sh.list.member.fields == 0)                                  { ret opt[str].some{GROUP_FIELDS}; }
+        if (!element_ok(r.operands.at, r.operands.len, ?sh.list.member)) { ret opt[str].some{ELEMENT_WIDTH}; }
+        ret admits(s, ?sh.list.member, taken[field.NUMBER]);
+    }
+    or (sel sh.id) {
+        if (!check_fixup.bound(s, sh.id.fixup)) { ret opt[str].some{check.UNBOUND_FIXUP}; }
+    }
+    or (sel sh.marker) {
+        var p: u32 = 0;
+        for (p < field.PARTS) {
+            if (taken[p] != 0) { ret opt[str].some{MARKER}; }
+            p = p + 1;
+        }
+        var w: u32 = 0;
+        for (w < r.encoding.len) {
+            if (r.encoding.at[w].operand == op) { ret opt[str].some{MARKER}; }
+            w = w + 1;
+        }
+        if (sh.marker == operand.NO_FIXUP)    { ret opt[str].some{MARKER}; }
+        if (!check_fixup.bound(s, sh.marker)) { ret opt[str].some{check.UNBOUND_FIXUP}; }
+    }
+    or (sel sh.enumerant) {
+        ret enumeration(s, ?sh.enumerant);
+    }
+    or (sel sh.condition) {
+        ret enumeration(s, ?sh.condition);
+    }
+    ret opt[str].none{};
+}
+
+# the fields of a row: kinds in the table, units of whole bytes, and slices inside their operand, part and unit
+fun fields(s: *S.Set, r: *row.Row) opt[str] {
+    var f: u32 = 0;
+    for (f < r.encoding.len) {
+        val fl: *field.Field = ?r.encoding.at[f];
+        if (fl.kind::u32 >= s.codec.fields.count)                                { ret opt[str].some{UNKNOWN_KIND}; }
+        if (fl.width % 8 != 0 || fl.width > 64)                                  { ret opt[str].some{UNIT_WIDTH}; }
+        if (fl.operand != field.NO_OPERAND && fl.operand::u32 >= r.operands.len) { ret opt[str].some{FIELD_OPERAND}; }
+        var k: u32 = 0;
+        for (k < fl.slices.len) {
+            val sl: *field.Slice = ?fl.slices.at[k];
+            if (sl.operand::u32 >= r.operands.len || sl.part::u32 >= field.PARTS || sl.len == 0 || sl.lo::u32 + sl.len::u32 > 64 || sl.at::u32 + sl.len::u32 > fl.width::u32) {
+                ret opt[str].some{SLICE};
+            }
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether `side` names an operand of `r` whose value holds a register of its part
+fun side_ok(r: *row.Row, side: constraint.Side) bool {
+    if (side.operand::u32 >= r.operands.len) { ret false; }
+    val sh: *operand.Shape = ?r.operands.at[side.operand].shape;
+    if (side.part == constraint.WHOLE) { ret sel sh.register || sel sh.list; }
+    if (sel sh.memory) {
+        if (side.part == constraint.BASE)  { ret sh.memory.base.classes.len > 0; }
+        if (side.part == constraint.INDEX) { ret sh.memory.index.classes.len > 0; }
+    }
+    ret false;
+}
+
+# whether `side` of `r` is a group a permit by element widths reads: a whole register operand stating its element width,
+# of one field when `fields` asks it
+fun grouped(r: *row.Row, side: constraint.Side, one: bool) bool {
+    if (side.part != constraint.WHOLE) { ret false; }
+    val op:  *operand.Operand  = ?r.operands.at[side.operand];
+    var reg: *operand.Register = nil;
+    if (sel op.shape.register) { reg = ?op.shape.register; }
+    or (sel op.shape.list)     { reg = ?op.shape.list.member; }
+    or                         { ret false; }
+    if (sel reg.element.none)  { ret false; }
+    ret !one || reg.fields == 1;
+}
+
+# whether each register constraint of `r` names operands it has, of a kind their parts read, and a register of the file,
+# keeps its side apart from something, permits an overlap by element widths only between groups stating them, and tests
+# operands of its terms' kinds, by the terms check effect rules share
+fun constraints(s: *S.Set, r: *row.Row) opt[str] {
+    var i: u32 = 0;
+    for (i < r.constraints.len) {
+        val c: *constraint.Constraint = ?r.constraints.at[i];
+        if (!side_ok(r, c.side))                                                                                      { ret opt[str].some{KEPT_OPERAND}; }
+        if (c.permit != constraint.DISJOINT && c.permit != constraint.BY_WIDTHS && c.permit != constraint.SAME_WIDTH) { ret opt[str].some{KEPT_PERMIT}; }
+        val widths: bool = c.permit != constraint.DISJOINT;
+        val one:    bool = c.permit == constraint.BY_WIDTHS;
+        var group:  bool = !widths || grouped(r, c.side, one);
+        if (sel c.against.sides) {
+            val sides: constraint.Sides = c.against.sides;
+            if (sides.len == 0) { ret opt[str].some{KEPT_OPERAND}; }
+            var k: u32 = 0;
+            for (k < sides.len) {
+                if (!side_ok(r, sides.at[k])) { ret opt[str].some{KEPT_OPERAND}; }
+                group = group && (!widths || grouped(r, sides.at[k], one));
+                k     = k + 1;
+            }
+        }
+        or {
+            group = group && !widths;
+        }
+        if (sel c.against.register && c.against.register >= check_register.register_count(s)) { ret opt[str].some{check.EFFECT_ROW}; }
+        if (!group)                                                                           { ret opt[str].some{KEPT_PERMIT}; }
+        if (c.when.len > 0) {
+            val tested: opt[str] = check_effect.terms(s, r, c.when);
+            if (sel tested.some) { ret tested; }
+        }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+pub fun rows(s: *S.Set) err[check.Refusal] {
+    val keyed: err[check.Refusal] = check.indexed(s, ?s.codec.keys, s.codec.rows.len, s.codec.rows.len, row_key, 0, "row", SHARED_KEY);
+    if (sel keyed.err) { ret keyed; }
+    var i: u32 = 0;
+    for (i < s.codec.rows.len) {
+        val defect: opt[str] = row_defect(s, ?s.codec.rows.at[i]);
+        if (sel defect.some) { ret check.refuse(s, defect.some, "row", i); }
+        i = i + 1;
+    }
+    ret check.fine();
+}
+
+# what is wrong with row `r` over the set's field table, register file and catalog, none when nothing is
+pub fun row_defect(s: *S.Set, r: *row.Row) opt[str] {
+    if (r.operands.len > row.MAX_OPERANDS)                              { ret opt[str].some{OPERANDS}; }
+    if (r.encoding.len > row.MAX_FIELDS)                                { ret opt[str].some{FIELDS}; }
+    if (!check_extension.required_in_catalog(s.extensions, r.requires)) { ret opt[str].some{check.UNKNOWN_EXTENSION}; }
+    val laid: opt[str] = fields(s, r);
+    if (sel laid.some) { ret laid; }
+    var op: u32 = 0;
+    for (op < r.operands.len) {
+        val shaped: opt[str] = shape(s, r, op::u8);
+        if (sel shaped.some) { ret shaped; }
+        op = op + 1;
+    }
+    val affected: opt[str] = check_effect.effects(s, r);
+    if (sel affected.some) { ret affected; }
+    ret constraints(s, r);
+}
+
+pub fun dispatch(s: *S.Set) err[check.Refusal] {
+    val d: *core_dispatch.Dispatch = s.codec.dispatch;
+    if (d.node_count == 0) { ret check.refuse(s, NO_ROOT, "node", 0); }
+    var n: u32 = 0;
+    for (n < d.node_count) {
+        val node: *core_dispatch.Node = ?d.nodes[n];
+        if (node.key::u32 >= d.key_count || node.first::u64 + node.count::u64 > d.entry_count::u64) { ret check.refuse(s, NODE, "node", n); }
+        var k: u32 = 0;
+        for (k < node.count) {
+            val e: *core_dispatch.Entry = ?d.entries[node.first + k];
+            if (k > 0 && d.entries[node.first + k - 1].value >= e.value) { ret check.refuse(s, UNSORTED, "node", n); }
+            if (e.node != 0) {
+                if (e.node > d.node_count) { ret check.refuse(s, ENTRY, "entry", node.first + k); }
+            }
+            or (e.first::u64 + e.count::u64 > d.candidate_count::u64) {
+                ret check.refuse(s, ENTRY, "entry", node.first + k);
+            }
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    var c: u32 = 0;
+    for (c < d.candidate_count) {
+        val at: u32 = d.candidates[c];
+        if (at >= s.codec.rows.len) { ret check.refuse(s, CANDIDATE, "candidate", c); }
+        c = c + 1;
+    }
+    ret check.fine();
+}
+
+# the row of the step that takes the target, which a relaxation has exactly once
+fun target_row(rx: *relax.Relaxation) u32 {
+    var i: u32 = 0;
+    for (i < rx.form.len) {
+        val step: *relax.Step = ?rx.form.at[i];
+        var k:    u32         = 0;
+        for (k < step.values.len) {
+            val src: *relax.Source = ?step.values.at[k];
+            if (sel src.target) { ret step.row; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret effect.NO_ROW;
+}
+
+fun form(s: *S.Set, rx: *relax.Relaxation) opt[str] {
+    val from:    *row.Row = ?s.codec.rows.at[rx.row];
+    var targets: u32      = 0;
+    if (rx.form.len == 0) { ret opt[str].some{RELAX_FORM}; }
+    var i: u32 = 0;
+    for (i < rx.form.len) {
+        val step: *relax.Step = ?rx.form.at[i];
+        if (step.row >= s.codec.rows.len)                              { ret opt[str].some{RELAX_ROW}; }
+        if (step.values.len != s.codec.rows.at[step.row].operands.len) { ret opt[str].some{RELAX_FORM}; }
+        var k: u32 = 0;
+        for (k < step.values.len) {
+            val src: *relax.Source = ?step.values.at[k];
+            if ((sel src.operand && src.operand::u32 >= from.operands.len) || (sel src.flipped && src.flipped.operand::u32 >= from.operands.len) || (sel src.register && src.register >= check_register.register_count(s))) {
+                ret opt[str].some{RELAX_SOURCE};
+            }
+            if (sel src.target) { targets = targets + 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (targets != 1) { ret opt[str].some{RELAX_TARGET}; }
+    ret opt[str].none{};
+}
+
+# bearer `row` of the relaxation index: the row its relaxation relaxes
+fun relax_key(s: *S.Set, of: u32, row: u32, scratch: *u8) View {
+    ret check.spelled(s.codec.rows.at[s.relax.at[row].row].key);
+}
+
+pub fun relaxations(s: *S.Set) err[check.Refusal] {
+    val all: relax.Relaxations = s.relax;
+    var i:   u32               = 0;
+    for (i < all.len) {
+        val rx: *relax.Relaxation = ?all.at[i];
+        if (rx.row >= s.codec.rows.len)                              { ret check.refuse(s, RELAX_ROW, "relaxation", i); }
+        if (rx.operand::u32 >= s.codec.rows.at[rx.row].operands.len) { ret check.refuse(s, RELAX_OPERAND, "relaxation", i); }
+        val desc: *operand.Operand = ?s.codec.rows.at[rx.row].operands.at[rx.operand];
+        if (!sel desc.shape.relative) { ret check.refuse(s, RELAX_OPERAND, "relaxation", i); }
+        val formed: opt[str] = form(s, rx);
+        if (sel formed.some) { ret check.refuse(s, formed.some, "relaxation", i); }
+        i = i + 1;
+    }
+    val keyed: err[check.Refusal] = check.indexed(s, ?all.keys, all.len, all.len, relax_key, 0, "relaxation", RELAX_TWICE);
+    if (sel keyed.err) { ret keyed; }
+    # a chain of relaxations follows the step taking the target, and must end
+    i = 0;
+    for (i < all.len) {
+        var next:  u32 = target_row(?all.at[i]);
+        var steps: u32 = 0;
+        for (next != effect.NO_ROW) {
+            if (steps >= all.len) { ret check.refuse(s, RELAX_CYCLE, "relaxation", i); }
+            val at: opt[u32] = index.find(?all.keys, s.codec.rows.at[next].key);
+            next = effect.NO_ROW;
+            if (sel at.some) { next = target_row(?all.at[at.some]); }
+            steps = steps + 1;
+        }
+        i = i + 1;
+    }
+    ret check.fine();
+}

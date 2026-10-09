@@ -1,0 +1,440 @@
+# the check of a set's assembly syntaxes: templates, aliases, specifiers, the index and sequence spellings
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use masc.check.check;
+use check_extension: masc.check.extension;
+use check_fixup:     masc.check.fixup;
+use check_register:  masc.check.register;
+use masc.codec.walk;
+use masc.core.effect;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.row;
+use S:           masc.core.set;
+use core_syntax: masc.core.syntax;
+
+pub val NO_ASSEMBLY:     str = "set has no assembly syntax";
+pub val SHARED_SYNTAX:   str = "syntax name given twice";
+pub val FORMS:           str = "syntax does not spell each row of the codec once";
+pub val TEMPLATE:        str = "template malformed, or a hole names no operand";
+pub val WRITTEN_TWICE:   str = "template writes an operand twice";
+pub val UNWRITTEN:       str = "template leaves an operand unwritten that the row does not fix";
+pub val GROUP_OPERAND:   str = "an optional operand outside a group, or a required one inside";
+pub val NO_HOOK:         str = "operand kind with no hook in the syntax";
+pub val ALIAS_ROW:       str = "alias names no row, or aliases out of row order";
+pub val ALIAS_SOURCES:   str = "alias sources do not match its base row";
+pub val ALIAS_SOURCE:    str = "source names an operand or register that is not there, or a fixed value that names one";
+pub val ALIAS_OPERAND:   str = "alias operand no source or derivation gives";
+pub val ALIAS_EXCLUSION: str = "alias excludes a value its operand cannot hold, or out of operand order";
+pub val PREFERENCE:      str = "two aliases of one row share a preference";
+pub val NO_MNEMONIC:     str = "template has no mnemonic to index it by";
+pub val INDEX_ENTRY:     str = "index entry empty, out of order with its candidates or past the candidates";
+pub val INDEX_ORDER:     str = "index keys or an entry's candidates not in ascending order";
+pub val INDEX_KEY:       str = "candidate indexed under a key that is not its mnemonic, or names no row or alias";
+pub val INDEX_TWICE:     str = "index key or candidate given twice";
+pub val INDEX_MISSING:   str = "row or alias missing from the index";
+pub val SPECIFIER:       str = "specifier template does not hold exactly one hole with text around it";
+pub val SPECIFIER_KIND:  str = "specifier names no fixup kind";
+pub val SEQUENCE:        str = "sequence spelling of fewer than two steps or more than an expansion holds, a step whose parts do not match its row or name what is not there, an operand no step takes, or out of order of its first row";
+pub val SEQUENCE_INDEX:  str = "sequence spellings not indexed once each in ascending order of mnemonic";
+pub val SEQUENCE_MODE:   str = "sequence spelling holds under a value its set's modes do not take, or under two values of one mode";
+pub val NO_OWN:          str = "sequence part names its own label in a syntax with no stem for it, or one longer than a stem holds";
+pub val NO_ANONYMOUS:    str = "syntax reserves no spelling for anonymous labels, or one past the longest";
+pub val SPECIFIER_TWICE: str = "specifier spelled twice for one operand, or one fixup kind spelled twice";
+
+# the defect of `template` over `count` operands read by `descs`, bit n of `unwritten` set when operand n may go unwritten
+pub fun template_defect(syntax: *core_syntax.Syntax, template: str, descs: **operand.Operand, count: u32, unwritten: u32) opt[str] {
+    if (template == nil) { ret opt[str].some{TEMPLATE}; }
+    var seen: u32   = 0;
+    var open: bool  = false;
+    var at:   usize = 0;
+    for {
+        val p: core_syntax.Piece = core_syntax.piece(template, at);
+        at = p.at + p.len;
+        if (p.kind == core_syntax.END)                                                                                      { brk; }
+        if (p.kind == core_syntax.BROKEN || (p.kind == core_syntax.OPEN && open) || (p.kind == core_syntax.CLOSE && !open)) { ret opt[str].some{TEMPLATE}; }
+        if (p.kind == core_syntax.OPEN)                                                                                     { open = true; }
+        if (p.kind == core_syntax.CLOSE)                                                                                    { open = false; }
+        if (p.kind == core_syntax.HOLE) {
+            if (p.operand::u32 >= count || descs[p.operand] == nil) { ret opt[str].some{TEMPLATE}; }
+            val bit: u32 = 1::u32 << p.operand::u32;
+            if ((seen & bit) != 0) { ret opt[str].some{WRITTEN_TWICE}; }
+            seen = seen | bit;
+            val d: *operand.Operand = descs[p.operand];
+            if ((d.quantity == operand.OPTIONAL) != open) { ret opt[str].some{GROUP_OPERAND}; }
+            val shape: *operand.Shape = ?d.shape;
+            if (!(sel shape.register || sel shape.enumerant || sel shape.condition) && core_syntax.hook(syntax, shape) == nil) { ret opt[str].some{NO_HOOK}; }
+        }
+    }
+    if (open) { ret opt[str].some{TEMPLATE}; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (((seen | unwritten) & (1::u32 << k)) == 0) { ret opt[str].some{UNWRITTEN}; }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether `imm` holds every value of `values` and excludes none of them itself
+fun holds_integers(imm: *operand.Immediate, values: operand.Integers) bool {
+    var k: u32 = 0;
+    for (k < values.len) {
+        val bad: opt[str] = walk.unrepresentable(imm, values.at[k]);
+        if (sel bad.some || operand.excludes_value(imm, values.at[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether `e` admits every value of `values`, and `values` names at least one
+fun holds_members(e: *operand.Enumeration, values: operand.Numbers) bool {
+    if (values.len == 0) { ret false; }
+    var k: u32 = 0;
+    for (k < values.len) {
+        if (!operand.member(e, values.at[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether `d`, one value per operand, holds every value of `ex` and excludes none of them itself, and `ex` names at least one
+pub fun excludable(s: *S.Set, d: *operand.Operand, ex: *core_syntax.Excluded) bool {
+    if (d.quantity == operand.VARIADIC) { ret false; }
+    val shape: *operand.Shape = ?d.shape;
+    var k:     u32            = 0;
+    if (sel ex.register) {
+        if (ex.register.len == 0 || !sel shape.register) { ret false; }
+        if (sel shape.register) {
+            val r: *operand.Register = ?shape.register;
+            if (!check_register.in_file(s, r)) { ret false; }
+            for (k < ex.register.len) {
+                val n:    u32  = ex.register.at[k];
+                var held: bool = false;
+                var i:    u32  = 0;
+                for (i < r.classes.len) {
+                    if (operand.within(r, n, s.codec.registers.classes[r.classes.at[i]].count)) { held = true; }
+                    i = i + 1;
+                }
+                if (!held || operand.excludes_number(r, n)) { ret false; }
+                k = k + 1;
+            }
+        }
+        ret true;
+    }
+    if (sel ex.immediate) {
+        if (ex.immediate.len == 0) { ret false; }
+        if (sel shape.immediate)   { ret holds_integers(?shape.immediate, ex.immediate); }
+        ret false;
+    }
+    if (sel ex.relative) {
+        if (ex.relative.len == 0) { ret false; }
+        if (sel shape.relative)   { ret holds_integers(?shape.relative.offset, ex.relative); }
+        ret false;
+    }
+    if (sel ex.enumerant) {
+        if (sel shape.enumerant) { ret holds_members(?shape.enumerant, ex.enumerant); }
+        ret false;
+    }
+    if (sel ex.condition) {
+        if (sel shape.condition) { ret holds_members(?shape.condition, ex.condition); }
+        ret false;
+    }
+    ret false;
+}
+
+# the defect of alias `a` of `syntax`, `before` the alias preceding it or nil
+pub fun alias_defect(s: *S.Set, syntax: *core_syntax.Syntax, a: *core_syntax.Alias, before: *core_syntax.Alias) opt[str] {
+    if (a.row >= s.codec.rows.len || (before != nil && before.row > a.row)) { ret opt[str].some{ALIAS_ROW}; }
+    val base: *row.Row = ?s.codec.rows.at[a.row];
+    if (a.sources.len != base.operands.len || a.count::u32 > row.MAX_OPERANDS) { ret opt[str].some{ALIAS_SOURCES}; }
+    var j: u32 = 0;
+    for (j < a.sources.len) {
+        val src: core_syntax.Source = a.sources.at[j];
+        var bad: bool               = false;
+        if (sel src.operand)  { bad = src.operand >= a.count; }
+        if (sel src.flipped)  { bad = src.flipped.operand >= a.count; }
+        if (sel src.masked)   { bad = src.masked.operand >= a.count || (src.masked.value & ~src.masked.mask) != 0; }
+        if (sel src.register) { bad = src.register >= check_register.register_count(s); }
+        if (sel src.derived)  { bad = a.derive == nil; }
+        if (sel src.value) {
+            val v: operand.Value = src.value;
+            bad = sel v.register || sel v.memory || sel v.list || sel v.symbol;
+        }
+        if (bad) { ret opt[str].some{ALIAS_SOURCE}; }
+        j = j + 1;
+    }
+    if (a.derive != nil && a.derive.operands.len != a.count::u32)       { ret opt[str].some{ALIAS_OPERAND}; }
+    if (!check_extension.required_in_catalog(s.extensions, a.requires)) { ret opt[str].some{check.UNKNOWN_EXTENSION}; }
+    var descs: [row.MAX_OPERANDS]*operand.Operand;
+    var k:     u8 = 0;
+    for (k < a.count) {
+        descs[k] = core_syntax.alias_operand(a, base, k);
+        if (descs[k] == nil) { ret opt[str].some{ALIAS_OPERAND}; }
+        k = k + 1;
+    }
+    var i: u32 = 0;
+    for (i < a.exclusions.len) {
+        val x: *core_syntax.Exclusion = ?a.exclusions.at[i];
+        if (x.operand >= a.count || (i > 0 && a.exclusions.at[i - 1].operand >= x.operand) || !excludable(s, descs[x.operand], ?x.excluded)) { ret opt[str].some{ALIAS_EXCLUSION}; }
+        i = i + 1;
+    }
+    if (a.preference != 0) {
+        i = 0;
+        for (?syntax.aliases.at[i] != a) {
+            val other: *core_syntax.Alias = ?syntax.aliases.at[i];
+            if (other.row == a.row && other.preference == a.preference) { ret opt[str].some{PREFERENCE}; }
+            i = i + 1;
+        }
+    }
+    ret template_defect(syntax, a.template, ?descs[0], a.count::u32, 0);
+}
+
+# the defect of specifier `spec` of `syntax`
+fun specifier_defect(s: *S.Set, syntax: *core_syntax.Syntax, spec: *core_syntax.Specifier) opt[str] {
+    if (spec.template == nil) { ret opt[str].some{SPECIFIER}; }
+    var holes: u32   = 0;
+    var first: bool  = false;
+    var after: bool  = false;
+    var at:    usize = 0;
+    for {
+        val p: core_syntax.Piece = core_syntax.piece(spec.template, at);
+        at = p.at + p.len;
+        if (p.kind == core_syntax.END) { brk; }
+        if (p.kind == core_syntax.HOLE && p.operand == 0 && p.format.len == 0) {
+            first = at == p.len;
+            holes = holes + 1;
+        }
+        or (p.kind == core_syntax.TEXT) {
+            if (holes > 0) { after = true; }
+        }
+        or {
+            ret opt[str].some{SPECIFIER};
+        }
+    }
+    if (holes != 1 || (first && !after) || (!first && spec.template[0] == 0))     { ret opt[str].some{SPECIFIER}; }
+    if (spec.fixup == operand.NO_FIXUP)                                           { ret opt[str].some{SPECIFIER_KIND}; }
+    if (!check_fixup.bound(s, spec.operand) || !check_fixup.bound(s, spec.fixup)) { ret opt[str].some{check.UNBOUND_FIXUP}; }
+    var i: u32 = 0;
+    for (?syntax.specifiers.at[i] != spec) {
+        val other: *core_syntax.Specifier = ?syntax.specifiers.at[i];
+        if (other.operand == spec.operand && (other.fixup == spec.fixup || str_equals(other.template, spec.template))) { ret opt[str].some{SPECIFIER_TWICE}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the defect of the form of row `index` in `syntax`
+fun form_defect(s: *S.Set, syntax: *core_syntax.Syntax, index: u32) opt[str] {
+    val r:         *row.Row = ?s.codec.rows.at[index];
+    var descs:     [row.MAX_OPERANDS]*operand.Operand;
+    var unwritten: u32      = 0;
+    var i:         u32      = 0;
+    for (i < r.operands.len && i < row.MAX_OPERANDS) {
+        descs[i] = ?r.operands.at[i];
+        val at: opt[register.Id] = effect.fixed(s.codec.registers, r.effect, i::u8);
+        if (sel at.some) { unwritten = unwritten | (1::u32 << i); }
+        i = i + 1;
+    }
+    ret template_defect(syntax, syntax.forms.at[index], ?descs[0], r.operands.len, unwritten);
+}
+
+# the defect of candidate `c` indexed under `key`, `before` the candidate preceding it in its entry or nil
+fun candidate_defect(s: *S.Set, syntax: *core_syntax.Syntax, key: View, c: core_syntax.Candidate, before: *core_syntax.Candidate) opt[str] {
+    if (c.row >= s.codec.rows.len || c.alias > syntax.aliases.len)                                    { ret opt[str].some{INDEX_KEY}; }
+    if (c.alias > 0 && syntax.aliases.at[c.alias - 1].row != c.row)                                   { ret opt[str].some{INDEX_KEY}; }
+    if (core_syntax.compare(syntax, core_syntax.mnemonic(core_syntax.template(syntax, c)), key) != 0) { ret opt[str].some{INDEX_KEY}; }
+    if (before != nil) {
+        if (before.row == c.row && before.alias == c.alias)                        { ret opt[str].some{INDEX_TWICE}; }
+        if (before.row > c.row || (before.row == c.row && before.alias > c.alias)) { ret opt[str].some{INDEX_ORDER}; }
+    }
+    ret opt[str].none{};
+}
+
+# the defect of entry `e` of `syntax`'s index, whose candidates start at `first` and whose preceding entry is `before` or nil
+fun entry_defect(s: *S.Set, syntax: *core_syntax.Syntax, e: *core_syntax.Entry, first: u32, before: *core_syntax.Entry) opt[str] {
+    val index: *core_syntax.Index = ?syntax.index;
+    if (e.key == nil || e.key[0] == 0 || e.len == 0 || e.first != first || e.len > index.count - first) { ret opt[str].some{INDEX_ENTRY}; }
+    val key: View = view(e.key, str_len(e.key));
+    if (before != nil) {
+        val order: i64 = core_syntax.compare(syntax, view(before.key, str_len(before.key)), key);
+        if (order == 0) { ret opt[str].some{INDEX_TWICE}; }
+        if (order > 0)  { ret opt[str].some{INDEX_ORDER}; }
+    }
+    var k: u32 = 0;
+    for (k < e.len) {
+        var prior: *core_syntax.Candidate = nil;
+        if (k > 0) { prior = ?index.candidates[e.first + k - 1]; }
+        val defect: opt[str] = candidate_defect(s, syntax, key, index.candidates[e.first + k], prior);
+        if (sel defect.some) { ret defect; }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the index of `syntax`, which holds each row and each alias once under its mnemonic, the keys and each entry's candidates in order
+fun index_defect(s: *S.Set, syntax: *core_syntax.Syntax) err[check.Refusal] {
+    val index: *core_syntax.Index = ?syntax.index;
+    var i:     u32                = 0;
+    for (i < syntax.forms.len) {
+        if (core_syntax.mnemonic(syntax.forms.at[i]).len == 0) { ret check.refuse(s, NO_MNEMONIC, "form", i); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < syntax.aliases.len) {
+        if (core_syntax.mnemonic(syntax.aliases.at[i].template).len == 0) { ret check.refuse(s, NO_MNEMONIC, "alias row", i); }
+        i = i + 1;
+    }
+    var first: u32 = 0;
+    i = 0;
+    for (i < index.len) {
+        var before: *core_syntax.Entry = nil;
+        if (i > 0) { before = ?index.at[i - 1]; }
+        val defect: opt[str] = entry_defect(s, syntax, ?index.at[i], first, before);
+        if (sel defect.some) { ret check.refuse(s, defect.some, "index", i); }
+        first = first + index.at[i].len;
+        i     = i + 1;
+    }
+    if (first != index.count || index.count != syntax.forms.len + syntax.aliases.len) { ret check.refuse(s, INDEX_MISSING, "index", index.len); }
+    ret check.fine();
+}
+
+# the index of `r` among the codec's rows, the row count when it is not one of them
+fun row_at(s: *S.Set, r: *row.Row) u32 {
+    if (r:~u64 < s.codec.rows.at:~u64) { ret s.codec.rows.len; }
+    val at: u64 = (r:~u64 - s.codec.rows.at:~u64) / $size_of(row.Row)::u64;
+    if (at >= s.codec.rows.len::u64) { ret s.codec.rows.len; }
+    ret at::u32;
+}
+
+# the defect of sequence spelling `i` of `syntax`
+fun sequence_defect(s: *S.Set, syntax: *core_syntax.Syntax, i: u32) opt[str] {
+    val q: *core_syntax.Sequence = ?syntax.sequences.at[i];
+    if (q.steps.len < 2 || q.steps.len > relax.MAX_STEPS || q.operands.len > row.MAX_OPERANDS) { ret opt[str].some{SEQUENCE}; }
+    var taken: u32 = 0;
+    var j:     u32 = 0;
+    for (j < q.steps.len) {
+        val step: *core_syntax.Step = ?q.steps.at[j];
+        if (row_at(s, step.row) == s.codec.rows.len || step.parts.len != step.row.operands.len) { ret opt[str].some{SEQUENCE}; }
+        var k: u32 = 0;
+        for (k < step.parts.len) {
+            val part: core_syntax.Part = step.parts.at[k];
+            if (sel part.operand) {
+                if (part.operand::u32 >= q.operands.len) { ret opt[str].some{SEQUENCE}; }
+                taken = taken | (1::u32 << part.operand::u32);
+            }
+            if (sel part.symbol) {
+                if (part.symbol.operand::u32 >= q.operands.len || part.symbol.fixup == operand.NO_FIXUP || !check_fixup.bound(s, part.symbol.fixup)) { ret opt[str].some{SEQUENCE}; }
+                taken = taken | (1::u32 << part.symbol.operand::u32);
+            }
+            if (sel part.register) {
+                if (s.codec.registers == nil) { ret opt[str].some{SEQUENCE}; }
+                val held: opt[*register.Register] = register.row_of(s.codec.registers, part.register);
+                if (sel held.none) { ret opt[str].some{SEQUENCE}; }
+            }
+            if (sel part.here) {
+                if (part.here == operand.NO_FIXUP || !check_fixup.bound(s, part.here)) { ret opt[str].some{SEQUENCE}; }
+                if (syntax.own == nil || syntax.own[0] == 0)                           { ret opt[str].some{NO_OWN}; }
+                if (str_len(syntax.own) > core_syntax.MAX_ANONYMOUS)                   { ret opt[str].some{NO_OWN}; }
+            }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    if (!check_extension.required_in_catalog(s.extensions, q.requires)) { ret opt[str].some{check.UNKNOWN_EXTENSION}; }
+    var state: mode.State = mode.initial(?s.assembly);
+    j = 0;
+    for (j < q.when.len) {
+        if (!mode.change(?state, q.when.at[j])) { ret opt[str].some{SEQUENCE_MODE}; }
+        var k: u32 = 0;
+        for (k < j) {
+            if (q.when.at[k].mode == q.when.at[j].mode) { ret opt[str].some{SEQUENCE_MODE}; }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    if (taken != (1::u32 << q.operands.len) - 1)                                                       { ret opt[str].some{SEQUENCE}; }
+    if (i > 0 && row_at(s, syntax.sequences.at[i - 1].steps.at[0].row) > row_at(s, q.steps.at[0].row)) { ret opt[str].some{SEQUENCE}; }
+    var descs: [row.MAX_OPERANDS]*operand.Operand;
+    j = 0;
+    for (j < q.operands.len) {
+        descs[j] = ?q.operands.at[j];
+        j        = j + 1;
+    }
+    ret template_defect(syntax, q.template, ?descs[0], q.operands.len, 0);
+}
+
+# whether the syntax's sequence spellings are indexed once each in ascending order of mnemonic
+fun sequences_named(syntax: *core_syntax.Syntax) bool {
+    val qs: *core_syntax.Sequences = ?syntax.sequences;
+    var i:  u32                    = 0;
+    for (i < qs.len) {
+        if (qs.named[i] >= qs.len) { ret false; }
+        var j: u32 = 0;
+        for (j < i) {
+            if (qs.named[j] == qs.named[i]) { ret false; }
+            j = j + 1;
+        }
+        if (i > 0 && core_syntax.compare(syntax, core_syntax.mnemonic(qs.at[qs.named[i - 1]].template), core_syntax.mnemonic(qs.at[qs.named[i]].template)) > 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun syntaxes(s: *S.Set) err[check.Refusal] {
+    if (s.syntaxes.len == 0) { ret check.refuse(s, NO_ASSEMBLY, "syntax", 0); }
+    var n: u32 = 0;
+    for (n < s.syntaxes.len) {
+        val syntax: *core_syntax.Syntax = ?s.syntaxes.at[n];
+        var m:      u32                 = 0;
+        for (m < n) {
+            if (str_equals(s.syntaxes.at[m].name, syntax.name)) { ret check.refuse(s, SHARED_SYNTAX, "syntax", n); }
+            m = m + 1;
+        }
+        if (syntax.forms.len != s.codec.rows.len)                                                                         { ret check.refuse(s, FORMS, "syntax", n); }
+        if (syntax.anonymous == nil || syntax.anonymous[0] == 0 || str_len(syntax.anonymous) > core_syntax.MAX_ANONYMOUS) { ret check.refuse(s, NO_ANONYMOUS, "syntax", n); }
+        var i: u32 = 0;
+        for (i < syntax.forms.len) {
+            val formed: opt[str] = form_defect(s, syntax, i);
+            if (sel formed.some) { ret check.refuse(s, formed.some, "form", i); }
+            i = i + 1;
+        }
+        i = 0;
+        for (i < syntax.aliases.len) {
+            var before: *core_syntax.Alias = nil;
+            if (i > 0) { before = ?syntax.aliases.at[i - 1]; }
+            val aliased: opt[str] = alias_defect(s, syntax, ?syntax.aliases.at[i], before);
+            if (sel aliased.some) { ret check.refuse(s, aliased.some, "alias row", i); }
+            i = i + 1;
+        }
+        val indexed: err[check.Refusal] = index_defect(s, syntax);
+        if (sel indexed.err) { ret indexed; }
+        i = 0;
+        for (i < syntax.specifiers.len) {
+            val specified: opt[str] = specifier_defect(s, syntax, ?syntax.specifiers.at[i]);
+            if (sel specified.some) { ret check.refuse(s, specified.some, "specifier", i); }
+            i = i + 1;
+        }
+        i = 0;
+        for (i < syntax.sequences.len) {
+            val sequenced: opt[str] = sequence_defect(s, syntax, i);
+            if (sel sequenced.some) { ret check.refuse(s, sequenced.some, "sequence", i); }
+            i = i + 1;
+        }
+        if (!sequences_named(syntax)) { ret check.refuse(s, SEQUENCE_INDEX, "sequence", 0); }
+        n = n + 1;
+    }
+    ret check.fine();
+}
