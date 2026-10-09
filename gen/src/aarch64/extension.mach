@@ -1,0 +1,434 @@
+# the aarch64 extension catalog generator
+#
+# it reads Arm's feature model, Features.json of the vendored AARCHMRS
+# release, and llvm's names for the features, AArch64Features.td, and
+# emits the catalog's data beside masc's aarch64 modules: an id for each
+# row, the rows with their implications and revisions, the levels, the
+# conflicts and combinations, the name index, and the names -mattr and
+# -march give the rows. how the model is read is gen.aarch64.feature's,
+# and how the names are, gen.aarch64.llvm's.
+#
+# a level is named armvN-a for the version vNAp0 and armvN.M-a for vNApM,
+# as llvm-mc's -march and .arch spell it, and selects its version. an
+# llvm name covers the rows of its FEAT_* names, or, for a name that gives
+# none, as sve2-aes, those of the features it implies. a FEAT_* name llvm
+# gives that the model has no row for is listed in LLVM_UNLISTED, so a
+# release that adds it shows in the table's drift.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use gen.aarch64.feature;
+use gen.aarch64.llvm;
+use gen.diag;
+use gen.emit;
+use gen.set;
+use gen.source;
+use gen.tar;
+
+pub val FEATURES: str = "Features.json";
+pub val NAMES:    str = "AArch64Features.td";
+
+pub val NO_ARCHIVE:  str = "source holds no single .tar.gz release";
+pub val NO_NAMES:    str = "input holds no AArch64Features.td";
+pub val NO_IMPLIED:  str = "llvm feature implies a def the file does not give";
+pub val NAMED_TWICE: str = "llvm name covers different rows in two defs";
+pub val IDENT_TWICE: str = "two rows mangle to one identifier";
+
+# one llvm name and the rows it covers
+rec Spelt {
+    name:  str;
+    ids:   vector.Vector[u32];
+    march: bool;
+}
+
+fun memory(subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, subject)};
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+# the identifier of row `row`: SIMD for FEAT_AdvSIMD, VN_M for vNApM, else the name after FEAT_
+fun ident(f: *emit.File, row: str) str {
+    if (str_equals(row, "FEAT_AdvSIMD")) { ret "SIMD"; }
+    if (feature.version(row)) {
+        var v: [5]u8;
+        v[0] = 'V';
+        v[1] = row[1];
+        v[2] = '_';
+        v[3] = row[4];
+        v[4] = 0;
+        ret emit.ident(f, ?v[0]);
+    }
+    ret emit.ident(f, ?row[5]);
+}
+
+# the level name of version `row`
+fun level(a: *A.Allocator, row: str) str {
+    var v:    [12]u8;
+    var n:    usize = 0;
+    val head: str   = "armv";
+    for (n < 4) {
+        v[n] = head[n];
+        n    = n + 1;
+    }
+    v[n] = row[1];
+    n    = n + 1;
+    if (row[4] != '0') {
+        v[n]     = '.';
+        v[n + 1] = row[4];
+        n        = n + 2;
+    }
+    v[n]     = '-';
+    v[n + 1] = 'a';
+    v[n + 2] = 0;
+    val got: res[str, StrError] = str_join(a, ?v[0]);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+fun by_spelt(a: *Spelt, b: *Spelt) i64 {
+    ret str_compare(a.name, b.name);
+}
+
+fun by_text(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+fun by_id(a: *u32, b: *u32) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+fun holds(v: *vector.Vector[u32], id: u32) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun listed(v: *vector.Vector[str], s: str) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (str_equals(v.data[i], s)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun same(a: *vector.Vector[u32], b: *vector.Vector[u32]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `n` covering `ids` added to the names, refused when a name covers other rows already
+fun spell(spelt: *vector.Vector[Spelt], n: str, ids: *vector.Vector[u32], march: bool, file: str) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < spelt.len) {
+        if (str_equals(spelt.data[i].name, n)) {
+            if (!same(?spelt.data[i].ids, ids)) { ret err[diag.Refusal].err{diag.refusal(file, 0, NAMED_TWICE, n)}; }
+            ret err[diag.Refusal].ok{};
+        }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Spelt](spelt, Spelt{name: n, ids: @ids, march: march});
+    if (sel pushed.err) { ret memory(n); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the rows each llvm name covers, and the FEAT names that have none
+fun spellings(a: *A.Allocator, m: *feature.Model, names: *llvm.Names, file: str, spelt: *vector.Vector[Spelt], unlisted: *vector.Vector[str]) err[diag.Refusal] {
+    var march: vector.Vector[str] = vector.init[str](a);
+    var i:     usize              = 0;
+    for (i < names.extensions.len) {
+        val e: *llvm.Extension = ?names.extensions.data[i];
+        if (e.visible[0] != 0) { vector.push[str](?march, e.visible); }
+        if (e.alias[0] != 0)   { vector.push[str](?march, e.alias); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < names.extensions.len) {
+        val e:   *llvm.Extension    = ?names.extensions.data[i];
+        var ids: vector.Vector[u32] = vector.init[u32](a);
+        var k:   usize              = 0;
+        for (k < e.arm.len) {
+            val id: opt[u32] = feature.row(m, e.arm.data[k]);
+            if (sel id.some) {
+                if (!holds(?ids, id.some)) { vector.push[u32](?ids, id.some); }
+            }
+            or (!listed(unlisted, e.arm.data[k])) { vector.push[str](unlisted, e.arm.data[k]); }
+            k = k + 1;
+        }
+        if (e.arm.len == 0) {
+            k = 0;
+            for (k < e.implies.len) {
+                var found: bool  = false;
+                var j:     usize = 0;
+                for (j < names.extensions.len) {
+                    val d: *llvm.Extension = ?names.extensions.data[j];
+                    if (str_equals(d.name, e.implies.data[k])) {
+                        found = true;
+                        var x: usize = 0;
+                        for (x < d.arm.len) {
+                            val id: opt[u32] = feature.row(m, d.arm.data[x]);
+                            if (sel id.some) {
+                                if (!holds(?ids, id.some)) { vector.push[u32](?ids, id.some); }
+                            }
+                            x = x + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+                if (!found) { ret err[diag.Refusal].err{diag.refusal(file, 0, NO_IMPLIED, e.implies.data[k])}; }
+                k = k + 1;
+            }
+        }
+        if (ids.len > 0) {
+            sort.sort_by[u32](ids.data, ids.len, by_id);
+            val each: [3]str = [3]str{e.feature, e.visible, e.alias};
+            k = 0;
+            for (k < 3) {
+                val n: str = each[k];
+                if (n[0] != 0) {
+                    val added: err[diag.Refusal] = spell(spelt, n, ?ids, listed(?march, n), file);
+                    if (sel added.err) { ret added; }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < names.architectures.len) {
+        val arch: *llvm.Architecture = ?names.architectures.data[i];
+        var v:    [6]u8;
+        v[0] = 'v';
+        v[1] = '0' + arch.major::u8;
+        v[2] = 'A';
+        v[3] = 'p';
+        v[4] = '0' + arch.minor::u8;
+        v[5] = 0;
+        val id: opt[u32] = feature.row(m, ?v[0]);
+        if (sel id.some) {
+            var ids: vector.Vector[u32] = vector.init[u32](a);
+            vector.push[u32](?ids, id.some);
+            val added: err[diag.Refusal] = spell(spelt, arch.name, ?ids, false, file);
+            if (sel added.err) { ret added; }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Spelt](spelt.data, spelt.len, by_spelt);
+    sort.sort_by[str](unlisted.data, unlisted.len, by_text);
+    ret err[diag.Refusal].ok{};
+}
+
+# a run of ids in pool `p` declared as `array`, as requirement.Ids, or NO_IDS when empty
+fun run(f: *emit.File, p: *emit.Pool, array: str, idents: *vector.Vector[str], ids: *vector.Vector[u32]) emit.Value {
+    if (ids.len == 0) { ret name("requirement.NO_IDS"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](f.alloc);
+    var i:     usize                     = 0;
+    for (i < ids.len) {
+        vector.push[emit.Value](?items, name(idents.data[ids.data[i]]));
+        i = i + 1;
+    }
+    val at: u32          = emit.pooled(f, p, items.data, items.len::u32);
+    val r:  *emit.Record = emit.record(f, "requirement.Ids");
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(ids.len::i64));
+    ret emit.Value.record{r};
+}
+
+fun entry(f: *emit.File, key: str, row: u32) emit.Value {
+    val e: *emit.Record = emit.record(f, "index.Entry");
+    emit.member(f, e, "key", emit.Value.text{key});
+    emit.member(f, e, "row", number(row::i64));
+    ret emit.Value.record{e};
+}
+
+# the table of model `m` and its llvm names
+fun table(c: *set.Context, m: *feature.Model, spelt: *vector.Vector[Spelt], unlisted: *vector.Vector[str]) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "extension");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "std.types.string.str");
+    emit.uses(f, "masc.core.extension");
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.requirement");
+    val count:  u32                = m.rows.len::u32;
+    var idents: vector.Vector[str] = vector.init[str](c.alloc);
+    var seen:   map.Map[str, u32]  = map.init[str, u32](c.alloc);
+    var i:      u32                = 0;
+    for (i < count) {
+        val id:    str       = ident(f, m.rows.data[i]);
+        var key:   str       = id;
+        val known: opt[*u32] = map.get[str, u32](?seen, ?key);
+        if (sel known.some) { ret err[diag.Refusal].err{diag.refusal(f.path, 0, IDENT_TWICE, m.rows.data[i])}; }
+        map.insert[str, u32](?seen, id, i);
+        vector.push[str](?idents, id);
+        emit.declare(f, id, "requirement.Id", number(i::i64));
+        i = i + 1;
+    }
+    emit.declare(f, "COUNT", "u32", number(count::i64));
+
+    var implied: emit.Pool   = emit.pool(f, "requirement.Id");
+    val rows:    *emit.Array = emit.array(f, "extension.Extension");
+    i = 0;
+    for (i < count) {
+        val r: *emit.Record = emit.record(f, "extension.Extension");
+        emit.member(f, r, "name", emit.Value.text{m.rows.data[i]});
+        emit.member(f, r, "implies", run(f, ?implied, "IMPLIED", ?idents, ?m.implies.data[i]));
+        emit.member(f, r, "revision", emit.Value.text{m.revisions.data[i]});
+        emit.item(f, rows, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare(f, "ROWS", nil, emit.Value.array{rows});
+    emit.declare_array(f, "IMPLIED", implied.array);
+
+    val members: *emit.Array = emit.array(f, "requirement.Id");
+    val levels:  *emit.Array = emit.array(f, "extension.Level");
+    val named:   *emit.Array = emit.keyed(f, "index.Entry");
+    i = 0;
+    for (i < m.versions) {
+        val v:  u32 = 4 + i;
+        val ln: str = level(c.alloc, m.rows.data[v]);
+        if (ln == nil) { ret memory(m.rows.data[v]); }
+        emit.item(f, members, name(idents.data[v]));
+        val r: *emit.Record = emit.record(f, "extension.Level");
+        emit.member(f, r, "name", emit.Value.text{ln});
+        val ids: *emit.Record = emit.record(f, "requirement.Ids");
+        emit.member(f, ids, "at", emit.element(f, "LEVEL_MEMBERS", i));
+        emit.member(f, ids, "len", number(1));
+        emit.member(f, r, "members", emit.Value.record{ids});
+        emit.item(f, levels, emit.Value.record{r});
+        emit.entry(f, named, ln, entry(f, ln, count + i));
+        i = i + 1;
+    }
+    emit.declare(f, "LEVEL_MEMBERS", nil, emit.Value.array{members});
+    emit.declare(f, "LEVELS", nil, emit.Value.array{levels});
+    emit.declare(f, "LEVEL_COUNT", "u32", number(m.versions::i64));
+    i = 0;
+    for (i < count) {
+        emit.entry(f, named, m.rows.data[i], entry(f, m.rows.data[i], i));
+        i = i + 1;
+    }
+    emit.seal(f, named);
+    emit.declare(f, "NAMES", nil, emit.Value.array{named});
+
+    val conflicts: *emit.Array = emit.array(f, "extension.Conflict");
+    var k:         usize       = 0;
+    for (k < m.conflicts.len) {
+        val r: *emit.Record = emit.record(f, "extension.Conflict");
+        emit.member(f, r, "a", name(idents.data[m.conflicts.data[k].a]));
+        emit.member(f, r, "b", name(idents.data[m.conflicts.data[k].b]));
+        emit.item(f, conflicts, emit.Value.record{r});
+        k = k + 1;
+    }
+    emit.declare(f, "CONFLICTS", nil, emit.Value.array{conflicts});
+    emit.declare(f, "CONFLICT_COUNT", "u32", number(m.conflicts.len::i64));
+
+    var combined:     emit.Pool   = emit.pool(f, "requirement.Id");
+    val combinations: *emit.Array = emit.array(f, "extension.Combination");
+    k = 0;
+    for (k < m.combinations.len) {
+        val x: *feature.Combination = ?m.combinations.data[k];
+        val r: *emit.Record         = emit.record(f, "extension.Combination");
+        emit.member(f, r, "by", name(idents.data[x.by]));
+        emit.member(f, r, "when", run(f, ?combined, "COMBINED", ?idents, ?x.when));
+        emit.member(f, r, "implies", run(f, ?combined, "COMBINED", ?idents, ?x.then));
+        emit.item(f, combinations, emit.Value.record{r});
+        k = k + 1;
+    }
+    emit.declare(f, "COMBINATIONS", nil, emit.Value.array{combinations});
+    emit.declare(f, "COMBINATION_COUNT", "u32", number(m.combinations.len::i64));
+    emit.declare_array(f, "COMBINED", combined.array);
+
+    var spelled:   emit.Pool   = emit.pool(f, "requirement.Id");
+    val spellings: *emit.Array = emit.array(f, "requirement.Ids");
+    val names:     *emit.Array = emit.array(f, "index.Entry");
+    val marched:   *emit.Array = emit.array(f, "index.Entry");
+    k = 0;
+    for (k < spelt.len) {
+        val s: *Spelt = ?spelt.data[k];
+        emit.item(f, spellings, run(f, ?spelled, "SPELLED", ?idents, ?s.ids));
+        emit.item(f, names, entry(f, s.name, k::u32));
+        if (s.march) { emit.item(f, marched, entry(f, s.name, k::u32)); }
+        k = k + 1;
+    }
+    emit.declare(f, "SPELLINGS", nil, emit.Value.array{spellings});
+    emit.declare(f, "SPELLING_NAMES", nil, emit.Value.array{names});
+    emit.declare(f, "SPELLING_COUNT", "u32", number(spelt.len::i64));
+    emit.declare(f, "MARCH_NAMES", nil, emit.Value.array{marched});
+    emit.declare(f, "MARCH_COUNT", "u32", number(emit.length(marched)::i64));
+    emit.declare_array(f, "SPELLED", spelled.array);
+
+    val missing: *emit.Array = emit.array(f, "str");
+    k = 0;
+    for (k < unlisted.len) {
+        emit.item(f, missing, emit.Value.text{unlisted.data[k]});
+        k = k + 1;
+    }
+    emit.declare_array(f, "LLVM_UNLISTED", missing);
+    emit.declare(f, "LLVM_UNLISTED_COUNT", "u32", number(unlisted.len::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# the aarch64 extension catalog generated from the feature model and llvm's names
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    var archive: *source.File = nil;
+    var i:       usize        = 0;
+    for (i < c.tree.files.len) {
+        if (str_ends_with(c.tree.files.data[i].path, ".tar.gz")) {
+            if (archive != nil) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_ARCHIVE, nil)}; }
+            archive = ?c.tree.files.data[i];
+        }
+        i = i + 1;
+    }
+    if (archive == nil) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_ARCHIVE, nil)}; }
+    val features: res[source.File, diag.Refusal] = tar.member(c.alloc, archive, FEATURES);
+    if (sel features.err) { ret err[diag.Refusal].err{features.err}; }
+    var ff:   source.File                      = features.ok;
+    val read: res[feature.Model, diag.Refusal] = feature.read(c.alloc, ?ff);
+    if (sel read.err) { ret err[diag.Refusal].err{read.err}; }
+    var m: feature.Model = read.ok;
+    if (c.inputs.len != 1) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_NAMES, nil)}; }
+    val td: opt[*source.File] = source.find(c.inputs.data[0], NAMES);
+    if (sel td.none) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_NAMES, nil)}; }
+    val names: res[llvm.Names, diag.Refusal] = llvm.read(c.alloc, td.some);
+    if (sel names.err) { ret err[diag.Refusal].err{names.err}; }
+    var n:        llvm.Names           = names.ok;
+    var spelt:    vector.Vector[Spelt] = vector.init[Spelt](c.alloc);
+    var unlisted: vector.Vector[str]   = vector.init[str](c.alloc);
+    val spelled:  err[diag.Refusal]    = spellings(c.alloc, ?m, ?n, td.some.path, ?spelt, ?unlisted);
+    if (sel spelled.err) { ret spelled; }
+    ret table(c, ?m, ?spelt, ?unlisted);
+}
