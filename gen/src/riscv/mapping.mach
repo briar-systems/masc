@@ -37,6 +37,7 @@ use std.collections.sort;
 use std.collections.vector;
 use std.format;
 
+use masc.core.constraint;
 use masc.core.diagnostic;
 use masc.core.effect;
 use masc.core.extension;
@@ -51,6 +52,7 @@ use riscv_register:  masc.isa.riscv.register;
 
 use gen.diag;
 use gen.lines;
+use gen.riscv.constraints;
 use gen.riscv.effects;
 use gen.riscv.overlay;
 use gen.riscv.read;
@@ -72,6 +74,7 @@ pub val NO_ROW:        str = "overlay names a row that does not exist";
 pub val NO_STACK_LIST: str = "stack adjustment with no register list";
 pub val UNSTATED:      str = "floating-point row with no stated control and status state";
 pub val LAST_OPERAND:  str = "row has more operands than an operand index holds";
+pub val NO_KEPT:       str = "register constraint's argument not in the row";
 
 # one extension alternative: the ids it names and its closure under the catalog
 pub rec Alternative {
@@ -165,6 +168,21 @@ pub rec Effect {
     fixed:    vector.Vector[effect.Fixed];
 }
 
+# one register constraint of a row
+# ---
+# side:     the registers kept apart
+# against:  the operands' registers they are kept from, empty when `register` is
+# register: the register row they are kept from, effect.NO_ROW when `against` names operands
+# permit:   the overlap allowed nonetheless
+# mask:     the mask operand under whose v0.t it holds, field.NO_OPERAND when it holds for every value
+pub rec Keep {
+    side:     constraint.Side;
+    against:  vector.Vector[constraint.Side];
+    register: u32;
+    permit:   constraint.Permit;
+    mask:     u8;
+}
+
 # a row of the catalog
 # ---
 # key:          its key, the name masc's saved texts spell it by, by the rule at `admit_row`
@@ -181,6 +199,7 @@ pub rec Effect {
 # param:        that field's parameter
 # whole:        the operand that field encodes whole, field.NO_OPERAND when none
 # effect:       what it does beyond its operands
+# keeps:        its register constraints
 # context:      its bits of the dispatch's context word, one per catalog conflict
 # context_mask: which of those bits it fixes
 # every:        whether some file states it with no requirement, so every selection admits it
@@ -201,6 +220,7 @@ pub rec Row {
     param:        u64;
     whole:        u8;
     effect:       Effect;
+    keeps:        vector.Vector[Keep];
     context:      u64;
     context_mask: u64;
     every:        bool;
@@ -226,9 +246,12 @@ pub rec Respelling {
 }
 
 # the catalog the mapping builds
+# ---
+# idle: the patterns of the overlay's register constraints no row matched, which a source naming every instruction leaves empty
 pub rec Catalog {
     rows:        vector.Vector[*Row];
     respellings: vector.Vector[Respelling];
+    idle:        vector.Vector[str];
 }
 
 # the state of one mapping
@@ -1224,6 +1247,71 @@ fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
     ret err[diag.Refusal].ok{};
 }
 
+# whether `row`'s mnemonic matches one of the `count` patterns of `patterns`
+fun matched(patterns: *str, count: u32, row: *Row) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (overlay.matches(patterns[i], row.mnemonic)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the side of `row` argument `arg` names, its fields one per segment field when a segment load's destination
+fun side_of(row: *Row, arg: str) opt[constraint.Side] {
+    val at: u8 = operand_of(row, arg);
+    if (at == field.NO_OPERAND) { ret opt[constraint.Side].none{}; }
+    var fields: u8 = 1;
+    if (str_equals(arg, "vd") && matched(?constraints.SEGMENTED[0], constraints.SEGMENTED_COUNT, row)) { fields = ((row.match >> constraints.NF_LO) & 7)::u8 + 1; }
+    ret opt[constraint.Side].some{constraint.Side{operand: at, part: constraint.WHOLE, fields: fields}};
+}
+
+# a constraint of `row` keeping argument `arg` from the arguments `against`, or from the register `reg` when `against` is empty
+fun keep(m: *Mapper, row: *Row, arg: str, against: str, reg: str, permit: constraint.Permit, mask: u8) err[diag.Refusal] {
+    val side: opt[constraint.Side] = side_of(row, arg);
+    if (sel side.none) { ret refuse(row.record, NO_KEPT, arg); }
+    var made: Keep = Keep{side: side.some, against: vector.init[constraint.Side](m.alloc), register: effect.NO_ROW, permit: permit, mask: mask};
+    if (str_len(against) == 0) {
+        val found: opt[u32] = register_row(m.file, reg);
+        if (sel found.none) { ret refuse(row.record, UNKNOWN_NAME, reg); }
+        made.register = found.some;
+    }
+    val len: usize = str_len(against);
+    var at:  usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && against[end] != ' ') {
+            end = end + 1;
+        }
+        val got: res[str, StrError] = str_copy_slice(m.alloc, against, at, end - at);
+        if (sel got.err) { ret err[diag.Refusal].err{memory()}; }
+        val other: opt[constraint.Side] = side_of(row, got.ok);
+        if (sel other.none)                                                   { ret refuse(row.record, NO_KEPT, got.ok); }
+        if (!pushed(vector.push[constraint.Side](?made.against, other.some))) { ret err[diag.Refusal].err{memory()}; }
+        at = end + 1;
+    }
+    if (!pushed(vector.push[Keep](?row.keeps, made))) { ret err[diag.Refusal].err{memory()}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the register constraints of `row`: each of the overlay's it matches, `used` marking those, and the mask rule
+fun keeps_of(m: *Mapper, row: *Row, used: *bool) err[diag.Refusal] {
+    row.keeps = vector.init[Keep](m.alloc);
+    var i: u32 = 0;
+    for (i < constraints.KEEPS_COUNT) {
+        val k: *constraints.Keep = ?constraints.KEEPS[i];
+        if (overlay.matches(k.mnemonic, row.mnemonic)) {
+            used[i] = true;
+            val made: err[diag.Refusal] = keep(m, row, k.arg, k.against, k.register, k.permit, field.NO_OPERAND);
+            if (sel made.err) { ret made; }
+        }
+        i = i + 1;
+    }
+    val vm: u8 = operand_of(row, constraints.MASK_ARG);
+    if (vm == field.NO_OPERAND || operand_of(row, "vd") == field.NO_OPERAND || matched(?constraints.MASK_FREE[0], constraints.MASK_FREE_COUNT, row)) { ret err[diag.Refusal].ok{}; }
+    ret keep(m, row, "vd", "", constraints.MASK_REGISTER, constraint.DISJOINT, vm);
+}
+
 # the field of `row`: its unit, and the kind zcmp's stack and s register rows need
 # whether every alternative of `row` holds the extension `name`
 fun holds(m: *Mapper, row: *Row, name: str) bool {
@@ -1407,6 +1495,7 @@ fun extras(m: *Mapper) err[diag.Refusal] {
 pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, file: *register.File, out: *Catalog) err[diag.Refusal] {
     out.rows        = vector.init[*Row](a);
     out.respellings = vector.init[Respelling](a);
+    out.idle        = vector.init[str](a);
     var m:     Mapper            = Mapper{alloc: a, source: s, catalog: catalog, file: file, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), out: out};
     val extra: err[diag.Refusal] = extras(?m);
     if (sel extra.err) { ret extra; }
@@ -1425,12 +1514,25 @@ pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, fil
         if (sel laid.err) { ret laid; }
         i = i + 1;
     }
+    var used: [constraints.KEEPS_COUNT]bool;
+    i = 0;
+    for (i < constraints.KEEPS_COUNT::usize) {
+        used[i] = false;
+        i       = i + 1;
+    }
     i = 0;
     for (i < out.rows.len) {
         val row:  *Row              = out.rows.data[i];
         val done: err[diag.Refusal] = effect_of(?m, row);
         if (sel done.err) { ret done; }
+        val kept: err[diag.Refusal] = keeps_of(?m, row, ?used[0]);
+        if (sel kept.err) { ret kept; }
         context(?m, row);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < constraints.KEEPS_COUNT::usize) {
+        if (!used[i] && !pushed(vector.push[str](?out.idle, constraints.KEEPS[i].mnemonic))) { ret err[diag.Refusal].err{memory()}; }
         i = i + 1;
     }
     sort.sort_by[*Row](out.rows.data, out.rows.len, by_mnemonic);
