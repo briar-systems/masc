@@ -12,6 +12,12 @@
 # to x31 require risc-v's i base, which the e base conflicts with. a
 # selection filters the file through these conditions once, and every query
 # after that reads its view.
+#
+# registers of one bank share its storage, each a footprint within it. a write
+# through one leaves the rest of its bank as its row states, kept or cleared,
+# unless the write's encoding decides it, as x86 vex does for a vector register.
+# `overwrites` derives what a write overwrites from those two facts and the
+# footprints, so a reader ending the values a write kills asks it alone.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -127,6 +133,37 @@ pub val PC:      Flags = 0x4;
 pub val ACCRUED: Flags = 0x8;
 pub val LENGTH:  Flags = 0x10;
 
+# what a write through a register leaves in the rest of its bank, the storage past its own footprint that other
+# registers of the bank hold. a bank holding nothing past the register leaves nothing to extend into, so only KEEP
+# is stated there. every row states one and check refuses UNSTATED, so a row that forgets its fact never reads as
+# keeping
+# ---
+# UNSTATED: no fact, the value of a row that states none
+# KEEP:     the rest keeps its value, as x86 ax, al and ah within rax, a legacy sse write of xmm0 within ymm0, or a
+#           risc-v csr field within the csr that holds it
+# ZEROES:   the rest is cleared, as x86 eax within rax, aarch64 w0 within x0, or a vex write of xmm0 up to the widest
+#           vector register
+# ONES:     the rest is set, as a narrower float nan-boxed within a wider float register, or an mmx write of the x87
+#           register it shares, whose exponent it sets
+pub def Extend: u8;
+
+pub val UNSTATED: Extend = 0;
+pub val KEEP:     Extend = 1;
+pub val ZEROES:   Extend = 2;
+pub val ONES:     Extend = 3;
+
+# what one write leaves in the rest of its register's bank. row is the first case, so an operand that states
+# nothing writes as its register's row does, which is the deliberate default: only an encoding that decides the
+# extension states another
+# ---
+# row:    as the register's row states
+# extend: this, whatever the row states, where the instruction's encoding decides it, as a vex write of xmm0
+#         zeroing the rest of ymm0 that a legacy sse write keeps
+pub tag Write: u8 {
+    row;
+    extend: Extend;
+}
+
 # one register
 # ---
 # name:     the spelling the printer writes
@@ -138,6 +175,7 @@ pub val LENGTH:  Flags = 0x10;
 # count:    its pieces, each its class's width, so a contiguous register has 1
 # flags:    its fixed architectural roles
 # requires: the alternatives of extensions and modes a selection must hold, any one fully, for it to exist, none for every selection
+# extend:   what a write through it leaves in the rest of its bank, unless the write states otherwise. never UNSTATED
 pub rec Register {
     name:     str;
     class:    u16;
@@ -148,6 +186,7 @@ pub rec Register {
     count:    Scaled;
     flags:    Flags;
     requires: requirement.Requirement;
+    extend:   Extend;
 }
 
 # a further spelling of a register the parser accepts
@@ -604,9 +643,14 @@ pub rec Placement {
 # ---
 # ret: the placement, none when the rows share no bank or a piece of part is not wholly inside one piece of container
 pub fun within(file: *File, part: *Register, container: *Register, multiplier: u64) opt[Placement] {
+    ret placed(file, part, multiplier, container, multiplier);
+}
+
+# where row `part` at multiplier `mp` lies within row `container` at `mc`, as `within` finds it
+fun placed(file: *File, part: *Register, mp: u64, container: *Register, mc: u64) opt[Placement] {
     if (part.bank != container.bank) { ret opt[Placement].none{}; }
-    val p: Pieces = pieces(file, part, multiplier);
-    val c: Pieces = pieces(file, container, multiplier);
+    val p: Pieces = pieces(file, part, mp);
+    val c: Pieces = pieces(file, container, mc);
     if (p.width == 0 || p.count == 0) { ret opt[Placement].none{}; }
     var i: u64 = 0;
     for (i < p.count) {
@@ -620,30 +664,92 @@ pub fun within(file: *File, part: *Register, container: *Register, multiplier: u
     ret opt[Placement].some{Placement{offset: p.offset - c.offset, width: p.width, stride: p.stride, count: p.count}};
 }
 
+# whether row `part` of `file` lies within row `whole` at every legal multiplier of each scale, so whatever a
+# selection fixes. rows of one scale take one multiplier, as overlap pairs them
+fun inside(file: *File, part: *Register, whole: *Register) bool {
+    if (part.bank != whole.bank) { ret false; }
+    val sp:   opt[u8] = scale_of(file, part);
+    val sw:   opt[u8] = scale_of(file, whole);
+    var same: bool    = false;
+    if (sel sp.some) {
+        if (sel sw.some) { same = sp.some == sw.some; }
+    }
+    var mp: u64 = 1;
+    for (mp <= scale_max(file, sp)) {
+        var mw: u64 = 1;
+        for (mw <= scale_max(file, sw)) {
+            if (!same || mp == mw) {
+                val p: opt[Placement] = placed(file, part, mp, whole, mw);
+                if (sel p.none) { ret false; }
+            }
+            mw = mw * 2;
+        }
+        mp = mp * 2;
+    }
+    ret true;
+}
+
+# what `write` through row `row` leaves in the rest of the row's bank: the write's own extension where its encoding
+# states one, the row's else
+pub fun extend_of(row: *Register, write: Write) Extend {
+    if (sel write.extend) { ret write.extend; }
+    ret row.extend;
+}
+
+# whether a write through row `written` of `file` leaves every bit of row `other` overwritten, at every legal
+# multiplier of each scale: other lies within written, or the write, as `extend_of` finds it, zeroes or sets the
+# rest of the bank they share. a write through a register flagged ZERO is discarded and overwrites nothing. the one
+# rule of what a register write kills
+pub fun overwrites(file: *File, written: *Register, other: *Register, write: Write) bool {
+    if ((written.flags & ZERO) != 0 || written.bank != other.bank) { ret false; }
+    val extend: Extend = extend_of(written, write);
+    if (extend == ZEROES || extend == ONES) { ret true; }
+    ret inside(file, other, written);
+}
+
+# whether the bank of row `row` of `file` holds storage past the row's footprint at some legal multiplier, a row
+# of the bank not lying within it, so that a write through it has a rest to extend into. it scans the file's rows,
+# and only the registration check asks it
+pub fun contained(file: *File, row: *Register) bool {
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        val y: *Register = ?file.registers[i];
+        if (y.bank == row.bank && !inside(file, y, row)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # slices of the x86-64, risc-v and aarch64 files for the tests below
 #[testing]
-val X86_CLASSES: [5]Class = [5]Class{
+val X86_CLASSES: [7]Class = [7]Class{
     Class{kind: GENERAL, width: Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
     Class{kind: GENERAL, width: Scaled{fixed: 16, per: 0, scale: 0}, count: 32},
     Class{kind: GENERAL, width: Scaled{fixed: 8, per: 0, scale: 0}, count: 32},
     Class{kind: GENERAL, width: Scaled{fixed: 8, per: 0, scale: 0}, count: 8},
     Class{kind: GENERAL, width: Scaled{fixed: 32, per: 0, scale: 0}, count: 32},
+    Class{kind: VECTOR, width: Scaled{fixed: 128, per: 0, scale: 0}, count: 32},
+    Class{kind: VECTOR, width: Scaled{fixed: 256, per: 0, scale: 0}, count: 32},
+};
+
+# eax zeroes the rest of rax and ax, al and ah keep it. xmm0 keeps the rest of ymm0 as a legacy sse write leaves it,
+# and a vex write states that it zeroes it
+#[testing]
+val X86_REGISTERS: [8]Register = [8]Register{
+    Register{name: "rax", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: requirement.NONE, extend: KEEP},
+    Register{name: "ax", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "al", class: 2, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "ah", class: 3, number: 4, bank: 0, offset: Scaled{fixed: 8, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "eax", class: 4, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: ZEROES},
+    Register{name: "xmm0", class: 5, number: 0, bank: 16, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "ymm0", class: 6, number: 0, bank: 16, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
 };
 
 #[testing]
-val X86_REGISTERS: [6]Register = [6]Register{
-    Register{name: "rax", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "rsp", class: 0, number: 4, bank: 4, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: requirement.NONE},
-    Register{name: "ax", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "al", class: 2, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "ah", class: 3, number: 4, bank: 0, offset: Scaled{fixed: 8, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "eax", class: 4, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-};
-
+val X86_DWARF:    [8]u32 = [8]u32{0, 7, UNNUMBERED, UNNUMBERED, UNNUMBERED, UNNUMBERED, UNNUMBERED, UNNUMBERED};
 #[testing]
-val X86_DWARF:    [6]u32 = [6]u32{0, 7, UNNUMBERED, UNNUMBERED, UNNUMBERED, UNNUMBERED};
-#[testing]
-val X86_CODEVIEW: [6]u32 = [6]u32{328, 335, 9, 1, 5, UNNUMBERED};
+val X86_CODEVIEW: [8]u32 = [8]u32{328, 335, 9, 1, 5, UNNUMBERED, UNNUMBERED, UNNUMBERED};
 
 #[testing]
 val X86_DWARF_NUMBERED:    [2]index.Number = [2]index.Number{index.Number{key: 0, row: 0}, index.Number{key: 7, row: 1}};
@@ -658,18 +764,20 @@ val X86_CODEVIEW_NUMBERED: [5]index.Number = [5]index.Number{
 
 #[testing]
 val X86_COLUMNS: [2]Column = [2]Column{
-    Column{format: DWARF, numbers: ?X86_DWARF[0], len: 6, numbered: index.Numbers{at: ?X86_DWARF_NUMBERED[0], len: 2}},
-    Column{format: CODEVIEW, numbers: ?X86_CODEVIEW[0], len: 6, numbered: index.Numbers{at: ?X86_CODEVIEW_NUMBERED[0], len: 5}},
+    Column{format: DWARF, numbers: ?X86_DWARF[0], len: 8, numbered: index.Numbers{at: ?X86_DWARF_NUMBERED[0], len: 2}},
+    Column{format: CODEVIEW, numbers: ?X86_CODEVIEW[0], len: 8, numbered: index.Numbers{at: ?X86_CODEVIEW_NUMBERED[0], len: 5}},
 };
 
 #[testing]
-val X86_NAMES: [6]index.Entry = [6]index.Entry{
+val X86_NAMES: [8]index.Entry = [8]index.Entry{
     index.Entry{key: "ah", row: 4},
     index.Entry{key: "al", row: 3},
     index.Entry{key: "ax", row: 2},
     index.Entry{key: "eax", row: 5},
     index.Entry{key: "rax", row: 0},
     index.Entry{key: "rsp", row: 1},
+    index.Entry{key: "xmm0", row: 6},
+    index.Entry{key: "ymm0", row: 7},
 };
 
 #[testing]
@@ -677,13 +785,13 @@ val X86: File = File{
     scales:         nil,
     scale_count:    0,
     classes:        ?X86_CLASSES[0],
-    class_count:    5,
+    class_count:    7,
     class_names:    index.EMPTY,
     registers:      ?X86_REGISTERS[0],
-    register_count: 6,
+    register_count: 8,
     aliases:        nil,
     alias_count:    0,
-    names:          index.Index{at: ?X86_NAMES[0], len: 6},
+    names:          index.Index{at: ?X86_NAMES[0], len: 8},
     columns:        ?X86_COLUMNS[0],
     column_count:   2,
 };
@@ -726,16 +834,16 @@ val RISCV_I_ALT: [1]requirement.Ids = [1]requirement.Ids{requirement.Ids{at: ?RI
 
 #[testing]
 val RISCV_REGISTERS: [10]Register = [10]Register{
-    Register{name: "x0", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: ZERO, requires: requirement.NONE},
-    Register{name: "x2", class: 0, number: 2, bank: 2, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: requirement.NONE},
-    Register{name: "x8", class: 0, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "x9", class: 0, number: 9, bank: 8, offset: Scaled{fixed: 0, per: 32, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "x16", class: 0, number: 16, bank: 16, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.Requirement{at: ?RISCV_I_ALT[0], len: 1}},
-    Register{name: "f0", class: 1, number: 0, bank: 32, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "v8", class: 2, number: 8, bank: 72, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "v9", class: 2, number: 9, bank: 72, offset: Scaled{fixed: 0, per: 32, scale: 2}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "v8m4", class: 3, number: 8, bank: 72, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 32, scale: 2}, count: Scaled{fixed: 4, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "x8_x9", class: 4, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 32, scale: 0}, count: Scaled{fixed: 2, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    Register{name: "x0", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: ZERO, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x2", class: 0, number: 2, bank: 2, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: STACK, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x8", class: 0, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x9", class: 0, number: 9, bank: 8, offset: Scaled{fixed: 0, per: 32, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x16", class: 0, number: 16, bank: 16, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.Requirement{at: ?RISCV_I_ALT[0], len: 1}, extend: KEEP},
+    Register{name: "f0", class: 1, number: 0, bank: 32, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "v8", class: 2, number: 8, bank: 72, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "v9", class: 2, number: 9, bank: 72, offset: Scaled{fixed: 0, per: 32, scale: 2}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "v8m4", class: 3, number: 8, bank: 72, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 32, scale: 2}, count: Scaled{fixed: 4, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x8_x9", class: 4, number: 8, bank: 8, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 32, scale: 0}, count: Scaled{fixed: 2, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
 };
 
 #[testing]
@@ -786,18 +894,22 @@ val AARCH64_SCALES: [1]Scale = [1]Scale{
     Scale{name: "svl", max: 16, fixes: NO_FIXINGS},
 };
 
-# za has svl / 8 rows of svl bits, and zan.d takes every eighth row from row n
+# za has svl / 8 rows of svl bits, and zan.d takes every eighth row from row n. w0 zeroes the rest of x0
 #[testing]
-val AARCH64_CLASSES: [2]Class = [2]Class{
+val AARCH64_CLASSES: [4]Class = [4]Class{
     Class{kind: TILE, width: Scaled{fixed: 0, per: 128, scale: 0}, count: 1},
     Class{kind: TILE, width: Scaled{fixed: 0, per: 128, scale: 0}, count: 8},
+    Class{kind: GENERAL, width: Scaled{fixed: 64, per: 0, scale: 0}, count: 31},
+    Class{kind: GENERAL, width: Scaled{fixed: 32, per: 0, scale: 0}, count: 31},
 };
 
 #[testing]
-val AARCH64_REGISTERS: [3]Register = [3]Register{
-    Register{name: "za0.b", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 128, scale: 0}, count: Scaled{fixed: 0, per: 16, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "za0.d", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: requirement.NONE},
-    Register{name: "za1.d", class: 1, number: 1, bank: 0, offset: Scaled{fixed: 0, per: 128, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: requirement.NONE},
+val AARCH64_REGISTERS: [5]Register = [5]Register{
+    Register{name: "za0.b", class: 0, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 128, scale: 0}, count: Scaled{fixed: 0, per: 16, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "za0.d", class: 1, number: 0, bank: 0, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "za1.d", class: 1, number: 1, bank: 0, offset: Scaled{fixed: 0, per: 128, scale: 0}, stride: Scaled{fixed: 0, per: 1024, scale: 0}, count: Scaled{fixed: 0, per: 2, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "x0", class: 2, number: 0, bank: 1, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: KEEP},
+    Register{name: "w0", class: 3, number: 0, bank: 1, offset: Scaled{fixed: 0, per: 0, scale: 0}, stride: Scaled{fixed: 0, per: 0, scale: 0}, count: Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: ZEROES},
 };
 
 #[testing]
@@ -805,10 +917,10 @@ val AARCH64: File = File{
     scales:         ?AARCH64_SCALES[0],
     scale_count:    1,
     classes:        ?AARCH64_CLASSES[0],
-    class_count:    2,
+    class_count:    4,
     class_names:    index.EMPTY,
     registers:      ?AARCH64_REGISTERS[0],
-    register_count: 3,
+    register_count: 5,
     aliases:        nil,
     alias_count:    0,
     names:          index.EMPTY,
@@ -948,6 +1060,28 @@ test overlap__shared_bank_both_directions {
     if (!overlap(?X86, al, ax) || !overlap(?X86, ax, al))   { ret 2; }
     if (overlap(?X86, al, ah) || overlap(?X86, ah, al))     { ret 3; }
     if (overlap(?X86, rsp, rax) || overlap(?X86, rax, rsp)) { ret 4; }
+    ret 0;
+}
+
+test overwrites__a_write_overwrites_its_footprint_and_what_its_row_or_encoding_extends_through {
+    val rax:  *Register = ?X86_REGISTERS[0];
+    val rsp:  *Register = ?X86_REGISTERS[1];
+    val ax:   *Register = ?X86_REGISTERS[2];
+    val al:   *Register = ?X86_REGISTERS[3];
+    val ah:   *Register = ?X86_REGISTERS[4];
+    val eax:  *Register = ?X86_REGISTERS[5];
+    val xmm0: *Register = ?X86_REGISTERS[6];
+    val ymm0: *Register = ?X86_REGISTERS[7];
+    val x0:   *Register = ?AARCH64_REGISTERS[3];
+    val w0:   *Register = ?AARCH64_REGISTERS[4];
+    val row:  Write     = Write.row{};
+    val vex:  Write     = Write.extend{ZEROES};
+    if (!overwrites(?X86, eax, rax, row) || !overwrites(?X86, eax, ah, row) || overwrites(?X86, eax, rsp, row))                       { ret 1; }
+    if (overwrites(?X86, ax, rax, row) || !overwrites(?X86, ax, al, row) || overwrites(?X86, al, ah, row))                            { ret 2; }
+    if (overwrites(?X86, xmm0, ymm0, row) || !overwrites(?X86, xmm0, ymm0, vex) || !overwrites(?X86, ymm0, xmm0, row))                { ret 3; }
+    if (!overwrites(?AARCH64, w0, x0, row) || overwrites(?AARCH64, w0, x0, Write.extend{KEEP}) || !overwrites(?AARCH64, x0, w0, row)) { ret 4; }
+    # a write of risc-v x0 is discarded
+    if (overwrites(?RISCV, ?RISCV_REGISTERS[0], ?RISCV_REGISTERS[0], row)) { ret 5; }
     ret 0;
 }
 

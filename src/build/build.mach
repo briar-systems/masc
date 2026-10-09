@@ -7,8 +7,9 @@
 # a label is local until it is exposed with a binding, a visibility and a kind.
 #
 # `finish` lays the sections out to a fixed point, encodes every fragment and
-# hands back mink's neutral object. a fixup folds into its bytes when its
-# operand is relative, its target is a label of the same section that cannot
+# hands back mink's neutral object. a fixup of any step of an instruction's
+# form, grown or not, folds into its bytes when its operand is relative or a
+# pc-relative address, its target is a label of the same section that cannot
 # be preempted, its relocation kind is plain pc-relative, and no instruction
 # the linker may resize lies between. every other fixup becomes a relocation
 # through the set's bindings. an instruction grows by the set's relaxation
@@ -73,14 +74,19 @@ use std.collections.vector;
 use mink;
 
 use masc.core.compress;
+use masc.core.constraint;
+use masc.core.ct;
 use masc.core.diagnostic;
+use masc.core.effect;
 use masc.core.extension;
 use masc.core.field;
+use masc.core.index;
 use masc.core.inst;
 use masc.core.mode;
 use masc.core.operand;
 use masc.core.register;
 use masc.core.relax;
+use masc.core.requirement;
 use masc.core.row;
 use masc.core.set;
 use masc.core.spelling;
@@ -184,12 +190,15 @@ pub rec Label {
 # flags:       the flags it carries, its kind's or more
 # disposition: how garbage collection treats it
 # entsize:     the size of each entry of a section of entries, as strings to merge, 0 for none
+# apart:       whether a named section is kept apart from the others of its name, never found by it and re-entered by
+#              the handle `open` returns, as a nameless one is
 pub rec Spec {
     name:        opt[str];
     kind:        *mink.section.Kind;
     flags:       mink.section.Flags;
     disposition: *mink.section.Disposition;
     entsize:     u64;
+    apart:       bool;
 }
 
 # what makes a label a symbol of the object
@@ -899,7 +908,7 @@ fun name_bytes(b: *Builder, p: *u8, n: usize) res[mink.table.Id[mink.intern.Name
     ret res[mink.table.Id[mink.intern.Name], Refusal].ok{id.ok};
 }
 
-# a new section, which is current once switched to. a nameless one is a section of its own each time
+# a new section, which is current once switched to. a nameless one, or one opened apart, is a section of its own each time
 pub fun open(b: *Builder, spec: Spec) res[Section, Refusal] {
     if (b.finished)                               { ret res[Section, Refusal].err{refuse(FINISHED)}; }
     if (!held(vector.reserve[Area](?b.areas, 1))) { ret res[Section, Refusal].err{memory()}; }
@@ -925,12 +934,12 @@ pub fun open(b: *Builder, spec: Spec) res[Section, Refusal] {
     };
     vector.push[Area](?b.areas, area);
     if (sel name.some) {
-        if (b.titled.data[name.some.index::usize] == 0) { b.titled.data[name.some.index::usize] = index + 1; }
+        if (!spec.apart && b.titled.data[name.some.index::usize] == 0) { b.titled.data[name.some.index::usize] = index + 1; }
     }
     ret res[Section, Refusal].ok{Section{index: index}};
 }
 
-# the first section opened with the name `name`, none when no section has it. a nameless section has none
+# the first section opened with the name `name` and not apart, none when no section is. a nameless section has none
 pub fun section_named(b: *Builder, name: View) opt[Section] {
     val known: opt[mink.table.Id[mink.intern.Name]] = mink.intern.find(?b.names, name.data::*u8, name.len);
     if (sel known.none) { ret opt[Section].none{}; }
@@ -1792,15 +1801,60 @@ fun kind_of(b: *Builder, kind: operand.FixupKind) *mink.reloc.Kind {
     ret b.kinds.data[kind::usize];
 }
 
-# the distance from fragment `j` of section `s` to the target of operand `k`'s symbol, none when it does not fold, and
-# with `across` none only when the layout cannot measure it
+# the distance from fragment `j` of section `s` to the symbol operand `k` names as a distance from the program counter,
+# a relative target or a pc-relative address, none when it does not fold, and with `across` none only when the layout
+# cannot measure it
 fun fold(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value, across: bool) opt[i64] {
-    if (!sel v.symbol) { ret opt[i64].none{}; }
-    val desc: *operand.Operand = ?r.operands.at[k];
-    if (!sel desc.shape.relative) { ret opt[i64].none{}; }
-    var fixup: operand.FixupKind = desc.shape.relative.offset.fixup;
-    if (v.symbol.fixup != operand.NO_FIXUP) { fixup = v.symbol.fixup; }
-    ret measured(b, s, j, v.symbol.id, v.symbol.addend, fixup, across);
+    val desc: *operand.Operand    = ?r.operands.at[k];
+    val sym:  opt[operand.Symbol] = operand.pc_symbol(desc, v);
+    if (sel sym.none) { ret opt[i64].none{}; }
+    var fixup: operand.FixupKind = operand.default_fixup(desc);
+    if (sym.some.fixup != operand.NO_FIXUP) { fixup = sym.some.fixup; }
+    ret measured(b, s, j, sym.some.id, sym.some.addend, fixup, across);
+}
+
+# every value of the steps of `out`, the form of fragment `j` of section `s` under view `v`, that names a symbol by its
+# distance from the program counter and folds, replaced by that distance from its own step's anchor. each step is
+# measured with those values zero, as a length is the length of an encoding
+fun fold_form(b: *Builder, s: u32, j: u32, v: *register.Available, out: *relax.Expansion) err[Refusal] {
+    var probe: relax.Expansion = @out;
+    var any:   bool            = false;
+    var i:     u32             = 0;
+    for (i < out.count) {
+        val r: *row.Row = out.steps[i].row;
+        var k: u32      = 0;
+        for (k < r.operands.len) {
+            val folded: opt[i64] = fold(b, s, j, r, k, ?out.steps[i].values[k], false);
+            if (sel folded.some) {
+                probe.steps[i].values[k] = operand.resolved(?probe.steps[i].values[k], 0);
+                any                      = true;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (!any) { ret err[Refusal].ok{}; }
+    var at: i64 = 0;
+    i = 0;
+    for (i < out.count) {
+        val r:    *row.Row                  = out.steps[i].row;
+        var step: inst.Inst                 = inst.Inst{row: r, values: ?probe.steps[i].values[0], count: r.operands.len};
+        val len:  res[usize, field.Refusal] = measure(b, v, ?step);
+        if (sel len.err) { ret err[Refusal].err{encoding(len.err)}; }
+        var k: u32 = 0;
+        for (k < r.operands.len) {
+            val folded: opt[i64] = fold(b, s, j, r, k, ?out.steps[i].values[k], false);
+            if (sel folded.some) {
+                var d: i64 = folded.some - at;
+                if (operand.anchor_of(?r.operands.at[k]) == operand.END) { d = d - len.ok::i64; }
+                out.steps[i].values[k] = operand.resolved(?out.steps[i].values[k], d);
+            }
+            k = k + 1;
+        }
+        at = at + len.ok::i64;
+        i  = i + 1;
+    }
+    ret err[Refusal].ok{};
 }
 
 # the distance from fragment `j` of section `s` to label `id` plus `addend` under fixup kind `fixup`, none when the
@@ -1899,12 +1953,6 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
     val r:     *row.Row            = coded(?c.of);
     var given: [row.MAX_OPERANDS]operand.Value;
     recall(b, c, ?given[0]);
-    var folded: [row.MAX_OPERANDS]opt[i64];
-    var k:      u32 = 0;
-    for (k < c.count) {
-        folded[k] = fold(b, s, j, r, k, ?given[k], false);
-        k         = k + 1;
-    }
     # the distance to the relaxed operand's target as the layout measures it, folded or not, none when only the
     # linker knows it
     var reach: opt[i64] = opt[i64].none{};
@@ -1912,36 +1960,21 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
     if (sel c.relax.some) {
         val op: u32 = c.relax.some.operand::u32;
         reach = fold(b, s, j, r, op, ?given[op], true);
-        near  = folded[op];
+        near  = fold(b, s, j, r, op, ?given[op], false);
     }
     var target: u32 = 0;
     if (c.depth == 0) {
         out.count           = 1;
         out.steps[0].row    = r;
         out.steps[0].marker = c.marker;
-        k                   = 0;
+        var k: u32 = 0;
         for (k < c.count) {
             out.steps[0].values[k] = given[k];
-            if (sel folded[k].some) { out.steps[0].values[k] = operand.Value.relative{0}; }
-            k = k + 1;
-        }
-        var probe:  inst.Inst                 = inst.Inst{row: r, values: ?out.steps[0].values[0], count: c.count};
-        val zeroed: res[usize, field.Refusal] = measure(b, v, ?probe);
-        if (sel zeroed.err) { ret res[Formed, Refusal].err{encoding(zeroed.err)}; }
-        k = 0;
-        for (k < c.count) {
-            if (sel folded[k].some) {
-                val desc: *operand.Operand = ?r.operands.at[k];
-                var d:    i64              = folded[k].some;
-                if (sel desc.shape.relative && desc.shape.relative.anchor == operand.END) { d = d - zeroed.ok::i64; }
-                out.steps[0].values[k] = operand.Value.relative{d};
-            }
-            k = k + 1;
+            k                      = k + 1;
         }
     }
     or {
-        # a grown form takes only its target from the layout, and only when it folds: its other symbols, and a target
-        # the linker resolves, stay relocations
+        # a grown form takes its target from the layout when it folds, and its other symbols fold below by the same rule
         var from:       inst.Inst           = inst.Inst{row: r, values: ?given[0], count: c.count};
         var shortening: compress.Shortening = compress.Shortening{codec: codec, all: b.set.compress, available: v};
         val why:        opt[str]            = relax.grown(codec, v, b.set.relax, ?from, c.depth, near, compress.shorten(?shortening), out, ?target, ?b.scratch, ?b.fixups);
@@ -1951,6 +1984,8 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
         }
         out.steps[0].marker = c.marker;
     }
+    val folding: err[Refusal] = fold_form(b, s, j, v, out);
+    if (sel folding.err) { ret res[Formed, Refusal].err{folding.err}; }
     if (sel c.relax.some) {
         val reached: opt[bool] = relax.reaches(codec, v, b.set.relax, out, target, reach, ?b.scratch, ?b.fixups);
         if (sel reached.none) { ret res[Formed, Refusal].err{refuse(EXPAND)}; }
@@ -2973,6 +3008,7 @@ rec T {
     s: extension.Selection;
     v: register.Available;
     b: Builder;
+    x: set.Set;
 }
 
 #[testing]
@@ -2989,6 +3025,127 @@ fun t_make(t: *T, isa: str) bool {
     if (sel built.err) { ret false; }
     t.b = built.ok;
     ret true;
+}
+
+# an x86-shaped set for the tests below, over the risc-v catalog and file: `jmpm` is jmp through a rip-relative address,
+# ff 25 disp32, and `jmp8m` and `jmp32m` take a short or near relative target and a rip-relative address, the short
+# form relaxing to the near one with the address carried over. every distance is measured from the instruction's end
+#[testing]
+val T_X86_OPERANDS: [5]operand.Operand = [5]operand.Operand{
+    operand.Operand{shape: operand.Shape.memory{operand.Memory{base: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, index: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, segment: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, scales: 0, disp: operand.Immediate{bits: 32, signed: true, scale: 0, bias: 0, fixup: 1, format: operand.INTEGER, excluded: operand.NO_INTEGERS}, forms: operand.PCREL, anchor: operand.END}}, role: operand.READ, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.relative{operand.Relative{offset: operand.Immediate{bits: 8, signed: true, scale: 0, bias: 0, fixup: 1, format: operand.INTEGER, excluded: operand.NO_INTEGERS}, anchor: operand.END}}, role: operand.NONE, width: 0, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.memory{operand.Memory{base: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, index: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, segment: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, scales: 0, disp: operand.Immediate{bits: 32, signed: true, scale: 0, bias: 0, fixup: 1, format: operand.INTEGER, excluded: operand.NO_INTEGERS}, forms: operand.PCREL, anchor: operand.END}}, role: operand.READ, width: 64, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.relative{operand.Relative{offset: operand.Immediate{bits: 32, signed: true, scale: 0, bias: 0, fixup: 1, format: operand.INTEGER, excluded: operand.NO_INTEGERS}, anchor: operand.END}}, role: operand.NONE, width: 0, quantity: operand.ONE},
+    operand.Operand{shape: operand.Shape.memory{operand.Memory{base: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, index: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, segment: operand.Register{classes: operand.Classes{at: nil, len: 0}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}, scales: 0, disp: operand.Immediate{bits: 32, signed: true, scale: 0, bias: 0, fixup: 1, format: operand.INTEGER, excluded: operand.NO_INTEGERS}, forms: operand.PCREL, anchor: operand.END}}, role: operand.READ, width: 64, quantity: operand.ONE},
+};
+
+#[testing]
+val T_X86_SLICES: [3]field.Slice = [3]field.Slice{
+    field.Slice{operand: 0, part: field.DISP, lo: 0, len: 32, at: 0, invert: false},
+    field.Slice{operand: 0, part: field.NUMBER, lo: 0, len: 8, at: 0, invert: false},
+    field.Slice{operand: 0, part: field.NUMBER, lo: 0, len: 32, at: 0, invert: false},
+};
+
+#[testing]
+val T_X86_SLICES_1: [1]field.Slice = [1]field.Slice{field.Slice{operand: 1, part: field.DISP, lo: 0, len: 32, at: 0, invert: false}};
+
+#[testing]
+val T_X86_FIELDS: [10]field.Field = [10]field.Field{
+    field.Field{kind: 0, width: 16, fixed: 0x25FF, mask: 0xFFFF, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 32, fixed: 0, mask: 0, slices: field.Slices{at: ?T_X86_SLICES[0], len: 1}, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 8, fixed: 0xEB, mask: 0xFF, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 8, fixed: 0, mask: 0, slices: field.Slices{at: ?T_X86_SLICES[1], len: 1}, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 8, fixed: 0x05, mask: 0xFF, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 32, fixed: 0, mask: 0, slices: field.Slices{at: ?T_X86_SLICES_1[0], len: 1}, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 8, fixed: 0xE9, mask: 0xFF, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 32, fixed: 0, mask: 0, slices: field.Slices{at: ?T_X86_SLICES[2], len: 1}, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 8, fixed: 0x05, mask: 0xFF, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0},
+    field.Field{kind: 0, width: 32, fixed: 0, mask: 0, slices: field.Slices{at: ?T_X86_SLICES_1[0], len: 1}, operand: field.NO_OPERAND, param: 0},
+};
+
+#[testing]
+val T_X86_EFFECT: effect.Effect = effect.Effect{
+    implicit: effect.Registers{otherwise: effect.NO_TOUCHED, rules: effect.NO_REGISTER_RULES, may: effect.NO_TOUCHED, must: effect.NO_TOUCHED},
+    flags:    effect.Flags{read: effect.Set{words: nil, len: 0}, written: effect.Set{words: nil, len: 0}, undefined: effect.Set{words: nil, len: 0}, kept: effect.Set{words: nil, len: 0}},
+    memory:   effect.NO_ACCESSES,
+    control:  effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: 0, rules: effect.NO_RULES},
+    stack:    effect.Stack.none{},
+    latency:  effect.ONE,
+    fixed:    effect.NO_FIXEDS,
+};
+
+#[testing]
+val T_X86_ROWS: [3]row.Row = [3]row.Row{
+    row.Row{key: "jmpm", mnemonic: "jmpm", operands: row.Operands{at: ?T_X86_OPERANDS[0], len: 1}, encoding: field.Fields{at: ?T_X86_FIELDS[0], len: 2}, requires: requirement.NONE, effect: ?T_X86_EFFECT, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0},
+    row.Row{key: "jmp8m", mnemonic: "jmp8m", operands: row.Operands{at: ?T_X86_OPERANDS[1], len: 2}, encoding: field.Fields{at: ?T_X86_FIELDS[2], len: 4}, requires: requirement.NONE, effect: ?T_X86_EFFECT, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0},
+    row.Row{key: "jmp32m", mnemonic: "jmp32m", operands: row.Operands{at: ?T_X86_OPERANDS[3], len: 2}, encoding: field.Fields{at: ?T_X86_FIELDS[6], len: 4}, requires: requirement.NONE, effect: ?T_X86_EFFECT, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0},
+};
+
+#[testing]
+val T_X86_KEYS: [3]index.Entry = [3]index.Entry{index.Entry{key: "jmp32m", row: 2}, index.Entry{key: "jmp8m", row: 1}, index.Entry{key: "jmpm", row: 0}};
+
+#[testing]
+val T_X86_KINDS: [1]*field.Kind = [1]*field.Kind{?field.UNIT};
+
+#[testing]
+val T_X86_TABLE: field.Table = field.Table{kinds: ?T_X86_KINDS[0], count: 1, order: field.LITTLE};
+
+#[testing]
+val T_X86_CODEC: walk.Codec = walk.Codec{fields: ?T_X86_TABLE, registers: ?riscv_register.FILE, rows: row.Rows{at: ?T_X86_ROWS[0], len: 3}, keys: index.Index{at: ?T_X86_KEYS[0], len: 3}, dispatch: nil};
+
+#[testing]
+val T_X86_SOURCES: [2]relax.Source = [2]relax.Source{relax.Source.target{}, relax.Source.operand{1}};
+
+#[testing]
+val T_X86_STEPS: [1]relax.Step = [1]relax.Step{relax.Step{row: 2, values: relax.Sources{at: ?T_X86_SOURCES[0], len: 2}}};
+
+#[testing]
+val T_X86_RELAXATIONS: [1]relax.Relaxation = [1]relax.Relaxation{relax.Relaxation{row: 1, operand: 0, form: relax.Steps{at: ?T_X86_STEPS[0], len: 1}}};
+
+#[testing]
+val T_X86_RELAX_KEYS: [1]index.Entry = [1]index.Entry{index.Entry{key: "jmp8m", row: 0}};
+
+#[testing]
+val T_X86_BINDINGS: [1]set.Binding = [1]set.Binding{set.Binding{fixup: 1, kind: ?mink.reloc.PC32}};
+
+# a builder over the x86-shaped set, the risc-v set's catalog, modes and traits under it
+#[testing]
+fun t_make_x86(t: *T) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, "rv64i", diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[register.Available, register.Error] = register.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v          = viewed.ok;
+    t.x          = riscv_set.SET;
+    t.x.codec    = ?T_X86_CODEC;
+    t.x.bindings = set.Bindings{at: ?T_X86_BINDINGS[0], len: 1};
+    t.x.relax    = relax.Relaxations{at: ?T_X86_RELAXATIONS[0], len: 1, keys: index.Index{at: ?T_X86_RELAX_KEYS[0], len: 1}};
+    t.x.compress = compress.NONE;
+    t.x.spans    = set.NO_SPANS;
+    t.x.data     = set.NO_DATA;
+    val built: res[Builder, Refusal] = make(a, ?t.x, ?t.v, ?mink.arch.RISCV64, T_ABI);
+    if (sel built.err) { ret false; }
+    t.b = built.ok;
+    ret true;
+}
+
+# row `at` of the x86-shaped set with the values `x` and `y`, of which it takes as many as it has operands, emitted
+#[testing]
+fun t_emit_x86(t: *T, at: u32, x: operand.Value, y: operand.Value) bool {
+    val r:      *row.Row         = ?T_X86_ROWS[at];
+    var values: [2]operand.Value = [2]operand.Value{x, y};
+    var ins:    inst.Inst        = inst.Inst{row: r, values: ?values[0], count: r.operands.len};
+    val done:   err[Refusal]     = emit(?t.b, ?ins, operand.NO_FIXUP);
+    ret sel done.ok;
+}
+
+# a rip-relative address of label `l`
+#[testing]
+fun t_rip(l: Label) operand.Value {
+    ret operand.Value.memory{operand.Address{base: register.NONE, index: register.NONE, scale: 0, disp: 0, segment: register.NONE, mode: operand.RELATIVE_PC, symbol: operand.Symbol{id: l.id, addend: 0, fixup: operand.NO_FIXUP}}};
 }
 
 # the float ABI a test object states, a convention fact the builder only passes through
@@ -4037,5 +4194,50 @@ test build__the_written_object_reads_back_through_mink_equal_to_the_built_one {
     val freed: err[mink.fail.Fail] = mink.object.release(?r);
     if (!same || sel freed.err) { ret 20; }
     if (!t_done(?t, ?o))        { ret 21; }
+    ret 0;
+}
+
+test build__a_rip_relative_address_folds_to_a_label_of_its_section_and_relocates_to_an_external_one {
+    var t: T;
+    if (!t_make_x86(?t)) { ret 1; }
+    t_text(?t, ".text");
+    val l:   Label = t_anon(?t);
+    val ext: Label = t_named(?t, "ext");
+    if (!t_ok(expose(?t.b, ext, T_GLOBAL)))                   { ret 2; }
+    if (!t_emit_x86(?t, 0, t_rip(l), operand.Value.none{}))   { ret 3; }
+    if (!t_emit_x86(?t, 0, t_rip(ext), operand.Value.none{})) { ret 4; }
+    if (!t_ok(define(?t.b, l)))                               { ret 5; }
+    val done: res[mink.object.Object, Refusal] = finish(?t.b);
+    if (sel done.err) { ret 6; }
+    var o: mink.object.Object = done.ok;
+    # rip is the end of the first jmp, 6 bytes before the label
+    val want: [12]u8 = [12]u8{0xFF, 0x25, 0x06, 0x00, 0x00, 0x00, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    if (!t_same(t_bytes(?o, 0), 0, ?want[0], 12)) { ret 7; }
+    if (o.relocs.count != 1)                      { ret 8; }
+    val r: *mink.object.Reloc = t_reloc(?o, 0);
+    if (r.offset != 8 || r.kind != ?mink.reloc.PC32) { ret 9; }
+    val sym: *mink.object.Symbol = t_named_by(?o, r);
+    if (sym == nil || sym.binding != ?mink.symbol.GLOBAL) { ret 10; }
+    if (!t_done(?t, ?o))                                  { ret 11; }
+    ret 0;
+}
+
+test build__a_grown_form_folds_its_other_pc_relative_operands_as_its_target {
+    var t: T;
+    if (!t_make_x86(?t)) { ret 1; }
+    t_text(?t, ".text");
+    val l: Label = t_anon(?t);
+    # the short target is out of reach, so the jump grows to its near form, which carries the address over
+    if (!t_emit_x86(?t, 1, target(l, 0), t_rip(l))) { ret 2; }
+    if (!t_ok(zero(?t.b, 200)))                     { ret 3; }
+    if (!t_ok(define(?t.b, l)))                     { ret 4; }
+    val done: res[mink.object.Object, Refusal] = finish(?t.b);
+    if (sel done.err) { ret 5; }
+    var o: mink.object.Object = done.ok;
+    # both distances are from the near form's end, 200 bytes before the label
+    val want: [10]u8 = [10]u8{0xE9, 0xC8, 0x00, 0x00, 0x00, 0x05, 0xC8, 0x00, 0x00, 0x00};
+    if (!t_same(t_bytes(?o, 0), 0, ?want[0], 10)) { ret 6; }
+    if (o.relocs.count != 0)                      { ret 7; }
+    if (!t_done(?t, ?o))                          { ret 8; }
     ret 0;
 }
