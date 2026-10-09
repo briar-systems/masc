@@ -1,7 +1,8 @@
 # the x86 generator
 #
 # it reads the register families masc writes under vendor/x86-registers and emits the x86-64 register file beside masc's x86
-# modules: the scales, classes, register rows with their banks, views and write extensions, the dwarf and codeview columns and the
+# modules: the scales, classes, register rows with their banks, views, places, write extensions and the reach of each, the dwarf and
+# codeview columns and the
 # indexes over them. a family is a line of the source, and a row's name, number, bank and requirement, and the number of every
 # register in a debug format, are derived here, so the table is never edited by hand
 
@@ -46,7 +47,9 @@ pub val BAD_FLAG:     str = "flag is not zero, stack or pc, or states none for a
 pub val BAD_REQUIRES: str = "required extension is not one the register file names, or states none for a register";
 pub val BAD_BANK:     str = "bank is not new, with a class or of a class by a delta, or names a class that does not hold it";
 pub val BAD_PIECES:   str = "pieces are not a stride and a count in bits";
-pub val BAD_OFFSET:   str = "offset is not bits or number";
+pub val BAD_OFFSET:   str = "offset is not bits, number or number times bits";
+pub val BAD_PLACES:   str = "places are not a step and a count in bits";
+pub val BAD_REACH:    str = "reach is not bank or an offset and a width in bits";
 pub val BAD_FIX:      str = "fixing names no scale, no extension, or a multiplier outside the scale";
 pub val BAD_FORMAT:   str = "debug format is not dwarf or codeview";
 pub val UNKNOWN:      str = "name is not a scale, class or register";
@@ -77,9 +80,12 @@ rec Fix {
 # ---
 # names:  the list of names, a name or a pattern and a range per entry, a dash for a number without a register
 # bank:   0 for banks of its own, 1 for the bank of the first register of `with`, 2 for the bank of the register `delta` past a
-#         register's number in `with`
+#         register's number in `with`, 3 for one bank every register of it shares
 # base:   the bank of its first register, assigned once every class is read
-# offset: 0 for none, 1 for `fixed` bits, 2 for the register's number as bits
+# offset: 0 for none, 1 for `fixed` bits, 2 for the register's number times `fixed` bits
+# places: how many places each register may be, 1 for one, each `step` bits past the last
+# reach:  whether a write's extension reaches only the part `reach_offset` bits past the register for `reach_width` bits, the whole
+#         bank else
 # extend, flags and requires: the attribute for each number, as a list of `range:value` entries and a last plain value
 rec Class {
     name:      str;
@@ -97,25 +103,35 @@ rec Class {
     pieces:    u32;
     offset:    u32;
     fixed:     u32;
+    places:    u32;
+    step:      u32;
     extend:    str;
+    part:      bool;
+    reach_at:  u32;
+    reach_len: u32;
     flags:     str;
     requires:  str;
     line:      lines.Line;
 }
 
 rec Row {
-    name:     str;
-    class:    u32;
-    number:   u32;
-    bank:     u32;
-    offset:   Quantity;
-    stride:   Quantity;
-    count:    Quantity;
-    flags:    str;
-    requires: str;
-    extend:   str;
-    dwarf:    i64;
-    cv:       i64;
+    name:      str;
+    class:     u32;
+    number:    u32;
+    bank:      u32;
+    offset:    Quantity;
+    stride:    Quantity;
+    count:     Quantity;
+    places:    u32;
+    step:      u32;
+    flags:     str;
+    requires:  str;
+    extend:    str;
+    part:      bool;
+    reach_at:  u32;
+    reach_len: u32;
+    dwarf:     i64;
+    cv:        i64;
 }
 
 # the names a `number` record gives to consecutive numbers of one debug format
@@ -229,6 +245,7 @@ fun extension_id(v: View) str {
     if (view_eq_str(v, "avx"))      { ret "x86_extension.AVX"; }
     if (view_eq_str(v, "avx512f"))  { ret "x86_extension.AVX512F"; }
     if (view_eq_str(v, "x87"))      { ret "x86_extension.X87"; }
+    if (view_eq_str(v, "mmx"))      { ret "x86_extension.MMX"; }
     if (view_eq_str(v, "amx_tile")) { ret "x86_extension.AMX_TILE"; }
     if (view_eq_str(v, "apx_f"))    { ret "x86_extension.APX_F"; }
     ret nil;
@@ -325,8 +342,24 @@ fun requires_ok(v: View) bool {
     ret true;
 }
 
+# two numbers of `v` either side of its first `sep`, none when it has no `sep` or either side is not a number
+fun pair(l: *lines.Line, v: View, sep: u8, a: *u32, b: *u32) bool {
+    var at: usize = 0;
+    for (at < v.len && v.data[at] != sep) {
+        at = at + 1;
+    }
+    if (at == v.len) { ret false; }
+    val x: res[u32, diag.Refusal] = decimal(l, View{data: v.data, len: at});
+    val y: res[u32, diag.Refusal] = decimal(l, View{data: ?v.data[at + 1], len: v.len - at - 1});
+    if (sel x.err) { ret false; }
+    if (sel y.err) { ret false; }
+    @a = x.ok;
+    @b = y.ok;
+    ret true;
+}
+
 fun class_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
-    if (t.len != 13) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    if (t.len != 15) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
     var c: Class;
     c.line = @l;
     val name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
@@ -349,7 +382,8 @@ fun class_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.R
     c.names = names.ok;
     c.with  = -1;
     val bank: View = t.data[7];
-    if (view_eq_str(bank, "new")) { c.bank = 0; }
+    if (view_eq_str(bank, "new"))    { c.bank = 0; }
+    or (view_eq_str(bank, "shared")) { c.bank = 3; }
     or {
         var at: usize = 0;
         if (bank.len > 5 && view_eq_str(View{data: bank.data, len: 5}, "with:")) {
@@ -394,20 +428,38 @@ fun class_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.R
         c.stride = st.ok;
         c.pieces = pc.ok;
     }
-    if (view_eq_str(t.data[9], "number")) { c.offset = 2; }
-    or (!view_eq_str(t.data[9], "-")) {
-        val o: res[u32, diag.Refusal] = decimal(l, t.data[9]);
+    val off: View = t.data[9];
+    if (view_eq_str(off, "number")) {
+        c.offset = 2;
+        c.fixed  = 1;
+    }
+    or (off.len > 7 && view_eq_str(View{data: off.data, len: 7}, "number*")) {
+        val o: res[u32, diag.Refusal] = decimal(l, View{data: ?off.data[7], len: off.len - 7});
+        if (sel o.err) { ret err[diag.Refusal].err{lines.refuse(l, BAD_OFFSET, nil)}; }
+        c.offset = 2;
+        c.fixed  = o.ok;
+    }
+    or (!view_eq_str(off, "-")) {
+        val o: res[u32, diag.Refusal] = decimal(l, off);
         if (sel o.err) { ret err[diag.Refusal].err{o.err}; }
         c.offset = 1;
         c.fixed  = o.ok;
     }
-    val e: res[str, diag.Refusal] = owned(f.alloc, l, t.data[10]);
+    c.places = 1;
+    if (!view_eq_str(t.data[10], "-")) {
+        if (!pair(l, t.data[10], 'x', ?c.step, ?c.places) || c.places < 2 || c.step == 0) { ret err[diag.Refusal].err{lines.refuse(l, BAD_PLACES, nil)}; }
+    }
+    val e: res[str, diag.Refusal] = owned(f.alloc, l, t.data[11]);
     if (sel e.err) { ret err[diag.Refusal].err{e.err}; }
     c.extend = e.ok;
-    val fl: res[str, diag.Refusal] = owned(f.alloc, l, t.data[11]);
+    if (!view_eq_str(t.data[12], "bank")) {
+        if (!pair(l, t.data[12], '+', ?c.reach_at, ?c.reach_len) || c.reach_len == 0) { ret err[diag.Refusal].err{lines.refuse(l, BAD_REACH, nil)}; }
+        c.part = true;
+    }
+    val fl: res[str, diag.Refusal] = owned(f.alloc, l, t.data[13]);
     if (sel fl.err) { ret err[diag.Refusal].err{fl.err}; }
     c.flags = fl.ok;
-    val rq: res[str, diag.Refusal] = owned(f.alloc, l, t.data[12]);
+    val rq: res[str, diag.Refusal] = owned(f.alloc, l, t.data[14]);
     if (sel rq.err) { ret err[diag.Refusal].err{rq.err}; }
     c.requires = rq.ok;
     if (!each_value(c.extend, extend_ok))           { ret err[diag.Refusal].err{lines.refuse(l, BAD_EXTEND, nil)}; }
@@ -574,15 +626,20 @@ fun expand(f: *Families) err[diag.Refusal] {
             if (str_equals(f.classes.data[j].name, c.name)) { ret err[diag.Refusal].err{lines.refuse(?c.line, CLASS_TWICE, c.name)}; }
             j = j + 1;
         }
-        if (c.bank != 0) {
+        if (c.bank == 1 || c.bank == 2) {
             val w: i64 = class_named(f, c.with_name);
-            if (w < 0 || w::usize >= i)      { ret err[diag.Refusal].err{lines.refuse(?c.line, BAD_BANK, c.with_name)}; }
-            if (f.classes.data[w].bank != 0) { ret err[diag.Refusal].err{lines.refuse(?c.line, BAD_BANK, c.with_name)}; }
+            if (w < 0 || w::usize >= i) { ret err[diag.Refusal].err{lines.refuse(?c.line, BAD_BANK, c.with_name)}; }
+            val held: u32 = f.classes.data[w].bank;
+            if (held != 0 && !(held == 3 && c.bank == 1)) { ret err[diag.Refusal].err{lines.refuse(?c.line, BAD_BANK, c.with_name)}; }
             c.with = w;
         }
         if (c.bank == 0) {
             c.base = next;
             next   = next + c.count;
+        }
+        or (c.bank == 3) {
+            c.base = next;
+            next   = next + 1;
         }
         i = i + 1;
     }
@@ -617,8 +674,10 @@ fun expand(f: *Families) err[diag.Refusal] {
                 if (sel spec.err) { ret err[diag.Refusal].err{lines.refuse(?c.line, diag.MEMORY, r.name)}; }
                 r.requires = spec.ok;
             }
-            if (c.bank == 0) { r.bank = c.base + n; }
-            or (c.bank == 1) { r.bank = f.classes.data[c.with].base + f.classes.data[c.with].first; }
+            if (c.bank == 0)                                     { r.bank = c.base + n; }
+            or (c.bank == 3)                                     { r.bank = c.base; }
+            or (c.bank == 1 && f.classes.data[c.with].bank == 3) { r.bank = f.classes.data[c.with].base; }
+            or (c.bank == 1)                                     { r.bank = f.classes.data[c.with].base + f.classes.data[c.with].first; }
             or {
                 val m: i64    = n::i64 + c.delta;
                 val o: *Class = ?f.classes.data[c.with];
@@ -626,7 +685,12 @@ fun expand(f: *Families) err[diag.Refusal] {
                 r.bank = o.base + m::u32;
             }
             if (c.offset == 1) { r.offset = Quantity{fixed: c.fixed, per: 0, scale: 0}; }
-            or (c.offset == 2) { r.offset = Quantity{fixed: n, per: 0, scale: 0}; }
+            or (c.offset == 2) { r.offset = Quantity{fixed: n * c.fixed, per: 0, scale: 0}; }
+            r.places    = c.places;
+            r.step      = c.step;
+            r.part      = c.part;
+            r.reach_at  = c.reach_at;
+            r.reach_len = c.reach_len;
             if (c.pieces != 0) {
                 r.stride = Quantity{fixed: c.stride, per: 0, scale: 0};
                 r.count  = Quantity{fixed: c.pieces, per: 0, scale: 0};
@@ -685,6 +749,26 @@ fun quantity(f: *emit.File, q: Quantity) emit.Value {
     emit.member(f, r, "per", number(q.per::i64));
     emit.member(f, r, "scale", number(q.scale::i64));
     ret emit.Value.record{r};
+}
+
+# the places of a row, ONE_PLACE for one
+fun places(f: *emit.File, x: *Row) emit.Value {
+    if (x.places == 1) { ret name("register.ONE_PLACE"); }
+    val r: *emit.Record = emit.record(f, "register.Places");
+    emit.member(f, r, "count", quantity(f, Quantity{fixed: x.places, per: 0, scale: 0}));
+    emit.member(f, r, "step", quantity(f, Quantity{fixed: x.step, per: 0, scale: 0}));
+    ret emit.Value.record{r};
+}
+
+# the reach of a row's extension, the whole bank or one piece of it past the register
+fun reach(f: *emit.File, x: *Row) emit.Value {
+    if (!x.part) { ret emit.Value.variant{emit.bare(f, "register.Reach.bank")}; }
+    val p: *emit.Record = emit.record(f, "register.Part");
+    emit.member(f, p, "offset", quantity(f, Quantity{fixed: x.reach_at, per: 0, scale: 0}));
+    emit.member(f, p, "stride", quantity(f, Quantity{fixed: 0, per: 0, scale: 0}));
+    emit.member(f, p, "count", quantity(f, Quantity{fixed: 1, per: 0, scale: 0}));
+    emit.member(f, p, "width", quantity(f, Quantity{fixed: x.reach_len, per: 0, scale: 0}));
+    ret emit.Value.variant{emit.variant(f, "register.Reach.part", emit.Value.record{p})};
 }
 
 fun known(seen: *vector.Vector[str], text: str) bool {
@@ -897,9 +981,11 @@ pub fun generate(c: *set.Context) err[diag.Refusal] {
         emit.member(f, r, "offset", quantity(f, x.offset));
         emit.member(f, r, "stride", quantity(f, x.stride));
         emit.member(f, r, "count", quantity(f, x.count));
+        emit.member(f, r, "places", places(f, x));
         emit.member(f, r, "flags", name(x.flags));
         emit.member(f, r, "requires", requirement_value(f, x.requires));
         emit.member(f, r, "extend", name(x.extend));
+        emit.member(f, r, "reach", reach(f, x));
         emit.item(f, rows, emit.Value.record{r});
         val e: *emit.Record = emit.record(f, "index.Entry");
         emit.member(f, e, "key", emit.Value.text{x.name});
