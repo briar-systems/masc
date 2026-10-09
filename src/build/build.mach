@@ -59,11 +59,13 @@ use masc.core.diagnostic;
 use masc.core.extension;
 use masc.core.field;
 use masc.core.inst;
+use masc.core.mode;
 use masc.core.operand;
 use masc.core.register;
 use masc.core.relax;
 use masc.core.row;
 use masc.core.set;
+use masc.core.spelling;
 use masc.core.walk;
 
 use riscv_catalog:   masc.isa.riscv.catalog;
@@ -113,6 +115,8 @@ pub val OBJECT:         str = "object refused";
 pub val NO_INSTRUCTION: str = "place attached to the next instruction, and no instruction follows in its section";
 pub val SEALED:         str = "writer changed a section or label that existed when the layout was settled";
 pub val NAMELESS:       str = "source file has no name";
+pub val OTHER_MODE:     str = "assembler mode of another set, or a value it does not take";
+pub val NO_STEM:        str = "label stem empty or longer than a stem holds";
 pub val WIDENED:        str = "view holds what the object's selection does not, or is of another register file";
 
 # the two modes of a refused pair, each as the extension that states it
@@ -392,8 +396,12 @@ pub tag Value: u8 {
 # value:    what it is when it is not placed, none for a label placed or never given one
 # size:     its size once finished, from its exposure
 # symbol:   the object's symbol for it, once finished
+# stem:     the stem an unnamed label is spelled by in the object, its number following, nil for none
+# number:   that number, the object's next for the stem that no named label spells, once finished
 rec Mark {
     name:     opt[mink.table.Id[mink.intern.Name]];
+    stem:     str;
+    number:   u32;
     exposure: opt[Exposure];
     defined:  bool;
     section:  u32;
@@ -436,6 +444,8 @@ rec Waiting {
 # sources:  the source files stated
 # realigns: the alignments the linker realigns
 # current:  the current section
+# view:     the view what is emitted next is written under
+# modes:    the assembler modes
 rec Snapshot {
     areas:    usize;
     labels:   usize;
@@ -448,6 +458,8 @@ rec Snapshot {
     sources:  usize;
     realigns: usize;
     current:  opt[usize];
+    view:     *register.Available;
+    modes:    mode.State;
 }
 
 # something that writes more of the object once the layout of the rest is settled, from the final places of what facts
@@ -524,6 +536,7 @@ rec Entry {
 # waiting:   the places waiting for the next instruction of a section
 # writers:   what writes more of the object after the layout, in the order they were added
 # taken:     while writers run, what existed when the layout was settled, which they may not change
+# modes:     the assembler modes the next statement is read under, each at its initial value until changed
 # finished:  whether the object was handed over
 pub rec Builder {
     a:         *A.Allocator;
@@ -556,6 +569,7 @@ pub rec Builder {
     waiting:   vector.Vector[Waiting];
     writers:   vector.Vector[Writer];
     taken:     opt[Snapshot];
+    modes:     mode.State;
     finished:  bool;
 }
 
@@ -690,6 +704,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, arch:
         waiting:   vector.init[Waiting](a),
         writers:   vector.init[Writer](a),
         taken:     opt[Snapshot].none{},
+        modes:     mode.initial(?s.assembly),
         finished:  false,
     };
     # the bindings indexed by fixup kind, so a relocation's kind is one load
@@ -738,6 +753,18 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, arch:
         ret res[Builder, Refusal].err{memory()};
     }
     ret res[Builder, Refusal].ok{b};
+}
+
+# the assembler modes the next statement is read under, which the reader of each statement reads them through
+pub fun modes_of(b: *Builder) *mode.State {
+    ret ?b.modes;
+}
+
+# the mode of `to` at its value for the statements after, as the caller's flags start the source and a directive changes
+# it between statements
+pub fun set_mode(b: *Builder, to: mode.Setting) err[Refusal] {
+    if (!mode.change(?b.modes, to)) { ret refused(OTHER_MODE); }
+    ret err[Refusal].ok{};
 }
 
 # the slot of a datum's basis and width among the builder's data kinds
@@ -882,6 +909,64 @@ pub fun anonymous(b: *Builder) res[Label, Refusal] {
     if (b.finished)                                  { ret res[Label, Refusal].err{refuse(FINISHED)}; }
     if (!held(vector.push[Mark](?b.labels, Mark{}))) { ret res[Label, Refusal].err{memory()}; }
     ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# a new label with no name of its own, spelled in the object as `stem` and a number, as llvm-mc spells risc-v's
+# `.Lpcrel_hi0`: the next number for the stem that no named label spells, in the order such labels are made
+pub fun stemmed(b: *Builder, stem: str) res[Label, Refusal] {
+    if (b.finished)                                            { ret res[Label, Refusal].err{refuse(FINISHED)}; }
+    if (stem == nil || stem[0] == 0)                           { ret res[Label, Refusal].err{refuse(NO_STEM)}; }
+    if (str_len(stem) > spelling.MAX_ANONYMOUS)                { ret res[Label, Refusal].err{refuse(NO_STEM)}; }
+    if (!held(vector.push[Mark](?b.labels, Mark{stem: stem}))) { ret res[Label, Refusal].err{memory()}; }
+    ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# `stem` and `n` in decimal written into `out`, how many bytes
+fun stem_spelling(stem: str, n: u32, out: *u8) usize {
+    var len: usize = 0;
+    for (stem[len] != 0) {
+        out[len] = stem[len];
+        len      = len + 1;
+    }
+    var digits: [10]u8;
+    var count:  usize = 0;
+    var m:      u32   = n;
+    for {
+        digits[count] = '0' + (m % 10)::u8;
+        count         = count + 1;
+        m             = m / 10;
+        if (m == 0) { brk; }
+    }
+    for (count > 0) {
+        count    = count - 1;
+        out[len] = digits[count];
+        len      = len + 1;
+    }
+    ret len;
+}
+
+# every stemmed label numbered, in the order they were made: each the next number of its stem that no named label spells
+fun number_stems(b: *Builder) {
+    var room: [spelling.MAX_ANONYMOUS + 10]u8;
+    var i:    usize = 0;
+    for (i < b.labels.len) {
+        val m: *Mark = ?b.labels.data[i];
+        i = i + 1;
+        if (m.stem == nil) { cnt; }
+        # the number after the last label of the same stem
+        var next: u32   = 0;
+        var j:    usize = i - 1;
+        for (j > 0) {
+            j = j - 1;
+            val before: *Mark = ?b.labels.data[j];
+            if (before.stem != nil && str_equals(before.stem, m.stem)) {
+                next = before.number + 1;
+                brk;
+            }
+        }
+        for (spells(b, View{data: ?room[0], len: stem_spelling(m.stem, next, ?room[0])})) { next = next + 1; }
+        m.number = next;
+    }
 }
 
 # a new label placed at the cursor of the current section, which is how a fact is attached to a place: the label is
@@ -2074,6 +2159,16 @@ fun no_name(o: *mink.object.Object) res[mink.table.Id[mink.intern.Name], mink.fa
     ret mink.object.name_str(o, "");
 }
 
+# the name label `m` has in the object: its own, its stem and number, or none
+fun mark_name(b: *Builder, o: *mink.object.Object, m: *Mark) res[mink.table.Id[mink.intern.Name], mink.fail.Fail] {
+    if (sel m.name.some) { ret interned(o, mink.intern.bytes_of(?b.names, m.name.some)); }
+    if (m.stem != nil) {
+        var room: [spelling.MAX_ANONYMOUS + 10]u8;
+        ret interned(o, View{data: ?room[0], len: stem_spelling(m.stem, m.number, ?room[0])});
+    }
+    ret no_name(o);
+}
+
 fun keep(slot: *opt[mink.table.Id[mink.object.Symbol]], id: mink.table.Id[mink.object.Symbol]) {
     @slot = opt[mink.table.Id[mink.object.Symbol]].some{id};
 }
@@ -2085,9 +2180,8 @@ fun local_symbol(b: *Builder, o: *mink.object.Object, m: *Mark, kind: *mink.relo
     if (!m.defined) {
         # a number has no section to stand for it, so it is a symbol of its own
         if (sel m.symbol.some) { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].ok{m.symbol.some}; }
-        var name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = no_name(o);
-        if (sel m.name.some) { name = interned(o, mink.intern.bytes_of(?b.names, m.name.some)); }
-        if (sel name.err)    { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].err{name.err}; }
+        val name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mark_name(b, o, m);
+        if (sel name.err) { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].err{name.err}; }
         val made: res[mink.table.Id[mink.object.Symbol], mink.fail.Fail] = mink.object.add_symbol(o, mink.object.Symbol{
             name:       name.ok,
             binding:    ?mink.symbol.LOCAL,
@@ -2103,9 +2197,8 @@ fun local_symbol(b: *Builder, o: *mink.object.Object, m: *Mark, kind: *mink.relo
     val own:    bool  = area.marks.data[area.fragments.len] > 0 || mink.reloc.has(kind, mink.reloc.PARTNER);
     if (own) {
         if (sel m.symbol.some) { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].ok{m.symbol.some}; }
-        var name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = no_name(o);
-        if (sel m.name.some) { name = interned(o, mink.intern.bytes_of(?b.names, m.name.some)); }
-        if (sel name.err)    { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].err{name.err}; }
+        val name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mark_name(b, o, m);
+        if (sel name.err) { ret res[mink.table.Id[mink.object.Symbol], mink.fail.Fail].err{name.err}; }
         val made: res[mink.table.Id[mink.object.Symbol], mink.fail.Fail] = mink.object.add_symbol(o, mink.object.Symbol{
             name:       name.ok,
             binding:    ?mink.symbol.LOCAL,
@@ -2202,6 +2295,7 @@ fun checked_labels(b: *Builder) err[Refusal] {
 fun build_object(b: *Builder, o: *mink.object.Object) err[mink.fail.Fail] {
     val traits: err[mink.fail.Fail] = state_traits(b, o);
     if (sel traits.err) { ret traits; }
+    number_stems(b);
     var i: usize = 0;
     i = 0;
     for (i < b.areas.len) {
@@ -2359,6 +2453,8 @@ fun snapshot(b: *Builder) Snapshot {
         sources:  b.sources.len,
         realigns: b.realigns.len,
         current:  b.current,
+        view:     b.view,
+        modes:    b.modes,
     };
 }
 
@@ -2393,6 +2489,8 @@ fun restore(b: *Builder, s: *Snapshot) {
     b.named.len  = s.names;
     b.titled.len = s.names;
     b.current    = s.current;
+    b.view       = s.view;
+    b.modes      = s.modes;
 }
 
 # every writer run in order, each writing from the final places, refused at the first that fails
@@ -2652,6 +2750,20 @@ pub fun value_of(b: *Builder, l: Label) opt[Value] {
     val m: opt[*Mark] = mark_of(b, l);
     if (sel m.none) { ret opt[Value].none{}; }
     ret m.some.value;
+}
+
+# the spelling of a label with no name of its own that the object names: a stem and a number following it
+pub rec Stem {
+    stem:   str;
+    number: u32;
+}
+
+# the stem and number the object spells `l` by, once finished, none for a label made otherwise or of another builder
+pub fun stem_of(b: *Builder, l: Label) opt[Stem] {
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none)         { ret opt[Stem].none{}; }
+    if (m.some.stem == nil) { ret opt[Stem].none{}; }
+    ret opt[Stem].some{Stem{stem: m.some.stem, number: m.some.number}};
 }
 
 # how many source files the object names
