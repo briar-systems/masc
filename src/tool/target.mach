@@ -1,0 +1,217 @@
+# a target resolved from its spellings
+#
+# a caller names an architecture, a selection, a syntax and the assembler
+# options it states, each as text, and every spelling goes to its owner:
+# mink's catalog names the architecture, the registry finds the set that
+# serves it, the set's selection hook reads the selection, the set's syntax
+# rows name its syntaxes and its option rows read each option. nothing here
+# reads a spelling itself, so a set whose selection is an ISA string, a level
+# or a feature list needs nothing of this module.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use mink;
+
+use masc.asm.model;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.register;
+use masc.core.set;
+use masc.isa.isa;
+
+use riscv_extension: masc.isa.riscv.extension;
+
+# an assembler option and the value it is given, as `-mabi` and `lp64d`
+pub rec Option {
+    option: str;
+    value:  str;
+}
+
+# options as a pointer to rows and a count
+pub rec Options {
+    at:  *Option;
+    len: u32;
+}
+
+# the options of a caller that states none
+pub val NO_OPTIONS: Options = Options{at: nil, len: 0};
+
+# what a caller names
+# ---
+# arch:      the architecture, by its name in mink's catalog
+# selection: the extensions, in the set's own selection syntax, handed to its hook whole
+# syntax:    the syntax by name, nil for the set's established one
+# options:   the assembler options that state the traits the set requires of a caller
+pub rec Request {
+    arch:      str;
+    selection: str;
+    syntax:    str;
+    options:   Options;
+}
+
+# why a request was not resolved
+# ---
+# arch:      no architecture of mink's catalog has the name
+# unserved:  no registered set serves the architecture
+# selection: the set's hook refused the selection
+# syntax:    the set has no syntax of the name
+# option:    the set spells no trait by the option and value
+# registers: the register view of the selection could not be made
+pub tag Refusal: u8 {
+    arch:      str;
+    unserved:  *mink.arch.Arch;
+    selection: extension.Error;
+    syntax:    str;
+    option:    Option;
+    registers: register.Error;
+    memory:    A.Error;
+}
+
+# a resolved target. it holds the selection its register view points at, so it lives where `open` made it
+# ---
+# arch:      the architecture
+# set:       the set serving it
+# selection: the closed selection
+# available: the register file viewed through the selection
+# syntax:    the index of the syntax among the set's
+# traits:    the traits the options state
+pub rec Target {
+    arch:      *mink.arch.Arch;
+    set:       *set.Set;
+    selection: extension.Selection;
+    available: register.Available;
+    syntax:    u32;
+    traits:    vector.Vector[mink.trait.Trait];
+}
+
+# the index among `s`'s syntaxes of the one named `name`, its established one for nil
+fun syntax_of(s: *set.Set, name: str) opt[u32] {
+    if (name == nil) { ret opt[u32].some{0}; }
+    var i: u32 = 0;
+    for (i < s.syntaxes.len) {
+        if (str_equals(s.syntaxes.at[i].name, name)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# an architecture and the set serving it
+pub rec Served {
+    arch: *mink.arch.Arch;
+    set:  *set.Set;
+}
+
+# the architecture of mink's catalog named `name` and the set of `registry` serving it
+pub fun served(registry: *set.Registry, name: str) res[Served, Refusal] {
+    val arch: res[*mink.arch.Arch, mink.fail.Fail] = mink.arch.by_name(name);
+    if (sel arch.err) { ret res[Served, Refusal].err{Refusal.arch{name}}; }
+    val s: opt[*set.Set] = set.find(registry, arch.ok);
+    if (sel s.none) { ret res[Served, Refusal].err{Refusal.unserved{arch.ok}}; }
+    ret res[Served, Refusal].ok{Served{arch: arch.ok, set: s.some}};
+}
+
+# `request` resolved against `registry` into `out`, which the caller releases. a refusal leaves nothing to release
+pub fun open(a: *A.Allocator, registry: *set.Registry, request: Request, out: *Target) err[Refusal] {
+    val found: res[Served, Refusal] = served(registry, request.arch);
+    if (sel found.err) { ret err[Refusal].err{found.err}; }
+    val s:      *set.Set = found.ok.set;
+    val syntax: opt[u32] = syntax_of(s, request.syntax);
+    if (sel syntax.none) { ret err[Refusal].err{Refusal.syntax{request.syntax}}; }
+    var traits: vector.Vector[mink.trait.Trait] = vector.init[mink.trait.Trait](a);
+    var i:      u32                             = 0;
+    for (i < request.options.len) {
+        val o:      *Option               = ?request.options.at[i];
+        val stated: opt[mink.trait.Trait] = set.stated(s, o.option, o.value);
+        if (sel stated.none) {
+            vector.dnit[mink.trait.Trait](?traits);
+            ret err[Refusal].err{Refusal.option{@o}};
+        }
+        val kept: res[usize, A.Error] = vector.push[mink.trait.Trait](?traits, stated.some);
+        if (sel kept.err) {
+            vector.dnit[mink.trait.Trait](?traits);
+            ret err[Refusal].err{Refusal.memory{kept.err}};
+        }
+        i = i + 1;
+    }
+    val selected: res[extension.Selection, extension.Error] = extension.select(a, s.extensions, request.selection, diagnostic.START);
+    if (sel selected.err) {
+        vector.dnit[mink.trait.Trait](?traits);
+        ret err[Refusal].err{Refusal.selection{selected.err}};
+    }
+    out.arch      = found.ok.arch;
+    out.set       = s;
+    out.selection = selected.ok;
+    out.syntax    = syntax.some;
+    out.traits    = traits;
+    val viewed: res[register.Available, register.Error] = register.select(a, s.codec.registers, ?out.selection);
+    if (sel viewed.err) {
+        extension.release(?out.selection);
+        vector.dnit[mink.trait.Trait](?out.traits);
+        ret err[Refusal].err{Refusal.registers{viewed.err}};
+    }
+    out.available = viewed.ok;
+    ret err[Refusal].ok{};
+}
+
+# the assembler options of `t`, with names starting `private` kept out of the symbol table
+pub fun assembler(t: *Target, private: str) model.Options {
+    ret model.Options{
+        arch:    t.arch,
+        syntax:  t.syntax,
+        traits:  set.Traits{at: t.traits.data, len: t.traits.len::u32},
+        private: private,
+        layers:  model.NO_LAYERS,
+    };
+}
+
+# give back what `t` owns
+pub fun release(t: *Target) {
+    register.release(?t.available);
+    extension.release(?t.selection);
+    vector.dnit[mink.trait.Trait](?t.traits);
+}
+
+#[testing]
+fun t_request(arch: str, selection: str) Request {
+    ret Request{arch: arch, selection: selection, syntax: nil, options: NO_OPTIONS};
+}
+
+test open__an_architecture_mink_does_not_name_is_refused {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    var t:      Target;
+    val opened: err[Refusal] = open(testing.allocator_of(?tt), ?isa.REGISTRY, t_request("pdp11", "rv64i"), ?t);
+    if (!sel opened.err)                       { ret 1; }
+    if (!sel opened.err.arch)                  { ret 2; }
+    if (!str_equals(opened.err.arch, "pdp11")) { ret 3; }
+    if (testing.live_count(?tt) != 0)          { ret 4; }
+    ret 0;
+}
+
+test open__the_selection_reaches_the_set_hook_whole {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    var t:      Target;
+    val opened: err[Refusal] = open(testing.allocator_of(?tt), ?isa.REGISTRY, t_request("riscv64", "rv64imac_zba"), ?t);
+    if (sel opened.err) { ret 1; }
+    val zba: bool = extension.has(?t.selection, riscv_extension.ZBA);
+    release(?t);
+    if (!zba) { ret 2; }
+    val refused: err[Refusal] = open(testing.allocator_of(?tt), ?isa.REGISTRY, t_request("riscv64", "rv64imac_zqq"), ?t);
+    if (!sel refused.err)                                      { ret 3; }
+    if (!sel refused.err.selection)                            { ret 4; }
+    if (!sel refused.err.selection.refused)                    { ret 5; }
+    if (refused.err.selection.refused.span.start.column != 10) { ret 6; }
+    if (testing.live_count(?tt) != 0)                          { ret 7; }
+    ret 0;
+}

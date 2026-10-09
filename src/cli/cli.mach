@@ -1,0 +1,464 @@
+# the masc command line
+#
+# `masc <command> [options]`, read by std.args against each command's flag
+# rows. the commands are one table of rows, each its help page, the most
+# operands it takes and what it runs, so a command is one row. every option
+# maps onto a library call: the target onto masc.tool.target, the format and
+# the written object onto masc.tool.object, the assembly onto masc.asm.asm,
+# the read object and its text onto masc.disasm.disasm, and every diagnostic
+# and help page onto masc.tool.render and masc.tool.help.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.args;
+use std.collections.vector;
+use fs: std.filesystem;
+use std.io.writer;
+
+use mink;
+
+use masc.asm.asm;
+use masc.asm.model;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.disasm.disasm;
+use masc.isa.isa;
+use masc.tool.help;
+use masc.tool.info;
+use masc.tool.object;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+
+val PROGRAM: str = "masc";
+val TITLE:   str = "masc - the assembler of the mach toolchain";
+
+val F_HELP:    args.Flag = args.Flag{name: "--help", short: "-h", kind: args.SWITCH, negatable: false, repeat: false, value: "", doc: "show the overview, or a command's page in place of running it"};
+val F_TARGET:  args.Flag = args.Flag{name: "--target", short: "-t", kind: args.VALUE, negatable: false, repeat: false, value: "arch", doc: "the architecture, by its name in mink's catalog"};
+val F_ISA:     args.Flag = args.Flag{name: "--isa", short: nil, kind: args.VALUE, negatable: false, repeat: false, value: "selection", doc: "the extensions, in the set's selection syntax, as rv64gc_zba"};
+val F_SYNTAX:  args.Flag = args.Flag{name: "--syntax", short: nil, kind: args.VALUE, negatable: false, repeat: false, value: "name", doc: "the assembly syntax, the set's established one by default"};
+val F_ABI:     args.Flag = args.Flag{name: "--abi", short: nil, kind: args.VALUE, negatable: false, repeat: false, value: "name", doc: "the abi, as the set's -mabi option names it"};
+val F_FORMAT:  args.Flag = args.Flag{name: "--format", short: nil, kind: args.VALUE, negatable: false, repeat: false, value: "name", doc: "the object format, by its name in mink's catalog, when several name the architecture"};
+val F_OUTPUT:  args.Flag = args.Flag{name: "--output", short: "-o", kind: args.VALUE, negatable: false, repeat: false, value: "path", doc: "write the output here"};
+val F_VERBOSE: args.Flag = args.Flag{name: "--verbose", short: "-v", kind: args.SWITCH, negatable: false, repeat: false, value: "", doc: "report what was written"};
+val F_ALIASES: args.Flag = args.Flag{name: "--aliases", short: nil, kind: args.SWITCH, negatable: true, repeat: false, value: "", doc: "print an instruction by its preferred alias, the default"};
+
+val GLOBAL_FLAGS:      [1]*args.Flag = [1]*args.Flag{?F_HELP};
+val ASSEMBLE_FLAGS:    [8]*args.Flag = [8]*args.Flag{?F_TARGET, ?F_ISA, ?F_SYNTAX, ?F_ABI, ?F_FORMAT, ?F_OUTPUT, ?F_VERBOSE, ?F_HELP};
+val DISASSEMBLE_FLAGS: [7]*args.Flag = [7]*args.Flag{?F_TARGET, ?F_ISA, ?F_SYNTAX, ?F_ALIASES, ?F_OUTPUT, ?F_VERBOSE, ?F_HELP};
+
+val ASSEMBLE_PAGE: help.Page = help.Page{
+    name:    "assemble",
+    summary: "assemble a source file into an object file",
+    usage:   "assemble <input> --target <arch> --isa <selection> -o <path> [options]",
+    effect:  "assemble the source file into mink's neutral object and write it in the target's object format",
+    flags:   ?ASSEMBLE_FLAGS[0],
+    count:   8,
+};
+val DISASSEMBLE_PAGE: help.Page = help.Page{
+    name:    "disassemble",
+    summary: "print an object file as assembly source",
+    usage:   "disassemble <input> --target <arch> --isa <selection> [options]",
+    effect:  "read the object file through mink and print it as source that assembles back to the same sections, on stdout or to -o",
+    flags:   ?DISASSEMBLE_FLAGS[0],
+    count:   7,
+};
+val INFO_PAGE: help.Page = help.Page{
+    name:    "info",
+    summary: "list the registered instruction sets with their syntaxes and levels",
+    usage:   "info",
+    effect:  "list every registered instruction set: the architectures it serves, its syntaxes and its levels",
+    flags:   ?GLOBAL_FLAGS[0],
+    count:   1,
+};
+val HELP_PAGE: help.Page = help.Page{
+    name:    "help",
+    summary: "show command help",
+    usage:   "help [command]",
+    effect:  "show the overview, or the page of a command",
+    flags:   ?GLOBAL_FLAGS[0],
+    count:   1,
+};
+
+# the most flags a command reads and the most operands it takes
+val MAX_FLAGS:    usize = 8;
+val MAX_OPERANDS: usize = 1;
+
+# a command line being run
+# ---
+# a:        the allocator everything lives in
+# args:     the arguments
+# command:  the command word's row
+# reader:   the reader of its flags, which points at settings
+# settings: one per flag row
+# operands: the operands, in order
+# count:    how many
+# out:      what goes to stdout
+# err:      what goes to stderr
+rec Run {
+    a:        *A.Allocator;
+    args:     args.Args;
+    command:  *Command;
+    reader:   args.Reader;
+    settings: [MAX_FLAGS]args.Setting;
+    operands: [MAX_OPERANDS]str;
+    count:    usize;
+    out:      text.Text;
+    err:      text.Text;
+}
+
+# one command
+# ---
+# page:     its help, which holds its name and flag rows
+# operands: how many operands it takes at most
+# least:    how many it takes at least
+# run:      what it runs once its line is read
+rec Command {
+    page:     *help.Page;
+    operands: usize;
+    least:    usize;
+    run:      fun(*Run) render.Exit;
+}
+
+val COMMAND_COUNT: usize                  = 4;
+val COMMANDS:      [COMMAND_COUNT]Command = [COMMAND_COUNT]Command{
+    Command{page: ?ASSEMBLE_PAGE, operands: 1, least: 1, run: assemble},
+    Command{page: ?DISASSEMBLE_PAGE, operands: 1, least: 1, run: disassemble},
+    Command{page: ?INFO_PAGE, operands: 0, least: 0, run: list},
+    Command{page: ?HELP_PAGE, operands: 1, least: 0, run: topic},
+};
+
+# every page, in command order, for the overview
+val PAGES: [COMMAND_COUNT]*help.Page = [COMMAND_COUNT]*help.Page{?ASSEMBLE_PAGE, ?DISASSEMBLE_PAGE, ?INFO_PAGE, ?HELP_PAGE};
+
+fun command_named(name: str) *Command {
+    var i: usize = 0;
+    for (i < COMMAND_COUNT) {
+        if (str_equals(COMMANDS[i].page.name, name)) { ret ?COMMANDS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the end of a command whose register view or selection storage was refused
+fun memory(r: *Run) render.Exit {
+    render.headline(?r.err, "cli.memory", "out of memory");
+    ret render.INTERNAL;
+}
+
+fun refuse(r: *Run, code: str, message: str, subject: str) render.Exit {
+    render.quoted(?r.err, code, message, subject);
+    ret render.USER;
+}
+
+fun overview(t: *text.Text) {
+    help.overview(t, TITLE, PROGRAM, ?PAGES[0], COMMAND_COUNT, ?GLOBAL_FLAGS[0], 1);
+}
+
+fun refuse_flag(r: *Run, why: args.Error) render.Exit {
+    if (sel why.unknown)       { ret refuse(r, "cli.flag_unknown", "unknown flag", why.unknown.flag); }
+    if (sel why.missing_value) { ret refuse(r, "cli.flag_missing_value", "flag takes a value", why.missing_value.flag); }
+    if (sel why.repeated)      { ret refuse(r, "cli.flag_repeated", "flag given twice", why.repeated.flag); }
+    ret render.INTERNAL;
+}
+
+# the command's flag rows read from argument `start` on, its operands kept. a refusal is rendered, and nil means read
+fun read(r: *Run, c: *Command, start: usize) opt[render.Exit] {
+    r.command = c;
+    r.count   = 0;
+    r.reader  = args.reader(r.args, start, c.page.flags, c.page.count, ?r.settings[0]);
+    for {
+        val e: res[args.Event, args.Error] = args.read(?r.reader);
+        if (sel e.err) { ret opt[render.Exit].some{refuse_flag(r, e.err)}; }
+        if (sel e.ok) {
+            if (sel e.ok.done) { brk; }
+            if (sel e.ok.operand) {
+                val word: str = r.args.argv[e.ok.operand]::str;
+                if (r.count == c.operands) { ret opt[render.Exit].some{refuse(r, "cli.operand_extra", "operand not taken", word)}; }
+                r.operands[r.count] = word;
+                r.count             = r.count + 1;
+            }
+        }
+    }
+    ret opt[render.Exit].none{};
+}
+
+fun value(r: *Run, f: *args.Flag) str {
+    ret args.value(r.reader, f);
+}
+
+# whether instructions print by their preferred alias: on unless --no-aliases
+fun aliases(r: *Run) bool {
+    ret !args.given(r.reader, ?F_ALIASES) || args.on(r.reader, ?F_ALIASES);
+}
+
+# the target the flags name. the options storage is the caller's
+fun request_of(r: *Run, abi: *target.Option) target.Request {
+    var q: target.Request = target.Request{arch: value(r, ?F_TARGET), selection: value(r, ?F_ISA), syntax: value(r, ?F_SYNTAX), options: target.NO_OPTIONS};
+    if (q.selection == nil) { q.selection = ""; }
+    val spelled: str = value(r, ?F_ABI);
+    if (spelled != nil) {
+        abi.option = "-mabi";
+        abi.value  = spelled;
+        q.options  = target.Options{at: abi, len: 1};
+    }
+    ret q;
+}
+
+fun refuse_selection(r: *Run, why: extension.Error, spelling: str) render.Exit {
+    if (sel why.refused) {
+        render.headline(?r.err, "target.selection", why.refused.message);
+        render.place(?r.err, "--isa", spelling, str_len(spelling), why.refused.span);
+        ret render.USER;
+    }
+    if (sel why.conflict) { ret refuse(r, "target.selection", "the selection holds extensions that conflict", spelling); }
+    ret memory(r);
+}
+
+fun refuse_target(r: *Run, why: target.Refusal, spelling: str) render.Exit {
+    if (sel why.arch)      { ret refuse(r, "target.arch", "unknown architecture", why.arch); }
+    if (sel why.unserved)  { ret refuse(r, "target.unserved", "no instruction set serves the architecture", why.unserved.name); }
+    if (sel why.syntax)    { ret refuse(r, "target.syntax", "the set has no syntax", why.syntax); }
+    if (sel why.option)    { ret refuse(r, "target.option", "the set states no abi", why.option.value); }
+    if (sel why.selection) { ret refuse_selection(r, why.selection, spelling); }
+    ret memory(r);
+}
+
+fun refuse_object(r: *Run, why: object.Refusal) render.Exit {
+    if (sel why.format)    { ret refuse(r, "object.format", "unknown object format", why.format); }
+    if (sel why.unnamed)   { ret refuse(r, "object.format", "the format names no code for the architecture", why.unnamed.format.name); }
+    if (sel why.ambiguous) { ret refuse(r, "object.format", "choose the object format with --format, several name the architecture", why.ambiguous.name); }
+    if (sel why.private)   { ret refuse(r, "object.format", "masc knows no private name spelling for the format", why.private.name); }
+    ret render.INTERNAL;
+}
+
+fun failed(r: *Run, code: str, f: mink.fail.Fail) render.Exit {
+    render.failure(?r.err, code, f);
+    ret render.exit_of(f);
+}
+
+fun assemble(r: *Run) render.Exit {
+    val path: str = r.operands[0];
+    val out:  str = value(r, ?F_OUTPUT);
+    if (out == nil) { ret refuse(r, "cli.flag_missing", "the command needs the flag", "--output"); }
+    var abi:    target.Option;
+    val q:      target.Request      = request_of(r, ?abi);
+    var t:      target.Target;
+    val opened: err[target.Refusal] = target.open(r.a, ?isa.REGISTRY, q, ?t);
+    if (sel opened.err) { ret refuse_target(r, opened.err, q.selection); }
+    val format: res[*mink.format.Format, object.Refusal] = object.format_for(t.arch, value(r, ?F_FORMAT));
+    if (sel format.err) {
+        target.release(?t);
+        ret refuse_object(r, format.err);
+    }
+    val private: res[str, object.Refusal] = object.private_of(format.ok);
+    if (sel private.err) {
+        target.release(?t);
+        ret refuse_object(r, private.err);
+    }
+    val loaded: res[mink.file.Loaded, mink.fail.Fail] = mink.file.load(r.a, path);
+    if (sel loaded.err) {
+        target.release(?t);
+        ret failed(r, "io.read", loaded.err);
+    }
+    var source: mink.file.Loaded                       = loaded.ok;
+    val built:  res[mink.object.Object, model.Refusal] = asm.assemble(r.a, t.set, ?t.available, target.assembler(?t, private.ok), source.input.data, source.input.len, diagnostic.START);
+    if (sel built.err) {
+        render.refusal(?r.err, "asm.refused", path, source.input.data, source.input.len, ?t.selection, ?built.err.diagnostic);
+        mink.file.unload(?source);
+        target.release(?t);
+        ret render.USER;
+    }
+    var o:     mink.object.Object  = built.ok;
+    val saved: err[mink.fail.Fail] = object.save(r.a, ?o, format.ok, out);
+    var exit:  render.Exit         = render.SUCCESS;
+    if (sel saved.err) { exit = failed(r, "object.write", saved.err); }
+    or (args.on(r.reader, ?F_VERBOSE)) {
+        text.put(?r.out, path);
+        text.put(?r.out, ": ");
+        text.decimal(?r.out, o.sections.count::i64);
+        text.put(?r.out, " sections, ");
+        text.decimal(?r.out, o.symbols.count::i64);
+        text.put(?r.out, " symbols, ");
+        text.decimal(?r.out, o.relocs.count::i64);
+        text.put(?r.out, " relocations, written to ");
+        text.put(?r.out, out);
+        text.put(?r.out, " as ");
+        text.put(?r.out, format.ok.name);
+        text.byte(?r.out, '\n');
+    }
+    mink.object.release(?o);
+    mink.file.unload(?source);
+    target.release(?t);
+    ret exit;
+}
+
+# how instructions are spelled: by their preferred alias unless --no-aliases
+fun spelling(r: *Run) disasm.Spelling {
+    if (aliases(r)) { ret disasm.ALIASES; }
+    ret disasm.FORMS;
+}
+
+fun disassemble(r: *Run) render.Exit {
+    val path:   str                 = r.operands[0];
+    val output: str                 = value(r, ?F_OUTPUT);
+    var abi:    target.Option;
+    val q:      target.Request      = request_of(r, ?abi);
+    var t:      target.Target;
+    val opened: err[target.Refusal] = target.open(r.a, ?isa.REGISTRY, q, ?t);
+    if (sel opened.err) { ret refuse_target(r, opened.err, q.selection); }
+    val got: res[disasm.File, mink.fail.Fail] = disasm.open(r.a, path);
+    if (sel got.err) {
+        target.release(?t);
+        ret failed(r, "object.read", got.err);
+    }
+    var f:       disasm.File        = got.ok;
+    var printed: vector.Vector[u8]  = vector.init[u8](r.a);
+    var into:    *vector.Vector[u8] = ?r.out.out;
+    if (output != nil) { into = ?printed; }
+    val options: disasm.Options      = disasm.Options{syntax: t.syntax, spelling: spelling(r)};
+    val done:    err[disasm.Refusal] = disasm.disassemble(r.a, t.set, ?t.available, options, ?f.object, into);
+    var exit:    render.Exit         = render.SUCCESS;
+    if (sel done.err) {
+        render.unprinted(?r.err, "disasm.refused", path, ?f.object, ?done.err);
+        exit = render.USER;
+    }
+    or (output != nil) {
+        val written: err[fs.FsError] = fs.write_bytes(output, printed.data, printed.len, mink.file.MODE);
+        if (sel written.err) {
+            render.quoted(?r.err, "io.write", "cannot write the file", output);
+            exit = render.ENVIRONMENT;
+        }
+        or (args.on(r.reader, ?F_VERBOSE)) {
+            text.put(?r.out, path);
+            text.put(?r.out, ": ");
+            text.decimal(?r.out, printed.len::i64);
+            text.put(?r.out, " bytes of source, written to ");
+            text.put(?r.out, output);
+            text.byte(?r.out, '\n');
+        }
+    }
+    vector.dnit[u8](?printed);
+    val closed: err[mink.fail.Fail] = disasm.close(?f);
+    target.release(?t);
+    if (sel closed.err) {
+        if (exit == render.SUCCESS) { ret failed(r, "object.read", closed.err); }
+    }
+    ret exit;
+}
+
+fun list(r: *Run) render.Exit {
+    info.describe(?isa.REGISTRY, ?r.out);
+    ret render.SUCCESS;
+}
+
+fun topic(r: *Run) render.Exit {
+    if (r.count == 0) {
+        overview(?r.out);
+        ret render.SUCCESS;
+    }
+    val c: *Command = command_named(r.operands[0]);
+    if (c == nil) { ret refuse(r, "cli.unknown_command", "unknown command", r.operands[0]); }
+    help.page(?r.out, PROGRAM, c.page);
+    ret render.SUCCESS;
+}
+
+# the command line `a` run, its output left in `r.out` and `r.err`
+fun dispatch(r: *Run) render.Exit {
+    val word: opt[str] = args.get(r.args, 1);
+    if (sel word.none) {
+        overview(?r.out);
+        ret render.SUCCESS;
+    }
+    val c: *Command = command_named(word.some);
+    if (c == nil && word.some[0] == '-') {
+        val refused: opt[render.Exit] = read(r, ?COMMANDS[3], 1);
+        if (sel refused.some) { ret refused.some; }
+        overview(?r.out);
+        ret render.SUCCESS;
+    }
+    if (c == nil) {
+        render.quoted(?r.err, "cli.unknown_command", "unknown command", word.some);
+        overview(?r.err);
+        ret render.USER;
+    }
+    val refused: opt[render.Exit] = read(r, c, 2);
+    if (sel refused.some) { ret refused.some; }
+    if (args.on(r.reader, ?F_HELP)) {
+        help.page(?r.out, PROGRAM, c.page);
+        ret render.SUCCESS;
+    }
+    if (r.count < c.least) { ret refuse(r, "cli.operand_missing", "the command needs an operand", c.page.name); }
+    ret c.run(r);
+}
+
+fun emit(f: fs.File, t: *text.Text) bool {
+    if (t.out.len == 0) { ret true; }
+    var w: writer.Writer          = fs.writer(f);
+    val r: err[writer.WriteError] = writer.write_all(?w, t.out.data, t.out.len);
+    ret sel r.ok;
+}
+
+fun start(r: *Run, a: *A.Allocator, v: args.Args) {
+    r.a    = a;
+    r.args = v;
+    r.out  = text.make(a);
+    r.err  = text.make(a);
+}
+
+fun finish(r: *Run) {
+    text.release(?r.out);
+    text.release(?r.err);
+}
+
+# the command line `v` run, its output written to stdout and stderr
+pub fun run(a: *A.Allocator, v: args.Args) i64 {
+    var r: Run;
+    start(?r, a, v);
+    var exit: render.Exit = dispatch(?r);
+    if (r.out.failed || r.err.failed) {
+        text.clear(?r.err);
+        r.err.failed = false;
+        render.headline(?r.err, "cli.memory", "out of memory");
+        exit = render.INTERNAL;
+    }
+    if (!emit(fs.STDOUT, ?r.out) || !emit(fs.STDERR, ?r.err)) { exit = render.ENVIRONMENT; }
+    finish(?r);
+    ret exit;
+}
+
+# whether the disassemble line `argv[0..argc]` reads and prints by alias
+#[testing]
+fun t_aliases(a: *A.Allocator, argc: usize, argv: **u8, want: bool) bool {
+    var r: Run;
+    start(?r, a, args.of(argc, argv));
+    val refused: opt[render.Exit] = read(?r, ?COMMANDS[1], 2);
+    val ok:      bool             = sel refused.none && aliases(?r) == want;
+    finish(?r);
+    ret ok;
+}
+
+test read__a_negatable_switch_takes_key_and_no_key {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    val a:   *A.Allocator = testing.allocator_of(?tt);
+    var off: [4]*u8       = [4]*u8{"masc", "disassemble", "--no-aliases", "x.o"};
+    var on:  [4]*u8       = [4]*u8{"masc", "disassemble", "--aliases", "x.o"};
+    var not: [3]*u8       = [3]*u8{"masc", "disassemble", "x.o"};
+    if (!t_aliases(a, 4, ?off[0], false)) { ret 1; }
+    if (!t_aliases(a, 4, ?on[0], true))   { ret 2; }
+    if (!t_aliases(a, 3, ?not[0], true))  { ret 3; }
+    if (testing.live_count(?tt) != 0)     { ret 4; }
+    ret 0;
+}
