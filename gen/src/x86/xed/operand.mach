@@ -1,0 +1,278 @@
+# the operands of XED: an instruction's OPERANDS and a nonterminal rule's bindings
+#
+# an operand is `name[=value][:action[:visibility][:width][:element][:extra]...]`
+# (pysrc/opnds.py parse_one_operand):
+#   value       a nonterminal `NT()`, a register `XED_REG_x`, an enumerant `XED_x`, a number, or
+#               letters naming bits a pattern captured. `!=` instead of `=` negates it. a bare name
+#               is a memory operand, an immediate, a branch or a pointer (MEM0, IMM0, AGEN, RELBR,
+#               ABSBR, PTR), XED_RESET, or a flag such as EMX_BROADCAST_1TO8_32
+#   action      r, w, rw, cr, cw, crw or rcw, read when it is not written
+#   visibility  EXPL, IMPL, SUPP or ECOND, an encoder condition, third or fourth, DEFAULT when not
+#               written
+#   width       a width code the widths files state. an operand that writes none takes the one
+#               the extra-widths file gives its nonterminal, register or constant
+#   element     an element type the element-types files state, after the width
+#   extra       `TXT=x`, a conversion for printing, or `MULTISOURCEn`, `MULTIDESTn` or
+#               `MULTISOURCEDESTn`, a register group of n
+# a register operand whose value is STACKPUSH or STACKPOP is a memory operand XED adds itself,
+# kept here as written
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use gen.diag;
+use gen.lines;
+use gen.x86.xed.pattern;
+use gen.x86.xed.table;
+use gen.x86.xed.text;
+
+# what an operand's value is
+# ---
+# NONTERMINAL: a nonterminal whose rules yield it
+# REGISTER:    a register
+# CONSTANT:    a number or an XED enumerant
+# LETTERS:     bits a pattern captured, named by their letters
+# BARE:        a memory operand, an immediate, a branch or a pointer, its value the instruction's
+# FLAG:        a name standing alone
+# RESET:       XED_RESET, which restarts the nonterminal at the current byte
+pub def Form: u8;
+
+pub val NONTERMINAL: Form = 0;
+pub val REGISTER:    Form = 1;
+pub val CONSTANT:    Form = 2;
+pub val LETTERS:     Form = 3;
+pub val BARE:        Form = 4;
+pub val FLAG:        Form = 5;
+pub val RESET:       Form = 6;
+
+# one operand
+# ---
+# name:        what it binds, such as REG0, MEM0 or OUTREG
+# form:        what its value is
+# value:       the nonterminal, the register without `XED_REG_`, the constant or the letters, as written
+# number:      the value of a numeric constant
+# numeric:     whether the constant is a number
+# negated:     whether it is written with `!=`
+# action:      how it is read and written
+# visibility:  EXPL, IMPL, SUPP, ECOND or DEFAULT
+# width:       its width code as written, nil for none
+# element:     its element type as written, nil for none
+# conversions: its `TXT=` conversions
+# group:       how many registers it names, 0 for one
+# grouping:    SOURCE, DEST or SOURCEDEST for a register group
+pub rec Operand {
+    name:        str;
+    form:        Form;
+    value:       str;
+    number:      u64;
+    numeric:     bool;
+    negated:     bool;
+    action:      str;
+    visibility:  str;
+    width:       str;
+    element:     str;
+    conversions: vector.Vector[str];
+    group:       u32;
+    grouping:    str;
+}
+
+pub val MALFORMED:   str = "operand is not a name and a value, or a known bare name";
+pub val BAD_ACTION:  str = "operand action is not r, w, rw, cr, cw, crw or rcw";
+pub val BAD_CHUNK:   str = "operand part is not a visibility, a width, an element type or a conversion";
+pub val NO_WIDTH:    str = "width code is not one the widths files state";
+pub val NO_REGISTER: str = "register is not one the register files state";
+
+val ACTIONS: [7]str = [7]str{"r", "w", "rw", "cr", "cw", "crw", "rcw"};
+
+val VISIBILITIES: [4]str = [4]str{"EXPL", "IMPL", "SUPP", "ECOND"};
+
+val BARES: [10]str = [10]str{"MEM0", "MEM1", "IMM0", "IMM1", "IMM2", "IMM3", "AGEN", "RELBR", "ABSBR", "PTR"};
+
+fun one_of(s: str, names: *str, count: u32) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (str_equals(s, names[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun lower_word(s: str) bool {
+    if (!(s[0] >= 'a' && s[0] <= 'z')) { ret false; }
+    var i: usize = 1;
+    for (s[i] != 0) {
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun letters(s: str) bool {
+    if (s[0] == 0) { ret false; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (!((s[i] >= 'a' && s[i] <= 'z') || s[i] == '_')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun known_element(a: *A.Allocator, x: *table.Tables, s: str) bool {
+    val t: opt[*table.Type] = table.element(a, x, s);
+    ret sel t.some;
+}
+
+# the parts of `w` between its colons, each owned
+fun chunks(a: *A.Allocator, l: *lines.Line, w: str) res[vector.Vector[str], diag.Refusal] {
+    var out:  vector.Vector[str] = vector.init[str](a);
+    val n:    usize              = str_len(w);
+    var from: usize              = 0;
+    var i:    usize              = 0;
+    for (i <= n) {
+        if (i == n || w[i] == ':') {
+            val got: res[str, StrError] = str_copy_slice(a, w, from, i - from);
+            if (sel got.err)                                  { ret res[vector.Vector[str], diag.Refusal].err{text.memory(l)}; }
+            if (!text.pushed(vector.push[str](?out, got.ok))) { ret res[vector.Vector[str], diag.Refusal].err{text.memory(l)}; }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    ret res[vector.Vector[str], diag.Refusal].ok{out};
+}
+
+# the multiple-register mark `MULTIx<n>`, its grouping and count
+fun multiple(a: *A.Allocator, c: str, grouping: *str, group: *u32) bool {
+    if (!str_starts_with(c, "MULTI")) { ret false; }
+    val kinds: [3]str = [3]str{"SOURCEDEST", "SOURCE", "DEST"};
+    var k:     u32    = 0;
+    for (k < 3) {
+        val kind: str = kinds[k];
+        if (str_starts_with(?c[5], kind)) {
+            val digits: str      = ?c[5 + str_len(kind)];
+            val n:      opt[u64] = text.number(view(digits, str_len(digits)));
+            if (sel n.none)           { ret false; }
+            if (n.some > 0xFFFF)      { ret false; }
+            if (str_len(digits) == 0) { ret false; }
+            @grouping = kind;
+            @group    = n.some::u32;
+            ret true;
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the operand `w`
+# ---
+# a: allocator for the operand
+# x: the flat tables, for the registers, widths and element types
+# l: the line it is on
+# w: the operand as written
+pub fun parse(a: *A.Allocator, x: *table.Tables, l: *lines.Line, w: str) res[Operand, diag.Refusal] {
+    var op:    Operand                               = Operand{name: nil, form: FLAG, value: nil, number: 0, numeric: false, negated: false, action: "r", visibility: "DEFAULT", width: nil, element: nil, conversions: vector.init[str](a), group: 0, grouping: nil};
+    val parts: res[vector.Vector[str], diag.Refusal] = chunks(a, l, w);
+    if (sel parts.err) { ret res[Operand, diag.Refusal].err{parts.err}; }
+    val c: *vector.Vector[str] = ?parts.ok;
+    # an empty action is one not written
+    if (c.len >= 2 && c.data[1][0] != 0) {
+        if (!one_of(c.data[1], ?ACTIONS[0], 7)) { ret res[Operand, diag.Refusal].err{lines.refuse(l, BAD_ACTION, w)}; }
+        op.action = c.data[1];
+    }
+    var i: usize = 2;
+    for (i < c.len) {
+        val part: str = c.data[i];
+        if ((i == 2 || i == 3) && one_of(part, ?VISIBILITIES[0], 4)) { op.visibility = part; }
+        or (multiple(a, part, ?op.grouping, ?op.group))              {}
+        or (str_starts_with(part, "TXT=") && part[4] != 0) {
+            if (!text.pushed(vector.push[str](?op.conversions, ?part[4]))) { ret res[Operand, diag.Refusal].err{text.memory(l)}; }
+        }
+        or (op.width == nil && lower_word(part)) {
+            val known: opt[*table.Width] = table.width(a, x, part);
+            if (sel known.none) { ret res[Operand, diag.Refusal].err{lines.refuse(l, NO_WIDTH, part)}; }
+            op.width = part;
+        }
+        or (op.width != nil && op.element == nil && known_element(a, x, part)) { op.element = part; }
+        or                                                                     { ret res[Operand, diag.Refusal].err{lines.refuse(l, BAD_CHUNK, part)}; }
+        i = i + 1;
+    }
+    # the name and its value
+    val head: str        = c.data[0];
+    val n:    usize      = str_len(head);
+    var eq:   opt[usize] = opt[usize].none{};
+    var k:    usize      = 0;
+    for (k < n && sel eq.none) {
+        if (head[k] == '=') { eq = opt[usize].some{k}; }
+        or                  { k = k + 1; }
+    }
+    if (sel eq.none) {
+        op.name = head;
+        if (one_of(head, ?BARES[0], 10))   { op.form = BARE; }
+        or (str_equals(head, "XED_RESET")) { op.form = RESET; }
+        or (n == 0)                        { ret res[Operand, diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+        ret res[Operand, diag.Refusal].ok{op};
+    }
+    var at: usize = eq.some;
+    if (at > 0 && head[at - 1] == '!') {
+        op.negated = true;
+        at         = at - 1;
+    }
+    if (at == 0 || eq.some + 1 >= n) { ret res[Operand, diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+    val name: res[str, StrError] = str_copy_slice(a, head, 0, at);
+    if (sel name.err) { ret res[Operand, diag.Refusal].err{text.memory(l)}; }
+    op.name = name.ok;
+    val value: str      = ?head[eq.some + 1];
+    val nt:    opt[str] = pattern.call(a, value);
+    val num:   opt[u64] = text.number(view(value, str_len(value)));
+    if (sel nt.some) {
+        op.form  = NONTERMINAL;
+        op.value = nt.some;
+    }
+    or (str_starts_with(value, "XED_REG_")) {
+        val r: opt[*table.Register] = table.register(a, x, ?value[8]);
+        if (sel r.none) { ret res[Operand, diag.Refusal].err{lines.refuse(l, NO_REGISTER, value)}; }
+        op.form  = REGISTER;
+        op.value = ?value[8];
+    }
+    or (str_starts_with(value, "XED_")) {
+        op.form  = CONSTANT;
+        op.value = value;
+    }
+    or (sel num.some) {
+        op.form    = CONSTANT;
+        op.value   = value;
+        op.number  = num.some;
+        op.numeric = true;
+    }
+    or (letters(value) && !op.negated) {
+        op.form  = LETTERS;
+        op.value = value;
+    }
+    or { ret res[Operand, diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+    ret res[Operand, diag.Refusal].ok{op};
+}
+
+# the width code of `op`: its own, or the one the extra-widths file gives what it names
+pub fun width(a: *A.Allocator, x: *table.Tables, op: *Operand) opt[str] {
+    if (op.width != nil)        { ret opt[str].some{op.width}; }
+    if (op.form == NONTERMINAL) { ret table.extra(a, x, table.NTS, op.value); }
+    if (op.form == REGISTER)    { ret table.extra(a, x, table.REGS, op.value); }
+    if (op.form == BARE)        { ret table.extra(a, x, table.CONSTS, op.name); }
+    ret opt[str].none{};
+}
