@@ -30,6 +30,7 @@ use masc.core.diagnostic;
 use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.field;
+use masc.core.form;
 use masc.core.index;
 use masc.core.inst;
 use masc.core.operand;
@@ -70,10 +71,13 @@ pub fun unrepresentable(imm: *operand.Immediate, v: i64) opt[str] {
     }
     val d: i64 = v - imm.bias;
     if (imm.scale > 0 && (d & field.ones(imm.scale)::i64) != 0) { ret opt[str].some{field.MISALIGNED}; }
-    if (imm.bits < 64) {
-        if (imm.signed) {
-            val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+    if (imm.bits > 0 && imm.bits < 64) {
+        val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+        if (imm.sign == operand.SIGNED) {
             if (d < -half || d >= half) { ret opt[str].some{field.OUT_OF_RANGE}; }
+        }
+        or (imm.sign == operand.EITHER) {
+            if (d < -half || (d >= 0 && d::u64 > field.ones(imm.bits))) { ret opt[str].some{field.OUT_OF_RANGE}; }
         }
         or (d < 0 || d::u64 > field.ones(imm.bits)) {
             ret opt[str].some{field.OUT_OF_RANGE};
@@ -335,7 +339,7 @@ fun admit_all(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, part
 # what each field's kind refuses of the values of `ins` beyond their shapes, encoded into `parts`, without writing
 fun kinds_admit(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts) err[field.Refusal] {
     val r:   *row.Row      = ins.row;
-    var enc: field.Encoder = field.Encoder{ctx: ctx, table: codec.fields, operands: r.operands.at, values: ins.values, parts: parts, count: r.operands.len, out: nil, fixups: nil, start: 0, field: 0};
+    var enc: field.Encoder = field.Encoder{ctx: ctx, table: codec.fields, operands: r.operands.at, values: ins.values, parts: parts, count: r.operands.len, form: ?ins.form, out: nil, fixups: nil, start: 0, field: 0};
     var j:   u32           = 0;
     for (j < r.encoding.len) {
         val f:    *field.Field = ?r.encoding.at[j];
@@ -451,6 +455,7 @@ pub fun encode(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, out
         values:   ins.values,
         parts:    ?parts[0],
         count:    r.operands.len,
+        form:     ?ins.form,
         out:      out,
         fixups:   fixups,
         start:    out.len,
@@ -520,7 +525,7 @@ fun settle_immediate(imm: *operand.Immediate, bits: u64, op: u8, offset: usize) 
     var raw: u64 = bits & field.ones(imm.bits);
     var v:   i64 = raw:~i64;
     if (imm.format != operand.FLOAT) {
-        if (imm.signed && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
+        if (imm.sign == operand.SIGNED && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
         v = raw:~i64 + imm.bias;
     }
     if (operand.excludes_value(imm, v)) { ret res[i64, field.Refusal].err{field.refusal(field.EXCLUDED, op, offset)}; }
@@ -628,13 +633,15 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
         store[i] = operand.Value.none{};
         i        = i + 1;
     }
-    var dec: field.Decoder = field.Decoder{
+    var read: form.Form     = form.PREFERRED;
+    var dec:  field.Decoder = field.Decoder{
         ctx:      ctx,
         table:    codec.fields,
         operands: r.operands.at,
         values:   store,
         parts:    ?parts[0],
         count:    count,
+        form:     ?read,
         in:       field.Stream{data: data, len: len, order: codec.fields.order},
         start:    at,
         at:       at,
@@ -644,11 +651,24 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
         used:     0,
         cap:      cap - count,
     };
-    var j: u32 = 0;
+    var offsets: [row.MAX_FIELDS]usize;
+    var j:       u32 = 0;
     for (j < r.encoding.len) {
-        val f:    *field.Field       = ?r.encoding.at[j];
+        val f: *field.Field = ?r.encoding.at[j];
+        offsets[j] = dec.at;
         val done: err[field.Refusal] = codec.fields.kinds[f.kind].decode(?dec, f);
         if (sel done.err) { ret res[Decoded, field.Refusal].err{done.err}; }
+        j = j + 1;
+    }
+    # a kind completes the parts it decides once every field is read
+    j = 0;
+    for (j < r.encoding.len) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.complete != nil) {
+            val done: err[field.Refusal] = kind.complete(?dec, f, offsets[j]);
+            if (sel done.err) { ret res[Decoded, field.Refusal].err{done.err}; }
+        }
         j = j + 1;
     }
     if (dec.declared && dec.at != dec.end) { ret res[Decoded, field.Refusal].err{field.refusal(field.LENGTH, field.NO_OPERAND, dec.at)}; }
@@ -671,7 +691,7 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
     if (sel keeps.err) { ret res[Decoded, field.Refusal].err{keeps.err}; }
     val touched: err[field.Refusal] = touches_held(codec, v, r, store, at);
     if (sel touched.err) { ret res[Decoded, field.Refusal].err{touched.err}; }
-    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count}, len: dec.at - at}};
+    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count, form: read}, len: dec.at - at}};
 }
 
 # the entry of `node` whose value is `key`
