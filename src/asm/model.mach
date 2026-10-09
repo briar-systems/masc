@@ -7,9 +7,15 @@
 # label, the numbered labels by number, the section stack, and the
 # directives by name. a label and an instruction are read here, and every
 # directive is a row of a name, the syntax of its operands and a handler, in
-# a layer of rows: the core rows, the set's integer data rows, and any the
-# caller adds. the rows are indexed once, and a name two layers state is
-# refused, so adding a directive is adding a row and never an edit here.
+# a layer of rows: the core rows, the set's own rows, and any the caller
+# adds. the rows are indexed once, and a name two layers state is refused, so
+# adding a directive is adding a row and never an edit here.
+#
+# the set's own rows are its integer data directives and the directive its
+# dialect states forms by, as risc-v's `.option`. the narrowings in force,
+# their stack and the narrowed views are the assembler's, and the builder is
+# told the view each statement after them is written under, which the
+# instructions are read under as well.
 #
 # a name in an expression resolves through the builder's labels: `.` is the
 # place the operand is written, `1b` and `1f` are the nearest numbered label
@@ -45,7 +51,9 @@ use mink;
 use masc.asm.source;
 use masc.build.build;
 use masc.core.diagnostic;
+use masc.core.extension;
 use masc.core.field;
+use masc.core.narrow;
 use masc.core.operand;
 use masc.core.register;
 use masc.core.relax;
@@ -81,6 +89,9 @@ pub val NO_PREVIOUS:       str = "no previous section";
 pub val NOT_A_NAME:        str = "expected a symbol name";
 pub val NOT_A_STRING:      str = "expected a string";
 pub val NOT_A_NUMBER:      str = "expected a number";
+pub val UNKNOWN_FORM:      str = "the dialect states no such form";
+pub val NOTHING_PUSHED:    str = "no narrowing pushed to pop";
+pub val WIDENS:            str = "lifts the selection past the object's, which does not hold what it states";
 
 # the handle `.` resolves to, which every operand binds to the place it is written before the builder sees it
 pub val HERE: u32 = 0xFFFF_FFFF;
@@ -269,6 +280,19 @@ rec Entry {
     layer:     *Layer;
 }
 
+# what the form directive's push saves of the statement state, which its pop restores
+# ---
+# active: the narrowings in force
+rec Saved {
+    active: u64;
+}
+
+# the view of the narrowings `active` marks, made the first time they are in force
+rec Kept {
+    active: u64;
+    view:   *narrow.Narrowed;
+}
+
 # how many operand values, list members and literal bytes one instruction reads, and how many requirements a refusal names
 val POOL:       u32 = 64;
 val LITERAL:    u32 = 256;
@@ -283,8 +307,11 @@ val ADMISSIONS: u32 = 16;
 # private:    the private spelling of names
 # b:          the builder everything is written through
 # layers:     every layer, the core first
-# rows:       the set's integer data rows, made from its widths
+# rows:       the set's own rows, made from its widths and its forms
 # own:        the layer of those rows
+# active:     the narrowings in force, one bit per row of the set's forms
+# pushed:     the statement states saved by the form directive's push, the last on top
+# kept:       the view of each mask of narrowings that has been in force, which outlives the builder
 # index:      every row by name, in ascending order of folded name
 # facts:      per label, label id less one, what the source declared of it
 # numbered:   the numbered labels by number
@@ -307,6 +334,9 @@ pub rec Assembler {
     layers:     vector.Vector[*Layer];
     rows:       vector.Vector[Directive];
     own:        vector.Vector[Layer];
+    active:     u64;
+    pushed:     vector.Vector[Saved];
+    kept:       vector.Vector[Kept];
     index:      vector.Vector[Entry];
     facts:      vector.Vector[Facts];
     numbered:   map.Map[u64, Numbered];
@@ -384,6 +414,9 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, optio
         layers:    vector.init[*Layer](a),
         rows:      vector.init[Directive](a),
         own:       vector.init[Layer](a),
+        active:    0,
+        pushed:    vector.init[Saved](a),
+        kept:      vector.init[Kept](a),
         index:     vector.init[Entry](a),
         facts:     vector.init[Facts](a),
         numbered:  map.init[u64, Numbered](a),
@@ -395,14 +428,17 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, optio
         names:     spelling.Symbols{context: nil, resolve: resolve, name: name_of},
     };
     val widths: set.Widths = s.source.widths;
-    var ok:     bool       = held(vector.reserve[Directive](?m.rows, widths.len::usize)) && held(vector.reserve[Layer](?m.own, 1));
+    val forms:  *set.Forms = ?s.source.forms;
+    val stated: bool       = forms.directive != nil && forms.directive[0] != 0;
+    var ok:     bool       = held(vector.reserve[Directive](?m.rows, widths.len::usize + 1)) && held(vector.reserve[Layer](?m.own, 1));
     var i:      u32        = 0;
     for (ok && i < widths.len) {
         vector.push[Directive](?m.rows, Directive{name: widths.at[i].name, operands: EXPRESSIONS, handler: integers, param: widths.at[i].width::u64});
         i = i + 1;
     }
+    if (ok && stated) { vector.push[Directive](?m.rows, Directive{name: forms.directive, operands: ONE, handler: form_directive, param: 0}); }
     if (ok) {
-        vector.push[Layer](?m.own, Layer{name: "data", directives: Directives{at: m.rows.data, len: m.rows.len::u32}, context: nil, finish: finished});
+        vector.push[Layer](?m.own, Layer{name: "set", directives: Directives{at: m.rows.data, len: m.rows.len::u32}, context: nil, finish: finished});
         ok = held(vector.push[*Layer](?m.layers, core)) && held(vector.push[*Layer](?m.layers, ?m.own.data[0]));
     }
     i = 0;
@@ -436,9 +472,16 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, optio
     ret res[Assembler, Refusal].ok{m};
 }
 
-# give back everything the assembler owns, the builder with it
+# give back everything the assembler owns, the builder with it and then the views it wrote under
 pub fun release(m: *Assembler) {
     build.release(?m.b);
+    var i: usize = 0;
+    for (i < m.kept.len) {
+        narrow.release(m.a, m.kept.data[i].view);
+        i = i + 1;
+    }
+    vector.dnit[Kept](?m.kept);
+    vector.dnit[Saved](?m.pushed);
     vector.dnit[*Layer](?m.layers);
     vector.dnit[Directive](?m.rows);
     vector.dnit[Layer](?m.own);
@@ -866,6 +909,83 @@ pub fun restore_previous(m: *Assembler, p: opt[build.Section]) {
     m.previous = p;
 }
 
+# whether `v` is spelled `s`, exactly, as the gnu assembler reads an option's operand
+fun spells(v: View, s: str) bool {
+    if (s == nil || v.len != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the narrowings `active` marks put in force, the builder told the view that writes under them, made the first time
+# they are in force. the view of the object's selection is the object's own, and a mask's view is kept by its mask, of
+# which there are at most as many as the dialect's narrowings combine to, so the scan of the kept views is bounded
+fun in_force(m: *Assembler, active: u64) err[str] {
+    var v: *register.Available = m.available;
+    if (active != 0) {
+        var found: *narrow.Narrowed = nil;
+        var i:     usize            = 0;
+        for (i < m.kept.len && found == nil) {
+            if (m.kept.data[i].active == active) { found = m.kept.data[i].view; }
+            i = i + 1;
+        }
+        if (found == nil) {
+            if (!held(vector.reserve[Kept](?m.kept, 1))) { ret err[str].err{field.MEMORY}; }
+            val made: res[*narrow.Narrowed, register.Error] = narrow.make(m.a, m.available, m.set.source.forms.narrowings, active);
+            if (sel made.err) { ret err[str].err{field.MEMORY}; }
+            vector.push[Kept](?m.kept, Kept{active: active, view: made.ok});
+            found = made.ok;
+        }
+        v = ?found.available;
+    }
+    val told: err[build.Refusal] = build.narrow(?m.b, v);
+    if (sel told.err) { ret err[str].err{told.err.message}; }
+    m.active = active;
+    ret err[str].ok{};
+}
+
+# the set's form directive: its push saves the narrowings in force and its pop restores them, a narrowing's operand puts
+# it in force and its lift takes it out, never past the object's selection
+fun form_directive(m: *Assembler, args: *Args) err[diagnostic.Diagnostic] {
+    val v:     Argument   = args.items[0].value;
+    val forms: *set.Forms = ?m.set.source.forms;
+    if (!sel v.name) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, NOT_A_NAME)}; }
+    val name: View = v.name;
+    if (spells(name, forms.push)) {
+        if (!held(vector.push[Saved](?m.pushed, Saved{active: m.active}))) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, field.MEMORY)}; }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    var active: u64  = m.active;
+    var known:  bool = false;
+    if (spells(name, forms.pop)) {
+        if (m.pushed.len == 0) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, NOTHING_PUSHED)}; }
+        active = m.pushed.data[m.pushed.len - 1].active;
+        known  = true;
+    }
+    var i: u32 = 0;
+    for (i < forms.narrowings.len && !known) {
+        val n: *set.Narrowing = ?forms.narrowings.at[i];
+        if (spells(name, n.narrow)) {
+            active = active | narrow.bit(i);
+            known  = true;
+        }
+        or (spells(name, n.lift)) {
+            if (!extension.has(m.available.selection, n.lifted)) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, WIDENS)}; }
+            active = active & ~narrow.bit(i);
+            known  = true;
+        }
+        i = i + 1;
+    }
+    if (!known) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, UNKNOWN_FORM)}; }
+    val put: err[str] = in_force(m, active);
+    if (sel put.err)             { ret err[diagnostic.Diagnostic].err{refuse(args, 0, put.err)}; }
+    if (spells(name, forms.pop)) { m.pushed.len = m.pushed.len - 1; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
 # a reader over `len` bytes of statement `st` from `at`, positioned at `origin`
 fun reader(m: *Assembler, st: *source.Statement, at: usize, len: usize, origin: diagnostic.Position) spelling.Reader {
     m.names.context = m::ptr;
@@ -876,7 +996,7 @@ fun reader(m: *Assembler, st: *source.Statement, at: usize, len: usize, origin: 
         end:       at + len,
         origin:    origin,
         codec:     m.set.codec,
-        available: m.available,
+        available: build.view(?m.b),
         syntax:    m.syntax,
         symbols:   ?m.names,
         context:   nil,
@@ -1290,6 +1410,9 @@ pub fun finish(m: *Assembler) res[mink.object.Object, Refusal] {
 
 # no operands
 pub val NONE: Shape = Shape{items: nil, len: 0, least: 0, repeat: false, text: false};
+
+# one name, as `.option push`
+pub val ONE: Shape = Shape{items: ?ONE_NAME[0], len: 1, least: 1, repeat: false, text: false};
 
 # operands the handler reads itself
 pub val TEXT: Shape = Shape{items: nil, len: 0, least: 0, repeat: false, text: true};
