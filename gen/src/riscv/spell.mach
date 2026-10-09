@@ -44,15 +44,17 @@ use gen.riscv.overlay;
 use gen.riscv.read;
 use gen.set;
 
-pub val NO_DIALECT:   str = "respelling not in the dialect, or its arguments differ from its record's";
-pub val BAD_ORDER:    str = "respelling's order names an argument its record does not leave free, twice, or leaves one out";
-pub val UNMAPPED:     str = "respelling's record fixes or frees only part of an operand the spelling cannot state";
-pub val NO_REGISTER:  str = "fixed register not in the register file";
-pub val EXCLUDED:     str = "respelling fixes a value its base row excludes";
-pub val NO_FORM:      str = "row has operands the dialect does not place";
-pub val BAD_TEMPLATE: str = "dialect template names an argument the spelling does not have";
-pub val ALONE:        str = "trailing modifier with no operand before it";
-pub val SUFFIXED:     str = "row has more suffix operands than the dialect places";
+pub val NO_DIALECT:    str = "respelling not in the dialect, or its arguments differ from its record's";
+pub val BAD_ORDER:     str = "respelling's order names an argument its record does not leave free, twice, or leaves one out";
+pub val UNMAPPED:      str = "respelling's record fixes or frees only part of an operand the spelling cannot state";
+pub val NO_REGISTER:   str = "fixed register not in the register file";
+pub val EXCLUDED:      str = "respelling fixes a value its base row excludes";
+pub val NO_FORM:       str = "row has operands the dialect does not place";
+pub val BAD_TEMPLATE:  str = "dialect template names an argument the spelling does not have";
+pub val ALONE:         str = "trailing modifier with no operand before it";
+pub val SUFFIXED:      str = "row has more suffix operands than the dialect places";
+pub val BAD_EXCLUSION: str = "dialect exclusion names no respelling's argument, or an operand that is neither a register nor an immediate";
+pub val UNSTATED:      str = "respelling's record excludes a value its base operand admits that the dialect does not state";
 
 # what an operand is in a template
 # ---
@@ -98,12 +100,24 @@ pub val FROM_VALUE:    u8 = 3;
 pub val FROM_CHOICE:   u8 = 4;
 pub val FROM_ID:       u8 = 5;
 
+# a value an alias operand excludes before it is emitted
+# ---
+# operand:  the alias operand
+# register: whether the value is a register's number rather than an immediate's value
+# value:    the value
+pub rec Excl {
+    operand:  u8;
+    register: bool;
+    value:    i64;
+}
+
 # an alias before it is emitted
 # ---
 # row:      its base row's index
 # template: its spelling
 # count:    how many operands it has
 # sources:  one per operand of the base row
+# excluded: the values its operands exclude, in ascending order of operand
 # fixed:    how many base operands it fixes
 # print:    whether the printer prefers it
 # own:      what its own file requires
@@ -114,6 +128,7 @@ pub rec Pending {
     template: str;
     count:    u8;
     sources:  vector.Vector[Src];
+    excluded: vector.Vector[Excl];
     fixed:    u32;
     print:    bool;
     own:      *mapping.Requirement;
@@ -706,8 +721,83 @@ fun source_of(s: *Spell, r: *read.Record, args: str, d: *dialect.Respell, o: *ma
     ret fixed_source(s, r, o, r.match);
 }
 
+# the first overlay group holding argument `arg`, nil when none does
+fun group_of(arg: str) *overlay.Group {
+    var i: u32 = 0;
+    for (i < overlay.GROUPS_COUNT) {
+        if (has_token(overlay.GROUPS[i].args, arg)) { ret ?overlay.GROUPS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether `excluded` holds a value of `operand` equal to `value`
+fun stated(excluded: *vector.Vector[Excl], operand: u8, value: i64) bool {
+    var i: usize = 0;
+    for (i < excluded.len) {
+        if (excluded.data[i].operand == operand && excluded.data[i].value == value) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the values the record's argument `arg` excludes beyond those of `o`, the operand it reads as, each stated in `excluded` for alias operand `k`
+fun implied(r: *read.Record, name: str, arg: str, o: *mapping.Operand, k: u8, excluded: *vector.Vector[Excl]) err[diag.Refusal] {
+    val g: *overlay.Group = group_of(arg);
+    if (g == nil) { ret err[diag.Refusal].ok{}; }
+    var i: u32 = 0;
+    if ((o.use == overlay.REGISTER || o.use == overlay.SREG) && g.position != nil && o.position != nil) {
+        for (i < g.position.excluded.len) {
+            val n: u32 = g.position.excluded.at[i];
+            if (!excludes_number(o.position, n) && !stated(excluded, k, n::i64)) { ret refuse(r, UNSTATED, name); }
+            i = i + 1;
+        }
+    }
+    if (o.use == overlay.IMMEDIATE && g.layout != nil && o.layout != nil) {
+        for (i < g.layout.value.excluded.len) {
+            val v: i64 = g.layout.value.excluded.at[i];
+            if (!operand.excludes_value(?o.layout.value, v) && !stated(excluded, k, v)) { ret refuse(r, UNSTATED, name); }
+            i = i + 1;
+        }
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the values the dialect excludes from the operands of respelling `p`, alias operand `k` written as the `k`th argument of `d.order` and reading as base operand `items[k].op`
+# ---
+# used: set for each dialect exclusion taken
+fun excluded_of(s: *Spell, p: *mapping.Respelling, d: *dialect.Respell, items: *Item, count: u32, used: *bool, out: *vector.Vector[Excl]) err[diag.Refusal] {
+    val r:  *read.Record = p.record;
+    var k:  u32          = 0;
+    var at: usize        = 0;
+    for (k < count) {
+        val len: usize              = token_len(d.order, at);
+        val arg: res[str, StrError] = str_copy_slice(s.alloc, d.order, at, len);
+        if (sel arg.err) { ret err[diag.Refusal].err{memory()}; }
+        val o: *mapping.Operand = ?p.row.operands.data[items[k].op];
+        var i: u32              = 0;
+        for (i < dialect.EXCLUSIONS_COUNT) {
+            val x: *dialect.Exclusion = ?dialect.EXCLUSIONS[i];
+            if (overlay.matches(x.name, p.name) && str_equals(x.arg, arg.ok)) {
+                val held: bool = o.use == overlay.REGISTER || o.use == overlay.SREG;
+                if (!held && o.use != overlay.IMMEDIATE)                                                   { ret refuse(r, BAD_EXCLUSION, p.name); }
+                if (!pushed(vector.push[Excl](out, Excl{operand: k::u8, register: held, value: x.value}))) { ret err[diag.Refusal].err{memory()}; }
+                used[i] = true;
+            }
+            i = i + 1;
+        }
+        val checked: err[diag.Refusal] = implied(r, p.name, arg.ok, o, k::u8, out);
+        if (sel checked.err) { ret checked; }
+        k  = k + 1;
+        at = next_token(d.order, at);
+    }
+    ret err[diag.Refusal].ok{};
+}
+
 # the alias that respells base row `p.row` as pseudo op record `p.record`, written in the dialect's order
-fun alias_of(s: *Spell, p: *mapping.Respelling, out: *vector.Vector[Pending]) err[diag.Refusal] {
+# ---
+# used: set for each dialect exclusion it takes
+fun alias_of(s: *Spell, p: *mapping.Respelling, used: *bool, out: *vector.Vector[Pending]) err[diag.Refusal] {
     val r:    *read.Record           = p.record;
     val row:  *mapping.Row           = p.row;
     val args: res[str, diag.Refusal] = record_args(s, r);
@@ -753,6 +843,9 @@ fun alias_of(s: *Spell, p: *mapping.Respelling, out: *vector.Vector[Pending]) er
         items[k] = Item{hole: k::u8, op: op};
         k        = k + 1;
     }
+    var excluded: vector.Vector[Excl] = vector.init[Excl](s.alloc);
+    val ex:       err[diag.Refusal]   = excluded_of(s, p, d, ?items[0], count, used, ?excluded);
+    if (sel ex.err) { ret ex; }
     var template: str = nil;
     if (str_len(d.text) > 0) {
         val e: res[str, diag.Refusal] = explicit(s, row, p.name, d.text, d.order);
@@ -764,7 +857,7 @@ fun alias_of(s: *Spell, p: *mapping.Respelling, out: *vector.Vector[Pending]) er
         if (sel c.err) { ret err[diag.Refusal].err{c.err}; }
         template = c.ok;
     }
-    val pending: Pending = Pending{row: row.index, template: template, count: count::u8, sources: sources, fixed: fixed, print: d.print, own: p.own, order: ((d:~u64 - (?dialect.RESPELLS[0]):~u64) / $size_of(dialect.Respell)::u64)::u32, prefer: 0};
+    val pending: Pending = Pending{row: row.index, template: template, count: count::u8, sources: sources, excluded: excluded, fixed: fixed, print: d.print, own: p.own, order: ((d:~u64 - (?dialect.RESPELLS[0]):~u64) / $size_of(dialect.Respell)::u64)::u32, prefer: 0};
     if (!pushed(vector.push[Pending](out, pending))) { ret err[diag.Refusal].err{memory()}; }
     ret err[diag.Refusal].ok{};
 }
@@ -866,6 +959,37 @@ fun requirement(a: *A.Allocator, f: *emit.File, ids: *emit.Pool, alts: *emit.Poo
     ret run(f, "requirement.Requirement", "REQUIRE_ALTERNATIVES", at, items.len::u32);
 }
 
+# the exclusions of `excluded` as a record over runs of the pools, the shared constant when there are none
+fun exclusions(a: *A.Allocator, f: *emit.File, exclus: *emit.Pool, numbers: *emit.Pool, ints: *emit.Pool, excluded: *vector.Vector[Excl]) emit.Value {
+    if (excluded.len == 0) { ret emit.Value.name{"spelling.NO_EXCLUSIONS"}; }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](a);
+    var i:     usize                     = 0;
+    for (i < excluded.len) {
+        val first: Excl                      = excluded.data[i];
+        var vals:  vector.Vector[emit.Value] = vector.init[emit.Value](a);
+        var j:     usize                     = i;
+        for (j < excluded.len && excluded.data[j].operand == first.operand) {
+            vector.push[emit.Value](?vals, number(excluded.data[j].value));
+            j = j + 1;
+        }
+        var excl: emit.Value = emit.Value.name{"nil"};
+        if (first.register) {
+            val at: u32 = emit.pooled(f, numbers, vals.data, vals.len::u32);
+            excl = emit.Value.variant{emit.variant(f, "spelling.Excluded.register", run(f, "operand.Numbers", "EXCLUDED_NUMBERS", at, vals.len::u32))};
+        }
+        or {
+            val at: u32 = emit.pooled(f, ints, vals.data, vals.len::u32);
+            excl = emit.Value.variant{emit.variant(f, "spelling.Excluded.immediate", run(f, "operand.Integers", "EXCLUDED_INTEGERS", at, vals.len::u32))};
+        }
+        val x: *emit.Record = emit.record(f, "spelling.Exclusion");
+        emit.member(f, x, "operand", number(first.operand::i64));
+        emit.member(f, x, "excluded", excl);
+        vector.push[emit.Value](?items, emit.Value.record{x});
+        i = j;
+    }
+    ret run(f, "spelling.Exclusions", "ALIAS_EXCLUSIONS", emit.pooled(f, exclus, items.data, items.len::u32), items.len::u32);
+}
+
 # a pointer and count record over run `at` of `count` items of the array declared `array`, nil when empty
 fun run(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
     val r: *emit.Record = emit.record(f, of);
@@ -897,15 +1021,29 @@ pub fun generate(a: *A.Allocator, f: *emit.File, source: *read.Source, catalog: 
         i = i + 1;
     }
     var pending: vector.Vector[Pending] = vector.init[Pending](a);
+    var used:    [dialect.EXCLUSIONS_COUNT]bool;
+    var u:       u32                    = 0;
+    for (u < dialect.EXCLUSIONS_COUNT) {
+        used[u] = false;
+        u       = u + 1;
+    }
     i = 0;
     for (i < catalog.respellings.len) {
-        val done: err[diag.Refusal] = alias_of(?s, ?catalog.respellings.data[i], ?pending);
+        val done: err[diag.Refusal] = alias_of(?s, ?catalog.respellings.data[i], ?used[0], ?pending);
         if (sel done.err) { ret done; }
         i = i + 1;
+    }
+    u = 0;
+    for (u < dialect.EXCLUSIONS_COUNT) {
+        if (!used[u]) { ret err[diag.Refusal].err{diag.refusal(nil, 0, BAD_EXCLUSION, dialect.EXCLUSIONS[u].name)}; }
+        u = u + 1;
     }
     sort.sort_by[Pending](pending.data, pending.len, by_base);
     prefer(?pending);
     var sources: emit.Pool   = emit.pool(f, "spelling.Source");
+    var exclus:  emit.Pool   = emit.pool(f, "spelling.Exclusion");
+    var numbers: emit.Pool   = emit.pool(f, "u32");
+    var ints:    emit.Pool   = emit.pool(f, "i64");
     var rids:    emit.Pool   = emit.pool(f, "requirement.Id");
     var ralts:   emit.Pool   = emit.pool(f, "requirement.Ids");
     val aliases: *emit.Array = emit.array(f, "spelling.Alias");
@@ -928,6 +1066,7 @@ pub fun generate(a: *A.Allocator, f: *emit.File, source: *read.Source, catalog: 
         emit.member(f, r, "count", number(p.count::i64));
         emit.member(f, r, "sources", emit.Value.record{sr});
         emit.member(f, r, "derive", emit.Value.name{"nil"});
+        emit.member(f, r, "exclusions", exclusions(a, f, ?exclus, ?numbers, ?ints, ?p.excluded));
         emit.member(f, r, "requires", requirement(a, f, ?rids, ?ralts, p.own));
         emit.member(f, r, "preference", number(p.prefer::i64));
         emit.item(f, aliases, emit.Value.record{r});
@@ -969,6 +1108,9 @@ pub fun generate(a: *A.Allocator, f: *emit.File, source: *read.Source, catalog: 
     }
     emit.declare(f, "FORM_TEXT", nil, emit.Value.array{forms});
     emit.declare(f, "SOURCES", nil, emit.Value.array{sources.array});
+    if (emit.length(exclus.array) > 0)  { emit.declare(f, "ALIAS_EXCLUSIONS", nil, emit.Value.array{exclus.array}); }
+    if (emit.length(numbers.array) > 0) { emit.declare(f, "EXCLUDED_NUMBERS", nil, emit.Value.array{numbers.array}); }
+    if (emit.length(ints.array) > 0)    { emit.declare(f, "EXCLUDED_INTEGERS", nil, emit.Value.array{ints.array}); }
     emit.declare(f, "REQUIRE_IDS", nil, emit.Value.array{rids.array});
     emit.declare(f, "REQUIRE_ALTERNATIVES", nil, emit.Value.array{ralts.array});
     emit.declare(f, "ALIAS_ROWS", nil, emit.Value.array{aliases});
