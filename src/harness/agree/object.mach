@@ -1,0 +1,149 @@
+# the sections of objects read through mink: an external tool's elf file, and masc's own object in memory
+#
+# every vector of a source file is in its own section, `.text.<n>` for the
+# vector n, so the bytes each tool gave a vector are that section's whole
+# contents, whatever lengths the tools chose.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+use fs: std.filesystem;
+
+use mink;
+
+use masc.core.operand;
+
+# the prefix of the section every vector is written in, its number after it
+pub val PREFIX: str = ".text.";
+
+# the bytes one vector's section holds
+# ---
+# vector: the vector's number in its source file
+# bytes:  the section's contents, owned by the run
+pub rec Placed {
+    vector: u32;
+    bytes:  operand.Bytes;
+}
+
+# `len` bytes at `p` copied into storage of `a`, none when it refuses
+pub fun own(a: *A.Allocator, p: *u8, len: usize) opt[operand.Bytes] {
+    if (len == 0) { ret opt[operand.Bytes].some{operand.Bytes{at: nil, len: 0}}; }
+    val got: res[*u8, A.Error] = A.allocate[u8](a, len);
+    if (sel got.err) { ret opt[operand.Bytes].none{}; }
+    var i: usize = 0;
+    for (i < len) {
+        got.ok[i] = p[i];
+        i         = i + 1;
+    }
+    ret opt[operand.Bytes].some{operand.Bytes{at: got.ok, len: len::u32}};
+}
+
+# the number a section named `name` gives its vector, none when it is not a vector's section
+pub fun numbered(name: *u8, len: usize) opt[u32] {
+    val n: usize = str_len(PREFIX);
+    if (len <= n) { ret opt[u32].none{}; }
+    var i: usize = 0;
+    for (i < n) {
+        if (name[i] != PREFIX[i]) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    var v: u32 = 0;
+    for (i < len) {
+        if (name[i] < '0' || name[i] > '9') { ret opt[u32].none{}; }
+        v = v * 10 + (name[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret opt[u32].some{v};
+}
+
+# the name at byte `at` of the string section `strings` of `m`, none when it is not there
+fun section_name(m: *mink.model.Elf, strings: u32, at: u32) opt[View] {
+    if (strings::usize >= mink.table.count[mink.model.Section](?m.sections)) { ret opt[View].none{}; }
+    val s: *mink.model.Section = mink.model.section_at(m, mink.table.nth[mink.model.Section](strings::usize));
+    if (!sel s.body.raw) { ret opt[View].none{}; }
+    val held: mink.store.Bytes = mink.model.bytes(m, ?s.body.raw);
+    if (at::usize >= held.len) { ret opt[View].none{}; }
+    var end: usize = at::usize;
+    for (end < held.len && held.data[end] != 0) { end = end + 1; }
+    ret opt[View].some{View{data: ?held.data[at::usize], len: end - at::usize}};
+}
+
+# the vectors' sections of the elf file at `path`, appended to `out` with their bytes copied into `a`
+# ---
+# scratch: the allocator of the file and its model, given back by the caller once this returns
+# ret:     ok, or why the file cannot be read
+pub fun elf_sections(a: *A.Allocator, scratch: *A.Allocator, path: str, out: *vector.Vector[Placed]) err[str] {
+    val loaded: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(scratch, path);
+    if (sel loaded.err) { ret err[str].err{"the object cannot be read"}; }
+    var input: mink.contract.Input                 = mink.contract.Input{file: path, data: loaded.ok.data, len: loaded.ok.len};
+    val read:  res[mink.model.Elf, mink.fail.Fail] = mink.read.read(scratch, ?input);
+    if (sel read.err) { ret err[str].err{"mink cannot read the object"}; }
+    var m:       mink.model.Elf                = read.ok;
+    val strings: res[opt[u32], mink.fail.Fail] = mink.model.string_section(?m);
+    var names:   opt[u32]                      = opt[u32].none{};
+    if (sel strings.ok) { names = strings.ok; }
+    if (sel names.none) {
+        val dropped: err[mink.fail.Fail] = mink.model.release(?m);
+        ret err[str].err{"the object names no sections"};
+    }
+    var i: usize = 0;
+    for (i < mink.table.count[mink.model.Section](?m.sections)) {
+        val s:    *mink.model.Section = mink.model.section_at(?m, mink.table.nth[mink.model.Section](i));
+        val name: opt[View]           = section_name(?m, names.some, s.name);
+        var n:    opt[u32]            = opt[u32].none{};
+        if (sel name.some) { n = numbered(name.some.data, name.some.len); }
+        if (sel n.some) {
+            if (sel s.body.raw) {
+                val held:  mink.store.Bytes   = mink.model.bytes(?m, ?s.body.raw);
+                val owned: opt[operand.Bytes] = own(a, held.data, held.len);
+                if (sel owned.none) {
+                    val dropped: err[mink.fail.Fail] = mink.model.release(?m);
+                    ret err[str].err{"out of memory"};
+                }
+                val pushed: res[usize, A.Error] = vector.push[Placed](out, Placed{vector: n.some, bytes: owned.some});
+                if (sel pushed.err) {
+                    val dropped: err[mink.fail.Fail] = mink.model.release(?m);
+                    ret err[str].err{"out of memory"};
+                }
+            }
+        }
+        i = i + 1;
+    }
+    val released: err[mink.fail.Fail] = mink.model.release(?m);
+    ret err[str].ok{};
+}
+
+# the contents of the section of `o` named `name`, copied into `a`
+# ---
+# ret: the bytes, or why there are none
+pub fun section_bytes(a: *A.Allocator, o: *mink.object.Object, name: str) res[operand.Bytes, str] {
+    val want: usize = str_len(name);
+    var i:    usize = 0;
+    for (i < o.sections.count) {
+        val n:    View  = mink.object.name_of(o, o.sections.items[i].name);
+        var same: bool  = n.len == want;
+        var k:    usize = 0;
+        for (same && k < want) {
+            same = n.data[k] == name[k];
+            k    = k + 1;
+        }
+        if (same) {
+            val got:   mink.store.Bytes   = mink.object.bytes(o, ?o.sections.items[i].contents);
+            val owned: opt[operand.Bytes] = own(a, got.data, got.len);
+            if (sel owned.none) { ret res[operand.Bytes, str].err{"out of memory"}; }
+            ret res[operand.Bytes, str].ok{owned.some};
+        }
+        i = i + 1;
+    }
+    ret res[operand.Bytes, str].err{"the object has no such section"};
+}
