@@ -6,12 +6,11 @@
 # else. reserved and allocatable sets are calling-convention facts and are not
 # modelled here.
 #
-# a register row states the extensions a selection must hold for it to exist.
-# a mode is an extension of the set's catalog, as x86 long mode or risc-v's
-# rv64, and an absence is the presence of its conflicting complement, as x16
-# to x31 require risc-v's i base, which the e base conflicts with. a
-# selection filters the file through these conditions once, and every query
-# after that reads its view.
+# a register row states what a selection and the state code runs under must
+# hold for it to exist, over extensions and state values, as x86's r8 needs
+# 64-bit width and risc-v's x16 to x31 need the i base. a context filters the
+# file through these conditions once (`masc.core.state.select`), and every
+# query after that reads its view.
 #
 # registers of one bank share its storage, each a footprint within it. a
 # register whose physical storage is chosen at run time, as x87 st(i) relative
@@ -45,7 +44,7 @@ use std.allocator.testing;
 use std.collections.bitset;
 use std.collections.vector;
 
-use masc.core.diagnostic;
+#[testing]
 use masc.core.extension;
 use masc.core.index;
 use masc.core.quantity;
@@ -73,12 +72,13 @@ pub val SYSTEM:    Kind = 6;
 # name:  its name, unique within the file and stable: a saved text names the class by it, so it never depends on the class's place
 # kind:  what its members hold
 # width: the bits of each member, or of one row of a tile
-# count: the hardware numbers its encoding spans, 0 to count - 1
+# count: the hardware numbers its encoding spans, 0 to count - 1, which may scale with the slot of its width, as the
+#        slices of an sme tile number svl / esize. a member past the count a context resolves does not exist there
 pub rec Class {
     name:  str;
     kind:  Kind;
     width: quantity.Scaled;
-    count: u32;
+    count: quantity.Scaled;
 }
 
 # fixed architectural roles, as bits of a register's flags
@@ -178,7 +178,7 @@ pub tag Reach: u8 {
 # count:    its pieces, each its class's width, so a contiguous register has 1
 # places:   the places it may be, ONE_PLACE for a register whose storage no run-time state chooses
 # flags:    its fixed architectural roles
-# requires: the alternatives of extensions and modes a selection must hold, any one fully, for it to exist, none for every selection
+# requires: what a selection and its state must hold for it to exist, over extensions and state values, none for every one
 # extend:   what a write through it leaves in the part of its bank `reach` names, unless the write states otherwise. never UNSTATED
 # reach:    the part of its bank past its footprint a write's extension reaches
 pub rec Register {
@@ -230,16 +230,20 @@ pub rec Column {
     numbered: index.Numbers;
 }
 
-# a register file: its scales, classes, registers, aliases and debug columns
+# a register file: its quantities and the slots that bind them, classes, registers, aliases and debug columns
 # ---
+# quantities:  the quantities its widths and footprints scale with
+# bindings:    which quantity each slot binds under which requirement, every slot below slot_count bound by one at least
+# slot_count:  how many slots a scaled amount may name
 # class_names: the classes by name, one entry per class
 # registers:   the register rows in ascending order of identity, so a row is found by binary search of the rows
 # names:       the registers by spelling, one entry per register row and per alias. an entry's row is the register's own row, or the
 #              register count plus the alias's index
 # columns:     the debug columns in ascending order of format, one per format
 pub rec File {
-    scales:         *quantity.Scale;
-    scale_count:    u32;
+    quantities:     quantity.Quantities;
+    bindings:       quantity.Bindings;
+    slot_count:     u32;
     classes:        *Class;
     class_count:    u32;
     class_names:    index.Index;
@@ -384,39 +388,36 @@ pub fun from_debug_number(file: *File, number: u32, format: Format) opt[Id] {
     ret opt[Id].some{id_of(?file.registers[at.some])};
 }
 
-# whether the selection admits the register `row`. the one availability
-# predicate: a selection's view is built from it, so the parser, the encoder,
-# decode and the instruction api all read its answer
-pub fun admits(s: *extension.Selection, row: *Register) bool {
-    ret extension.admits(s, row.requires);
-}
-
-# a selection's view of a register file: the rows it admits and the scales it fixes
+# a context's view of a register file: the rows it admits, the quantity each slot binds and the range each quantity
+# resolves to, which `masc.core.state.select` makes
 # ---
-# file:        the file, nil for a set with none, whose view then holds nothing
-# selection:   the selection the view filters by
-# allocator:   the allocator the view's storage came from
-# rows:        one bit per register row, set when the selection admits it
-# multipliers: one multiplier per scale of the file, 0 when no extension of the selection fixes it
+# file:      the file, nil for a set with none, whose view then holds nothing
+# allocator: the allocator the view's storage came from
+# rows:      one bit per register row, set when the context admits it
+# bound:     per slot, the index of the quantity it binds, quantity.UNBOUND when no binding holds
+# ranges:    per quantity, the multipliers every bound that holds leaves, never empty
 pub rec Available {
-    file:        *File;
-    selection:   *extension.Selection;
-    allocator:   *A.Allocator;
-    rows:        bitset.Bitset;
-    multipliers: *u32;
+    file:      *File;
+    allocator: *A.Allocator;
+    rows:      bitset.Bitset;
+    bound:     *u8;
+    ranges:    *quantity.Range;
 }
 
 # why a view was not made
 # ---
 # memory: the allocator refused the view's storage
+# empty:  the bounds that hold leave this quantity no multiplier, as a selection whose extensions state two vector lengths
 pub tag Error: u8 {
     memory: A.Error;
+    empty:  u8;
 }
 
-# a register named that the selection does not admit
+# a register named that the context does not admit
 # ---
 # row:      its row
-# requires: the requirement the selection leaves unmet, rendered by `extension.spell_requirement`
+# requires: its requirement, which the context leaves unmet or whose class does not number it under the context, rendered
+#           by `masc.core.state.spell_requirement`
 pub rec Unavailable {
     row:      *Register;
     requires: requirement.Requirement;
@@ -425,50 +426,64 @@ pub rec Unavailable {
 # why a view refused a register
 # ---
 # unknown:     no row of the file is it or spells it
-# unavailable: its row's condition is unmet by the selection
+# unavailable: its row's condition is unmet by the context
 pub tag Absent: u8 {
     unknown;
     unavailable: Unavailable;
 }
 
-# the view of `file` through the selection `s`, which must outlive it
-# ---
-# ret: the view, or why it was not made
-pub fun select(a: *A.Allocator, file: *File, s: *extension.Selection) res[Available, Error] {
-    var count:  u32 = 0;
-    var scales: u32 = 0;
+# a view of `file` admitting no row, every slot unbound and every quantity across its domain, which the context it is
+# made for fills in
+pub fun blank(a: *A.Allocator, file: *File) res[Available, Error] {
+    var count:      u32 = 0;
+    var slots:      u32 = 0;
+    var quantities: u32 = 0;
     if (file != nil) {
-        count  = file.register_count;
-        scales = file.scale_count;
+        count      = file.register_count;
+        slots      = file.slot_count;
+        quantities = file.quantities.len;
     }
     val made: res[bitset.Bitset, A.Error] = bitset.init(a, count::usize);
     if (sel made.err) { ret res[Available, Error].err{Error.memory{made.err}}; }
-    var v: Available = Available{file: file, selection: s, allocator: a, rows: made.ok, multipliers: nil};
-    if (scales != 0) {
-        val kept: res[*u32, A.Error] = A.zallocate[u32](a, scales::usize);
+    var v: Available = Available{file: file, allocator: a, rows: made.ok, bound: nil, ranges: nil};
+    if (slots != 0) {
+        val kept: res[*u8, A.Error] = A.allocate[u8](a, slots::usize);
         if (sel kept.err) {
             bitset.dnit(?v.rows);
             ret res[Available, Error].err{Error.memory{kept.err}};
         }
-        v.multipliers = kept.ok;
+        v.bound = kept.ok;
+        var k: u32 = 0;
+        for (k < slots) {
+            v.bound[k] = quantity.UNBOUND;
+            k          = k + 1;
+        }
     }
-    var k: u32 = 0;
-    for (k < scales) {
-        val fixed: opt[u32] = quantity.resolve(?file.scales[k], s);
-        if (sel fixed.some) { v.multipliers[k] = fixed.some; }
-        k = k + 1;
-    }
-    var i: u32 = 0;
-    for (i < count) {
-        if (admits(s, ?file.registers[i])) { bitset.set(?v.rows, i::usize); }
-        i = i + 1;
+    if (quantities != 0) {
+        val kept: res[*quantity.Range, A.Error] = A.allocate[quantity.Range](a, quantities::usize);
+        if (sel kept.err) {
+            release(?v);
+            ret res[Available, Error].err{Error.memory{kept.err}};
+        }
+        v.ranges = kept.ok;
+        var q: u32 = 0;
+        for (q < quantities) {
+            v.ranges[q] = quantity.span(file.quantities.at[q].domain);
+            q           = q + 1;
+        }
     }
     ret res[Available, Error].ok{v};
 }
 
+# row `row` of the file admitted by the view, which only the context making it sets
+pub fun admit(v: *Available, row: u32) {
+    bitset.set(?v.rows, row::usize);
+}
+
 # release a view's storage
 pub fun release(v: *Available) err[A.Error] {
-    if (v.multipliers != nil) { A.deallocate[u32](v.allocator, v.multipliers, v.file.scale_count::usize); }
+    if (v.bound != nil)  { A.deallocate[u8](v.allocator, v.bound, v.file.slot_count::usize); }
+    if (v.ranges != nil) { A.deallocate[quantity.Range](v.allocator, v.ranges, v.file.quantities.len::usize); }
     ret bitset.dnit(?v.rows);
 }
 
@@ -484,15 +499,6 @@ pub fun admitted(v: *Available, reg: Id) err[Absent] {
     ret err[Absent].err{Absent.unavailable{Unavailable{row: row, requires: row.requires}}};
 }
 
-# why `u` was refused spelled onto `out`: the register's name, then its requirement as the one renderer words it
-pub fun spell(v: *Available, u: *Unavailable, out: *vector.Vector[u8]) err[A.Error] {
-    val named: err[A.Error] = extension.append(out, u.row.name);
-    if (sel named.err) { ret named; }
-    val gap: err[A.Error] = extension.append(out, " ");
-    if (sel gap.err) { ret gap; }
-    ret extension.spell_requirement(v.selection, u.requires, out);
-}
-
 # the register spelled exactly `name` through the view, by its name or one of its aliases
 # ---
 # ret: the register, or why the view refuses the name
@@ -505,13 +511,37 @@ pub fun lookup(v: *Available, name: View) res[Id, Absent] {
     ret res[Id, Absent].ok{found.some};
 }
 
-# the multiplier the selection fixes for scale `scale`, none when no extension of
-# it does or the file has no such scale
-pub fun multiplier(v: *Available, scale: u8) opt[u32] {
-    if (v.file == nil || scale::u32 >= v.file.scale_count) { ret opt[u32].none{}; }
-    val m: u32 = v.multipliers[scale];
-    if (m == 0) { ret opt[u32].none{}; }
-    ret opt[u32].some{m};
+# the quantity slot `slot` binds through the view, none when no binding of it holds or the file has no such slot
+pub fun bound(v: *Available, slot: u8) opt[u8] {
+    if (v.file == nil || slot::u32 >= v.file.slot_count) { ret opt[u8].none{}; }
+    if (v.bound[slot] == quantity.UNBOUND)               { ret opt[u8].none{}; }
+    ret opt[u8].some{v.bound[slot]};
+}
+
+# the multipliers quantity `q` of the file resolves to through the view, its whole domain for a quantity the file has not
+pub fun range(v: *Available, q: u8) quantity.Range {
+    if (v.file == nil || q::u32 >= v.file.quantities.len) { ret quantity.Range{least: 1, most: 1}; }
+    ret v.ranges[q];
+}
+
+# the multiplier the slot `slot` resolves to through the view: its bound quantity's when the context fixes it, none when
+# the context leaves a choice to the implementation, binds no quantity or the file has no such slot
+pub fun multiplier(v: *Available, slot: u8) opt[u32] {
+    val q: opt[u8] = bound(v, slot);
+    if (sel q.none) { ret opt[u32].none{}; }
+    val r: quantity.Range = v.ranges[q.some];
+    if (r.least != r.most) { ret opt[u32].none{}; }
+    ret opt[u32].some{r.least};
+}
+
+# the most members the class `class` of `file` has through the view: its count at the largest multiplier its slot's
+# quantity resolves to, or at the slot's largest legal multiplier when no binding of it holds
+pub fun members(v: *Available, class: u16) u64 {
+    val count: quantity.Scaled = v.file.classes[class].count;
+    if (count.per == 0) { ret count.fixed::u64; }
+    val q: opt[u8] = bound(v, count.scale);
+    if (sel q.some) { ret quantity.at(count, v.ranges[q.some].most::u64); }
+    ret quantity.at(count, slot_most(v.file, opt[u8].some{count.scale}));
 }
 
 # the bits of each member of the class of `reg` through the view
@@ -546,10 +576,44 @@ fun scale_of(file: *File, row: *Register) opt[u8] {
     ret opt[u8].none{};
 }
 
-# the largest multiplier of a scale, 1 for a fixed footprint
-fun scale_max(file: *File, scale: opt[u8]) u64 {
-    if (sel scale.some) { ret file.scales[scale.some].max::u64; }
-    ret 1;
+# the least legal multiplier of slot `slot` past `m` among the quantities it may bind, 0 when none is, as no multiplier
+# is 0. a fixed footprint, no slot, has the one multiplier 1. 0 starts at the first
+pub fun slot_next(file: *File, slot: opt[u8], m: u64) u64 {
+    if (sel slot.some) {
+        var best: u64 = 0;
+        var i:    u32 = 0;
+        for (i < file.bindings.len) {
+            val b: *quantity.Binding = ?file.bindings.at[i];
+            if (b.slot == slot.some && b.quantity::u32 < file.quantities.len) {
+                val n: opt[u64] = quantity.next(file.quantities.at[b.quantity].domain, m);
+                if (sel n.some) {
+                    if (best == 0 || n.some < best) { best = n.some; }
+                }
+            }
+            i = i + 1;
+        }
+        ret best;
+    }
+    if (m == 0) { ret 1; }
+    ret 0;
+}
+
+# the largest legal multiplier of slot `slot`, 1 for a fixed footprint or a slot binding nothing
+pub fun slot_most(file: *File, slot: opt[u8]) u64 {
+    var most: u64 = 1;
+    var m:    u64 = slot_next(file, slot, 0);
+    for (m != 0) {
+        most = m;
+        m    = slot_next(file, slot, m);
+    }
+    ret most;
+}
+
+# the most members class `class` of `file` has at any legal multiplier of its count's slot
+pub fun count_most(file: *File, class: u16) u64 {
+    val count: quantity.Scaled = file.classes[class].count;
+    if (count.per == 0) { ret count.fixed::u64; }
+    ret quantity.at(count, slot_most(file, opt[u8].some{count.scale}));
 }
 
 # the pieces of a register or a part at one multiplier and place, which is the one storage rule overlap, within and
@@ -646,14 +710,14 @@ fun meets(file: *File, a: *Register, b: *Register, part: opt[Part]) bool {
     if (sel sa.some) {
         if (sel sb.some) { same = sa.some == sb.some; }
     }
-    var ma: u64 = 1;
-    for (ma <= scale_max(file, sa)) {
-        var mb: u64 = 1;
-        for (mb <= scale_max(file, sb)) {
+    var ma: u64 = slot_next(file, sa, 0);
+    for (ma != 0) {
+        var mb: u64 = slot_next(file, sb, 0);
+        for (mb != 0) {
             if ((!same || ma == mb) && intersect(file, a, ma, b, mb, part)) { ret true; }
-            mb = mb * 2;
+            mb = slot_next(file, sb, mb);
         }
-        ma = ma * 2;
+        ma = slot_next(file, sa, ma);
     }
     ret false;
 }
@@ -789,14 +853,14 @@ fun inside(file: *File, part: *Register, whole: *Register, reach: opt[Part]) boo
     if (sel sp.some) {
         if (sel sw.some) { same = sp.some == sw.some; }
     }
-    var mp: u64 = 1;
-    for (mp <= scale_max(file, sp)) {
-        var mw: u64 = 1;
-        for (mw <= scale_max(file, sw)) {
+    var mp: u64 = slot_next(file, sp, 0);
+    for (mp != 0) {
+        var mw: u64 = slot_next(file, sw, 0);
+        for (mw != 0) {
             if ((!same || mp == mw) && !lies_in(file, part, mp, whole, mw, reach)) { ret false; }
-            mw = mw * 2;
+            mw = slot_next(file, sw, mw);
         }
-        mp = mp * 2;
+        mp = slot_next(file, sp, mp);
     }
     ret true;
 }
@@ -842,19 +906,15 @@ pub fun contained(file: *File, row: *Register) bool {
     ret false;
 }
 
-# the legal multipliers of the scale of `row`, 1, 2 and so on to its max, as `m` steps through them
-fun legal(file: *File, row: *Register, m: u64) bool {
-    ret m <= scale_max(file, scale_of(file, row));
-}
-
 # whether row `row` of `file` has at least one place at every legal multiplier, and its places lie apart wherever it has
 # more than one. only the registration check asks it
 pub fun placed_apart(file: *File, row: *Register) bool {
-    var m: u64 = 1;
-    for (legal(file, row, m)) {
+    val slot: opt[u8] = scale_of(file, row);
+    var m:    u64     = slot_next(file, slot, 0);
+    for (m != 0) {
         val n: u64 = places_at(row, m);
         if (n == 0 || (n > 1 && quantity.at(row.places.step, m) == 0)) { ret false; }
-        m = m * 2;
+        m = slot_next(file, slot, m);
     }
     ret true;
 }
@@ -863,16 +923,17 @@ pub fun placed_apart(file: *File, row: *Register) bool {
 # lies clear of the row's own footprint at every place. only the registration check asks it
 pub fun reach_clear(file: *File, row: *Register) bool {
     if (sel row.reach.bank) { ret true; }
-    val p: Part = row.reach.part;
-    var m: u64  = 1;
-    for (legal(file, row, m)) {
+    val p:    Part    = row.reach.part;
+    val slot: opt[u8] = scale_of(file, row);
+    var m:    u64     = slot_next(file, slot, 0);
+    for (m != 0) {
         var k: u64 = 0;
         for (k < places_at(row, m)) {
             val rest: Pieces = part_pieces(row, p, m, k);
             if (rest.width == 0 || rest.count == 0 || meet(pieces(file, row, m, k), rest)) { ret false; }
             k = k + 1;
         }
-        m = m * 2;
+        m = slot_next(file, slot, m);
     }
     ret true;
 }
@@ -880,15 +941,15 @@ pub fun reach_clear(file: *File, row: *Register) bool {
 # slices of the x86-64, risc-v and aarch64 files for the tests below
 #[testing]
 val X86_CLASSES: [9]Class = [9]Class{
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 16, per: 0, scale: 0}, count: 32},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 8, per: 0, scale: 0}, count: 32},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 8, per: 0, scale: 0}, count: 8},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 32, per: 0, scale: 0}, count: 32},
-    Class{kind: VECTOR, width: quantity.Scaled{fixed: 128, per: 0, scale: 0}, count: 32},
-    Class{kind: VECTOR, width: quantity.Scaled{fixed: 256, per: 0, scale: 0}, count: 32},
-    Class{kind: FLOAT, width: quantity.Scaled{fixed: 80, per: 0, scale: 0}, count: 8},
-    Class{kind: VECTOR, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: 8},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 16, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 8, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 8, per: 0, scale: 0}, count: quantity.Scaled{fixed: 8, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 32, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: VECTOR, width: quantity.Scaled{fixed: 128, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: VECTOR, width: quantity.Scaled{fixed: 256, per: 0, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: FLOAT, width: quantity.Scaled{fixed: 80, per: 0, scale: 0}, count: quantity.Scaled{fixed: 8, per: 0, scale: 0}},
+    Class{kind: VECTOR, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: quantity.Scaled{fixed: 8, per: 0, scale: 0}},
 };
 
 # the eight physical x87 registers lie 128 bits apart in one bank, so mm3 is bits 0 to 63 of the fourth. st(i) is named
@@ -957,8 +1018,9 @@ val X86_NAMES: [12]index.Entry = [12]index.Entry{
 
 #[testing]
 val X86: File = File{
-    scales:         nil,
-    scale_count:    0,
+    quantities:     quantity.NO_QUANTITIES,
+    bindings:       quantity.NO_BINDINGS,
+    slot_count:     0,
     classes:        ?X86_CLASSES[0],
     class_count:    9,
     class_names:    index.NO_ENTRIES,
@@ -973,42 +1035,105 @@ val X86: File = File{
 
 # rv32 and rv64 fix xlen at 1 and 2, and rv128 would fix it at 4. f, d and q fix flen at 1, 2 and 4
 #[testing]
-val RISCV_XLEN: [2]quantity.Fixing = [2]quantity.Fixing{
-    quantity.Fixing{by: 2, multiplier: 1},
-    quantity.Fixing{by: 3, multiplier: 2},
+val RISCV_D: [1]requirement.Id = [1]requirement.Id{5};
+
+#[testing]
+val RISCV_F: [1]requirement.Id = [1]requirement.Id{4};
+
+#[testing]
+val RISCV_BASES: [7]extension.Extension = [7]extension.Extension{
+    extension.Extension{name: "i", implies: requirement.NO_IDS, revision: "2.1"},
+    extension.Extension{name: "e", implies: requirement.NO_IDS, revision: "2.0"},
+    extension.Extension{name: "rv32", implies: requirement.NO_IDS, revision: "2.1"},
+    extension.Extension{name: "rv64", implies: requirement.NO_IDS, revision: "2.1"},
+    extension.Extension{name: "f", implies: requirement.NO_IDS, revision: "2.2"},
+    extension.Extension{name: "d", implies: requirement.Ids{at: ?RISCV_F[0], len: 1}, revision: "2.2"},
+    extension.Extension{name: "q", implies: requirement.Ids{at: ?RISCV_D[0], len: 1}, revision: "2.2"},
 };
 
 #[testing]
-val RISCV_FLEN: [3]quantity.Fixing = [3]quantity.Fixing{
-    quantity.Fixing{by: 4, multiplier: 1},
-    quantity.Fixing{by: 5, multiplier: 2},
-    quantity.Fixing{by: 6, multiplier: 4},
+val RISCV_BASE_CONFLICT: [2]extension.Conflict = [2]extension.Conflict{extension.Conflict{a: 0, b: 1}, extension.Conflict{a: 2, b: 3}};
+
+#[testing]
+val RISCV_NAMES_BY_SPELLING: [7]index.Entry = [7]index.Entry{
+    index.Entry{key: "d", row: 5},
+    index.Entry{key: "e", row: 1},
+    index.Entry{key: "f", row: 4},
+    index.Entry{key: "i", row: 0},
+    index.Entry{key: "q", row: 6},
+    index.Entry{key: "rv32", row: 2},
+    index.Entry{key: "rv64", row: 3},
 };
 
 #[testing]
-val RISCV_SCALES: [3]quantity.Scale = [3]quantity.Scale{
-    quantity.Scale{name: "xlen", max: 4, fixes: quantity.Fixings{at: ?RISCV_XLEN[0], len: 2}},
-    quantity.Scale{name: "flen", max: 4, fixes: quantity.Fixings{at: ?RISCV_FLEN[0], len: 3}},
-    quantity.Scale{name: "vlen", max: 8, fixes: quantity.NO_FIXINGS},
+pub val RISCV_CATALOG: extension.Catalog = extension.Catalog{extensions: ?RISCV_BASES[0], count: 7, levels: nil, level_count: 0, names: index.Index{at: ?RISCV_NAMES_BY_SPELLING[0], len: 7}, conflicts: ?RISCV_BASE_CONFLICT[0], conflict_count: 2, combinations: nil, combination_count: 0, syntax: ?extension.LIST};
+
+# xlen is 32 or 64 bits by rv32 or rv64, and flen the widest of f, d and q held, which a bound states as the range
+# of one multiplier where its format is held and no wider one is
+#[testing]
+val RISCV_RV32: [1]requirement.Id = [1]requirement.Id{2};
+#[testing]
+val RISCV_RV64: [1]requirement.Id = [1]requirement.Id{3};
+#[testing]
+val RISCV_Q:    [1]requirement.Id = [1]requirement.Id{6};
+
+#[testing]
+val RISCV_XLEN_WHEN: [2]requirement.Alternative = [2]requirement.Alternative{
+    requirement.Alternative{all: requirement.Ids{at: ?RISCV_RV32[0], len: 1}, none: requirement.NO_IDS},
+    requirement.Alternative{all: requirement.Ids{at: ?RISCV_RV64[0], len: 1}, none: requirement.NO_IDS},
+};
+
+#[testing]
+val RISCV_FLEN_WHEN: [3]requirement.Alternative = [3]requirement.Alternative{
+    requirement.Alternative{all: requirement.Ids{at: ?RISCV_F[0], len: 1}, none: requirement.Ids{at: ?RISCV_D[0], len: 1}},
+    requirement.Alternative{all: requirement.Ids{at: ?RISCV_D[0], len: 1}, none: requirement.Ids{at: ?RISCV_Q[0], len: 1}},
+    requirement.Alternative{all: requirement.Ids{at: ?RISCV_Q[0], len: 1}, none: requirement.NO_IDS},
+};
+
+#[testing]
+val RISCV_XLEN_BOUNDS: [2]quantity.Bound = [2]quantity.Bound{
+    quantity.Bound{when: requirement.Requirement{at: ?RISCV_XLEN_WHEN[0], len: 1}, least: 1, most: 1},
+    quantity.Bound{when: requirement.Requirement{at: ?RISCV_XLEN_WHEN[1], len: 1}, least: 2, most: 2},
+};
+
+#[testing]
+val RISCV_FLEN_BOUNDS: [3]quantity.Bound = [3]quantity.Bound{
+    quantity.Bound{when: requirement.Requirement{at: ?RISCV_FLEN_WHEN[0], len: 1}, least: 1, most: 1},
+    quantity.Bound{when: requirement.Requirement{at: ?RISCV_FLEN_WHEN[1], len: 1}, least: 2, most: 2},
+    quantity.Bound{when: requirement.Requirement{at: ?RISCV_FLEN_WHEN[2], len: 1}, least: 4, most: 4},
+};
+
+#[testing]
+val RISCV_QUANTITIES: [3]quantity.Quantity = [3]quantity.Quantity{
+    quantity.Quantity{name: "xlen", unit: 32, domain: quantity.Domain.powers{quantity.Range{least: 1, most: 4}}, bounds: quantity.Bounds{at: ?RISCV_XLEN_BOUNDS[0], len: 2}, register: quantity.NO_ROW},
+    quantity.Quantity{name: "flen", unit: 32, domain: quantity.Domain.powers{quantity.Range{least: 1, most: 4}}, bounds: quantity.Bounds{at: ?RISCV_FLEN_BOUNDS[0], len: 3}, register: quantity.NO_ROW},
+    quantity.Quantity{name: "vlen", unit: 32, domain: quantity.Domain.powers{quantity.Range{least: 1, most: 8}}, bounds: quantity.NO_BOUNDS, register: quantity.NO_ROW},
+};
+
+#[testing]
+val RISCV_BINDINGS: [3]quantity.Binding = [3]quantity.Binding{
+    quantity.Binding{slot: 0, when: requirement.NO_ALTERNATIVES, quantity: 0},
+    quantity.Binding{slot: 1, when: requirement.NO_ALTERNATIVES, quantity: 1},
+    quantity.Binding{slot: 2, when: requirement.NO_ALTERNATIVES, quantity: 2},
 };
 
 #[testing]
 val RISCV_CLASSES: [5]Class = [5]Class{
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 0, per: 32, scale: 0}, count: 32},
-    Class{kind: FLOAT, width: quantity.Scaled{fixed: 0, per: 32, scale: 1}, count: 32},
-    Class{kind: VECTOR, width: quantity.Scaled{fixed: 0, per: 32, scale: 2}, count: 32},
-    Class{kind: VECTOR, width: quantity.Scaled{fixed: 0, per: 32, scale: 2}, count: 8},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 0, per: 32, scale: 0}, count: 16},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 0, per: 32, scale: 0}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: FLOAT, width: quantity.Scaled{fixed: 0, per: 32, scale: 1}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: VECTOR, width: quantity.Scaled{fixed: 0, per: 32, scale: 2}, count: quantity.Scaled{fixed: 32, per: 0, scale: 0}},
+    Class{kind: VECTOR, width: quantity.Scaled{fixed: 0, per: 32, scale: 2}, count: quantity.Scaled{fixed: 8, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 0, per: 32, scale: 0}, count: quantity.Scaled{fixed: 16, per: 0, scale: 0}},
 };
 
 # x16 exists only with the i base, which the e base conflicts with
 #[testing]
-val RISCV_I:     [1]requirement.Id  = [1]requirement.Id{0};
+val RISCV_I:     [1]requirement.Id          = [1]requirement.Id{0};
 #[testing]
-val RISCV_I_ALT: [1]requirement.Ids = [1]requirement.Ids{requirement.Ids{at: ?RISCV_I[0], len: 1}};
+val RISCV_I_ALT: [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?RISCV_I[0], len: 1}, none: requirement.NO_IDS}};
 
 #[testing]
-val RISCV_REGISTERS: [10]Register = [10]Register{
+pub val RISCV_REGISTERS: [10]Register = [10]Register{
     Register{name: "x0", class: 0, number: 0, bank: 0, offset: quantity.Scaled{fixed: 0, per: 0, scale: 0}, stride: quantity.Scaled{fixed: 0, per: 0, scale: 0}, count: quantity.Scaled{fixed: 1, per: 0, scale: 0}, places: ONE_PLACE, flags: ZERO, requires: requirement.NO_ALTERNATIVES, extend: KEEP, reach: Reach.bank{}},
     Register{name: "x2", class: 0, number: 2, bank: 2, offset: quantity.Scaled{fixed: 0, per: 0, scale: 0}, stride: quantity.Scaled{fixed: 0, per: 0, scale: 0}, count: quantity.Scaled{fixed: 1, per: 0, scale: 0}, places: ONE_PLACE, flags: STACK, requires: requirement.NO_ALTERNATIVES, extend: KEEP, reach: Reach.bank{}},
     Register{name: "x8", class: 0, number: 8, bank: 8, offset: quantity.Scaled{fixed: 0, per: 0, scale: 0}, stride: quantity.Scaled{fixed: 0, per: 0, scale: 0}, count: quantity.Scaled{fixed: 1, per: 0, scale: 0}, places: ONE_PLACE, flags: 0, requires: requirement.NO_ALTERNATIVES, extend: KEEP, reach: Reach.bank{}},
@@ -1049,9 +1174,10 @@ val RISCV_NAMES: [14]index.Entry = [14]index.Entry{
 };
 
 #[testing]
-val RISCV: File = File{
-    scales:         ?RISCV_SCALES[0],
-    scale_count:    3,
+pub val RISCV: File = File{
+    quantities:     quantity.Quantities{at: ?RISCV_QUANTITIES[0], len: 3},
+    bindings:       quantity.Bindings{at: ?RISCV_BINDINGS[0], len: 3},
+    slot_count:     3,
     classes:        ?RISCV_CLASSES[0],
     class_count:    5,
     class_names:    index.NO_ENTRIES,
@@ -1065,17 +1191,20 @@ val RISCV: File = File{
 };
 
 #[testing]
-val AARCH64_SCALES: [1]quantity.Scale = [1]quantity.Scale{
-    quantity.Scale{name: "svl", max: 16, fixes: quantity.NO_FIXINGS},
+val AARCH64_QUANTITIES: [1]quantity.Quantity = [1]quantity.Quantity{
+    quantity.Quantity{name: "svl", unit: 128, domain: quantity.Domain.powers{quantity.Range{least: 1, most: 16}}, bounds: quantity.NO_BOUNDS, register: quantity.NO_ROW},
 };
+
+#[testing]
+val AARCH64_BINDINGS: [1]quantity.Binding = [1]quantity.Binding{quantity.Binding{slot: 0, when: requirement.NO_ALTERNATIVES, quantity: 0}};
 
 # za has svl / 8 rows of svl bits, and zan.d takes every eighth row from row n. w0 zeroes the rest of x0
 #[testing]
 val AARCH64_CLASSES: [4]Class = [4]Class{
-    Class{kind: TILE, width: quantity.Scaled{fixed: 0, per: 128, scale: 0}, count: 1},
-    Class{kind: TILE, width: quantity.Scaled{fixed: 0, per: 128, scale: 0}, count: 8},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: 31},
-    Class{kind: GENERAL, width: quantity.Scaled{fixed: 32, per: 0, scale: 0}, count: 31},
+    Class{kind: TILE, width: quantity.Scaled{fixed: 0, per: 128, scale: 0}, count: quantity.Scaled{fixed: 1, per: 0, scale: 0}},
+    Class{kind: TILE, width: quantity.Scaled{fixed: 0, per: 128, scale: 0}, count: quantity.Scaled{fixed: 8, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 64, per: 0, scale: 0}, count: quantity.Scaled{fixed: 31, per: 0, scale: 0}},
+    Class{kind: GENERAL, width: quantity.Scaled{fixed: 32, per: 0, scale: 0}, count: quantity.Scaled{fixed: 31, per: 0, scale: 0}},
 };
 
 #[testing]
@@ -1089,8 +1218,9 @@ val AARCH64_REGISTERS: [5]Register = [5]Register{
 
 #[testing]
 val AARCH64: File = File{
-    scales:         ?AARCH64_SCALES[0],
-    scale_count:    1,
+    quantities:     quantity.Quantities{at: ?AARCH64_QUANTITIES[0], len: 1},
+    bindings:       quantity.Bindings{at: ?AARCH64_BINDINGS[0], len: 1},
+    slot_count:     1,
     classes:        ?AARCH64_CLASSES[0],
     class_count:    4,
     class_names:    index.NO_ENTRIES,
@@ -1111,107 +1241,6 @@ test named__name_and_alias_reach_one_id {
     if (!sel s0.some)                                                      { ret 2; }
     if (!sel fp.some)                                                      { ret 3; }
     if (x8.some != make(0, 8) || s0.some != x8.some || fp.some != x8.some) { ret 4; }
-    ret 0;
-}
-
-#[testing]
-val RISCV_D: [1]requirement.Id = [1]requirement.Id{5};
-
-#[testing]
-val RISCV_F: [1]requirement.Id = [1]requirement.Id{4};
-
-#[testing]
-val RISCV_BASES: [7]extension.Extension = [7]extension.Extension{
-    extension.Extension{name: "i", implies: requirement.NO_IDS, revision: "2.1"},
-    extension.Extension{name: "e", implies: requirement.NO_IDS, revision: "2.0"},
-    extension.Extension{name: "rv32", implies: requirement.NO_IDS, revision: "2.1"},
-    extension.Extension{name: "rv64", implies: requirement.NO_IDS, revision: "2.1"},
-    extension.Extension{name: "f", implies: requirement.NO_IDS, revision: "2.2"},
-    extension.Extension{name: "d", implies: requirement.Ids{at: ?RISCV_F[0], len: 1}, revision: "2.2"},
-    extension.Extension{name: "q", implies: requirement.Ids{at: ?RISCV_D[0], len: 1}, revision: "2.2"},
-};
-
-#[testing]
-val RISCV_BASE_CONFLICT: [2]extension.Conflict = [2]extension.Conflict{extension.Conflict{a: 0, b: 1}, extension.Conflict{a: 2, b: 3}};
-
-#[testing]
-val RISCV_NAMES_BY_SPELLING: [7]index.Entry = [7]index.Entry{
-    index.Entry{key: "d", row: 5},
-    index.Entry{key: "e", row: 1},
-    index.Entry{key: "f", row: 4},
-    index.Entry{key: "i", row: 0},
-    index.Entry{key: "q", row: 6},
-    index.Entry{key: "rv32", row: 2},
-    index.Entry{key: "rv64", row: 3},
-};
-
-#[testing]
-val RISCV_CATALOG: extension.Catalog = extension.Catalog{extensions: ?RISCV_BASES[0], count: 7, levels: nil, level_count: 0, names: index.Index{at: ?RISCV_NAMES_BY_SPELLING[0], len: 7}, conflicts: ?RISCV_BASE_CONFLICT[0], conflict_count: 2, combinations: nil, combination_count: 0, syntax: ?extension.LIST};
-
-test lookup__an_unavailable_register_is_refused_naming_every_alternative {
-    var t: testing.Testing;
-    testing.make(?t);
-    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t), ?RISCV_CATALOG, "e", diagnostic.START);
-    if (sel made.err) { ret 1; }
-    var s:      extension.Selection   = made.ok;
-    val viewed: res[Available, Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
-    if (sel viewed.err) { ret 2; }
-    var v:   Available       = viewed.ok;
-    val x16: res[Id, Absent] = lookup(?v, view("x16", 3));
-    if (sel x16.ok)                                                                     { ret 3; }
-    if (!(sel x16.err.unavailable && (x16.err.unavailable.row == ?RISCV_REGISTERS[4]))) { ret 4; }
-    var u: Unavailable;
-    if (sel x16.err.unavailable) { u = x16.err.unavailable; }
-    var out:    vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t));
-    val worded: err[A.Error]      = spell(?v, ?u, ?out);
-    if (sel worded.err || !extension.t_spelled(?out, "x16 needs i")) { ret 7; }
-    vector.dnit[u8](?out);
-    val f_q:    [2]requirement.Id  = [2]requirement.Id{4, 6};
-    val either: [2]requirement.Ids = [2]requirement.Ids{requirement.Ids{at: ?RISCV_I[0], len: 1}, requirement.Ids{at: ?f_q[0], len: 2}};
-    var two:    Unavailable        = u;
-    two.requires = requirement.Requirement{at: ?either[0], len: 2};
-    out          = vector.init[u8](testing.allocator_of(?t));
-    val both: err[A.Error] = spell(?v, ?two, ?out);
-    if (sel both.err || !extension.t_spelled(?out, "x16 needs i, or f and q")) { ret 8; }
-    vector.dnit[u8](?out);
-    val s0: res[Id, Absent] = lookup(?v, view("s0", 2));
-    if (!(sel s0.ok && s0.ok == make(0, 8))) { ret 5; }
-    release(?v);
-    extension.release(?s);
-    if (testing.live_count(?t) != 0) { ret 6; }
-    ret 0;
-}
-
-# the width of the register `reg` under the selection `spelling`, in `bits` when known
-#[testing]
-fun t_width(spelling: str, reg: Id, known: *bool, bits: *u64) u8 {
-    var t: testing.Testing;
-    testing.make(?t);
-    val made: res[extension.Selection, extension.Error] = extension.select(testing.allocator_of(?t), ?RISCV_CATALOG, spelling, diagnostic.START);
-    if (sel made.err) { ret 1; }
-    var s:      extension.Selection   = made.ok;
-    val viewed: res[Available, Error] = select(testing.allocator_of(?t), ?RISCV, ?s);
-    if (sel viewed.err) { ret 2; }
-    var v:    Available             = viewed.ok;
-    val read: res[opt[u64], Absent] = width(?v, reg);
-    if (sel read.err) { ret 3; }
-    @known = sel read.ok.some;
-    if (sel read.ok.some) { @bits = read.ok.some; }
-    release(?v);
-    extension.release(?s);
-    if (testing.live_count(?t) != 0) { ret 4; }
-    ret 0;
-}
-
-test width__resolves_where_an_extension_fixes_the_scale_and_nested_fixings_take_the_largest {
-    var known: bool = false;
-    var bits:  u64  = 0;
-    if (t_width("i,rv32", make(0, 0), ?known, ?bits) != 0 || !known || bits != 32)    { ret 1; }
-    if (t_width("i,rv64", make(0, 0), ?known, ?bits) != 0 || !known || bits != 64)    { ret 2; }
-    if (t_width("i", make(0, 0), ?known, ?bits) != 0 || known)                        { ret 3; }
-    if (t_width("i,rv64,f", make(1, 0), ?known, ?bits) != 0 || !known || bits != 32)  { ret 4; }
-    if (t_width("i,rv64,d", make(1, 0), ?known, ?bits) != 0 || !known || bits != 64)  { ret 5; }
-    if (t_width("i,rv64,q", make(1, 0), ?known, ?bits) != 0 || !known || bits != 128) { ret 6; }
     ret 0;
 }
 
