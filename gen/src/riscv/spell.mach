@@ -55,6 +55,7 @@ pub val ALONE:         str = "trailing modifier with no operand before it";
 pub val SUFFIXED:      str = "row has more suffix operands than the dialect places";
 pub val BAD_EXCLUSION: str = "dialect exclusion names no respelling's argument, or an operand that is neither a register nor an immediate";
 pub val UNSTATED:      str = "respelling's record excludes a value its base operand admits that the dialect does not state";
+pub val CONFLICT:      str = "respelling's record fixes a bit its base row fixes to the other value";
 
 # what an operand is in a template
 # ---
@@ -771,8 +772,8 @@ fun excluded_of(s: *Spell, p: *mapping.Respelling, d: *dialect.Respell, items: *
         if (sel arg.err) { ret err[diag.Refusal].err{memory()}; }
         val o: *mapping.Operand = ?p.row.operands.data[items[k].op];
         var i: u32              = 0;
-        for (i < dialect.EXCLUSIONS_COUNT) {
-            val x: *dialect.Exclusion = ?dialect.EXCLUSIONS[i];
+        for (i < dialect.EXCLUSIONS.len) {
+            val x: *dialect.Exclusion = ?dialect.EXCLUSIONS.at[i];
             if (overlay.matches(x.name, p.name) && str_equals(x.arg, arg.ok)) {
                 val held: bool = o.use == overlay.REGISTER || o.use == overlay.SREG;
                 if (!held && o.use != overlay.IMMEDIATE)                                                   { ret refuse(r, BAD_EXCLUSION, p.name); }
@@ -798,8 +799,9 @@ fun alias_of(s: *Spell, p: *mapping.Respelling, used: *bool, out: *vector.Vector
     val args: res[str, diag.Refusal] = record_args(s, r);
     if (sel args.err) { ret err[diag.Refusal].err{args.err}; }
     val d: *dialect.Respell = dialect_of(p, args.ok);
-    if (d == nil)            { ret refuse(r, NO_DIALECT, p.name); }
-    if (str_len(d.skip) > 0) { ret err[diag.Refusal].ok{}; }
+    if (d == nil)                                         { ret refuse(r, NO_DIALECT, p.name); }
+    if (str_len(d.skip) > 0)                              { ret err[diag.Refusal].ok{}; }
+    if (((r.match ^ row.match) & r.mask & row.mask) != 0) { ret refuse(r, CONFLICT, p.name); }
     var sources: vector.Vector[Src] = vector.init[Src](s.alloc);
     var fixed:   u32                = 0;
     var j:       u32                = 0;
@@ -854,6 +856,45 @@ fun alias_of(s: *Spell, p: *mapping.Respelling, used: *bool, out: *vector.Vector
     }
     val pending: Pending = Pending{row: row.index, template: template, count: count::u8, sources: sources, excluded: excluded, fixed: fixed, print: d.print, own: p.own, order: ((d:~u64 - (?dialect.RESPELLS[0]):~u64) / $size_of(dialect.Respell)::u64)::u32, prefer: 0};
     if (!pushed(vector.push[Pending](out, pending))) { ret err[diag.Refusal].err{memory()}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the alias of `row` for each operand that takes a choice the dialect leaves unwritten at a value, written as the row's
+# own form without that operand, its value fixed, which the printer prefers
+# ---
+# none: the requirement of no extension, as the alias needs none beyond its row's
+fun defaults_of(s: *Spell, row: *mapping.Row, none: *mapping.Requirement, out: *vector.Vector[Pending]) err[diag.Refusal] {
+    var d: u32 = 0;
+    for (d < dialect.DEFAULTS_COUNT) {
+        val dflt: *dialect.Default = ?dialect.DEFAULTS[d];
+        var k:    usize            = 0;
+        for (k < row.operands.len) {
+            val o: *mapping.Operand = ?row.operands.data[k];
+            if (o.use == overlay.CHOICE && o.choice == dflt.choice) {
+                if (row_text(row) != nil) { ret err[diag.Refusal].err{diag.refusal(row.record.path, row.record.line, NO_FORM, row.mnemonic)}; }
+                var items:   [32]Item;
+                var sources: vector.Vector[Src] = vector.init[Src](s.alloc);
+                var n:       u32                = 0;
+                var j:       usize              = 0;
+                for (j < row.operands.len) {
+                    var src: Src = Src{kind: FROM_CHOICE, n: 0, mask: 0, value: dflt.value::i64};
+                    if (j != k) {
+                        items[n] = Item{hole: n::u8, op: j::u8};
+                        src      = Src{kind: FROM_OPERAND, n: n, mask: 0, value: 0};
+                        n        = n + 1;
+                    }
+                    if (!pushed(vector.push[Src](?sources, src))) { ret err[diag.Refusal].err{memory()}; }
+                    j = j + 1;
+                }
+                val c: res[str, diag.Refusal] = compose(s, row, row.mnemonic, ?items[0], n, false);
+                if (sel c.err) { ret err[diag.Refusal].err{c.err}; }
+                val pending: Pending = Pending{row: row.index, template: c.ok, count: n::u8, sources: sources, excluded: vector.init[Excl](s.alloc), fixed: 1, print: true, own: none, order: dialect.RESPELLS_COUNT + d, prefer: 0};
+                if (!pushed(vector.push[Pending](out, pending))) { ret err[diag.Refusal].err{memory()}; }
+            }
+            k = k + 1;
+        }
+        d = d + 1;
+    }
     ret err[diag.Refusal].ok{};
 }
 
@@ -1015,21 +1056,30 @@ pub fun generate(a: *A.Allocator, f: *emit.File, source: *read.Source, catalog: 
         i = i + 1;
     }
     var pending: vector.Vector[Pending] = vector.init[Pending](a);
-    var used:    [dialect.EXCLUSIONS_COUNT]bool;
+    var used:    vector.Vector[bool]    = vector.init[bool](a);
     var u:       u32                    = 0;
-    for (u < dialect.EXCLUSIONS_COUNT) {
-        used[u] = false;
-        u       = u + 1;
+    for (u < dialect.EXCLUSIONS.len) {
+        if (!pushed(vector.push[bool](?used, false))) { ret err[diag.Refusal].err{memory()}; }
+        u = u + 1;
     }
     i = 0;
     for (i < catalog.respellings.len) {
-        val done: err[diag.Refusal] = alias_of(?s, ?catalog.respellings.data[i], ?used[0], ?pending);
+        val done: err[diag.Refusal] = alias_of(?s, ?catalog.respellings.data[i], used.data, ?pending);
+        if (sel done.err) { ret done; }
+        i = i + 1;
+    }
+    val none: res[*mapping.Requirement, A.Error] = A.allocate[mapping.Requirement](a, 1);
+    if (sel none.err) { ret err[diag.Refusal].err{memory()}; }
+    none.ok.alternatives = vector.init[*mapping.Alternative](a);
+    i                    = 0;
+    for (i < catalog.rows.len) {
+        val done: err[diag.Refusal] = defaults_of(?s, catalog.rows.data[i], none.ok, ?pending);
         if (sel done.err) { ret done; }
         i = i + 1;
     }
     u = 0;
-    for (u < dialect.EXCLUSIONS_COUNT) {
-        if (!used[u]) { ret err[diag.Refusal].err{diag.refusal(nil, 0, BAD_EXCLUSION, dialect.EXCLUSIONS[u].name)}; }
+    for (u < dialect.EXCLUSIONS.len) {
+        if (!used.data[u]) { ret err[diag.Refusal].err{diag.refusal(nil, 0, BAD_EXCLUSION, dialect.EXCLUSIONS.at[u].name)}; }
         u = u + 1;
     }
     sort.sort_by[Pending](pending.data, pending.len, by_base);
