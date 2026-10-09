@@ -1,0 +1,1428 @@
+# the builder's listing: source text printed from its statement record, which assembles alone to the same object
+#
+# the listing is the record of what the caller asked the builder for, never
+# a reading of the bytes it encoded: each section's statements as they were
+# written, an instruction by its row as written and its values with symbols
+# as symbols, data, zero fill, alignments, data that name labels and
+# differences of labels, with the labels placed between them and the
+# symbols' bindings, visibilities, kinds, sizes and values declared before
+# the sections. masc's assembler reads it through the same builder, so what
+# the builder derives from a statement, as relaxation, folding and the
+# realign markers, it derives again.
+#
+# every encoding choice the builder made is pinned in the text. an
+# instruction is spelled so that it reads back to the row the builder wrote
+# it in, with the same values, and so that the builder writes the statement
+# read back in that same form under the view the statement was written
+# under: its text is parsed again and given its forms by `build.forms`, the
+# one owner of that choice. a statement written under a narrowing of the
+# selection is written under the dialect's form directives, as risc-v's
+# `.option push`, `.option norvc` and `.option pop` keep an instruction
+# full length that the object's selection would compress, and every section
+# ends under the object's selection.
+#
+# what the text cannot state is refused by a typed reason, naming the
+# section and offset or the label, with the output left as it was: a writer's
+# records, a view of the selection no form directive states, a section the
+# assembler would read otherwise, a name it reads as another, and an
+# instruction no spelling reads back to. the traits the object states are
+# the caller's to give the assembler again, as they were the caller's to give
+# the builder.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+
+use mink;
+
+use masc.asm.asm;
+use masc.asm.core;
+use masc.asm.model;
+use masc.build.build;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.narrow;
+use masc.core.operand;
+use rf: masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.set;
+use masc.core.spelling;
+use masc.emit.emit;
+use masc.syntax.parse;
+use masc.syntax.print;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_fixup:     masc.isa.riscv.fixup;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_set:       masc.isa.riscv.set;
+
+use masc.isa.riscv.gen_row;
+
+pub val NO_SYNTAX:   str = "no syntax of the set at this index";
+pub val UNFINISHED:  str = "the builder has not handed its object over, so its record is not final";
+pub val RECORDS:     str = "a writer states records on the object, which no statement states";
+pub val STARTS:      str = "the first section is not the one the assembler starts in, as its convention opens it";
+pub val TWICE:       str = "two sections of one name, which the assembler reads as one";
+pub val DISPOSITION: str = "section disposition no .section states";
+pub val SECTION:     str = "section whose kind and flags no .section reads back to";
+pub val QUOTED:      str = "name that cannot be written in a string";
+pub val UNSPELLED:   str = "label name the assembler does not read as one symbol";
+pub val NAMELESS:    str = "symbol of the object with no name, which no label of the text can state";
+pub val BINDING:     str = "symbol binding no directive states";
+pub val VISIBILITY:  str = "symbol visibility no directive states";
+pub val TYPE:        str = "symbol kind no .type states";
+pub val PRIVATE:     str = "local symbol whose name the assembler keeps out of the symbol table";
+pub val NAMED_LOCAL: str = "label the object holds as no symbol, whose name the assembler makes one";
+pub val UNDEFINED:   str = "local symbol that is never defined, which the assembler refuses";
+pub val DUPLICATE:   str = "two labels spelled alike";
+pub val VIEW:        str = "view of the selection that no form directive of the dialect states";
+pub val NO_BYTE:     str = "the set's source dialect has no one-byte data directive";
+pub val NO_WIDTH:    str = "the set's source dialect has no data directive of this width";
+pub val UNREAD:      str = "instruction whose spelling does not read back to the row and values the builder wrote";
+pub val UNPINNED:    str = "instruction the assembler would write in another form under its view";
+pub val MEMORY:      str = "out of memory";
+
+# the syntax a set lists in by default, its established one
+pub val DEFAULT: u32 = 0;
+
+# the section of a refusal about the object as a whole or a label
+pub val NO_SECTION: u32 = 0xFFFF_FFFF;
+
+# what a listing is asked for
+# ---
+# syntax:  the index of the set's syntax it is written in
+# private: the spelling that starts the names the assembler reading it keeps out of the object's symbol table, as elf's
+#          `.L`, which `masc.tool.object.private_of` gives for a format
+pub rec Options {
+    syntax:  u32;
+    private: str;
+}
+
+# why the builder's record was not listed
+# ---
+# message: what was refused, one of the wordings above
+# section: the section it was found in, NO_SECTION for the object as a whole or a label
+# offset:  where in that section
+# label:   the label it is about, operand.NO_SYMBOL for none
+# encode:  the printer's refusal, when an instruction's values have no spelling
+pub rec Refusal {
+    message: str;
+    section: u32;
+    offset:  u64;
+    label:   u32;
+    encode:  opt[field.Refusal];
+}
+
+# operand values a parsed statement holds, its list members included
+val STORE: u32 = 32;
+
+# alternatives a refused parse notes
+val ALTERNATIVES: u32 = 16;
+
+# literal bytes the parser cannot borrow from the text
+val LITERALS: u32 = 64;
+
+# bytes of raw data on one line
+val PER_LINE: usize = 16;
+
+# the name index of a label not yet named
+val UNNAMED: u32 = 0xFFFF_FFFF;
+
+# a label at its place in the record
+rec Placed {
+    section:   u32;
+    statement: u32;
+    id:        u32;
+}
+
+# a view of the selection statements were written under, and the narrowings in force that state it
+# ---
+# v:      the view
+# mask:   the dialect's narrowings in force, one bit each
+# stated: whether the form directives state it
+rec Scope {
+    v:      *rf.Available;
+    mask:   u64;
+    stated: bool;
+}
+
+# the values of one instruction of a statement
+rec Held {
+    values: [row.MAX_OPERANDS]operand.Value;
+}
+
+# the state of one listing
+# ---
+# names:   the spelling of every label, interned once
+# spelled: per label, less one, the index of its spelling
+# owners:  per spelling, the label it names
+# places:  every placed label, in place order
+# pi:      the next of `places` to write
+# scopes:  the views met so far and what states them, at most as many as the dialect's narrowings combine to
+# now:     the narrowings in force where the text written so far ends
+# byte:    the one-byte data directive, nil for none
+# full:    whether the output failed to grow
+rec Lister {
+    a:       *A.Allocator;
+    b:       *build.Builder;
+    syntax:  *spelling.Syntax;
+    private: str;
+    out:     *vector.Vector[u8];
+    names:   mink.intern.Interner;
+    spelled: vector.Vector[u32];
+    owners:  vector.Vector[u32];
+    places:  vector.Vector[Placed];
+    pi:      usize;
+    scopes:  vector.Vector[Scope];
+    now:     u64;
+    symbols: spelling.Symbols;
+    byte:    str;
+    full:    bool;
+    held:    [relax.MAX_STEPS]Held;
+    steps:   [relax.MAX_STEPS]inst.Inst;
+    markers: [relax.MAX_STEPS]operand.FixupKind;
+    pool:    [STORE]operand.Value;
+    room:    [ALTERNATIVES]requirement.Ids;
+    lits:    [LITERALS]u8;
+}
+
+fun refusal(message: str, section: u32, offset: u64) err[Refusal] {
+    ret err[Refusal].err{Refusal{message: message, section: section, offset: offset, label: operand.NO_SYMBOL}};
+}
+
+fun whole(message: str) err[Refusal] {
+    ret refusal(message, NO_SECTION, 0);
+}
+
+fun about(message: str, label: u32) err[Refusal] {
+    ret err[Refusal].err{Refusal{message: message, section: NO_SECTION, offset: 0, label: label}};
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# `n` bytes at `p` appended, noting a failure to grow
+fun put_bytes(l: *Lister, p: *u8, n: usize) {
+    if (!held(vector.reserve[u8](l.out, n))) {
+        l.full = true;
+        ret;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        l.out.data[l.out.len] = p[i];
+        l.out.len             = l.out.len + 1;
+        i                     = i + 1;
+    }
+}
+
+fun put(l: *Lister, s: str) {
+    put_bytes(l, s, str_len(s));
+}
+
+fun put_view(l: *Lister, v: View) {
+    put_bytes(l, v.data, v.len);
+}
+
+fun put_char(l: *Lister, c: u8) {
+    put_bytes(l, ?c, 1);
+}
+
+fun put_unsigned(l: *Lister, value: u64) {
+    var digits: [20]u8;
+    var n:      u64 = value;
+    var at:     u32 = 20;
+    for {
+        at         = at - 1;
+        digits[at] = '0' + (n % 10)::u8;
+        n          = n / 10;
+        if (n == 0) { brk; }
+    }
+    put_bytes(l, ?digits[at], (20 - at)::usize);
+}
+
+fun put_signed(l: *Lister, value: i64) {
+    if (value < 0) {
+        put_char(l, '-');
+        put_unsigned(l, ~(value:~u64) + 1);
+        ret;
+    }
+    put_unsigned(l, value:~u64);
+}
+
+fun put_hex(l: *Lister, b: u8) {
+    put(l, "0x");
+    put_char(l, "0123456789abcdef"[(b >> 4)::usize]);
+    put_char(l, "0123456789abcdef"[(b & 15)::usize]);
+}
+
+# a constant added, as `+4` or `-4`, nothing for zero
+fun put_addend(l: *Lister, addend: i64) {
+    if (addend > 0)  { put_char(l, '+'); }
+    if (addend != 0) { put_signed(l, addend); }
+}
+
+# `name` written as a string, refused when it holds a quote, a backslash or a control character
+fun put_string(l: *Lister, name: View) bool {
+    var i: usize = 0;
+    for (i < name.len) {
+        val c: u8 = name.data[i];
+        if (c == '"' || c == '\\' || c < 0x20) { ret false; }
+        i = i + 1;
+    }
+    put_char(l, '"');
+    put_view(l, name);
+    put_char(l, '"');
+    ret true;
+}
+
+# whether `c` is a byte a name is written with unquoted
+fun name_byte(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+}
+
+# whether `name` is written unquoted, as a section name is
+fun plain(name: View) bool {
+    if (name.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (!name_byte(name.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `name` reads as one symbol: written unquoted and not starting with a digit, which reads as a number
+fun symbol_name(name: View) bool {
+    ret plain(name) && !(name.data[0] >= '0' && name.data[0] <= '9');
+}
+
+# whether `v` starts with `prefix`, which is never empty
+fun starts_with(v: View, prefix: str) bool {
+    val n: usize = str_len(prefix);
+    if (n == 0 || v.len < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun same_view(a: View, b: View) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the spelling of label `id`
+fun name_of(l: *Lister, id: u32) View {
+    ret mink.intern.bytes_of(?l.names, mink.table.Id[mink.intern.Name]{index: l.spelled.data[id::usize - 1]});
+}
+
+fun named(context: ptr, id: u32) View {
+    ret name_of(context::*Lister, id);
+}
+
+fun resolved(context: ptr, name: View) res[spelling.Resolved, str] {
+    val l:     *Lister                              = context::*Lister;
+    val known: opt[mink.table.Id[mink.intern.Name]] = mink.intern.find(?l.names, name.data::*u8, name.len);
+    if (sel known.none) { ret res[spelling.Resolved, str].err{"unknown symbol"}; }
+    ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{l.owners.data[known.some.index::usize]}};
+}
+
+# the stem followed by `number` in decimal, written to `to`, answering how long it is
+fun stemmed(stem: str, number: u32, to: *u8) usize {
+    var lead: usize = 0;
+    for (stem[lead] != 0) {
+        to[lead] = stem[lead];
+        lead     = lead + 1;
+    }
+    var digits: [10]u8;
+    var count:  usize = 0;
+    var left:   u32   = number;
+    for {
+        digits[count] = '0' + (left % 10)::u8;
+        count         = count + 1;
+        left          = left / 10;
+        if (left == 0) { brk; }
+    }
+    var k: usize = 0;
+    for (k < count) {
+        to[lead + k] = digits[count - 1 - k];
+        k            = k + 1;
+    }
+    ret lead + count;
+}
+
+# label `id` given the spelling `name`, refused when another label has it
+fun give(l: *Lister, id: u32, name: View) err[Refusal] {
+    val before: usize                                                = mink.intern.count(?l.names);
+    val made:   res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.intern.intern(?l.names, name.data::*u8, name.len);
+    if (sel made.err)                           { ret whole(MEMORY); }
+    if (mink.intern.count(?l.names) == before)  { ret about(DUPLICATE, id); }
+    if (!held(vector.push[u32](?l.owners, id))) { ret whole(MEMORY); }
+    l.spelled.data[id::usize - 1] = made.ok.index;
+    ret err[Refusal].ok{};
+}
+
+# every label spelled: by its own name, and an unnamed one by the syntax's anonymous stem and the lowest number no
+# label spells, in turn
+fun name_all(l: *Lister) err[Refusal] {
+    val count: usize = build.label_count(l.b);
+    if (!held(vector.reserve[u32](?l.spelled, count))) { ret whole(MEMORY); }
+    var id: usize = 1;
+    for (id <= count) {
+        vector.push[u32](?l.spelled, UNNAMED);
+        id = id + 1;
+    }
+    id = 1;
+    for (id <= count) {
+        val own: opt[View] = build.label_name(l.b, build.Label{id: id::u32});
+        if (sel own.some) {
+            val given: err[Refusal] = give(l, id::u32, own.some);
+            if (sel given.err) { ret given; }
+        }
+        id = id + 1;
+    }
+    var scratch: [spelling.MAX_ANONYMOUS + 10]u8;
+    var next:    u32 = 0;
+    id = 1;
+    for (id <= count) {
+        if (l.spelled.data[id - 1] == UNNAMED) {
+            var length: usize = 0;
+            for {
+                length = stemmed(l.syntax.anonymous, next, ?scratch[0]);
+                val taken: opt[mink.table.Id[mink.intern.Name]] = mink.intern.find(?l.names, ?scratch[0], length);
+                if (sel taken.none) { brk; }
+                next = next + 1;
+            }
+            next = next + 1;
+            val given: err[Refusal] = give(l, id::u32, view(?scratch[0], length));
+            if (sel given.err) { ret given; }
+        }
+        id = id + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+fun by_place(x: *Placed, y: *Placed) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.statement != y.statement) {
+        if (x.statement < y.statement) { ret -1; }
+        ret 1;
+    }
+    if (x.id < y.id) { ret -1; }
+    if (x.id > y.id) { ret 1; }
+    ret 0;
+}
+
+# every placed label in place order, made once
+fun place_all(l: *Lister) err[Refusal] {
+    var id: usize = 1;
+    for (id <= build.label_count(l.b)) {
+        val spot: opt[build.Spot] = build.spot_of(l.b, build.Label{id: id::u32});
+        if (sel spot.some && !held(vector.push[Placed](?l.places, Placed{section: spot.some.section.index, statement: spot.some.statement, id: id::u32}))) { ret whole(MEMORY); }
+        id = id + 1;
+    }
+    sort.sort_by[Placed](l.places.data, l.places.len, by_place);
+    ret err[Refusal].ok{};
+}
+
+# whether the sections are those the assembler opens reading them in order: the first the one it starts in, as its
+# convention opens it, and no name twice
+fun sections_read(l: *Lister) err[Refusal] {
+    val count: usize = build.section_count(l.b);
+    if (count == 0) { ret whole(STARTS); }
+    val first: build.Opened = build.opened(l.b, build.Section{index: 0});
+    val start: View         = View{data: core.START, len: str_len(core.START)};
+    var spec:  build.Spec   = core.conventional(start);
+    if (!same_view(first.name, start) || !build.matches(l.b, build.Section{index: 0}, ?spec)) { ret refusal(STARTS, 0, 0); }
+    var s: usize = 1;
+    for (s < count) {
+        val o:     build.Opened       = build.opened(l.b, build.Section{index: s::u32});
+        val found: opt[build.Section] = build.section_named(l.b, o.name);
+        if (sel found.some && found.some.index != s::u32) { ret refusal(TWICE, s::u32, 0); }
+        s = s + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# `.name` followed by label `id`'s spelling
+fun directive(l: *Lister, name: str, id: u32) {
+    put_char(l, '\t');
+    put(l, name);
+    put_char(l, ' ');
+    put_view(l, name_of(l, id));
+}
+
+# the source files the object names
+fun sources(l: *Lister) err[Refusal] {
+    var i: usize = 0;
+    for (i < build.source_count(l.b)) {
+        put(l, "\t.file ");
+        if (!put_string(l, build.source_at(l.b, i))) { ret whole(QUOTED); }
+        put_char(l, '\n');
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the expression `plus - minus + addend` of difference `d`
+fun put_difference(l: *Lister, d: build.Difference) {
+    put_view(l, name_of(l, d.plus.id));
+    put(l, " - ");
+    put_view(l, name_of(l, d.minus.id));
+    if (d.addend > 0) { put(l, " + "); }
+    if (d.addend < 0) {
+        put(l, " - ");
+        put_unsigned(l, ~(d.addend:~u64) + 1);
+    }
+    or (d.addend > 0) { put_unsigned(l, d.addend:~u64); }
+}
+
+# whether the labels a difference names read as symbols
+fun spells_difference(l: *Lister, d: build.Difference) bool {
+    ret symbol_name(name_of(l, d.plus.id)) && symbol_name(name_of(l, d.minus.id));
+}
+
+# the declarations of label `id`: what makes it a symbol, and the value it is given in place of a place
+fun declare(l: *Lister, id: u32) err[Refusal] {
+    val lb:    build.Label         = build.Label{id: id};
+    val shown: opt[build.Exposure] = build.exposure_of(l.b, lb);
+    val value: opt[build.Value]    = build.value_of(l.b, lb);
+    val spot:  opt[build.Spot]     = build.spot_of(l.b, lb);
+    val own:   opt[View]           = build.label_name(l.b, lb);
+    val name:  View                = name_of(l, id);
+    if (sel shown.none && sel value.none && sel spot.none) { ret err[Refusal].ok{}; }
+    if (!symbol_name(name))                                { ret about(UNSPELLED, id); }
+    # the assembler makes a symbol of every label it holds whose name is not private
+    if (sel shown.none && !starts_with(name, l.private)) { ret about(NAMED_LOCAL, id); }
+    if (sel shown.some) {
+        val e: build.Exposure = shown.some;
+        if (sel own.none) { ret about(NAMELESS, id); }
+        if (e.binding == ?mink.symbol.LOCAL) {
+            if (starts_with(name, l.private)) { ret about(PRIVATE, id); }
+            if (!build.bound(l.b, lb))        { ret about(UNDEFINED, id); }
+        }
+        val binding: opt[str] = core.binding_directive(e.binding);
+        if (sel binding.none) { ret about(BINDING, id); }
+        directive(l, binding.some, id);
+        put_char(l, '\n');
+        if (e.visibility != ?mink.symbol.DEFAULT) {
+            val v: opt[str] = core.visibility_directive(e.visibility);
+            if (sel v.none) { ret about(VISIBILITY, id); }
+            directive(l, v.some, id);
+            put_char(l, '\n');
+        }
+        # common storage takes a kind of its own when none is stated
+        var common: bool = false;
+        if (sel value.some) { common = sel value.some.common; }
+        if (e.kind != ?mink.symbol.NOTYPE || common) {
+            val t: opt[str] = core.type_spelling(e.kind);
+            if (sel t.none) { ret about(TYPE, id); }
+            directive(l, ".type", id);
+            put(l, ", ");
+            put_char(l, l.b.set.source.types[0]);
+            put(l, t.some);
+            put_char(l, '\n');
+        }
+        val size: build.Size = e.size;
+        if (sel size.fixed) {
+            directive(l, ".size", id);
+            put(l, ", ");
+            put_unsigned(l, size.fixed);
+            put_char(l, '\n');
+        }
+        if (sel size.measured) {
+            if (!spells_difference(l, size.measured)) { ret about(UNSPELLED, id); }
+            directive(l, ".size", id);
+            put(l, ", ");
+            put_difference(l, size.measured);
+            put_char(l, '\n');
+        }
+    }
+    if (sel value.none) { ret err[Refusal].ok{}; }
+    val v: build.Value = value.some;
+    if (sel v.absolute) {
+        directive(l, ".set", id);
+        put(l, ", ");
+        put_signed(l, v.absolute:~i64);
+        put_char(l, '\n');
+    }
+    if (sel v.common) {
+        directive(l, ".comm", id);
+        put(l, ", ");
+        put_unsigned(l, v.common.size);
+        put(l, ", ");
+        put_unsigned(l, v.common.align);
+        put_char(l, '\n');
+    }
+    if (sel v.equate) {
+        if (!symbol_name(name_of(l, v.equate.target))) { ret about(UNSPELLED, v.equate.target); }
+        directive(l, ".set", id);
+        put(l, ", ");
+        put_view(l, name_of(l, v.equate.target));
+        put_addend(l, v.equate.addend);
+        put_char(l, '\n');
+    }
+    ret err[Refusal].ok{};
+}
+
+# the dialect's form directive written with `operand`
+fun put_form(l: *Lister, operand: str) {
+    put_char(l, '\t');
+    put(l, l.b.set.source.forms.directive);
+    put_char(l, ' ');
+    put(l, operand);
+    put_char(l, '\n');
+}
+
+# whether the dialect saves the narrowings in force on a stack
+fun stacked(forms: *set.Forms) bool {
+    ret forms.push != nil && forms.push[0] != 0;
+}
+
+# what states view `v`: the narrowings of the dialect that take what the object's selection holds and `v` lacks, when
+# they make exactly `v`'s selection and the text can end them. the scope is made the first time the view is met
+fun scope_of(l: *Lister, v: *rf.Available) res[Scope, Refusal] {
+    val object: *rf.Available = l.b.available;
+    if (v == object) { ret res[Scope, Refusal].ok{Scope{v: v, mask: 0, stated: true}}; }
+    var i: usize = 0;
+    for (i < l.scopes.len) {
+        if (l.scopes.data[i].v == v) { ret res[Scope, Refusal].ok{l.scopes.data[i]}; }
+        i = i + 1;
+    }
+    val forms:  *set.Forms = ?l.b.set.source.forms;
+    var mask:   u64        = 0;
+    var stated: bool       = true;
+    var n:      u32        = 0;
+    for (n < forms.narrowings.len) {
+        val row_: *set.Narrowing = ?forms.narrowings.at[n];
+        if (narrow.narrows(object.selection, row_) && !narrow.narrows(v.selection, row_)) {
+            mask   = mask | narrow.bit(n);
+            stated = stated && (stacked(forms) || extension.has(object.selection, row_.lifted));
+        }
+        n = n + 1;
+    }
+    if (mask == 0) { stated = extension.within(v.selection, object.selection) && extension.within(object.selection, v.selection); }
+    or {
+        val made: res[*narrow.Narrowed, rf.Error] = narrow.make(l.a, object, forms.narrowings, mask);
+        if (sel made.err) { ret res[Scope, Refusal].err{Refusal{message: MEMORY, section: NO_SECTION, offset: 0, label: operand.NO_SYMBOL}}; }
+        val s: *extension.Selection = ?made.ok.selection;
+        stated = stated && extension.within(v.selection, s) && extension.within(s, v.selection);
+        narrow.release(l.a, made.ok);
+    }
+    val got: Scope = Scope{v: v, mask: mask, stated: stated};
+    if (!held(vector.push[Scope](?l.scopes, got))) { ret res[Scope, Refusal].err{Refusal{message: MEMORY, section: NO_SECTION, offset: 0, label: operand.NO_SYMBOL}}; }
+    ret res[Scope, Refusal].ok{got};
+}
+
+# the form directives that move the text from the narrowings in force to those of `to` written
+fun enter(l: *Lister, to: u64) {
+    if (to == l.now) { ret; }
+    val forms: *set.Forms = ?l.b.set.source.forms;
+    if (l.now != 0) {
+        if (stacked(forms)) { put_form(l, forms.pop); }
+        or {
+            var n: u32 = 0;
+            for (n < forms.narrowings.len) {
+                if ((l.now & narrow.bit(n)) != 0) { put_form(l, forms.narrowings.at[n].lift); }
+                n = n + 1;
+            }
+        }
+    }
+    if (to != 0) {
+        if (stacked(forms)) { put_form(l, forms.push); }
+        var n: u32 = 0;
+        for (n < forms.narrowings.len) {
+            if ((to & narrow.bit(n)) != 0) { put_form(l, forms.narrowings.at[n].narrow); }
+            n = n + 1;
+        }
+    }
+    l.now = to;
+}
+
+# the text moved to the view `v` statement `at` of section `s` was written under
+fun under(l: *Lister, v: *rf.Available, s: u32, at: u64) err[Refusal] {
+    val got: res[Scope, Refusal] = scope_of(l, v);
+    if (sel got.err)    { ret err[Refusal].err{got.err}; }
+    if (!got.ok.stated) { ret refusal(VIEW, s, at); }
+    enter(l, got.ok.mask);
+    ret err[Refusal].ok{};
+}
+
+# the `.section` that opens section `s`
+fun header(l: *Lister, s: u32) err[Refusal] {
+    val o: build.Opened = build.opened(l.b, build.Section{index: s});
+    if (o.disposition != ?mink.section.WHOLE) { ret refusal(DISPOSITION, s, 0); }
+    val t: opt[str] = core.section_type(o.name, o.kind, o.flags);
+    if (sel t.none) { ret refusal(SECTION, s, 0); }
+    var letters: [core.FLAG_LETTERS]u8;
+    val n:       opt[usize] = core.flag_string(o.flags, ?letters[0]);
+    if (sel n.none) { ret refusal(SECTION, s, 0); }
+    put(l, "\t.section ");
+    if (plain(o.name))          { put_view(l, o.name); }
+    or (!put_string(l, o.name)) { ret refusal(QUOTED, s, 0); }
+    put(l, ", \"");
+    put_bytes(l, ?letters[0], n.some);
+    put(l, "\", ");
+    put_char(l, l.b.set.source.types[0]);
+    put(l, t.some);
+    if (o.entsize != 0) {
+        put(l, ", ");
+        put_unsigned(l, o.entsize);
+    }
+    put_char(l, '\n');
+    ret err[Refusal].ok{};
+}
+
+# the labels placed before statement `j` of section `s`, at `at`
+fun labels_at(l: *Lister, s: u32, j: u32, at: u64) err[Refusal] {
+    for (l.pi < l.places.len && l.places.data[l.pi].section == s && l.places.data[l.pi].statement == j) {
+        val id: u32 = l.places.data[l.pi].id;
+        if (!symbol_name(name_of(l, id))) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: at, label: id}}; }
+        put_view(l, name_of(l, id));
+        put(l, ":\n");
+        l.pi = l.pi + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# whether a label is placed inside the `count` statements from `j` of section `s`, past the first
+fun inside(l: *Lister, s: u32, j: u32, count: u32) bool {
+    var i: usize = l.pi;
+    for (i < l.places.len && l.places.data[i].section == s && l.places.data[i].statement < j + count) {
+        if (l.places.data[i].statement > j) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# why the statement from `start` to the output's end does not state the `count` instructions at `l.steps` under view
+# `v`, none when it does: it reads back to their rows and values, and the builder writes what it reads in those same
+# forms with the same markers
+fun unstated(l: *Lister, start: usize, v: *rf.Available, count: u32) opt[str] {
+    var rd: spelling.Reader = spelling.Reader{
+        text:      l.out.data,
+        start:     start,
+        at:        start,
+        end:       l.out.len,
+        origin:    diagnostic.START,
+        codec:     l.b.set.codec,
+        available: v,
+        syntax:    l.syntax,
+        symbols:   ?l.symbols,
+        context:   nil,
+        row:       nil,
+        pool:      ?l.pool[0],
+        cap:       STORE,
+        used:      0,
+        bytes:     ?l.lits[0],
+        room:      LITERALS,
+        taken:     0,
+        refused:   field.Admissions{at: ?l.room[0], cap: ALTERNATIVES, used: 0},
+    };
+    var read_: relax.Expansion;
+    val got:   err[diagnostic.Diagnostic] = parse.statement(?rd, ?read_);
+    if (sel got.err || read_.count != count) { ret opt[str].some{UNREAD}; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (!same_step(?read_.steps[i], ?l.steps[i])) { ret opt[str].some{UNREAD}; }
+        i = i + 1;
+    }
+    var written: relax.Expansion;
+    val formed:  err[build.Refusal] = build.forms(l.b, v, ?read_, ?written);
+    if (sel formed.err) { ret opt[str].some{UNPINNED}; }
+    i = 0;
+    for (i < count) {
+        if (!same_step(?written.steps[i], ?l.steps[i]) || written.steps[i].marker != l.markers[i]) { ret opt[str].some{UNPINNED}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the fixup kind a symbol in operand `desc` stands under, its default when it states none
+fun kind_in(desc: *operand.Operand, kind: operand.FixupKind) operand.FixupKind {
+    if (kind != operand.NO_FIXUP || desc.quantity == operand.VARIADIC) { ret kind; }
+    if (sel desc.shape.immediate)                                      { ret desc.shape.immediate.fixup; }
+    if (sel desc.shape.relative)                                       { ret desc.shape.relative.offset.fixup; }
+    if (sel desc.shape.memory)                                         { ret desc.shape.memory.disp.fixup; }
+    if (sel desc.shape.id)                                             { ret desc.shape.id.fixup; }
+    ret kind;
+}
+
+# `v` with the fixup kind of its symbol stated as the one it stands under in operand `desc`
+fun stated_kind(desc: *operand.Operand, v: *operand.Value) operand.Value {
+    var out: operand.Value = @v;
+    if (sel out.symbol) { out.symbol.fixup = kind_in(desc, out.symbol.fixup); }
+    if (sel out.memory) { out.memory.symbol.fixup = kind_in(desc, out.memory.symbol.fixup); }
+    ret out;
+}
+
+# whether `got` is `want`'s row with its values, a symbol's default fixup kind and the kind stated alike
+fun same_step(got: *relax.Emitted, want: *inst.Inst) bool {
+    if (got.row != want.row) { ret false; }
+    var k: u32 = 0;
+    for (k < want.count) {
+        val desc: *operand.Operand = ?want.row.operands.at[k];
+        var x:    operand.Value    = stated_kind(desc, ?got.values[k]);
+        var y:    operand.Value    = stated_kind(desc, ?want.values[k]);
+        if (!operand.equal(?x, ?y)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the writer of an instruction's spelling under view `v`
+fun writer(l: *Lister, v: *rf.Available) spelling.Writer {
+    ret spelling.Writer{out: l.out, codec: l.b.set.codec, selection: v.selection, syntax: l.syntax, symbols: ?l.symbols, context: nil, row: nil};
+}
+
+# instruction `k` of `l.steps` written alone under view `v`, by the first spelling that states it: its preferred alias,
+# then its row's own form
+fun one(l: *Lister, k: u32, v: *rf.Available, s: u32, at: u64) err[Refusal] {
+    var w:     spelling.Writer = writer(l, v);
+    var why:   str             = UNREAD;
+    var tried: u32             = 0;
+    for (tried < 2) {
+        put_char(l, '\t');
+        val start:   usize              = l.out.len;
+        var spelled: err[field.Refusal] = err[field.Refusal].ok{};
+        if (tried == 0) { spelled = print.instruction(?w, ?l.steps[k]); }
+        or              { spelled = print.form(?w, ?l.steps[k]); }
+        tried = tried + 1;
+        if (sel spelled.err) {
+            l.out.len = start - 1;
+            if (tried == 2) { ret err[Refusal].err{Refusal{message: UNREAD, section: s, offset: at, label: operand.NO_SYMBOL, encode: opt[field.Refusal].some{spelled.err}}}; }
+            cnt;
+        }
+        # a statement of one instruction is read back as one, wherever its sequence runs on
+        l.steps[0]   = l.steps[k];
+        l.markers[0] = l.markers[k];
+        val wrong: opt[str] = unstated(l, start, v, 1);
+        if (sel wrong.none) {
+            put_char(l, '\n');
+            ret err[Refusal].ok{};
+        }
+        why       = wrong.some;
+        l.out.len = start - 1;
+    }
+    ret refusal(why, s, at);
+}
+
+# the instructions from statement `j` of section `s` written, a sequence by the syntax's spelling of it when one states
+# it and else each alone, answering how many statements they are
+fun code(l: *Lister, s: u32, j: u32, first: build.Statement) res[u32, Refusal] {
+    val sec:   build.Section = build.Section{index: s};
+    val v:     *rf.Available = first.view;
+    var count: u32           = 1;
+    if (sel first.stated.code)                 { count = first.stated.code.run; }
+    if (count == 0 || count > relax.MAX_STEPS) { count = 1; }
+    var at: [relax.MAX_STEPS]u64;
+    var k:  u32 = 0;
+    for (k < count) {
+        var st: build.Statement = build.statement(l.b, sec, (j + k)::usize, ?l.held[k].values[0]);
+        # a sequence's statements are its instructions, every one
+        if (!sel st.stated.code) {
+            count = k;
+            brk;
+        }
+        l.steps[k]   = st.stated.code.inst;
+        l.markers[k] = st.stated.code.marker;
+        at[k]        = st.offset;
+        k            = k + 1;
+    }
+    val moved: err[Refusal] = under(l, v, s, first.offset);
+    if (sel moved.err) { ret res[u32, Refusal].err{moved.err}; }
+    if (count > 1 && !inside(l, s, j, count)) {
+        var w: spelling.Writer = writer(l, v);
+        put_char(l, '\t');
+        val start:   usize                    = l.out.len;
+        val spelled: res[bool, field.Refusal] = print.sequence(?w, ?l.steps[0], count);
+        if (sel spelled.ok && spelled.ok) {
+            val wrong: opt[str] = unstated(l, start, v, count);
+            if (sel wrong.none) {
+                put_char(l, '\n');
+                ret res[u32, Refusal].ok{count};
+            }
+        }
+        l.out.len = start - 1;
+    }
+    # each alone, each checked through the first slot, which the one before it no longer needs
+    k = 0;
+    for (k < count) {
+        if (k > 0) {
+            val placed: err[Refusal] = labels_at(l, s, j + k, at[k]);
+            if (sel placed.err) { ret res[u32, Refusal].err{placed.err}; }
+        }
+        val wrote: err[Refusal] = one(l, k, v, s, at[k]);
+        if (sel wrote.err) { ret res[u32, Refusal].err{wrote.err}; }
+        k = k + 1;
+    }
+    ret res[u32, Refusal].ok{count};
+}
+
+# the directive that writes data of `width` bytes, none when the dialect has none
+fun width_directive(l: *Lister, width: u8) opt[str] {
+    var i: u32 = 0;
+    for (i < l.b.set.source.widths.len) {
+        if (l.b.set.source.widths.at[i].width == width) { ret opt[str].some{l.b.set.source.widths.at[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the bytes `data` written as one-byte data
+fun raw(l: *Lister, data: View) {
+    var i: usize = 0;
+    for (i < data.len) {
+        put_char(l, '\t');
+        put(l, l.byte);
+        put_char(l, ' ');
+        var n: usize = 0;
+        for (i < data.len && n < PER_LINE) {
+            if (n > 0) { put(l, ", "); }
+            put_hex(l, data.data[i]);
+            i = i + 1;
+            n = n + 1;
+        }
+        put_char(l, '\n');
+    }
+}
+
+# the alignment `al` as `.balign`, its fill and limit when stated
+fun align(l: *Lister, al: build.Align) {
+    put(l, "\t.balign ");
+    put_unsigned(l, al.boundary);
+    if (sel al.fill.some || sel al.max.some) { put(l, ", "); }
+    if (sel al.fill.some)                    { put_unsigned(l, al.fill.some::u64); }
+    if (sel al.max.some) {
+        put(l, ", ");
+        put_unsigned(l, al.max.some);
+    }
+    put_char(l, '\n');
+}
+
+# statement `st` of section `s` that is data, written
+fun data(l: *Lister, s: u32, st: build.Statement) err[Refusal] {
+    val stated: build.Stated = st.stated;
+    if (sel stated.data) {
+        if (l.byte == nil) { ret refusal(NO_BYTE, s, st.offset); }
+        raw(l, stated.data);
+        ret err[Refusal].ok{};
+    }
+    if (sel stated.zero) {
+        put(l, "\t.zero ");
+        put_unsigned(l, stated.zero);
+        put_char(l, '\n');
+        ret err[Refusal].ok{};
+    }
+    if (sel stated.datum) {
+        val r: build.Reference = stated.datum;
+        val d: opt[str]        = width_directive(l, r.width);
+        if (sel d.none)                            { ret refusal(NO_WIDTH, s, st.offset); }
+        if (!symbol_name(name_of(l, r.target.id))) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: st.offset, label: r.target.id}}; }
+        put_char(l, '\t');
+        put(l, d.some);
+        put_char(l, ' ');
+        put_view(l, name_of(l, r.target.id));
+        put_addend(l, r.addend);
+        # a distance from the datum's own place is the difference from `.`, which the builder measures alike
+        if (r.basis == set.RELATIVE) { put(l, " - ."); }
+        put_char(l, '\n');
+        ret err[Refusal].ok{};
+    }
+    if (!sel stated.difference) { ret err[Refusal].ok{}; }
+    val g: build.Measure = stated.difference;
+    val d: opt[str]      = width_directive(l, g.width);
+    if (sel d.none)                  { ret refusal(NO_WIDTH, s, st.offset); }
+    if (!spells_difference(l, g.of)) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: st.offset, label: g.of.plus.id}}; }
+    put_char(l, '\t');
+    put(l, d.some);
+    put_char(l, ' ');
+    put_difference(l, g.of);
+    put_char(l, '\n');
+    ret err[Refusal].ok{};
+}
+
+# section `s` written: its header, then its labels and statements in order, ending under the object's selection
+fun section(l: *Lister, s: u32) err[Refusal] {
+    val opened: err[Refusal] = header(l, s);
+    if (sel opened.err) { ret opened; }
+    val sec:   build.Section = build.Section{index: s};
+    val code_: bool          = (build.opened(l.b, sec).flags & mink.section.EXEC) != 0;
+    val count: usize         = build.statement_count(l.b, sec);
+    var j:     usize         = 0;
+    for (j < count) {
+        val st:     build.Statement = build.statement(l.b, sec, j, ?l.held[0].values[0]);
+        val placed: err[Refusal]    = labels_at(l, s, j::u32, st.offset);
+        if (sel placed.err) { ret placed; }
+        if (sel st.stated.code) {
+            val took: res[u32, Refusal] = code(l, s, j::u32, st);
+            if (sel took.err) { ret err[Refusal].err{took.err}; }
+            j = j + took.ok::usize;
+            cnt;
+        }
+        if (sel st.stated.align) {
+            # code alignment pads with the fill its view admits, so it is written under that view
+            if (code_) {
+                val moved: err[Refusal] = under(l, st.view, s, st.offset);
+                if (sel moved.err) { ret moved; }
+            }
+            align(l, st.stated.align);
+            j = j + 1;
+            cnt;
+        }
+        val wrote: err[Refusal] = data(l, s, st);
+        if (sel wrote.err) { ret wrote; }
+        j = j + 1;
+    }
+    val ended: err[Refusal] = labels_at(l, s, count::u32, build.size_of(l.b, sec));
+    if (sel ended.err) { ret ended; }
+    enter(l, 0);
+    ret err[Refusal].ok{};
+}
+
+# the whole listing written
+fun run(l: *Lister) err[Refusal] {
+    val read_: err[Refusal] = sections_read(l);
+    if (sel read_.err) { ret read_; }
+    val names: err[Refusal] = name_all(l);
+    if (sel names.err) { ret names; }
+    val places: err[Refusal] = place_all(l);
+    if (sel places.err) { ret places; }
+    val files: err[Refusal] = sources(l);
+    if (sel files.err) { ret files; }
+    var id: usize = 1;
+    for (id <= build.label_count(l.b)) {
+        val declared: err[Refusal] = declare(l, id::u32);
+        if (sel declared.err) { ret declared; }
+        id = id + 1;
+    }
+    var s: usize = 0;
+    for (s < build.section_count(l.b)) {
+        val wrote: err[Refusal] = section(l, s::u32);
+        if (sel wrote.err) { ret wrote; }
+        s = s + 1;
+    }
+    if (l.full) { ret whole(MEMORY); }
+    ret err[Refusal].ok{};
+}
+
+# the listing of the finished builder `b` appended to `out`: source text that assembles alone, through masc's assembler
+# under the object's selection and the traits the builder was given, to the same sections and relocations
+# ---
+# ret: ok, or the first fact the text cannot state, with `out` as it was
+pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[Refusal] {
+    if (options.syntax >= b.set.syntaxes.len) { ret whole(NO_SYNTAX); }
+    if (!build.handed_over(b))                { ret whole(UNFINISHED); }
+    if (build.records(b))                     { ret whole(RECORDS); }
+    var l: Lister = Lister{
+        a:       out.a,
+        b:       b,
+        syntax:  ?b.set.syntaxes.at[options.syntax],
+        private: options.private,
+        out:     out,
+        names:   mink.intern.make(out.a),
+        spelled: vector.init[u32](out.a),
+        owners:  vector.init[u32](out.a),
+        places:  vector.init[Placed](out.a),
+        pi:      0,
+        scopes:  vector.init[Scope](out.a),
+        now:     0,
+        byte:    nil,
+        full:    false,
+    };
+    l.symbols = spelling.Symbols{context: (?l)::ptr, resolve: resolved, name: named};
+    var i: u32 = 0;
+    for (i < b.set.source.widths.len && l.byte == nil) {
+        if (b.set.source.widths.at[i].width == 1) { l.byte = b.set.source.widths.at[i].name; }
+        i = i + 1;
+    }
+    val start: usize        = out.len;
+    val done:  err[Refusal] = run(?l);
+    mink.intern.release(?l.names);
+    vector.dnit[u32](?l.spelled);
+    vector.dnit[u32](?l.owners);
+    vector.dnit[Placed](?l.places);
+    vector.dnit[Scope](?l.scopes);
+    if (sel done.err) { out.len = start; }
+    ret done;
+}
+
+# a test's selection, its register view, a narrowing of it under `.option norvc` and a builder of a risc-v object
+#[testing]
+rec T {
+    t:  testing.Testing;
+    s:  extension.Selection;
+    v:  rf.Available;
+    rv: *narrow.Narrowed;
+    b:  build.Builder;
+}
+
+# the float ABI a test object states, passed through by the builder
+#[testing]
+val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?mink.arch.RISCV_FLOAT_ABI, setting: mink.trait.Setting.choice{?mink.arch.RISCV_DOUBLE}}};
+
+#[testing]
+val T_ABI: set.Traits = set.Traits{at: ?T_DOUBLE[0], len: 1};
+
+#[testing]
+val T_OPTIONS: Options = Options{syntax: DEFAULT, private: ".L"};
+
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[rf.Available, rf.Error] = rf.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v = viewed.ok;
+    val norvc: res[*narrow.Narrowed, rf.Error] = narrow.make(a, ?t.v, riscv_set.SET.source.forms.narrowings, narrow.bit(0));
+    if (sel norvc.err) { ret false; }
+    t.rv = norvc.ok;
+    val built: res[build.Builder, build.Refusal] = build.make(a, ?riscv_set.SET, ?t.v, ?mink.arch.RISCV64, T_ABI);
+    if (sel built.err) { ret false; }
+    t.b = built.ok;
+    ret true;
+}
+
+#[testing]
+fun t_ok(e: err[build.Refusal]) bool {
+    ret sel e.ok;
+}
+
+# a section opened as the assembler's convention for `name` opens it, made current
+#[testing]
+fun t_section(t: *T, name: str) bool {
+    var spec: build.Spec = core.conventional(View{data: name, len: str_len(name)});
+    spec.name = name;
+    val s: res[build.Section, build.Refusal] = build.open(?t.b, spec);
+    if (sel s.err) { ret false; }
+    ret t_ok(build.switch(?t.b, s.ok));
+}
+
+#[testing]
+fun t_named(t: *T, name: str) build.Label {
+    val l: res[build.Label, build.Refusal] = build.label(?t.b, name);
+    if (sel l.err) { ret build.Label{id: operand.NO_SYMBOL}; }
+    ret l.ok;
+}
+
+#[testing]
+fun t_anon(t: *T) build.Label {
+    val l: res[build.Label, build.Refusal] = build.anonymous(?t.b);
+    if (sel l.err) { ret build.Label{id: operand.NO_SYMBOL}; }
+    ret l.ok;
+}
+
+#[testing]
+fun t_x(n: u16) rf.Id {
+    ret rf.make(0, n);
+}
+
+# row `r` of two registers and an immediate
+#[testing]
+fun t_rri(t: *T, r: *row.Row, x: u16, y: u16, n: i64) bool {
+    val started: res[emit.Instruction, build.Refusal] = emit.start(?t.b, r);
+    if (sel started.err) { ret false; }
+    var ins: emit.Instruction = started.ok;
+    if (!t_ok(emit.register(?t.b, ?ins, t_x(x))) || !t_ok(emit.register(?t.b, ?ins, t_x(y))) || !t_ok(emit.immediate(?t.b, ?ins, n))) { ret false; }
+    ret t_ok(emit.put(?t.b, ?ins));
+}
+
+# row `r` of registers `x` and `y` and label `l`, or of register `x` and `l` when `y` is negative
+#[testing]
+fun t_to(t: *T, r: *row.Row, x: u16, y: i32, l: build.Label) bool {
+    val started: res[emit.Instruction, build.Refusal] = emit.start(?t.b, r);
+    if (sel started.err) { ret false; }
+    var ins: emit.Instruction = started.ok;
+    if (!t_ok(emit.register(?t.b, ?ins, t_x(x))))                { ret false; }
+    if (y >= 0 && !t_ok(emit.register(?t.b, ?ins, t_x(y::u16)))) { ret false; }
+    if (!t_ok(emit.symbol(?t.b, ?ins, l, 0, operand.NO_FIXUP)))  { ret false; }
+    ret t_ok(emit.put(?t.b, ?ins));
+}
+
+# a jump `offset` bytes from the instruction, linking nothing
+#[testing]
+fun t_jump(t: *T, offset: i64) bool {
+    val started: res[emit.Instruction, build.Refusal] = emit.start(?t.b, gen_row.JAL);
+    if (sel started.err) { ret false; }
+    var ins: emit.Instruction = started.ok;
+    if (!t_ok(emit.register(?t.b, ?ins, t_x(0))) || !t_ok(emit.relative(?t.b, ?ins, offset))) { ret false; }
+    ret t_ok(emit.put(?t.b, ?ins));
+}
+
+# a call to `l` built from rows, an auipc whose relocation covers the jalr after it, written as one sequence
+#[testing]
+fun t_call(t: *T, l: build.Label) bool {
+    var pair: [2]emit.Instruction;
+    val high: res[emit.Instruction, build.Refusal] = emit.start(?t.b, gen_row.AUIPC);
+    if (sel high.err) { ret false; }
+    pair[0] = high.ok;
+    if (!t_ok(emit.register(?t.b, ?pair[0], t_x(1))) || !t_ok(emit.symbol(?t.b, ?pair[0], l, 0, riscv_fixup.CALL_PLT_PAIR))) { ret false; }
+    val low: res[emit.Instruction, build.Refusal] = emit.start(?t.b, gen_row.JALR);
+    if (sel low.err) { ret false; }
+    pair[1] = low.ok;
+    if (!t_ok(emit.register(?t.b, ?pair[1], t_x(1))) || !t_ok(emit.register(?t.b, ?pair[1], t_x(1))) || !t_ok(emit.immediate(?t.b, ?pair[1], 0))) { ret false; }
+    ret t_ok(emit.sequence(?t.b, ?pair[0], 2));
+}
+
+#[testing]
+val T_FUNCTION: build.Exposure = build.Exposure{binding: ?mink.symbol.GLOBAL, visibility: ?mink.symbol.DEFAULT, kind: ?mink.symbol.FUNCTION};
+
+#[testing]
+val T_EXTERNAL: build.Exposure = build.Exposure{binding: ?mink.symbol.GLOBAL, visibility: ?mink.symbol.DEFAULT, kind: ?mink.symbol.NOTYPE};
+
+# everything the test made given back, and whether nothing is left live
+#[testing]
+fun t_release(t: *T) bool {
+    build.release(?t.b);
+    narrow.release(testing.allocator_of(?t.t), t.rv);
+    rf.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+#[testing]
+fun t_same_bytes(x: mink.store.Bytes, y: mink.store.Bytes) bool {
+    if (x.len != y.len) { ret false; }
+    var k: usize = 0;
+    for (k < x.len) {
+        if (x.data[k] != y.data[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether relocation targets `p` of `a` and `q` of `b` are one symbol: of one name, or a label with no name in `a` and
+# the one the listing names at its place in `b`
+#[testing]
+fun t_same_target(a: *mink.object.Object, p: mink.object.Target, b: *mink.object.Object, q: mink.object.Target) bool {
+    if (sel p.none)    { ret sel q.none; }
+    if (!sel p.symbol) { ret false; }
+    if (!sel q.symbol) { ret false; }
+    val x: *mink.object.Symbol = mink.object.symbol_at(a, p.symbol);
+    val y: *mink.object.Symbol = mink.object.symbol_at(b, q.symbol);
+    if (same_view(mink.object.name_of(a, x.name), mink.object.name_of(b, y.name))) { ret true; }
+    if (mink.object.name_of(a, x.name).len != 0)                                   { ret false; }
+    if (!sel x.def.placed)                                                         { ret false; }
+    if (!sel y.def.placed)                                                         { ret false; }
+    ret x.def.placed.section.index == y.def.placed.section.index && x.def.placed.offset == y.def.placed.offset;
+}
+
+# whether `a` and `b` hold the same sections, each's name and bytes, and the same relocations
+#[testing]
+fun t_same_object(a: *mink.object.Object, b: *mink.object.Object) bool {
+    if (a.sections.count != b.sections.count || a.relocs.count != b.relocs.count) { ret false; }
+    var s: usize = 0;
+    for (s < a.sections.count) {
+        val x: *mink.object.Section = ?a.sections.items[s];
+        val y: *mink.object.Section = ?b.sections.items[s];
+        if (!same_view(mink.object.name_of(a, x.name), mink.object.name_of(b, y.name)) || x.align != y.align)           { ret false; }
+        if (sel x.contents.held != sel y.contents.held)                                                                 { ret false; }
+        if (sel x.contents.held && !t_same_bytes(mink.object.bytes(a, ?x.contents), mink.object.bytes(b, ?y.contents))) { ret false; }
+        s = s + 1;
+    }
+    var r: usize = 0;
+    for (r < a.relocs.count) {
+        val p: *mink.object.Reloc = ?a.relocs.items[r];
+        val q: *mink.object.Reloc = ?b.relocs.items[r];
+        if (p.kind != q.kind || p.section.index != q.section.index || p.offset != q.offset || p.addend != q.addend) { ret false; }
+        if (!t_same_target(a, p.target, b, q.target))                                                               { ret false; }
+        r = r + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_assemble(t: *T, text: *vector.Vector[u8], out: *mink.object.Object) bool {
+    val options: model.Options                          = model.Options{arch: ?mink.arch.RISCV64, syntax: 0, traits: T_ABI, private: ".L", layers: model.NO_LAYERS};
+    val made:    res[mink.object.Object, model.Refusal] = asm.assemble(testing.allocator_of(?t.t), ?riscv_set.SET, ?t.v, options, text.data, text.len, diagnostic.START);
+    if (sel made.err) { ret false; }
+    @out = made.ok;
+    ret true;
+}
+
+# the listing of the first test, a line each
+#[testing]
+val T_LISTING: [27]str = [27]str{
+    "\t.globl f",
+    "\t.type f, @function",
+    "\t.size f, .Ltmp1 - f",
+    "\t.globl g",
+    "\t.section .text, \"ax\", @progbits",
+    "f:",
+    "\tc.addi sp, -16",
+    ".Lback:",
+    "\tbeqz a0, .Ltmp0",
+    "\tcall g",
+    "\t.balign 16",
+    "\t.option push",
+    "\t.option norvc",
+    "\tj 6",
+    "\t.option pop",
+    "\tc.j 2",
+    "\tj .Lback",
+    ".Ltmp0:",
+    "\tc.jr ra",
+    ".Ltmp1:",
+    "\t.section .data, \"aw\", @progbits",
+    "\t.byte 0x68, 0x69",
+    "\t.balign 8",
+    "\t.quad f+4",
+    "\t.word .Ltmp1 - f",
+    "\t.word g - .",
+    "\t.zero 3",
+};
+
+# whether `out` holds the `n` lines at `lines`, each ended by a new line
+#[testing]
+fun t_lines(out: *vector.Vector[u8], lines: *str, n: usize) bool {
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (i < n) {
+        val line: View = View{data: lines[i], len: str_len(lines[i])};
+        if (at + line.len + 1 > out.len)                                { ret false; }
+        if (!same_view(View{data: ?out.data[at], len: line.len}, line)) { ret false; }
+        if (out.data[at + line.len] != '\n')                            { ret false; }
+        at = at + line.len + 1;
+        i  = i + 1;
+    }
+    ret at == out.len;
+}
+
+test listing__the_listing_of_a_builder_assembles_alone_to_the_same_sections_and_relocations {
+    var t: T;
+    if (!t_make(?t, "rv64ic"))   { ret 1; }
+    if (!t_section(?t, ".text")) { ret 2; }
+    val f:     build.Label    = t_named(?t, "f");
+    val g:     build.Label    = t_named(?t, "g");
+    val back:  build.Label    = t_named(?t, ".Lback");
+    val skip:  build.Label    = t_anon(?t);
+    val end:   build.Label    = t_anon(?t);
+    var sized: build.Exposure = T_FUNCTION;
+    sized.size = build.Size.measured{build.Difference{plus: end, minus: f, addend: 0}};
+    if (!t_ok(build.expose(?t.b, f, sized)) || !t_ok(build.expose(?t.b, g, T_EXTERNAL)) || !t_ok(build.define(?t.b, f))) { ret 3; }
+    # a compressed addi, a branch across a call the linker may shrink, the call and a realigned alignment after it
+    if (!t_rri(?t, gen_row.ADDI, 2, 2, -16))                                                             { ret 4; }
+    if (!t_ok(build.define(?t.b, back)))                                                                 { ret 5; }
+    if (!t_to(?t, gen_row.BEQ, 10, 0, skip))                                                             { ret 6; }
+    if (!t_call(?t, g))                                                                                  { ret 7; }
+    if (!t_ok(build.align(?t.b, build.Align{boundary: 16, fill: opt[u8].none{}, max: opt[u64].none{}}))) { ret 8; }
+    # a jal kept full length under the narrowing, then the same jal the object's selection compresses
+    if (!t_ok(build.narrow(?t.b, ?t.rv.available))) { ret 9; }
+    if (!t_jump(?t, 6))                             { ret 10; }
+    if (!t_ok(build.narrow(?t.b, ?t.v)))            { ret 11; }
+    if (!t_jump(?t, 2))                             { ret 12; }
+    if (!t_to(?t, gen_row.JAL, 0, -1, back))        { ret 12; }
+    if (!t_ok(build.define(?t.b, skip)))            { ret 13; }
+    if (!t_rri(?t, gen_row.JALR, 0, 1, 0))          { ret 14; }
+    if (!t_ok(build.define(?t.b, end)))             { ret 15; }
+    # data: bytes, the function's address, its length across the call, a relative datum and an alignment
+    if (!t_section(?t, ".data")) { ret 16; }
+    var hi: [2]u8 = [2]u8{'h', 'i'};
+    if (!t_ok(build.data(?t.b, ?hi[0], 2)))                                                             { ret 17; }
+    if (!t_ok(build.align(?t.b, build.Align{boundary: 8, fill: opt[u8].none{}, max: opt[u64].none{}}))) { ret 18; }
+    if (!t_ok(build.datum(?t.b, build.Reference{target: f, addend: 4, width: 8, basis: set.ABSOLUTE}))) { ret 19; }
+    if (!t_ok(build.difference(?t.b, build.Difference{plus: end, minus: f, addend: 0}, 4)))             { ret 20; }
+    if (!t_ok(build.datum(?t.b, build.Reference{target: g, addend: 0, width: 4, basis: set.RELATIVE}))) { ret 21; }
+    if (!t_ok(build.zero(?t.b, 3)))                                                                     { ret 22; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 23; }
+    var o:      mink.object.Object = done.ok;
+    var out:    vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t.t));
+    val listed: err[Refusal]       = write(?t.b, T_OPTIONS, ?out);
+    if (sel listed.err) { ret 24; }
+    # the symbols first, then each section's statements as written, the narrowed jal under the form directives
+    if (!t_lines(?out, ?T_LISTING[0], 27)) { ret 25; }
+    var back_: mink.object.Object;
+    if (!t_assemble(?t, ?out, ?back_)) { ret 26; }
+    if (!t_same_object(?o, ?back_))    { ret 27; }
+    mink.object.release(?back_);
+    mink.object.release(?o);
+    vector.dnit[u8](?out);
+    if (!t_release(?t)) { ret 28; }
+    ret 0;
+}
+
+test listing__what_the_text_cannot_state_is_refused_by_its_reason_and_leaves_the_output_as_it_was {
+    var t: T;
+    if (!t_make(?t, "rv64imc"))  { ret 1; }
+    if (!t_section(?t, ".text")) { ret 2; }
+    var out: vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t.t));
+    vector.push[u8](?out, '#');
+    # a view of the selection without m, which no form directive of the dialect states
+    val a:       *A.Allocator                              = testing.allocator_of(?t.t);
+    val without: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, "rv64ic", diagnostic.START);
+    if (sel without.err) { ret 3; }
+    var s:      extension.Selection         = without.ok;
+    val viewed: res[rf.Available, rf.Error] = rf.select(a, ?riscv_register.FILE, ?s);
+    if (sel viewed.err) { ret 4; }
+    var v: rf.Available = viewed.ok;
+    if (!t_rri(?t, gen_row.ADDI, 10, 0, 1))  { ret 5; }
+    if (!t_ok(build.narrow(?t.b, ?v)))       { ret 6; }
+    if (!t_rri(?t, gen_row.ADDI, 10, 10, 1)) { ret 7; }
+    # nothing is listed before the object is handed over
+    val early: err[Refusal] = write(?t.b, T_OPTIONS, ?out);
+    if (sel early.ok)                               { ret 8; }
+    if (!str_equals(early.err.message, UNFINISHED)) { ret 8; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 9; }
+    var o:       mink.object.Object = done.ok;
+    val refused: err[Refusal]       = write(?t.b, T_OPTIONS, ?out);
+    if (sel refused.ok)                                                     { ret 10; }
+    if (!str_equals(refused.err.message, VIEW) || refused.err.section != 0) { ret 11; }
+    if (refused.err.offset != 2 || out.len != 1)                            { ret 12; }
+    mink.object.release(?o);
+    vector.dnit[u8](?out);
+    rf.release(?v);
+    extension.release(?s);
+    if (!t_release(?t)) { ret 13; }
+    # a label the object holds as no symbol, named as the assembler would make one
+    var u: T;
+    if (!t_make(?u, "rv64ic"))   { ret 14; }
+    if (!t_section(?u, ".text")) { ret 15; }
+    val loop: build.Label = t_named(?u, "loop");
+    if (!t_ok(build.define(?u.b, loop)) || !t_rri(?u, gen_row.ADDI, 10, 10, 1)) { ret 16; }
+    val made: res[mink.object.Object, build.Refusal] = build.finish(?u.b);
+    if (sel made.err) { ret 17; }
+    var p:      mink.object.Object = made.ok;
+    var empty:  vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?u.t));
+    val named_: err[Refusal]       = write(?u.b, T_OPTIONS, ?empty);
+    if (sel named_.ok)                                                               { ret 18; }
+    if (!str_equals(named_.err.message, NAMED_LOCAL) || named_.err.label != loop.id) { ret 19; }
+    if (empty.len != 0)                                                              { ret 20; }
+    mink.object.release(?p);
+    vector.dnit[u8](?empty);
+    if (!t_release(?u)) { ret 21; }
+    ret 0;
+}
