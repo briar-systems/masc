@@ -113,6 +113,7 @@ pub val IMPLICIT: overlay.Use = 0x80;
 # fixup:    the path of its default fixup kind, nil when it takes no symbol
 # rank:     where it stands among the row's operands
 # order:    its argument's position in the record, for ties
+# fields:   the groups its register value covers back to back, 1 but for a segment operand
 pub rec Operand {
     arg:      str;
     group:    str;
@@ -127,6 +128,7 @@ pub rec Operand {
     fixup:    str;
     rank:     u8;
     order:    u32;
+    fields:   u8;
 }
 
 # one access a row's effect states
@@ -216,6 +218,7 @@ pub rec Keep {
     register: u32;
     permit:   constraint.Permit;
     mask:     u8;
+    gap:      constraint.Gap;
 }
 
 # a row of the catalog
@@ -1107,7 +1110,7 @@ fun operands(m: *Mapper, row: *Row) err[diag.Refusal] {
                 k    = k + 1;
             }
             val first: str     = row.args.data[at[0]];
-            var op:    Operand = Operand{arg: first, group: group.args, use: group.use, layout: group.layout, position: group.position, choice: group.choice, adjust: nil, class: 0, role: role_of(row, first), relative: false, fixup: nil, rank: rank_of(first, group.use), order: at[0]::u32};
+            var op:    Operand = Operand{arg: first, group: group.args, use: group.use, layout: group.layout, position: group.position, choice: group.choice, adjust: nil, class: 0, role: role_of(row, first), relative: false, fixup: nil, rank: rank_of(first, group.use), order: at[0]::u32, fields: 1};
             var o:     u32     = 0;
             for (o < overlay.OVERRIDES_COUNT) {
                 if (str_equals(overlay.OVERRIDES[o].args, group.args) && overlay.matches(overlay.OVERRIDES[o].mnemonic, row.mnemonic)) {
@@ -1167,7 +1170,7 @@ fun operands(m: *Mapper, row: *Row) err[diag.Refusal] {
         if (str_equals(imp.mnemonic, row.mnemonic)) {
             val c: opt[u16] = class_index(m, overlay.INTEGER);
             if (sel c.none) { ret refuse(r, UNKNOWN_CLASS, effects.STACK_POINTER); }
-            val sp: Operand = Operand{arg: effects.STACK_POINTER, group: "", use: IMPLICIT, layout: nil, position: nil, choice: nil, adjust: nil, class: c.some, role: imp.role, relative: false, fixup: nil, rank: 0, order: 0};
+            val sp: Operand = Operand{arg: effects.STACK_POINTER, group: "", use: IMPLICIT, layout: nil, position: nil, choice: nil, adjust: nil, class: c.some, role: imp.role, relative: false, fixup: nil, rank: 0, order: 0, fields: 1};
             var at: usize   = row.operands.len;
             if (imp.at != effects.LAST && imp.at::usize < at)     { at = imp.at::usize; }
             if (!pushed(vector.push[Operand](?row.operands, sp))) { ret err[diag.Refusal].err{memory()}; }
@@ -1605,20 +1608,33 @@ fun matched(patterns: *str, count: u32, row: *Row) bool {
     ret false;
 }
 
-# the side of `row` argument `arg` names, its fields one per segment field when a segment load's destination
+# the side of `row` argument `arg` names
 fun side_of(row: *Row, arg: str) opt[constraint.Side] {
     val at: u8 = operand_of(row, arg);
     if (at == field.NO_OPERAND) { ret opt[constraint.Side].none{}; }
-    var fields: u8 = 1;
-    if (str_equals(arg, "vd") && matched(?constraints.SEGMENTED[0], constraints.SEGMENTED_COUNT, row)) { fields = ((row.match >> constraints.NF_LO) & 7)::u8 + 1; }
-    ret opt[constraint.Side].some{constraint.Side{operand: at, part: constraint.WHOLE, fields: fields}};
+    ret opt[constraint.Side].some{constraint.Side{operand: at, part: constraint.WHOLE}};
+}
+
+# the fields of `row`'s segment operand, one group per field, nf + 1 of them, when the overlay's segment patterns match it
+fun segments_of(row: *Row) err[diag.Refusal] {
+    var i: u32 = 0;
+    for (i < constraints.SEGMENTS_COUNT) {
+        val sg: *constraints.Segment = ?constraints.SEGMENTS[i];
+        if (overlay.matches(sg.mnemonic, row.mnemonic)) {
+            val at: u8 = operand_of(row, sg.arg);
+            if (at == field.NO_OPERAND) { ret refuse(row.record, NO_KEPT, sg.arg); }
+            row.operands.data[at].fields = ((row.match >> constraints.NF_LO) & 7)::u8 + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
 }
 
 # a constraint of `row` keeping argument `arg` from the arguments `against`, or from the register `reg` when `against` is empty
-fun keep(m: *Mapper, row: *Row, arg: str, against: str, reg: str, permit: constraint.Permit, mask: u8) err[diag.Refusal] {
+fun keep(m: *Mapper, row: *Row, arg: str, against: str, reg: str, permit: constraint.Permit, mask: u8, gap: constraint.Gap) err[diag.Refusal] {
     val side: opt[constraint.Side] = side_of(row, arg);
     if (sel side.none) { ret refuse(row.record, NO_KEPT, arg); }
-    var made: Keep = Keep{side: side.some, against: vector.init[constraint.Side](m.alloc), register: effect.NO_ROW, permit: permit, mask: mask};
+    var made: Keep = Keep{side: side.some, against: vector.init[constraint.Side](m.alloc), register: effect.NO_ROW, permit: permit, mask: mask, gap: gap};
     if (str_len(against) == 0) {
         val found: opt[u32] = register_row(m.file, reg);
         if (sel found.none) { ret refuse(row.record, UNKNOWN_NAME, reg); }
@@ -1642,22 +1658,47 @@ fun keep(m: *Mapper, row: *Row, arg: str, against: str, reg: str, permit: constr
     ret err[diag.Refusal].ok{};
 }
 
-# the register constraints of `row`: each of the overlay's it matches, `used` marking those, and the mask rule
-fun keeps_of(m: *Mapper, row: *Row, used: *bool) err[diag.Refusal] {
+# the register constraints of `row`: each of the overlay's it matches, `used` marking those of KEEPS and `gapped` those
+# of GAPS, and the mask rules
+fun keeps_of(m: *Mapper, row: *Row, used: *bool, gapped: *bool) err[diag.Refusal] {
     row.keeps = vector.init[Keep](m.alloc);
     var i: u32 = 0;
     for (i < constraints.KEEPS_COUNT) {
         val k: *constraints.Keep = ?constraints.KEEPS[i];
         if (overlay.matches(k.mnemonic, row.mnemonic)) {
             used[i] = true;
-            val made: err[diag.Refusal] = keep(m, row, k.arg, k.against, k.register, k.permit, field.NO_OPERAND);
+            val made: err[diag.Refusal] = keep(m, row, k.arg, k.against, k.register, k.permit, field.NO_OPERAND, constraint.NO_GAP);
+            if (sel made.err) { ret made; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < constraints.GAPS_COUNT) {
+        val gp: *constraints.Gap = ?constraints.GAPS[i];
+        if (overlay.matches(gp.mnemonic, row.mnemonic)) {
+            gapped[i] = true;
+            val made: err[diag.Refusal] = keep(m, row, gp.arg, gp.against, "", constraint.DISJOINT, field.NO_OPERAND, gp.gap);
             if (sel made.err) { ret made; }
         }
         i = i + 1;
     }
     val vm: u8 = operand_of(row, constraints.MASK_ARG);
-    if (vm == field.NO_OPERAND || operand_of(row, "vd") == field.NO_OPERAND || matched(?constraints.MASK_FREE[0], constraints.MASK_FREE_COUNT, row)) { ret err[diag.Refusal].ok{}; }
-    ret keep(m, row, "vd", "", constraints.MASK_REGISTER, constraint.DISJOINT, vm);
+    if (vm == field.NO_OPERAND) { ret err[diag.Refusal].ok{}; }
+    if (operand_of(row, "vd") != field.NO_OPERAND && !matched(?constraints.MASK_FREE[0], constraints.MASK_FREE_COUNT, row)) {
+        val made: err[diag.Refusal] = keep(m, row, "vd", "", constraints.MASK_REGISTER, constraint.DISJOINT, vm, constraint.NO_GAP);
+        if (sel made.err) { ret made; }
+    }
+    if (matched(?constraints.MASK_READS[0], constraints.MASK_READS_COUNT, row)) { ret err[diag.Refusal].ok{}; }
+    i = 0;
+    for (i < constraints.MASK_SOURCES_COUNT) {
+        val arg: str = constraints.MASK_SOURCES[i];
+        if (operand_of(row, arg) != field.NO_OPERAND) {
+            val made: err[diag.Refusal] = keep(m, row, arg, "", constraints.MASK_REGISTER, constraint.DISJOINT, vm, constraint.NO_GAP);
+            if (sel made.err) { ret made; }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
 }
 
 # the field of `row`: its unit, and the kind zcmp's stack and s register rows need
@@ -1862,6 +1903,8 @@ pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, fil
         if (sel made.err) { ret made; }
         val laid: err[diag.Refusal] = encoding(?m, row);
         if (sel laid.err) { ret laid; }
+        val grouped: err[diag.Refusal] = segments_of(row);
+        if (sel grouped.err) { ret grouped; }
         i = i + 1;
     }
     var used: [constraints.KEEPS_COUNT]bool;
@@ -1870,12 +1913,18 @@ pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, fil
         used[i] = false;
         i       = i + 1;
     }
+    var gapped: [constraints.GAPS_COUNT]bool;
+    i = 0;
+    for (i < constraints.GAPS_COUNT::usize) {
+        gapped[i] = false;
+        i         = i + 1;
+    }
     i = 0;
     for (i < out.rows.len) {
         val row:  *Row              = out.rows.data[i];
         val done: err[diag.Refusal] = effect_of(?m, row);
         if (sel done.err) { ret done; }
-        val kept: err[diag.Refusal] = keeps_of(?m, row, ?used[0]);
+        val kept: err[diag.Refusal] = keeps_of(?m, row, ?used[0], ?gapped[0]);
         if (sel kept.err) { ret kept; }
         context(?m, row);
         i = i + 1;
@@ -1883,6 +1932,11 @@ pub fun build(a: *A.Allocator, s: *read.Source, catalog: *extension.Catalog, fil
     i = 0;
     for (i < constraints.KEEPS_COUNT::usize) {
         if (!used[i] && !pushed(vector.push[str](?out.idle, constraints.KEEPS[i].mnemonic))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < constraints.GAPS_COUNT::usize) {
+        if (!gapped[i] && !pushed(vector.push[str](?out.idle, constraints.GAPS[i].mnemonic))) { ret err[diag.Refusal].err{memory()}; }
         i = i + 1;
     }
     sort.sort_by[*Row](out.rows.data, out.rows.len, by_mnemonic);
