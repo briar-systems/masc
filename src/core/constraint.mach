@@ -13,10 +13,13 @@
 # as risc-v's vtype decides how many registers a vector group covers. a
 # consumer that knows that state states it as a `Grouping`, which `grouping`
 # builds from the state and the operands' spans. the walks know no such
-# state, so they test at `UNIT`, where every group is one register. a form
-# refused there is refused under every grouping: a longer group only extends
-# a run past the register its operand names, so the runs' starts, and with
-# them every overlap and every permit below, stay as `UNIT` finds them.
+# state, so they test at `UNIT`, where a group whose length turns on state is
+# one register and a fixed span's covers what it states, as an even pair's
+# two. a form refused there is refused under every grouping: a longer group
+# only extends a run past the register its operand names, so the runs'
+# starts, and with them every overlap and every permit below, stay as `UNIT`
+# finds them. `touched` reads the same footprints as the registers an
+# instruction reads and writes.
 #
 # some rules turn on the operands' element widths, as risc-v's overlap rules
 # do, and a width can be the state's. where the grouping states no width and
@@ -125,7 +128,7 @@ pub val NO_CONSTRAINTS: Constraints = Constraints{at: nil, len: 0};
 # ---
 # lengths: one per operand a row can have, the registers of one group as a power of two exponent, negative for a
 #          group within one register, as a risc-v vector group under a fractional emul
-# len:     how many operands' lengths it states. an operand past them covers one register a group
+# len:     how many operands' lengths it states. an operand past them covers its fixed span's registers a group, one else
 # element: the element width the state sets, in bits, 0 when the grouping states none
 pub rec Grouping {
     lengths: [operand.MAX_OPERANDS]i8;
@@ -133,7 +136,8 @@ pub rec Grouping {
     element: u16;
 }
 
-# every group one register and no element width, the grouping the walks test at
+# no group's length stated and no element width, the grouping the walks test at: a group of a fixed span covers
+# what it states, and every other one register
 pub val UNIT: Grouping = Grouping{len: 0, element: 0};
 
 # state a vector instruction's groups follow, as risc-v's vtype, and the bounds of the groups it forms
@@ -227,10 +231,15 @@ fun fields_of(operands: *operand.Operand, op: u8, part: Part) u32 {
     ret r.fields::u32;
 }
 
-# the run of `fields` groups of operand `op` from `first` under `g`
-fun run_of(g: Grouping, op: u8, fields: u32, first: register.Id) Run {
+# the run of `fields` groups of operand `op`, of register shape `r`, from `first` under `g`. a fixed span needs no state,
+# so a group the grouping does not state covers the registers the shape's fixed span does, and one register else
+fun run_of(g: Grouping, r: *operand.Register, op: u8, fields: u32, first: register.Id) Run {
     var e: i8 = 0;
     if (op::u32 < g.len) { e = g.lengths[op]; }
+    or (r != nil) {
+        val sp: operand.Span = r.span;
+        if (sel sp.fixed) { e = sp.fixed::i8; }
+    }
     var per: u32 = 1;
     if (e > 0) { per = 1::u32 << e::u32; }
     ret Run{first: first, len: per * fields, whole: e >= 0, stated: op::u32 < g.len};
@@ -254,13 +263,14 @@ fun runs(values: operand.Values, op: u8, part: Part) u32 {
 
 # run `i` of part `part` of operand `op`'s value
 fun run(g: Grouping, operands: *operand.Operand, values: operand.Values, op: u8, part: Part, i: u32) Run {
-    val v:      operand.Value = values.at[op];
-    val fields: u32           = fields_of(operands, op, part);
-    if (sel v.register) { ret run_of(g, op, fields, v.register); }
+    val v:      operand.Value     = values.at[op];
+    val fields: u32               = fields_of(operands, op, part);
+    val shape:  *operand.Register = shape_of(operands, op, part);
+    if (sel v.register) { ret run_of(g, shape, op, fields, v.register); }
     if (sel v.list) {
         val members: operand.Values = v.list;
         val m:       operand.Value  = members.at[i];
-        if (sel m.register) { ret run_of(g, op, fields, m.register); }
+        if (sel m.register) { ret run_of(g, shape, op, fields, m.register); }
         ret Run{first: register.NONE, len: 0, whole: true, stated: false};
     }
     if (sel v.memory) {
@@ -592,6 +602,68 @@ pub fun violated(file: *register.File, cs: Constraints, operands: *operand.Opera
     }
     if (may != nil) { ret Verdict.inexact{may}; }
     ret Verdict.clear{};
+}
+
+# add register `reg` of `file` to the set of `words` words at `at`
+fun mark(file: *register.File, at: *u64, words: u32, reg: register.Id) {
+    val row: opt[u32] = register.index_of(file, reg);
+    if (sel row.none) { ret; }
+    val n: u32 = row.some;
+    if (n / 64 < words) { at[n / 64] = at[n / 64] | (1::u64 << (n % 64)::u64); }
+}
+
+# add every register of run `a` there is in `file` to the set of `words` words at `at`
+fun mark_run(file: *register.File, at: *u64, words: u32, a: *Run) {
+    var i: u32 = 0;
+    for (i < a.len) {
+        val x: opt[*register.Register] = member(file, a.first, i);
+        if (sel x.some) { mark(file, at, words, register.id_of(x.some)); }
+        i = i + 1;
+    }
+}
+
+# the registers the instruction whose operands are `operands` and effect `e`, holding `values`, reads and writes under
+# `g`: every register of each register operand's groups by its role, so an even pair's operand touches both of its
+# registers, a memory operand's base, index and segment read and a writeback's base written, and the registers no
+# operand names, as `effect.implicit` finds them. `read` and `written` each hold effect.words(file) words, which it
+# overwrites. an operand whose value is none touches nothing
+pub fun touched(file: *register.File, operands: *operand.Operand, e: *effect.Effect, values: operand.Values, g: Grouping, read: *u64, written: *u64) effect.Touched {
+    val words: u32            = effect.words(file);
+    val own:   effect.Touched = effect.implicit(file, e, values);
+    var w:     u32            = 0;
+    for (w < words) {
+        read[w]    = 0;
+        written[w] = 0;
+        if (w < own.read.len)    { read[w] = own.read.words[w]; }
+        if (w < own.written.len) { written[w] = own.written.words[w]; }
+        w = w + 1;
+    }
+    var op: u32 = 0;
+    for (op < values.len) {
+        val o: *operand.Operand = ?operands[op];
+        val v: operand.Value    = values.at[op];
+        if (sel v.memory) {
+            val a: operand.Address = v.memory;
+            if (a.base != register.NONE)                                                                { mark(file, read, words, a.base); }
+            if (a.index != register.NONE)                                                               { mark(file, read, words, a.index); }
+            if (a.segment != register.NONE)                                                             { mark(file, read, words, a.segment); }
+            if (a.base != register.NONE && (a.mode == operand.PREINDEX || a.mode == operand.POSTINDEX)) { mark(file, written, words, a.base); }
+        }
+        or (shape_of(operands, op::u8, WHOLE) != nil) {
+            val count: u32 = runs(values, op::u8, WHOLE);
+            var k:     u32 = 0;
+            for (k < count) {
+                val r: Run = run(g, operands, values, op::u8, WHOLE, k);
+                if (r.first != register.NONE) {
+                    if ((o.role & operand.READ) != 0)  { mark_run(file, read, words, ?r); }
+                    if ((o.role & operand.WRITE) != 0) { mark_run(file, written, words, ?r); }
+                }
+                k = k + 1;
+            }
+        }
+        op = op + 1;
+    }
+    ret effect.Touched{read: effect.Set{words: read, len: words}, written: effect.Set{words: written, len: words}};
 }
 
 # whether `n` is a power of two
