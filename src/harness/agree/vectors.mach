@@ -1,0 +1,486 @@
+# vectors: the instructions of a row the tools are asked to agree on
+#
+# a row's vectors are generated from its operands by kind. each operand has
+# its edges: the first and last register of each class it admits, the
+# boundaries of an immediate's or a target's range and the values around
+# zero, every member of an enumeration, each addressing form of a memory
+# operand, the shortest and longest list, and an absent optional. a base
+# vector holds one ordinary value per operand, registers spread apart so a
+# row that refuses overlapping operands admits it, and every other vector is
+# the base with one operand moved to one of its edges. a vector the row does
+# not admit, as encode admits it, is no vector. so a row of n operands of e
+# edges each has at most 1 + n * e vectors, every one of them distinct.
+#
+# a set adds what its operands mean beyond their kind through its hook, by
+# offering further values for one operand, as risc-v offers every named csr.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.walk;
+
+# the base vectors tried before a row is found to admit none, each spreading its registers and choosing its values
+# one step further along their edges
+val BASE_TRIES: u32 = 16;
+
+# how many operands' registers a base vector spreads apart over what an operand admits, so operand k's register is
+# a quarter of the range on from operand k - 1's, and four operands of one class hold four registers
+val SPREAD: u32 = 4;
+
+# what a row's vectors are generated with and into
+# ---
+# a:         the allocator of the vectors' values, which outlives the run
+# codec:     the set's codec
+# available: the view of the selection the vectors are generated under
+# row:       the row
+# edges:     each operand's edges, the values its vectors move it to
+# base:      the base vector's values
+# out:       the vectors, appended in order
+# failed:    whether the allocator refused, after which nothing more is generated
+pub rec Generation {
+    a:         *A.Allocator;
+    codec:     *walk.Codec;
+    available: *register.Available;
+    row:       *row.Row;
+    edges:     [row.MAX_OPERANDS]vector.Vector[operand.Value];
+    base:      [row.MAX_OPERANDS]operand.Value;
+    out:       *vector.Vector[inst.Inst];
+    failed:    bool;
+}
+
+# a set's hook: offers the values a row's operands take beyond their kind's edges, through `offer`
+pub def Hook: fun(*Generation);
+
+# the hook of a set whose operands mean nothing beyond their kind
+pub fun no_hook(g: *Generation) {}
+
+# a generation of the vectors of `r` under `available` into `out`, its values allocated from `a`
+pub fun make(a: *A.Allocator, codec: *walk.Codec, available: *register.Available, r: *row.Row, out: *vector.Vector[inst.Inst]) Generation {
+    var g: Generation;
+    g.a         = a;
+    g.codec     = codec;
+    g.available = available;
+    g.row       = r;
+    g.out       = out;
+    g.failed    = false;
+    var k: u32 = 0;
+    for (k < row.MAX_OPERANDS) {
+        g.edges[k] = vector.init[operand.Value](a);
+        k          = k + 1;
+    }
+    ret g;
+}
+
+# the edge storage given back
+pub fun release(g: *Generation) {
+    var k: u32 = 0;
+    for (k < row.MAX_OPERANDS) {
+        vector.dnit[operand.Value](?g.edges[k]);
+        k = k + 1;
+    }
+}
+
+# whether the view holds `reg`
+fun exists(g: *Generation, reg: register.Id) bool {
+    val got: err[register.Absent] = register.admitted(g.available, reg);
+    ret sel got.ok;
+}
+
+# the registers of class position `c` of `r` the view holds, counted, or the `nth` of them returned when it is reached
+# ---
+# ret: the register, or register.NONE with `count` holding how many there are
+fun registers_of(g: *Generation, r: *operand.Register, c: u32, nth: u32, count: *u32) register.Id {
+    @count = 0;
+    val file: *register.File = g.codec.registers;
+    if (file == nil) { ret register.NONE; }
+    val class: u16 = r.classes.at[c];
+    if (class::u32 >= file.class_count) { ret register.NONE; }
+    val span: u32 = operand.span(r, file.classes[class].count);
+    var i:    u32 = 0;
+    for (i < span) {
+        val n: u32 = r.first + i;
+        if (!operand.excludes_number(r, n)) {
+            val reg: register.Id = register.make(class, n::u16);
+            if (exists(g, reg)) {
+                if (@count == nth) { ret reg; }
+                @count = @count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret register.NONE;
+}
+
+# how many registers `r` admits under the view, over every class
+fun register_count(g: *Generation, r: *operand.Register) u32 {
+    var total: u32 = 0;
+    var c:     u32 = 0;
+    for (c < r.classes.len) {
+        var n: u32 = 0;
+        registers_of(g, r, c, 0xFFFF_FFFF, ?n);
+        total = total + n;
+        c     = c + 1;
+    }
+    ret total;
+}
+
+# the `nth` register `r` admits under the view, counting over every class in order
+fun register_at(g: *Generation, r: *operand.Register, nth: u32) register.Id {
+    var left: u32 = nth;
+    var c:    u32 = 0;
+    for (c < r.classes.len) {
+        var n:   u32         = 0;
+        val reg: register.Id = registers_of(g, r, c, left, ?n);
+        if (reg != register.NONE) { ret reg; }
+        left = left - n;
+        c    = c + 1;
+    }
+    ret register.NONE;
+}
+
+# the register of operand `k` in base try `t`: spread from the middle of what it admits
+fun register_default(g: *Generation, r: *operand.Register, k: u32, t: u32) register.Id {
+    val count: u32 = register_count(g, r);
+    if (count == 0) { ret register.NONE; }
+    var apart: u32 = count / SPREAD;
+    if (apart == 0) { apart = 1; }
+    ret register_at(g, r, (count / 2 + apart * k + t) % count);
+}
+
+# `v` appended to `list` unless an equal value is already there
+fun add(g: *Generation, list: *vector.Vector[operand.Value], v: operand.Value) {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (operand.equal(?list.data[i], ?v)) { ret; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[operand.Value](list, v);
+    if (sel pushed.err) { g.failed = true; }
+}
+
+# the first and last register of each class `r` admits under the view
+fun register_edges(g: *Generation, r: *operand.Register, out: *vector.Vector[operand.Value]) {
+    var c: u32 = 0;
+    for (c < r.classes.len) {
+        var n: u32 = 0;
+        registers_of(g, r, c, 0xFFFF_FFFF, ?n);
+        if (n > 0) {
+            var m: u32 = 0;
+            add(g, out, operand.Value.register{registers_of(g, r, c, 0, ?m)});
+            add(g, out, operand.Value.register{registers_of(g, r, c, n - 1, ?m)});
+        }
+        c = c + 1;
+    }
+}
+
+# the values `imm` holds at its edges, in the order a base tries them: the smallest step up, zero, the smallest
+# step down, then the ends of its range and the steps inside them, each one it can hold and does not exclude
+fun integer_edges(g: *Generation, imm: *operand.Immediate, relative: bool, out: *vector.Vector[operand.Value]) {
+    if (imm.bits == 0) { ret; }
+    val step: i128 = 1::i128 << imm.scale::i128;
+    var lo:   i128 = 0;
+    var hi:   i128 = (1::i128 << imm.bits::i128) - step;
+    if (imm.signed) {
+        lo = -(1::i128 << (imm.bits - 1)::i128);
+        hi = (1::i128 << (imm.bits - 1)::i128) - step;
+    }
+    val bias:  i128    = imm.bias::i128;
+    val tries: [7]i128 = [7]i128{step + bias, bias, bias - step, lo + bias, lo + step + bias, hi - step + bias, hi + bias};
+    var i:     u32     = 0;
+    for (i < 7) {
+        val wide: i128     = tries[i];
+        val v:    i64      = (wide & 0xFFFF_FFFF_FFFF_FFFF)::u64:~i64;
+        val bad:  opt[str] = walk.unrepresentable(imm, v);
+        if (sel bad.none && !operand.excludes_value(imm, v)) {
+            if (relative) { add(g, out, operand.Value.relative{v}); }
+            or            { add(g, out, operand.Value.immediate{v}); }
+        }
+        i = i + 1;
+    }
+}
+
+# every member of `e`, and the union of every member for a mask
+fun enumeration_edges(g: *Generation, e: *operand.Enumeration, condition: bool, out: *vector.Vector[operand.Value]) {
+    var all: u32 = 0;
+    var i:   u32 = 0;
+    for (i < e.count) {
+        val v: u32 = e.members[i].value;
+        if (condition) { add(g, out, operand.Value.condition{v}); }
+        or             { add(g, out, operand.Value.enumerant{v}); }
+        all = all | v;
+        i   = i + 1;
+    }
+    if (e.mask && all != 0) {
+        if (condition) { add(g, out, operand.Value.condition{all}); }
+        or             { add(g, out, operand.Value.enumerant{all}); }
+    }
+}
+
+# the lowest ids, then the highest
+fun id_edges(g: *Generation, t: *operand.Typed, out: *vector.Vector[operand.Value]) {
+    if (t.bits == 0) { ret; }
+    var top: u64 = 0xFFFF_FFFF;
+    if (t.bits < 32) { top = (1::u64 << t.bits::u64) - 1; }
+    add(g, out, operand.Value.id{0});
+    add(g, out, operand.Value.id{1});
+    add(g, out, operand.Value.id{(top - 1)::u32});
+    add(g, out, operand.Value.id{top::u32});
+}
+
+# `n` values allocated for a list, none when the allocator refuses
+fun values(g: *Generation, n: u32) *operand.Value {
+    if (n == 0) { ret nil; }
+    val got: res[*operand.Value, A.Error] = A.allocate[operand.Value](g.a, n::usize);
+    if (sel got.err) {
+        g.failed = true;
+        ret nil;
+    }
+    ret got.ok;
+}
+
+# a list of `len` members of `l` from its `start`th register, consecutive in number when the list must be, or nil
+# when the view holds too few
+fun list_of(g: *Generation, l: *operand.List, len: u32, start: u32) opt[operand.Value] {
+    val count: u32 = register_count(g, ?l.member);
+    if (count == 0 || (len > count && !l.consecutive)) { ret opt[operand.Value].none{}; }
+    val at: *operand.Value = values(g, len);
+    if (len > 0 && at == nil) { ret opt[operand.Value].none{}; }
+    var i: u32 = 0;
+    for (i < len) {
+        var reg: register.Id = register_at(g, ?l.member, (start + i) % count);
+        if (l.consecutive) {
+            val first: register.Id = register_at(g, ?l.member, start % count);
+            val span:  u32         = operand.span(?l.member, g.codec.registers.classes[register.class_of(first)].count);
+            val n:     u32         = l.member.first + (register.number_of(first)::u32 - l.member.first + i) % span;
+            reg = register.make(register.class_of(first), n::u16);
+        }
+        at[i] = operand.Value.register{reg};
+        i     = i + 1;
+    }
+    ret opt[operand.Value].some{operand.Value.list{operand.Values{at: at, len: len}}};
+}
+
+# the bytes of a literal of `len` bytes of `l`, or none when the allocator refuses
+fun literal_of(g: *Generation, l: *operand.Literal, len: u32) opt[operand.Value] {
+    if (len == 0 || len > l.max) { ret opt[operand.Value].none{}; }
+    val got: res[*u8, A.Error] = A.allocate[u8](g.a, len::usize);
+    if (sel got.err) {
+        g.failed = true;
+        ret opt[operand.Value].none{};
+    }
+    var fill: u8 = 'a';
+    if (l.content == operand.NUMBER) { fill = 0x5a; }
+    var i: u32 = 0;
+    for (i < len) {
+        got.ok[i] = fill;
+        i         = i + 1;
+    }
+    ret opt[operand.Value].some{operand.Value.literal{operand.Bytes{at: got.ok, len: len}}};
+}
+
+# a memory value of base `base`, index `index` at scale `scale`, segment `segment`, displacement `disp` and mode
+# `mode`, with no symbol
+fun address(base: register.Id, index: register.Id, scale: u8, segment: register.Id, disp: i64, mode: operand.Mode) operand.Value {
+    ret operand.Value.memory{operand.Address{base: base, index: index, scale: scale, disp: disp, segment: segment, mode: mode, symbol: operand.Symbol{id: operand.NO_SYMBOL, addend: 0, fixup: operand.NO_FIXUP}}};
+}
+
+# every addressing form of `m`, operand `k`'s: base plus each edge of the displacement, then an index at each scale,
+# a segment, and each of the forms beyond base plus displacement, these at the displacement's first edge
+fun memory_edges(g: *Generation, m: *operand.Memory, k: u32, out: *vector.Vector[operand.Value]) {
+    val base:  register.Id                  = register_default(g, ?m.base, k, 0);
+    var disps: vector.Vector[operand.Value] = vector.init[operand.Value](g.a);
+    integer_edges(g, ?m.disp, false, ?disps);
+    var disp: i64   = 0;
+    var i:    usize = 0;
+    for (i < disps.len) {
+        if (sel disps.data[i].immediate) {
+            if (i == 0) { disp = disps.data[i].immediate; }
+            add(g, out, address(base, register.NONE, 0, register.NONE, disps.data[i].immediate, operand.OFFSET));
+        }
+        i = i + 1;
+    }
+    vector.dnit[operand.Value](?disps);
+    if (register_count(g, ?m.index) > 0) {
+        val index: register.Id = register_default(g, ?m.index, k + 1, 0);
+        var s:     u8          = 0;
+        for (s < 8) {
+            if ((m.scales & (1::u8 << s)) != 0) { add(g, out, address(base, index, s, register.NONE, disp, operand.OFFSET)); }
+            s = s + 1;
+        }
+    }
+    if (register_count(g, ?m.segment) > 0) { add(g, out, address(base, register.NONE, 0, register_default(g, ?m.segment, 0, 0), disp, operand.OFFSET)); }
+    if ((m.forms & operand.ABSOLUTE) != 0) { add(g, out, address(register.NONE, register.NONE, 0, register.NONE, disp, operand.OFFSET)); }
+    if ((m.forms & operand.PCREL) != 0)    { add(g, out, address(register.NONE, register.NONE, 0, register.NONE, disp, operand.RELATIVE_PC)); }
+    if ((m.forms & operand.PRE) != 0)      { add(g, out, address(base, register.NONE, 0, register.NONE, disp, operand.PREINDEX)); }
+    if ((m.forms & operand.POST) != 0)     { add(g, out, address(base, register.NONE, 0, register.NONE, disp, operand.POSTINDEX)); }
+}
+
+# the edges of one value of `shape`, operand `k`'s
+fun shape_edges(g: *Generation, shape: *operand.Shape, k: u32, out: *vector.Vector[operand.Value]) {
+    if (sel shape.register)  { register_edges(g, ?shape.register, out); }
+    or (sel shape.immediate) { integer_edges(g, ?shape.immediate, false, out); }
+    or (sel shape.relative)  { integer_edges(g, ?shape.relative.offset, true, out); }
+    or (sel shape.enumerant) { enumeration_edges(g, ?shape.enumerant, false, out); }
+    or (sel shape.condition) { enumeration_edges(g, ?shape.condition, true, out); }
+    or (sel shape.id)        { id_edges(g, ?shape.id, out); }
+    or (sel shape.memory)    { memory_edges(g, ?shape.memory, k, out); }
+    or (sel shape.list) {
+        val l:     *operand.List      = ?shape.list;
+        val start: u32                = register_count(g, ?l.member) / 2;
+        val short: opt[operand.Value] = list_of(g, l, l.min::u32, start);
+        val long:  opt[operand.Value] = list_of(g, l, l.max::u32, start);
+        if (sel short.some) { add(g, out, short.some); }
+        if (sel long.some)  { add(g, out, long.some); }
+    }
+    or (sel shape.literal) {
+        val shortest: opt[operand.Value] = literal_of(g, ?shape.literal, 1);
+        val longest:  opt[operand.Value] = literal_of(g, ?shape.literal, shape.literal.max);
+        if (sel shortest.some) { add(g, out, shortest.some); }
+        if (sel longest.some)  { add(g, out, longest.some); }
+    }
+}
+
+# operand `k`'s edges: its fixed register alone when the row fixes it, else its kind's edges, as lists of one member
+# and of two for a variadic operand, and with no value for an optional one
+fun operand_edges(g: *Generation, k: u32) {
+    val out:  *vector.Vector[operand.Value] = ?g.edges[k];
+    val desc: *operand.Operand              = ?g.row.operands.at[k];
+    val held: opt[register.Id]              = walk.fixed(g.codec, g.row, k::u8);
+    if (sel held.some) {
+        add(g, out, operand.Value.register{held.some});
+        ret;
+    }
+    if (desc.quantity != operand.VARIADIC) {
+        shape_edges(g, ?desc.shape, k, out);
+        if (desc.quantity == operand.OPTIONAL) { add(g, out, operand.Value.none{}); }
+        ret;
+    }
+    var members: vector.Vector[operand.Value] = vector.init[operand.Value](g.a);
+    shape_edges(g, ?desc.shape, k, ?members);
+    var i: usize = 0;
+    for (i < members.len && i < 2) {
+        val at: *operand.Value = values(g, (i + 1)::u32);
+        if (at != nil) {
+            var j: usize = 0;
+            for (j <= i) {
+                at[j] = members.data[j];
+                j     = j + 1;
+            }
+            add(g, out, operand.Value.list{operand.Values{at: at, len: (i + 1)::u32}});
+        }
+        i = i + 1;
+    }
+    vector.dnit[operand.Value](?members);
+}
+
+# operand `k`'s value in base try `t`: its register spread from the others', or its `t`th edge
+fun base_value(g: *Generation, k: u32, t: u32) opt[operand.Value] {
+    val desc: *operand.Operand = ?g.row.operands.at[k];
+    val held: opt[register.Id] = walk.fixed(g.codec, g.row, k::u8);
+    if (sel held.none && desc.quantity == operand.ONE) {
+        if (sel desc.shape.register) {
+            val reg: register.Id = register_default(g, ?desc.shape.register, k, t);
+            if (reg == register.NONE) { ret opt[operand.Value].none{}; }
+            ret opt[operand.Value].some{operand.Value.register{reg}};
+        }
+    }
+    val edges: *vector.Vector[operand.Value] = ?g.edges[k];
+    if (edges.len == 0) { ret opt[operand.Value].none{}; }
+    ret opt[operand.Value].some{edges.data[t::usize % edges.len]};
+}
+
+# the instruction of the row over `held`, its values copied into storage of its own, appended when the row admits it
+fun keep(g: *Generation, held: *operand.Value) {
+    val n:   u32                = g.row.operands.len;
+    val ins: inst.Inst          = inst.Inst{row: g.row, values: held, count: n};
+    val ok:  err[field.Refusal] = walk.admits(g.codec, g.available, ?ins);
+    if (sel ok.err) { ret; }
+    val at: *operand.Value = values(g, n);
+    if (n > 0 && at == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        at[i] = held[i];
+        i     = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[inst.Inst](g.out, inst.Inst{row: g.row, values: at, count: n});
+    if (sel pushed.err) { g.failed = true; }
+}
+
+# the base vector with operand `k` holding `value`, appended when the row admits it. a set's hook offers each value
+# once per operand, and a value equal to the base's or to one of the operand's edges is already a vector, so it is not
+# offered again
+pub fun offer(g: *Generation, k: u32, value: operand.Value) {
+    if (k >= g.row.operands.len || g.failed) { ret; }
+    if (operand.equal(?g.base[k], ?value))   { ret; }
+    val edges: *vector.Vector[operand.Value] = ?g.edges[k];
+    var i:     usize                         = 0;
+    for (i < edges.len) {
+        if (operand.equal(?edges.data[i], ?value)) { ret; }
+        i = i + 1;
+    }
+    var held: [row.MAX_OPERANDS]operand.Value = g.base;
+    held[k] = value;
+    keep(g, ?held[0]);
+}
+
+# the row's vectors appended: the base, then each operand at each of its edges, then what the hook offers
+# ---
+# ret: whether the row admits a base vector, so that it has any
+pub fun generate(g: *Generation, hook: Hook) bool {
+    val n: u32 = g.row.operands.len;
+    var k: u32 = 0;
+    for (k < n) {
+        operand_edges(g, k);
+        k = k + 1;
+    }
+    var found: bool = false;
+    var t:     u32  = 0;
+    for (t < BASE_TRIES && !found && !g.failed) {
+        var complete: bool = true;
+        k = 0;
+        for (k < n && complete) {
+            val v: opt[operand.Value] = base_value(g, k, t);
+            if (sel v.some) { g.base[k] = v.some; }
+            or              { complete = false; }
+            k = k + 1;
+        }
+        if (complete) {
+            val ins: inst.Inst          = inst.Inst{row: g.row, values: ?g.base[0], count: n};
+            val ok:  err[field.Refusal] = walk.admits(g.codec, g.available, ?ins);
+            found = sel ok.ok;
+        }
+        t = t + 1;
+    }
+    if (!found) { ret false; }
+    keep(g, ?g.base[0]);
+    k = 0;
+    for (k < n) {
+        val edges: *vector.Vector[operand.Value] = ?g.edges[k];
+        var i:     usize                         = 0;
+        for (i < edges.len) {
+            if (!operand.equal(?edges.data[i], ?g.base[k])) {
+                var held: [row.MAX_OPERANDS]operand.Value = g.base;
+                held[k] = edges.data[i];
+                keep(g, ?held[0]);
+            }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    hook(g);
+    ret true;
+}
