@@ -16,18 +16,22 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view.View;
+use std.types.view.view;
 
 use A: std.allocator;
 use std.allocator.testing;
+use std.collections.vector;
 
 use mink;
 
 use masc.asm.core;
+use masc.asm.dialect;
 use masc.asm.model;
 use masc.asm.source;
 use masc.build.build;
 use masc.core.diagnostic;
 use masc.core.extension;
+use masc.core.field;
 use masc.core.mode;
 use masc.core.register;
 use masc.core.set;
@@ -97,7 +101,7 @@ val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?
 
 #[testing]
 fun t_options() model.Options {
-    ret model.Options{arch: ?mink.arch.RISCV64, syntax: 0, traits: set.Traits{at: ?T_DOUBLE[0], len: 1}, private: ".L", layers: model.NO_LAYERS};
+    ret model.Options{arch: ?mink.arch.RISCV64, syntax: 0, traits: set.Traits{at: ?T_DOUBLE[0], len: 1}, dialect: ?dialect.ELF, layers: model.NO_LAYERS};
 }
 
 #[testing]
@@ -135,7 +139,10 @@ fun t_is(v: View, s: str) bool {
 fun t_index(o: *mink.object.Object, name: str) u32 {
     var i: usize = 0;
     for (i < o.sections.count) {
-        if (t_is(mink.object.name_of(o, o.sections.items[i].name), name)) { ret i::u32; }
+        val named: opt[mink.table.Id[mink.intern.Name]] = o.sections.items[i].name;
+        if (sel named.some) {
+            if (t_is(mink.object.name_of(o, named.some), name)) { ret i::u32; }
+        }
         i = i + 1;
     }
     ret o.sections.count::u32;
@@ -264,6 +271,81 @@ fun t_relocates(o: *mink.object.Object, offset: u64, kind: *mink.reloc.Kind, to:
     ret false;
 }
 
+# whether section `name` of `o` is `len` bytes long and begins with the `n` bytes at `want`
+#[testing]
+fun t_begins(o: *mink.object.Object, name: str, want: *u8, n: usize, len: usize) bool {
+    val s: *mink.object.Section = t_section(o, name);
+    if (s == nil) { ret false; }
+    val got: mink.store.Bytes = mink.object.bytes(o, ?s.contents);
+    if (got.len != len) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (got.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# local branches and jumps, both ways and out of reach, and branches and a jump to a symbol only the linker knows,
+# under rv64gc. llvm-mc 23.1.1 (-triple=riscv64 -mattr=+c) writes the bytes and relocations below
+#[testing]
+val T_BRANCHES: str = "1: beq a0, zero, 2f\nbne s1, zero, 1b\nbeq zero, a2, 2f\nbeq a0, a1, 2f\nj 1b\nj 2f\n2: beq a2, zero, g\nbne a0, a1, g\nj g\nbeq a0, zero, 3f\nbeq a0, zero, 4f\n.fill 300, 1, 0\n3: nop\n.fill 5000, 1, 0\n4: nop\n";
+
+#[testing]
+val T_BRANCH_BYTES: [42]u8 = [42]u8{
+    0x19, 0xc5, 0xfd, 0xfc, 0x09, 0xc6, 0x63, 0x04, 0xb5, 0x00, 0xdd, 0xbf, 0x09, 0xa0, 0x19, 0xe2, 0x6f, 0x00, 0x00, 0x00, 0x63,
+    0x04, 0xb5, 0x00, 0x6f, 0x00, 0x00, 0x00, 0x6f, 0x00, 0x00, 0x00, 0x63, 0x0b, 0x05, 0x12, 0x19, 0xe1, 0x6f, 0x10, 0xa0, 0x4b,
+};
+
+# the same under `.option norvc`, which keeps every form full length (llvm-mc 23.1.1, -mattr=+c)
+#[testing]
+val T_FULL: str = ".option norvc\n1: beq a0, zero, 1b\nj 1b\nbeq a0, zero, g\nj g\n";
+
+#[testing]
+val T_FULL_BYTES: [20]u8 = [20]u8{0x63, 0x00, 0x05, 0x00, 0x6f, 0xf0, 0xdf, 0xff, 0x63, 0x14, 0x05, 0x00, 0x6f, 0x00, 0x00, 0x00, 0x6f, 0x00, 0x00, 0x00};
+
+# a jump and a branch across a call the linker may shrink, which stay compressed and relocate (llvm-mc 23.1.1,
+# -mattr=+c,+relax, whose policy for a call masc's is)
+#[testing]
+val T_ACROSS: str = "j out\nbeq a0, zero, out\ncall h\nout: nop\n";
+
+#[testing]
+val T_ACROSS_BYTES: [14]u8 = [14]u8{0x01, 0xa0, 0x01, 0xc1, 0x97, 0x00, 0x00, 0x00, 0xe7, 0x80, 0x00, 0x00, 0x01, 0x00};
+
+test asm__a_branch_is_laid_out_in_the_shortest_form_that_reaches_as_llvm_mc_lays_it {
+    var t: T;
+    if (!t_make(?t, "rv64gc")) { ret 1; }
+    # c.beqz and c.bnez forward and back, swapped registers too, beq with no short form, c.j both ways, the inverted
+    # branch past a jal for each symbol only the linker knows, j to it as jal, and beq and the long form out of reach
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, T_BRANCHES);
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    if (!t_begins(?o, ".text", ?T_BRANCH_BYTES[0], 42, 5346))                                                                                               { ret 3; }
+    if (o.relocs.count != 3)                                                                                                                                { ret 4; }
+    if (!t_relocates(?o, 0x10, ?mink.reloc.JAL20, "g") || !t_relocates(?o, 0x18, ?mink.reloc.JAL20, "g") || !t_relocates(?o, 0x1c, ?mink.reloc.JAL20, "g")) { ret 5; }
+    if (!t_done(?t, ?o))                                                                                                                                    { ret 6; }
+    var u: T;
+    if (!t_make(?u, "rv64gc")) { ret 7; }
+    var full: res[mink.object.Object, model.Refusal] = t_assemble(?u, T_FULL);
+    if (sel full.err) { ret 8; }
+    var p: mink.object.Object = full.ok;
+    if (!t_holds(?p, ".text", ?T_FULL_BYTES[0], 20))                                                     { ret 9; }
+    if (p.relocs.count != 2)                                                                             { ret 10; }
+    if (!t_relocates(?p, 0xc, ?mink.reloc.JAL20, "g") || !t_relocates(?p, 0x10, ?mink.reloc.JAL20, "g")) { ret 11; }
+    if (!t_done(?u, ?p))                                                                                 { ret 12; }
+    var w: T;
+    if (!t_make(?w, "rv64gc")) { ret 13; }
+    var across: res[mink.object.Object, model.Refusal] = t_assemble(?w, T_ACROSS);
+    if (sel across.err) { ret 14; }
+    var q: mink.object.Object = across.ok;
+    if (!t_holds(?q, ".text", ?T_ACROSS_BYTES[0], 14))                                                          { ret 15; }
+    if (q.relocs.count != 4)                                                                                    { ret 16; }
+    if (!t_relocates(?q, 0, ?mink.reloc.RVC_JUMP, "out") || !t_relocates(?q, 2, ?mink.reloc.RVC_BRANCH, "out")) { ret 17; }
+    if (!t_relocates(?q, 4, ?mink.reloc.CALL_PLT_PAIR, "h"))                                                    { ret 18; }
+    if (!t_done(?w, ?q))                                                                                        { ret 19; }
+    ret 0;
+}
+
 #[testing]
 val T_PIC: [1]mode.Setting = [1]mode.Setting{mode.Setting{mode: ?riscv_mode.POSITION, value: ?riscv_mode.PIC}};
 
@@ -305,6 +387,28 @@ test asm__la_is_lla_without_pic_and_a_got_load_with_it {
     ret 0;
 }
 
+# which of the two `la` of `text` load from the got: bit 0 the first, bit 1 the second, 4 when it does not assemble
+#[testing]
+fun t_la_pic(text: str) u32 {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 4; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, text);
+    if (sel got.err) { ret 4; }
+    var o:    mink.object.Object = got.ok;
+    var seen: u32                = 0;
+    if (t_relocates(?o, 0, ?mink.reloc.GOT_PCREL_HI20, "x")) { seen = seen | 1; }
+    if (t_relocates(?o, 8, ?mink.reloc.GOT_PCREL_HI20, "x")) { seen = seen | 2; }
+    if (!t_done(?t, ?o))                                     { ret 4; }
+    ret seen;
+}
+
+test asm__option_pic_and_nopic_change_what_la_expands_to_and_pop_restores_it {
+    if (t_la_pic("la a0, x\n.option pic\nla a0, x\nx: nop\n") != 2)                            { ret 1; }
+    if (t_la_pic(".option pic\nla a0, x\n.option nopic\nla a0, x\nx: nop\n") != 1)             { ret 2; }
+    if (t_la_pic(".option push\n.option pic\nla a0, x\n.option pop\nla a0, x\nx: nop\n") != 1) { ret 3; }
+    ret 0;
+}
+
 test asm__a_symbol_given_two_bindings_is_refused {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
@@ -332,6 +436,51 @@ test asm__section_flags_and_type_are_set_from_the_directive {
     val misc: *mink.object.Section = t_section(?o, ".misc");
     if (misc == nil || misc.kind != ?mink.section.TEXT || misc.flags != (mink.section.ALLOC | mink.section.EXEC)) { ret 8; }
     if (!t_done(?t, ?o))                                                                                          { ret 9; }
+    ret 0;
+}
+
+# whether section `i` of `o` is named `name` and holds exactly the `n` bytes at `want`
+#[testing]
+fun t_holds_at(o: *mink.object.Object, i: u32, name: str, want: *u8, n: usize) bool {
+    if (i::usize >= o.sections.count) { ret false; }
+    val s:     *mink.object.Section                 = ?o.sections.items[i];
+    val named: opt[mink.table.Id[mink.intern.Name]] = s.name;
+    if (sel named.none)                                  { ret false; }
+    if (!t_is(mink.object.name_of(o, named.some), name)) { ret false; }
+    val got: mink.store.Bytes = mink.object.bytes(o, ?s.contents);
+    if (got.len != n) { ret false; }
+    var k: usize = 0;
+    for (k < n) {
+        if (got.data[k] != want[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+test asm__a_unique_section_is_apart_from_the_others_of_its_name_as_llvm_mc_keeps_it {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".text\n.byte 1\n.section .text,\"ax\",@progbits,unique,1\n.byte 2\n.section .text,\"ax\",@progbits,unique,7\n.byte 3\n.section .text,\"ax\",@progbits, unique, 1\n.byte 4\n.section .text,\"ax\",@progbits\n.byte 5\n.section .rodata.x,\"aM\",@progbits,4,unique,3\n.word 1\n.section .rodata.x,\"aM\",@progbits,4\n.word 2\n");
+    if (sel got.err) { ret 2; }
+    var o:     mink.object.Object = got.ok;
+    val first: [2]u8              = [2]u8{1, 5};
+    val one:   [2]u8              = [2]u8{2, 4};
+    val seven: [1]u8              = [1]u8{3};
+    val three: [4]u8              = [4]u8{1, 0, 0, 0};
+    val plain: [4]u8              = [4]u8{2, 0, 0, 0};
+    if (o.sections.count != 5)                         { ret 3; }
+    if (!t_holds_at(?o, 0, ".text", ?first[0], 2))     { ret 4; }
+    if (!t_holds_at(?o, 1, ".text", ?one[0], 2))       { ret 5; }
+    if (!t_holds_at(?o, 2, ".text", ?seven[0], 1))     { ret 6; }
+    if (!t_holds_at(?o, 3, ".rodata.x", ?three[0], 4)) { ret 7; }
+    if (!t_holds_at(?o, 4, ".rodata.x", ?plain[0], 4)) { ret 8; }
+    if (o.sections.items[3].entsize != 4)              { ret 9; }
+    if (!t_done(?t, ?o))                               { ret 10; }
+    var u: T;
+    if (!t_make(?u, "rv64i")) { ret 11; }
+    var bare: res[mink.object.Object, model.Refusal] = t_assemble(?u, ".section .text,\"ax\",@progbits,unique\n");
+    if (!t_refused(?bare, model.NOT_A_NUMBER, 1, 37)) { ret 12; }
+    if (!t_release(?u))                               { ret 13; }
     ret 0;
 }
 
@@ -452,6 +601,28 @@ test asm__alignment_directives_pad_to_their_boundary {
     ret 0;
 }
 
+test asm__realigned_padding_is_llvm_mcs_c_nop_first {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    var got: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".text\ncall f\n.balign 8\nf: ret\n");
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    # llvm-mc 23.1.1 -triple=riscv64 -mattr=+c,+relax: the call, c.nop, one four byte nop, ret
+    val want: [16]u8 = [16]u8{0x97, 0, 0, 0, 0xE7, 0x80, 0, 0, 0x01, 0x00, 0x13, 0, 0, 0, 0x82, 0x80};
+    if (!t_holds(?o, ".text", ?want[0], 16)) { ret 3; }
+    if (!t_done(?t, ?o))                     { ret 4; }
+    # a view without c cannot hold c.nop, so its padding is four byte nops alone
+    var u: T;
+    if (!t_make(?u, "rv64ic")) { ret 5; }
+    var narrow: res[mink.object.Object, model.Refusal] = t_assemble(?u, ".option norvc\n.text\ncall f\n.balign 16\nf: nop\n");
+    if (sel narrow.err) { ret 6; }
+    var p:    mink.object.Object = narrow.ok;
+    val nops: [24]u8             = [24]u8{0x97, 0, 0, 0, 0xE7, 0x80, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0};
+    if (!t_holds(?p, ".text", ?nops[0], 24)) { ret 7; }
+    if (!t_done(?u, ?p))                     { ret 8; }
+    ret 0;
+}
+
 test asm__a_malformed_line_is_refused_at_its_column {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
@@ -463,6 +634,30 @@ test asm__a_malformed_line_is_refused_at_its_column {
     var head: res[mink.object.Object, model.Refusal] = t_assemble(?u, "nop\n , x\n");
     if (!t_refused(?head, source.MALFORMED, 2, 2)) { ret 5; }
     if (!t_release(?u))                            { ret 6; }
+    ret 0;
+}
+
+# a register the e base lacks, by its name or its abi alias, is refused at its spelling with what admits it
+test asm__a_register_the_e_base_lacks_is_refused_naming_the_base_it_needs {
+    var t: T;
+    if (!t_make(?t, "rv64e")) { ret 1; }
+    var named: res[mink.object.Object, model.Refusal] = t_assemble(?t, "add a0, a1, a5\nadd x16, x1, x2\n");
+    if (!t_refused(?named, field.UNAVAILABLE, 2, 5)) { ret 2; }
+    if (sel named.ok)                                { ret 2; }
+    var d:      diagnostic.Diagnostic = named.err.diagnostic;
+    var out:    vector.Vector[u8]     = vector.init[u8](testing.allocator_of(?t.t));
+    val worded: err[A.Error]          = extension.spell_diagnostic(?t.s, ?d, ?out);
+    if (sel worded.err || !t_is(view(out.data, out.len), "register not available under the selection: needs i")) { ret 3; }
+    vector.dnit[u8](?out);
+    var aliased: res[mink.object.Object, model.Refusal] = t_assemble(?t, "add a0, a1, a6\n");
+    if (!t_refused(?aliased, field.UNAVAILABLE, 1, 13)) { ret 4; }
+    if (!t_release(?t))                                 { ret 5; }
+    # {ra, s0-s2} names s2, x18, which the list's register rule touches, and rv64's stack base for it is 32 bytes
+    var u: T;
+    if (!t_make(?u, "rv64e_zcmp")) { ret 6; }
+    var listed: res[mink.object.Object, model.Refusal] = t_assemble(?u, "cm.push {ra, s0-s1}, -32\ncm.push {ra, s0-s2}, -32\n");
+    if (!t_refused(?listed, field.UNAVAILABLE, 2, 9)) { ret 7; }
+    if (!t_release(?u))                               { ret 8; }
     ret 0;
 }
 
@@ -494,6 +689,19 @@ test asm__a_narrowing_refuses_what_it_removes_and_never_widens {
     var widened: res[mink.object.Object, model.Refusal] = t_assemble(?u, ".option norvc\n.option rvc\n");
     if (!t_refused(?widened, model.WIDENS, 2, 9)) { ret 8; }
     if (!t_release(?u))                           { ret 9; }
+    ret 0;
+}
+
+# the source cannot write the sections elf holds the traits in, as their contents would contradict the stated traits,
+# and the refusal points at the name
+test asm__a_section_the_format_holds_the_traits_in_is_refused {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    var note: res[mink.object.Object, model.Refusal] = t_assemble(?t, "nop\n.section .note.gnu.property,\"a\",@note\n.word 4\n");
+    if (!t_refused(?note, build.TRAIT_SECTION, 2, 10)) { ret 2; }
+    var attributes: res[mink.object.Object, model.Refusal] = t_assemble(?t, ".pushsection .riscv.attributes\n.byte 0x41\n.popsection\n");
+    if (!t_refused(?attributes, build.TRAIT_SECTION, 1, 14)) { ret 3; }
+    if (!t_release(?t))                                      { ret 4; }
     ret 0;
 }
 
