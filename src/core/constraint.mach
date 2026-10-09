@@ -19,7 +19,8 @@
 # only extends a run past the register its operand names, so the runs'
 # starts, and with them every overlap and every permit below, stay as `UNIT`
 # finds them. `touched` reads the same footprints as the registers an
-# instruction reads and writes.
+# instruction reads and writes, and `kills` walks the same writes for what
+# register.overwrites says they overwrite.
 #
 # some rules turn on the operands' element widths, as risc-v's overlap rules
 # do, and a width can be the state's. where the grouping states no width and
@@ -614,13 +615,91 @@ fun mark(file: *register.File, at: *u64, words: u32, reg: register.Id, written: 
     if (n / 64 < words)                                            { at[n / 64] = at[n / 64] | (1::u64 << (n % 64)::u64); }
 }
 
-# add every register of run `a` there is in `file` to the set of `words` words at `at`, as `mark` does
-fun mark_run(file: *register.File, at: *u64, words: u32, a: *Run, written: bool) {
+# what a walk of an instruction's registers fills: the sets `touched` returns, and whether a write overwrites a register
+# ---
+# read:    the registers read, `words` words
+# written: the registers written, `words` words
+# words:   the words of each set, 0 for a walk that fills neither
+# other:   the register a write may overwrite, nil for none
+# covered: whether a write the walk met overwrites it
+rec Walk {
+    read:    *u64;
+    written: *u64;
+    words:   u32;
+    other:   *register.Register;
+    covered: bool;
+}
+
+# a read of register `reg` of `file`, met by the walk `w`
+fun reads(file: *register.File, w: *Walk, reg: register.Id) {
+    mark(file, w.read, w.words, reg, false);
+}
+
+# a write of register `reg` of `file` through `write`, met by the walk `w`
+fun writes(file: *register.File, w: *Walk, reg: register.Id, write: register.Write) {
+    mark(file, w.written, w.words, reg, true);
+    if (w.other == nil || w.covered) { ret; }
+    val row: opt[*register.Register] = register.row_of(file, reg);
+    if (sel row.some && register.overwrites(file, row.some, w.other, write)) { w.covered = true; }
+}
+
+# the registers no operand names that `set` holds written, met by the walk `w`, each written as its row states
+fun writes_set(file: *register.File, w: *Walk, set: effect.Set) {
+    var k: u32 = 0;
+    for (k < set.len) {
+        var bits: u64 = set.words[k];
+        var b:    u32 = 0;
+        for (bits != 0) {
+            val at: u32 = k * 64 + b;
+            if ((bits & 1) != 0 && at < file.register_count) { writes(file, w, register.id_of(?file.registers[at]), register.Write.row{}); }
+            bits = bits >> 1;
+            b    = b + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# every register of run `a` there is in `file`, read or written through `write` as `written` says, met by the walk `w`
+fun meets_run(file: *register.File, w: *Walk, a: *Run, written: bool, write: register.Write) {
     var i: u32 = 0;
     for (i < a.len) {
         val x: opt[*register.Register] = member(file, a.first, i);
-        if (sel x.some) { mark(file, at, words, register.id_of(x.some), written); }
+        if (sel x.some) {
+            if (written) { writes(file, w, register.id_of(x.some), write); }
+            or           { reads(file, w, register.id_of(x.some)); }
+        }
         i = i + 1;
+    }
+}
+
+# the registers the operands `operands` holding `values` read and write under `g`, met by the walk `w`: every register
+# of each register operand's groups by its role, each write through the operand's own, and a memory operand's base,
+# index and segment read and a writeback's base written as its row states. an operand whose value is none meets nothing
+fun walk_operands(file: *register.File, operands: *operand.Operand, values: operand.Values, g: Grouping, w: *Walk) {
+    var op: u32 = 0;
+    for (op < values.len) {
+        val o: *operand.Operand = ?operands[op];
+        val v: operand.Value    = values.at[op];
+        if (sel v.memory) {
+            val a: operand.Address = v.memory;
+            if (a.base != register.NONE)                                                                { reads(file, w, a.base); }
+            if (a.index != register.NONE)                                                               { reads(file, w, a.index); }
+            if (a.segment != register.NONE)                                                             { reads(file, w, a.segment); }
+            if (a.base != register.NONE && (a.mode == operand.PREINDEX || a.mode == operand.POSTINDEX)) { writes(file, w, a.base, register.Write.row{}); }
+        }
+        or (shape_of(operands, op::u8, WHOLE) != nil) {
+            val count: u32 = runs(values, op::u8, WHOLE);
+            var k:     u32 = 0;
+            for (k < count) {
+                val r: Run = run(g, operands, values, op::u8, WHOLE, k);
+                if (r.first != register.NONE) {
+                    if ((o.role & operand.READ) != 0)  { meets_run(file, w, ?r, false, o.write); }
+                    if ((o.role & operand.WRITE) != 0) { meets_run(file, w, ?r, true, o.write); }
+                }
+                k = k + 1;
+            }
+        }
+        op = op + 1;
     }
 }
 
@@ -632,7 +711,8 @@ fun mark_run(file: *register.File, at: *u64, words: u32, a: *Run, written: bool)
 # an operand with no known value leaves `effect.implicit` undecided. a decided answer's written holds only what the
 # values certainly write, an operand's write of a register the file flags ZERO being none, and a write that may keep any
 # of a register's old value is in read too, the contract of effect.Touched, so a reader takes read as live in and
-# written as a kill and a definition
+# written as a kill and a definition. a written register kills the storage of its own row, and `kills` says which
+# further registers its write overwrites
 pub fun touched(file: *register.File, operands: *operand.Operand, e: *effect.Effect, values: operand.Values, g: Grouping, read: *u64, written: *u64) effect.Answer[effect.Touched] {
     val found: effect.Answer[effect.Touched] = effect.implicit(file, operands, e, values);
     if (sel found.undecided) { ret effect.Answer[effect.Touched].undecided{found.undecided}; }
@@ -646,32 +726,26 @@ pub fun touched(file: *register.File, operands: *operand.Operand, e: *effect.Eff
         if (w < own.written.len) { written[w] = own.written.words[w]; }
         w = w + 1;
     }
-    var op: u32 = 0;
-    for (op < values.len) {
-        val o: *operand.Operand = ?operands[op];
-        val v: operand.Value    = values.at[op];
-        if (sel v.memory) {
-            val a: operand.Address = v.memory;
-            if (a.base != register.NONE)                                                                { mark(file, read, words, a.base, false); }
-            if (a.index != register.NONE)                                                               { mark(file, read, words, a.index, false); }
-            if (a.segment != register.NONE)                                                             { mark(file, read, words, a.segment, false); }
-            if (a.base != register.NONE && (a.mode == operand.PREINDEX || a.mode == operand.POSTINDEX)) { mark(file, written, words, a.base, true); }
-        }
-        or (shape_of(operands, op::u8, WHOLE) != nil) {
-            val count: u32 = runs(values, op::u8, WHOLE);
-            var k:     u32 = 0;
-            for (k < count) {
-                val r: Run = run(g, operands, values, op::u8, WHOLE, k);
-                if (r.first != register.NONE) {
-                    if ((o.role & operand.READ) != 0)  { mark_run(file, read, words, ?r, false); }
-                    if ((o.role & operand.WRITE) != 0) { mark_run(file, written, words, ?r, true); }
-                }
-                k = k + 1;
-            }
-        }
-        op = op + 1;
-    }
+    var walk: Walk = Walk{read: read, written: written, words: words, other: nil, covered: false};
+    walk_operands(file, operands, values, g, ?walk);
     ret effect.Answer[effect.Touched].decided{effect.Touched{read: effect.Set{words: read, len: words}, written: effect.Set{words: written, len: words}}};
+}
+
+# whether the instruction whose operands are `operands` and effect `e`, holding `values`, leaves every bit of register
+# `other` overwritten under `g`: some register `touched` finds it writing overwrites other, as register.overwrites decides from
+# the register's row and the write of the operand naming it, a register no operand names written as its row states.
+# undecided when `touched` is, and false for a register the file has no row of. a reader ending the values a write
+# kills ends other's when it is true, and takes touched's read as live in as ever, so an overwriting write that may keep
+# some of its own register's old value still reads it
+pub fun kills(file: *register.File, operands: *operand.Operand, e: *effect.Effect, values: operand.Values, g: Grouping, other: register.Id) effect.Answer[bool] {
+    val found: effect.Answer[effect.Touched] = effect.implicit(file, operands, e, values);
+    if (sel found.undecided) { ret effect.Answer[bool].undecided{found.undecided}; }
+    val row: opt[*register.Register] = register.row_of(file, other);
+    if (sel row.none) { ret effect.Answer[bool].decided{false}; }
+    var walk: Walk = Walk{read: nil, written: nil, words: 0, other: row.some, covered: false};
+    writes_set(file, ?walk, found.decided.written);
+    walk_operands(file, operands, values, g, ?walk);
+    ret effect.Answer[bool].decided{walk.covered};
 }
 
 # whether `n` is a power of two
@@ -754,10 +828,10 @@ val T_CLASSES: [1]register.Class = [1]register.Class{
 
 #[testing]
 val T_REGISTERS: [4]register.Register = [4]register.Register{
-    register.Register{name: "x0", class: 0, number: 0, bank: 0, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    register.Register{name: "x1", class: 0, number: 1, bank: 1, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    register.Register{name: "x2", class: 0, number: 2, bank: 2, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
-    register.Register{name: "x3", class: 0, number: 3, bank: 3, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    register.Register{name: "x0", class: 0, number: 0, bank: 0, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: register.KEEP},
+    register.Register{name: "x1", class: 0, number: 1, bank: 1, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: register.KEEP},
+    register.Register{name: "x2", class: 0, number: 2, bank: 2, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: register.KEEP},
+    register.Register{name: "x3", class: 0, number: 3, bank: 3, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE, extend: register.KEEP},
 };
 
 #[testing]
