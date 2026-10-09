@@ -26,6 +26,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.view.View;
 
 use A: std.allocator;
@@ -83,19 +84,6 @@ pub rec Location {
     discriminator: u32;
 }
 
-# bytes of the text the table keeps
-rec Span {
-    at:  usize;
-    len: usize;
-}
-
-# a file of the table, its text in the table's text
-rec Entry {
-    directory: Span;
-    name:      Span;
-    md5:       opt[mink.line.Md5];
-}
-
 # a location and the label that places it
 rec Mark {
     at:  build.Label;
@@ -103,29 +91,47 @@ rec Mark {
 }
 
 # the line facts of one object
+#
+# a file is keyed by its directory and name, so a file stated again is found
+# by one lookup. a key is the directory's length in 8 bytes, the directory,
+# then the name, which no other directory and name spell
 # ---
 # a:       the allocator
-# text:    the bytes of every file's directory and name
-# files:   the file table
+# keys:    the key of every distinct file
+# sums:    per key, the checksum its file states
+# files:   the file table, each file its key's index
+# scratch: room to spell a key in
 # marks:   the locations in the order they were attached
 # builder: the builder they are attached to, nil before the first
 pub rec Lines {
     a:       *A.Allocator;
-    text:    vector.Vector[u8];
-    files:   vector.Vector[Entry];
+    keys:    mink.intern.Interner;
+    sums:    vector.Vector[opt[mink.line.Md5]];
+    files:   vector.Vector[u32];
+    scratch: vector.Vector[u8];
     marks:   vector.Vector[Mark];
     builder: *build.Builder;
 }
 
 # the line facts of an object, empty
 pub fun make(a: *A.Allocator) Lines {
-    ret Lines{a: a, text: vector.init[u8](a), files: vector.init[Entry](a), marks: vector.init[Mark](a), builder: nil};
+    ret Lines{
+        a:       a,
+        keys:    mink.intern.make(a),
+        sums:    vector.init[opt[mink.line.Md5]](a),
+        files:   vector.init[u32](a),
+        scratch: vector.init[u8](a),
+        marks:   vector.init[Mark](a),
+        builder: nil,
+    };
 }
 
 # give back everything the facts own
 pub fun release(l: *Lines) {
-    vector.dnit[u8](?l.text);
-    vector.dnit[Entry](?l.files);
+    mink.intern.release(?l.keys);
+    vector.dnit[opt[mink.line.Md5]](?l.sums);
+    vector.dnit[u32](?l.files);
+    vector.dnit[u8](?l.scratch);
     vector.dnit[Mark](?l.marks);
 }
 
@@ -141,27 +147,27 @@ fun held(r: res[usize, A.Error]) bool {
     ret sel r.ok;
 }
 
-# `v` copied into the table's text
-fun keep(l: *Lines, v: View) res[Span, build.Refusal] {
-    if (!held(vector.reserve[u8](?l.text, v.len))) { ret res[Span, build.Refusal].err{refusal(field.MEMORY)}; }
-    val at: usize = l.text.len;
-    var i:  usize = 0;
+fun append(out: *vector.Vector[u8], v: View) {
+    var i: usize = 0;
     for (i < v.len) {
-        l.text.data[at + i] = v.data[i];
-        i                   = i + 1;
+        out.data[out.len + i] = v.data[i];
+        i                     = i + 1;
     }
-    l.text.len = at + v.len;
-    ret res[Span, build.Refusal].ok{Span{at: at, len: v.len}};
+    out.len = out.len + v.len;
 }
 
-# whether the table's text at `s` is `v`
-fun spells(l: *Lines, s: Span, v: View) bool {
-    if (s.len != v.len) { ret false; }
+# the key of `s` spelled into the scratch room, false when it cannot be
+fun spell(l: *Lines, s: *Source) bool {
+    l.scratch.len = 0;
+    if (!held(vector.reserve[u8](?l.scratch, 8 + s.directory.len + s.name.len))) { ret false; }
     var i: usize = 0;
-    for (i < s.len) {
-        if (l.text.data[s.at + i] != v.data[i]) { ret false; }
-        i = i + 1;
+    for (i < 8) {
+        l.scratch.data[i] = (s.directory.len >> (i * 8)::u64)::u8;
+        i                 = i + 1;
     }
+    l.scratch.len = 8;
+    append(?l.scratch, s.directory);
+    append(?l.scratch, s.name);
     ret true;
 }
 
@@ -179,21 +185,21 @@ fun same_sum(x: opt[mink.line.Md5], y: opt[mink.line.Md5]) bool {
 # the file `s` added to the table at the next index, which is returned. a file the table holds under the same directory
 # and name is the same file, as a first file numbered 1 is also file 0, and is refused when it states another checksum
 pub fun file(l: *Lines, s: Source) res[u32, build.Refusal] {
-    if (s.name.len == 0) { ret res[u32, build.Refusal].err{refusal(NO_NAME)}; }
-    var i: usize = 0;
-    for (i < l.files.len) {
-        val e: *Entry = ?l.files.data[i];
-        if (spells(l, e.directory, s.directory) && spells(l, e.name, s.name) && !same_sum(e.md5, s.md5)) { ret res[u32, build.Refusal].err{refusal(CHECKSUM)}; }
-        i = i + 1;
+    if (s.name.len == 0)                         { ret res[u32, build.Refusal].err{refusal(NO_NAME)}; }
+    if (!spell(l, ?s))                           { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
+    if (!held(vector.reserve[u32](?l.files, 1))) { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
+    val index: u32                                  = l.files.len::u32;
+    val known: opt[mink.table.Id[mink.intern.Name]] = mink.intern.find(?l.keys, l.scratch.data, l.scratch.len);
+    if (sel known.some) {
+        if (!same_sum(l.sums.data[known.some.index::usize], s.md5)) { ret res[u32, build.Refusal].err{refusal(CHECKSUM)}; }
+        vector.push[u32](?l.files, known.some.index);
+        ret res[u32, build.Refusal].ok{index};
     }
-    if (!held(vector.reserve[Entry](?l.files, 1))) { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
-    val kept_dir: res[Span, build.Refusal] = keep(l, s.directory);
-    if (sel kept_dir.err) { ret res[u32, build.Refusal].err{kept_dir.err}; }
-    val kept_name: res[Span, build.Refusal] = keep(l, s.name);
-    if (sel kept_name.err) { ret res[u32, build.Refusal].err{kept_name.err}; }
-    val index: u32 = l.files.len::u32;
-    l.files.data[l.files.len] = Entry{directory: kept_dir.ok, name: kept_name.ok, md5: s.md5};
-    l.files.len               = l.files.len + 1;
+    if (!held(vector.reserve[opt[mink.line.Md5]](?l.sums, 1))) { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
+    val key: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.intern.intern(?l.keys, l.scratch.data, l.scratch.len);
+    if (sel key.err) { ret res[u32, build.Refusal].err{refusal(field.MEMORY)}; }
+    vector.push[opt[mink.line.Md5]](?l.sums, s.md5);
+    vector.push[u32](?l.files, key.ok.index);
     ret res[u32, build.Refusal].ok{index};
 }
 
@@ -222,31 +228,32 @@ pub fun location(l: *Lines, b: *build.Builder, loc: Location) err[build.Refusal]
     ret err[build.Refusal].ok{};
 }
 
-# the name of the table's text at `s` interned on `o`
-fun named(l: *Lines, o: *mink.object.Object, s: Span) res[mink.table.Id[mink.intern.Name], mink.fail.Fail] {
-    ret mink.object.name(o, ?l.text.data[s.at], s.len);
-}
-
-# file `e` of the table as a file of `o`'s table, the one it holds under the same directory and name when it has one
-fun state_file(l: *Lines, o: *mink.object.Object, e: *Entry) res[mink.table.Id[mink.line.File], mink.fail.Fail] {
+# the file of key `k` as a file of `o`'s table
+fun state_file(l: *Lines, o: *mink.object.Object, k: usize) res[mink.table.Id[mink.line.File], mink.fail.Fail] {
+    val key: View  = mink.intern.bytes_of(?l.keys, mink.table.nth[mink.intern.Name](k));
+    var at:  usize = 0;
+    var i:   usize = 0;
+    for (i < 8) {
+        at = at | (key.data[i]::usize << (i * 8)::u64);
+        i  = i + 1;
+    }
     var directory: opt[mink.table.Id[mink.intern.Name]] = opt[mink.table.Id[mink.intern.Name]].none{};
-    if (e.directory.len != 0) {
-        val d: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = named(l, o, e.directory);
+    if (at != 0) {
+        val d: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.object.name(o, ?key.data[8], at);
         if (sel d.err) { ret res[mink.table.Id[mink.line.File], mink.fail.Fail].err{d.err}; }
         directory = opt[mink.table.Id[mink.intern.Name]].some{d.ok};
     }
-    val n: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = named(l, o, e.name);
+    val n: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.object.name(o, ?key.data[8 + at], key.len - 8 - at);
     if (sel n.err) { ret res[mink.table.Id[mink.line.File], mink.fail.Fail].err{n.err}; }
-    val found: opt[mink.table.Id[mink.line.File]] = mink.object.file_named(o, directory, n.ok);
-    if (sel found.some) { ret res[mink.table.Id[mink.line.File], mink.fail.Fail].ok{found.some}; }
-    ret mink.object.add_file(o, mink.line.File{directory: directory, name: n.ok, md5: e.md5});
+    ret mink.object.add_file(o, mink.line.File{directory: directory, name: n.ok, md5: l.sums.data[k]});
 }
 
-# the files and the rows of the facts stated on `o`, each row at the final place of its location
+# the files and the rows of the facts stated on `o`, each row at the final place of its location. `files` is filled per
+# key, and a row names the file of its location's key
 fun state(l: *Lines, b: *build.Builder, o: *mink.object.Object, files: *vector.Vector[mink.table.Id[mink.line.File]], open: *vector.Vector[u32]) err[build.Refusal] {
     var i: usize = 0;
-    for (i < l.files.len) {
-        val f: res[mink.table.Id[mink.line.File], mink.fail.Fail] = state_file(l, o, ?l.files.data[i]);
+    for (i < mink.intern.count(?l.keys)) {
+        val f: res[mink.table.Id[mink.line.File], mink.fail.Fail] = state_file(l, o, i);
         if (sel f.err)                                                      { ret refused(f.err); }
         if (!held(vector.push[mink.table.Id[mink.line.File]](files, f.ok))) { ret err[build.Refusal].err{refusal(field.MEMORY)}; }
         i = i + 1;
@@ -267,7 +274,7 @@ fun state(l: *Lines, b: *build.Builder, o: *mink.object.Object, files: *vector.V
         }
         val r: res[mink.table.Id[mink.line.Row], mink.fail.Fail] = mink.object.add_row(o, mink.table.Id[mink.object.Sequence]{index: open.data[s] - 1}, mink.line.Row{
             at:            p.some.offset,
-            file:          files.data[m.loc.file::usize],
+            file:          files.data[l.files.data[m.loc.file::usize]::usize],
             line:          m.loc.line,
             column:        m.loc.column,
             flags:         m.loc.flags,
@@ -449,5 +456,40 @@ test line__a_refused_finish_leaves_no_records_and_a_rerun_states_them_once {
     if (runs != 2)                       { ret 6; }
     if (!t_records(?o, 5012, ?at[0], 2)) { ret 7; }
     if (!t_done(?t, ?o))                 { ret 8; }
+    ret 0;
+}
+
+test line__a_restated_file_is_the_same_file_and_another_checksum_is_refused {
+    var t: T;
+    if (!t_make(?t)) { ret 1; }
+    var sum: mink.line.Md5;
+    sum.bytes[0] = 0xd4;
+    val dir:  View                    = View{data: "/src", len: 4};
+    val name: View                    = View{data: "b.c", len: 3};
+    val b:    res[u32, build.Refusal] = file(?t.l, Source{directory: dir, name: name, md5: opt[mink.line.Md5].some{sum}});
+    if (sel b.err) { ret 2; }
+    if (b.ok != 1) { ret 2; }
+    val again: res[u32, build.Refusal] = file(?t.l, Source{directory: dir, name: name, md5: opt[mink.line.Md5].some{sum}});
+    if (sel again.err) { ret 3; }
+    if (again.ok != 2) { ret 3; }
+    sum.bytes[0] = 0xd5;
+    val other: res[u32, build.Refusal] = file(?t.l, Source{directory: dir, name: name, md5: opt[mink.line.Md5].some{sum}});
+    if (sel other.ok)                             { ret 4; }
+    if (!str_equals(other.err.message, CHECKSUM)) { ret 5; }
+    val bare: res[u32, build.Refusal] = file(?t.l, Source{directory: dir, name: name, md5: opt[mink.line.Md5].none{}});
+    if (sel bare.ok)           { ret 6; }
+    if (file_count(?t.l) != 3) { ret 7; }
+    val placed: err[build.Refusal] = location(?t.l, ?t.b, Location{file: 2, line: 1, column: 0, flags: mink.line.STATEMENT, isa: 0, discriminator: 0});
+    if (sel placed.err) { ret 8; }
+    if (!t_addi(?t))    { ret 9; }
+    val done: res[mink.object.Object, build.Refusal] = build.finish(?t.b);
+    if (sel done.err) { ret 10; }
+    var o: mink.object.Object = done.ok;
+    # files 1 and 2 are one file of the object, after a.c
+    if (mink.table.count[mink.line.File](?o.files) != 2) { ret 11; }
+    val q: *mink.object.Sequence = mink.object.sequence_at(?o, mink.table.nth[mink.object.Sequence](0));
+    val r: *mink.line.Row        = mink.table.at[mink.line.Row](?q.rows, mink.table.nth[mink.line.Row](0));
+    if (r.file.index != 1) { ret 12; }
+    if (!t_done(?t, ?o))   { ret 13; }
     ret 0;
 }
