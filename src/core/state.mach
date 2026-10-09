@@ -1,0 +1,739 @@
+# execution state: the axes code runs under, and the context every reader takes
+#
+# an extension is something the processor implements, a state is something
+# code runs under and may switch between, as x86's code width, risc-v's xlen
+# or aarch64's streaming mode, and an assembler mode (`masc.core.mode`) is
+# only how source is read. a set declares its state as axes, each with its
+# values and the one it starts at, and whether code may switch it.
+#
+# a requirement is stated over atoms (`masc.core.requirement`): an atom below
+# the catalog's row count is an extension, and the atoms after it are the
+# state values, axis by axis, so `xlen=64` is one atom as `zba` is. a context
+# is a closed selection, a value for every axis and the view of the register
+# file they make, and `admits` is the one predicate: every row, register,
+# pattern, bound and binding is admitted through it. a reader takes the
+# context of the statement it reads or writes, which may be wider or narrower
+# than the object's.
+#
+# a selection's spelling may state values of the axes, as risc-v's `rv64`
+# states xlen=64, which a context takes over the architecture's initial ones.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.quantity;
+use masc.core.register;
+use masc.core.requirement;
+
+# the most axes a set declares, so a context holds the value of every axis without storage of its own
+pub val MAX_AXES: u32 = 8;
+
+# one value of an axis
+# ---
+# name: its spelling, as `64` of xlen or `on` of streaming, which a requirement's wording writes after the axis
+# flag: the command line flag that starts code at it, nil for none
+# doc:  one line for the flag's help
+pub rec Value {
+    name: str;
+    flag: str;
+    doc:  str;
+}
+
+# values as a pointer to static rows and a count
+pub rec Values {
+    at:  *Value;
+    len: u32;
+}
+
+# one axis of a set's execution state
+# ---
+# name:       its name, as `xlen`
+# values:     the values it takes, at least two
+# initial:    the value code runs under when nothing states one, an index of `values`
+# switchable: whether code switches it within an object, as x86's `.code32` does its width. one that is not is fixed by
+#             the architecture and the selection for the whole object, as risc-v's xlen
+pub rec Axis {
+    name:       str;
+    values:     Values;
+    initial:    u8;
+    switchable: bool;
+}
+
+# a set's axes as a pointer to static rows and a count, at most MAX_AXES
+pub rec Axes {
+    at:  *Axis;
+    len: u32;
+}
+
+# the axes of a set whose code runs under no state, as spir-v and wasm
+pub val NO_AXES: Axes = Axes{at: nil, len: 0};
+
+# the value of every axis, by axis, each an index of its axis's values
+pub rec Settings {
+    at: [MAX_AXES]u8;
+}
+
+# a state value by its axis and its index among the axis's values
+pub rec Placed {
+    axis:  u32;
+    value: u8;
+}
+
+# what a reader reads or writes under: the selection, the value of every axis and the view of the register file they
+# make, and the state of the stream it is in
+# ---
+# selection: the closed selection
+# axes:      the set's axes, which number the state atoms after the selection's catalog
+# values:    the value of each axis, in the order of `axes`
+# view:      the register file viewed through the selection and the values, nil while it is being made
+# stream:    the state a typed stream keeps across instructions, nil for a set with none
+pub rec Context {
+    selection: *extension.Selection;
+    axes:      *Axes;
+    values:    Settings;
+    view:      *register.Available;
+    stream:    ptr;
+}
+
+# why a context was not made
+# ---
+# unknown: the selection states an atom past its catalog that is no value of the set's axes
+# twice:   the selection states two values of the axis of this index
+pub tag Error: u8 {
+    unknown: requirement.Id;
+    twice:   u32;
+}
+
+# how many atoms the catalog and the axes number: the extensions, then every value of every axis
+pub fun atom_count(catalog: *extension.Catalog, axes: *Axes) u32 {
+    var n: u32 = catalog.count;
+    var i: u32 = 0;
+    for (i < axes.len) {
+        n = n + axes.at[i].values.len;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the atom of value `value` of axis `axis`
+pub fun atom(catalog: *extension.Catalog, axes: *Axes, axis: u32, value: u8) requirement.Id {
+    var n: u32 = catalog.count;
+    var i: u32 = 0;
+    for (i < axis && i < axes.len) {
+        n = n + axes.at[i].values.len;
+        i = i + 1;
+    }
+    ret n + value::u32;
+}
+
+# the axis and value of atom `id`, none for an extension or an atom past every axis
+pub fun place(catalog: *extension.Catalog, axes: *Axes, id: requirement.Id) opt[Placed] {
+    if (id < catalog.count) { ret opt[Placed].none{}; }
+    var at: u32 = id - catalog.count;
+    var i:  u32 = 0;
+    for (i < axes.len) {
+        val n: u32 = axes.at[i].values.len;
+        if (at < n) { ret opt[Placed].some{Placed{axis: i, value: at::u8}}; }
+        at = at - n;
+        i  = i + 1;
+    }
+    ret opt[Placed].none{};
+}
+
+# the atom `text[at..at + len]` names: an extension by its name in the catalog, or a state value as its axis, `=` and
+# its value, as `xlen=64`, the spelling `spell_atom` writes. none when it names neither
+pub fun lookup(catalog: *extension.Catalog, axes: *Axes, text: str, at: usize, len: usize) opt[requirement.Id] {
+    val found: opt[requirement.Id] = extension.lookup(catalog, text, at, len);
+    if (sel found.some) { ret found; }
+    var eq: usize = at;
+    for (eq < at + len && text[eq] != '=') {
+        eq = eq + 1;
+    }
+    if (eq == at + len) { ret opt[requirement.Id].none{}; }
+    var i: u32 = 0;
+    for (i < axes.len) {
+        val axis: *Axis = ?axes.at[i];
+        if (view_eq_str(view(?text[at], eq - at), axis.name)) {
+            var k: u32 = 0;
+            for (k < axis.values.len) {
+                if (view_eq_str(view(?text[eq + 1], at + len - eq - 1), axis.values.at[k].name)) { ret opt[requirement.Id].some{atom(catalog, axes, i, k::u8)}; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret opt[requirement.Id].none{};
+}
+
+# every axis of `axes` at its initial value
+pub fun initial(axes: *Axes) Settings {
+    var s: Settings;
+    var i: u32 = 0;
+    for (i < MAX_AXES) {
+        s.at[i] = 0;
+        if (i < axes.len) { s.at[i] = axes.at[i].initial; }
+        i = i + 1;
+    }
+    ret s;
+}
+
+# a context of `selection` under `axes`, each axis at its value of `start` unless the selection's spelling states
+# another. its view is nil until `select` makes one
+# ---
+# ret: the context, or the first atom the selection states that names no value or a second value of one axis
+pub fun make(selection: *extension.Selection, axes: *Axes, start: Settings) res[Context, Error] {
+    var ctx:  Context = Context{selection: selection, axes: axes, values: start, view: nil, stream: nil};
+    var seen: u32     = 0;
+    var i:    u32     = 0;
+    for (i < selection.stated.len) {
+        val id: requirement.Id = selection.stated.at[i];
+        val at: opt[Placed]    = place(selection.catalog, axes, id);
+        if (sel at.none) { ret res[Context, Error].err{Error.unknown{id}}; }
+        val bit: u32 = 1::u32 << at.some.axis;
+        if ((seen & bit) != 0 && ctx.values.at[at.some.axis] != at.some.value) { ret res[Context, Error].err{Error.twice{at.some.axis}}; }
+        seen                        = seen | bit;
+        ctx.values.at[at.some.axis] = at.some.value;
+        i                           = i + 1;
+    }
+    ret res[Context, Error].ok{ctx};
+}
+
+# whether the context holds atom `id`: its selection holds the extension, or its axis is at the value
+pub fun holds(ctx: *Context, id: requirement.Id) bool {
+    if (id < ctx.selection.catalog.count) { ret extension.has(ctx.selection, id); }
+    val at: opt[Placed] = place(ctx.selection.catalog, ctx.axes, id);
+    if (sel at.none) { ret false; }
+    ret ctx.values.at[at.some.axis] == at.some.value;
+}
+
+# whether the context holds every atom of `ids`
+fun all_held(ctx: *Context, ids: requirement.Ids) bool {
+    var i: u32 = 0;
+    for (i < ids.len) {
+        if (!holds(ctx, ids.at[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether the context holds no atom of `ids`
+fun none_held(ctx: *Context, ids: requirement.Ids) bool {
+    var i: u32 = 0;
+    for (i < ids.len) {
+        if (holds(ctx, ids.at[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether the context meets the alternative `alt`: every atom of its `all` held and none of its `none`
+pub fun meets(ctx: *Context, alt: requirement.Alternative) bool {
+    ret all_held(ctx, alt.all) && none_held(ctx, alt.none);
+}
+
+# whether the context meets any alternative of `required`, or `required` has none. the one admission predicate:
+# every row, register, pattern, bound and binding is admitted by it
+pub fun admits(ctx: *Context, required: requirement.Requirement) bool {
+    if (required.len == 0) { ret true; }
+    var i: u32 = 0;
+    for (i < required.len) {
+        if (meets(ctx, required.at[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the context with axis `axis` at value `value`
+# ---
+# ret: whether the set has the axis and the axis the value, the context unchanged when not
+pub fun set(ctx: *Context, axis: u32, value: u8) bool {
+    if (axis >= ctx.axes.len || value::u32 >= ctx.axes.at[axis].values.len) { ret false; }
+    ctx.values.at[axis] = value;
+    ret true;
+}
+
+# whether two contexts read alike: one selection's members, one value on every axis
+pub fun same(a: *Context, b: *Context) bool {
+    if (a.axes != b.axes || a.selection.catalog != b.selection.catalog)                             { ret false; }
+    if (!extension.within(a.selection, b.selection) || !extension.within(b.selection, a.selection)) { ret false; }
+    var i: u32 = 0;
+    for (i < a.axes.len) {
+        if (a.values.at[i] != b.values.at[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the least multiplier of `d` at or past `m`
+fun least_of(d: quantity.Domain, m: u32) u32 {
+    var from: u64 = 0;
+    if (m > 0) { from = m::u64 - 1; }
+    val got: opt[u64] = quantity.next(d, from);
+    if (sel got.some) { ret got.some::u32; }
+    ret m;
+}
+
+# the most multiplier of `d` at or below `m`, from `least`
+fun most_of(d: quantity.Domain, least: u32, m: u32) u32 {
+    var top: u32 = least;
+    for {
+        val at: opt[u64] = quantity.next(d, top::u64);
+        if (sel at.some) {
+            if (at.some > m::u64) { ret top; }
+            top = at.some::u32;
+        }
+        or { ret top; }
+    }
+    ret top;
+}
+
+# the view of `file` through the context: the rows it admits, of a number its class has under it, the quantity each
+# slot binds, and the range of multipliers every bound of a quantity that holds leaves. the context and the file must
+# outlive it, and the caller sets it as the context's view
+# ---
+# ret: the view, or why it was not made: a quantity whose bounds leave no multiplier of its domain
+pub fun select(a: *A.Allocator, file: *register.File, ctx: *Context) res[register.Available, register.Error] {
+    val made: res[register.Available, register.Error] = register.blank(a, file);
+    if (sel made.err) { ret made; }
+    var v: register.Available = made.ok;
+    if (file == nil) { ret res[register.Available, register.Error].ok{v}; }
+    var q: u32 = 0;
+    for (q < file.quantities.len) {
+        val row: *quantity.Quantity = ?file.quantities.at[q];
+        var r:   quantity.Range     = quantity.span(row.domain);
+        var b:   u32                = 0;
+        for (b < row.bounds.len) {
+            if (admits(ctx, row.bounds.at[b].when)) { r = quantity.clip(r, ?row.bounds.at[b]); }
+            b = b + 1;
+        }
+        if (!quantity.meets(row.domain, r)) {
+            register.release(?v);
+            ret res[register.Available, register.Error].err{register.Error.empty{q::u8}};
+        }
+        val least: u32 = least_of(row.domain, r.least);
+        v.ranges[q] = quantity.Range{least: least, most: most_of(row.domain, least, r.most)};
+        q           = q + 1;
+    }
+    var k: u32 = 0;
+    for (k < file.bindings.len) {
+        val bind: *quantity.Binding = ?file.bindings.at[k];
+        if (bind.slot::u32 < file.slot_count && v.bound[bind.slot] == quantity.UNBOUND && admits(ctx, bind.when)) { v.bound[bind.slot] = bind.quantity; }
+        k = k + 1;
+    }
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        val row: *register.Register = ?file.registers[i];
+        if (admits(ctx, row.requires) && row.number::u64 < register.members(?v, row.class)) { register.admit(?v, i); }
+        i = i + 1;
+    }
+    ret res[register.Available, register.Error].ok{v};
+}
+
+# a context of `selection` under `axes` at `start` with its view of `file` made into `view`, which the caller keeps for
+# as long as the context, as `select` makes it
+# ---
+# ret: the context, or why it or its view was not made
+pub fun open(a: *A.Allocator, file: *register.File, selection: *extension.Selection, axes: *Axes, start: Settings, view: *register.Available) res[Context, Opened] {
+    val made: res[Context, Error] = make(selection, axes, start);
+    if (sel made.err) { ret res[Context, Opened].err{Opened.state{made.err}}; }
+    var ctx:    Context                                 = made.ok;
+    val viewed: res[register.Available, register.Error] = select(a, file, ?ctx);
+    if (sel viewed.err) { ret res[Context, Opened].err{Opened.view{viewed.err}}; }
+    @view    = viewed.ok;
+    ctx.view = view;
+    ret res[Context, Opened].ok{ctx};
+}
+
+# why `open` made no context
+# ---
+# state: the selection states its axes wrongly
+# view:  the view was not made
+pub tag Opened: u8 {
+    state: Error;
+    view:  register.Error;
+}
+
+val BECAUSE: str = ": ";
+val NEEDS:   str = "needs ";
+val OR:      str = ", or ";
+val AND:     str = " and ";
+val NO:      str = "no ";
+val IS:      str = "=";
+
+# atom `id` named onto `out`: an extension by its name, a state value as its axis, `=` and its value, as `xlen=64`
+pub fun spell_atom(catalog: *extension.Catalog, axes: *Axes, id: requirement.Id, out: *vector.Vector[u8]) err[A.Error] {
+    if (id < catalog.count) { ret extension.append(out, catalog.extensions[id].name); }
+    val at: opt[Placed] = place(catalog, axes, id);
+    if (sel at.none) { ret extension.append(out, "?"); }
+    val axis:  *Axis        = ?axes.at[at.some.axis];
+    val named: err[A.Error] = extension.append(out, axis.name);
+    if (sel named.err) { ret named; }
+    val is: err[A.Error] = extension.append(out, IS);
+    if (sel is.err) { ret is; }
+    ret extension.append(out, axis.values.at[at.some.value].name);
+}
+
+# the lead of alternative `i`
+fun lead(out: *vector.Vector[u8], i: u32) err[A.Error] {
+    if (i == 0) { ret extension.append(out, NEEDS); }
+    ret extension.append(out, OR);
+}
+
+# atom `id` named within an alternative, joined to the one before unless it is the `first`, after `no` when it is one
+# the alternative's `none` names
+fun name(out: *vector.Vector[u8], catalog: *extension.Catalog, axes: *Axes, id: requirement.Id, first: bool, without: bool) err[A.Error] {
+    if (!first) {
+        val joined: err[A.Error] = extension.append(out, AND);
+        if (sel joined.err) { ret joined; }
+    }
+    if (without) {
+        val no: err[A.Error] = extension.append(out, NO);
+        if (sel no.err) { ret no; }
+    }
+    ret spell_atom(catalog, axes, id, out);
+}
+
+# the requirement `required` spelled onto `out` as every alternative with the atoms of its `all` the context does not
+# hold and those of its `none` it does, as "needs zbb, or zbkb", "needs a and b, or c" or "needs c and no zcd". the one
+# wording of an unmet requirement, whoever refuses, which `spell_unmet` words the same
+# ---
+# a requirement the context meets is not spelled: an alternative it meets adds no names, and a requirement with no
+# alternative adds nothing
+pub fun spell_requirement(ctx: *Context, required: requirement.Requirement, out: *vector.Vector[u8]) err[A.Error] {
+    var u: Unmet;
+    if (!unmet(ctx, required, ?u)) { ret err[A.Error].ok{}; }
+    ret spell_unmet(?u, out);
+}
+
+# the diagnostic `d` spelled onto `out`: its message, and what its refusal needed when it names a requirement, worded by
+# `spell_requirement` against `ctx`, the context `d` was refused under
+pub fun spell_diagnostic(ctx: *Context, d: *diagnostic.Diagnostic, out: *vector.Vector[u8]) err[A.Error] {
+    val worded: err[A.Error] = extension.append(out, d.message);
+    if (sel worded.err || d.requires.len == 0) { ret worded; }
+    val because: err[A.Error] = extension.append(out, BECAUSE);
+    if (sel because.err) { ret because; }
+    ret spell_requirement(ctx, d.requires, out);
+}
+
+# why `u` was refused spelled onto `out`: the register's name, then its requirement as the one renderer words it
+pub fun spell_unavailable(ctx: *Context, u: *register.Unavailable, out: *vector.Vector[u8]) err[A.Error] {
+    val named: err[A.Error] = extension.append(out, u.row.name);
+    if (sel named.err) { ret named; }
+    val gap: err[A.Error] = extension.append(out, " ");
+    if (sel gap.err) { ret gap; }
+    ret spell_requirement(ctx, u.requires, out);
+}
+
+# how many alternatives, and how many atoms across them, an unmet requirement holds
+pub val UNMET_ALTERNATIVES: u32 = 16;
+pub val UNMET_IDS:          u32 = 64;
+
+# what a refusal needed that the context it was refused under did not hold, by value, so it outlives that context
+# ---
+# catalog: the catalog the extensions are rows of, nil when nothing was needed
+# axes:    the axes that number the state atoms after it
+# ids:     the atoms each alternative needs that the context lacked, and the atoms of its `none` the context held,
+#          alternative after alternative
+# without: one bit per entry of `ids`, set for an atom of a `none` the context held
+# ends:    where each alternative's atoms end in `ids`
+# len:     how many alternatives there are, none when the refusal needed nothing
+pub rec Unmet {
+    catalog: *extension.Catalog;
+    axes:    *Axes;
+    ids:     [UNMET_IDS]requirement.Id;
+    without: u64;
+    ends:    [UNMET_ALTERNATIVES]u32;
+    len:     u32;
+}
+
+# the unmet requirement of a refusal that needed nothing
+pub fun nothing_unmet() Unmet {
+    var u: Unmet;
+    u.catalog = nil;
+    u.axes    = nil;
+    u.without = 0;
+    u.len     = 0;
+    ret u;
+}
+
+# atom `id` kept as entry `used` of `out`, a `none` atom when `without`
+fun keep(out: *Unmet, used: *u32, id: requirement.Id, without: bool) bool {
+    if (@used == UNMET_IDS) { ret false; }
+    out.ids[@used] = id;
+    if (without) { out.without = out.without | (1::u64 << (@used)::u64); }
+    @used = @used + 1;
+    ret true;
+}
+
+# `required` resolved against the context into `out`, every alternative kept with the atoms of its `all` the context
+# lacks and those of its `none` it holds. a requirement the context meets resolves to nothing
+# ---
+# ret: false when `required` is met, or has more alternatives or unmet atoms than an unmet requirement holds, with
+#      `out` then holding nothing
+pub fun unmet(ctx: *Context, required: requirement.Requirement, out: *Unmet) bool {
+    @out = nothing_unmet();
+    if (required.len > UNMET_ALTERNATIVES || admits(ctx, required)) { ret false; }
+    var used: u32 = 0;
+    var i:    u32 = 0;
+    for (i < required.len) {
+        val alt: requirement.Alternative = required.at[i];
+        var k:   u32                     = 0;
+        for (k < alt.all.len) {
+            if (!holds(ctx, alt.all.at[k]) && !keep(out, ?used, alt.all.at[k], false)) {
+                @out = nothing_unmet();
+                ret false;
+            }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < alt.none.len) {
+            if (holds(ctx, alt.none.at[k]) && !keep(out, ?used, alt.none.at[k], true)) {
+                @out = nothing_unmet();
+                ret false;
+            }
+            k = k + 1;
+        }
+        out.ends[i] = used;
+        i           = i + 1;
+    }
+    out.catalog = ctx.selection.catalog;
+    out.axes    = ctx.axes;
+    out.len     = required.len;
+    ret true;
+}
+
+# the unmet requirement `u` spelled onto `out`, worded as `spell_requirement` words it against the context `u` was
+# resolved against
+pub fun spell_unmet(u: *Unmet, out: *vector.Vector[u8]) err[A.Error] {
+    var from: u32 = 0;
+    var i:    u32 = 0;
+    for (i < u.len) {
+        val led: err[A.Error] = lead(out, i);
+        if (sel led.err) { ret led; }
+        var k: u32 = from;
+        for (k < u.ends[i]) {
+            val named: err[A.Error] = name(out, u.catalog, u.axes, u.ids[k], k == from, ((u.without >> k::u64) & 1) != 0);
+            if (sel named.err) { ret named; }
+            k = k + 1;
+        }
+        from = u.ends[i];
+        i    = i + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# the refusal worded `message` that needed `u` spelled onto `out`: its message, and what it needed when it needed
+# anything, worded by `spell_unmet`
+pub fun spell_refusal(message: str, u: *Unmet, out: *vector.Vector[u8]) err[A.Error] {
+    val worded: err[A.Error] = extension.append(out, message);
+    if (sel worded.err || u.len == 0) { ret worded; }
+    val because: err[A.Error] = extension.append(out, BECAUSE);
+    if (sel because.err) { ret because; }
+    ret spell_unmet(u, out);
+}
+
+# a test axis of two values the catalog's atoms number on from its extensions
+#[testing]
+val T_ON_OFF:    [2]Value = [2]Value{Value{name: "off", flag: nil, doc: "off"}, Value{name: "on", flag: nil, doc: "on"}};
+#[testing]
+val T_AXES_ROWS: [2]Axis  = [2]Axis{
+    Axis{name: "mode", values: Values{at: ?T_ON_OFF[0], len: 2}, initial: 0, switchable: true},
+    Axis{name: "width", values: Values{at: ?T_ON_OFF[0], len: 2}, initial: 1, switchable: false},
+};
+#[testing]
+pub val T_AXES: Axes = Axes{at: ?T_AXES_ROWS[0], len: 2};
+
+# the context of the riscv test catalog's selection `spelling` with its view of the test file, into `ctx` and `v`
+#[testing]
+fun t_open(a: *A.Allocator, spelling: str, s: *extension.Selection, v: *register.Available, ctx: *Context) bool {
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?register.RISCV_CATALOG, spelling, diagnostic.START);
+    if (sel made.err) { ret false; }
+    @s = made.ok;
+    val opened: res[Context, Opened] = open(a, ?register.RISCV, s, ?T_AXES, initial(?T_AXES), v);
+    if (sel opened.err) {
+        extension.release(s);
+        ret false;
+    }
+    @ctx = opened.ok;
+    ret true;
+}
+
+# an alternative holds with its `all` held and none of its `none`, over extensions and state values alike, and one
+# unmet is worded with what it lacks and what it should not hold
+test admits__an_alternative_needs_all_its_atoms_and_none_of_its_exclusions {
+    var t: testing.Testing;
+    testing.make(?t);
+    var s:   extension.Selection;
+    var v:   register.Available;
+    var ctx: Context;
+    if (!t_open(testing.allocator_of(?t), "i,f", ?s, ?v, ?ctx)) { ret 1; }
+    # the catalog's seven extensions, then mode=off, mode=on, width=off and width=on
+    val on:     requirement.Id             = atom(?register.RISCV_CATALOG, ?T_AXES, 0, 1);
+    val wide:   requirement.Id             = atom(?register.RISCV_CATALOG, ?T_AXES, 1, 1);
+    val f_wide: [2]requirement.Id          = [2]requirement.Id{4, wide};
+    val d_on:   [2]requirement.Id          = [2]requirement.Id{5, on};
+    val just_f: [1]requirement.Id          = [1]requirement.Id{4};
+    val alts:   [3]requirement.Alternative = [3]requirement.Alternative{
+        requirement.Alternative{all: requirement.Ids{at: ?f_wide[0], len: 2}, none: requirement.NO_IDS},
+        requirement.Alternative{all: requirement.Ids{at: ?d_on[0], len: 2}, none: requirement.NO_IDS},
+        requirement.Alternative{all: requirement.NO_IDS, none: requirement.Ids{at: ?just_f[0], len: 1}},
+    };
+    if (on != 8 || !holds(?ctx, wide) || holds(?ctx, on))             { ret 2; }
+    if (!admits(?ctx, requirement.Requirement{at: ?alts[0], len: 1})) { ret 3; }
+    if (admits(?ctx, requirement.Requirement{at: ?alts[1], len: 2}))  { ret 4; }
+    var out:    vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t));
+    val worded: err[A.Error]      = spell_requirement(?ctx, requirement.Requirement{at: ?alts[1], len: 2}, ?out);
+    if (sel worded.err || !extension.t_spelled(?out, "needs d and mode=on, or no f")) { ret 5; }
+    # resolved against the context, the requirement is worded the same once the context is gone
+    var u: Unmet;
+    if (!unmet(?ctx, requirement.Requirement{at: ?alts[1], len: 2}, ?u)) { ret 6; }
+    register.release(?v);
+    extension.release(?s);
+    out.len = 0;
+    val kept: err[A.Error] = spell_unmet(?u, ?out);
+    if (sel kept.err || !extension.t_spelled(?out, "needs d and mode=on, or no f")) { ret 7; }
+    vector.dnit[u8](?out);
+    if (testing.live_count(?t) != 0) { ret 8; }
+    ret 0;
+}
+
+# a selection's spelling states the values a context starts its axes at, over the start given, and two values of one
+# axis are refused
+test make__a_selection_states_its_axes_over_the_start_and_one_value_per_axis {
+    var t: testing.Testing;
+    testing.make(?t);
+    val made: res[extension.Request, extension.Error] = extension.request(testing.allocator_of(?t), ?register.RISCV_CATALOG, "", diagnostic.START);
+    if (sel made.err) { ret 1; }
+    var r: extension.Request = made.ok;
+    extension.request_add(?r, 0);
+    extension.request_add(?r, atom(?register.RISCV_CATALOG, ?T_AXES, 0, 1));
+    val closed: res[extension.Selection, extension.Error] = extension.close(r);
+    if (sel closed.err) { ret 2; }
+    var s:   extension.Selection = closed.ok;
+    val ctx: res[Context, Error] = make(?s, ?T_AXES, initial(?T_AXES));
+    if (sel ctx.err) { ret 3; }
+    if (sel ctx.ok) {
+        if (ctx.ok.values.at[0] != 1 || ctx.ok.values.at[1] != 1) { ret 3; }
+    }
+    s.stated.at[s.stated.len] = atom(?register.RISCV_CATALOG, ?T_AXES, 0, 0);
+    s.stated.len              = s.stated.len + 1;
+    val twice: res[Context, Error] = make(?s, ?T_AXES, initial(?T_AXES));
+    var axis:  u32                 = 99;
+    if (sel twice.err) {
+        val e: Error = twice.err;
+        if (sel e.twice) { axis = e.twice; }
+    }
+    if (axis != 0) { ret 4; }
+    s.stated.at[1] = atom_count(?register.RISCV_CATALOG, ?T_AXES);
+    val unknown: res[Context, Error] = make(?s, ?T_AXES, initial(?T_AXES));
+    if (!(sel unknown.err && sel unknown.err.unknown)) { ret 5; }
+    extension.release(?s);
+    ret 0;
+}
+
+test lookup__an_unavailable_register_is_refused_naming_every_alternative {
+    var t: testing.Testing;
+    testing.make(?t);
+    var s:   extension.Selection;
+    var v:   register.Available;
+    var ctx: Context;
+    if (!t_open(testing.allocator_of(?t), "e", ?s, ?v, ?ctx)) { ret 1; }
+    val x16: res[register.Id, register.Absent] = register.lookup(?v, view("x16", 3));
+    if (sel x16.ok)                                                                              { ret 3; }
+    if (!(sel x16.err.unavailable && (x16.err.unavailable.row == ?register.RISCV_REGISTERS[4]))) { ret 4; }
+    var u: register.Unavailable;
+    if (sel x16.err.unavailable) { u = x16.err.unavailable; }
+    var out:    vector.Vector[u8] = vector.init[u8](testing.allocator_of(?t));
+    val worded: err[A.Error]      = spell_unavailable(?ctx, ?u, ?out);
+    if (sel worded.err || !extension.t_spelled(?out, "x16 needs i")) { ret 7; }
+    vector.dnit[u8](?out);
+    val i:      [1]requirement.Id          = [1]requirement.Id{0};
+    val f_q:    [2]requirement.Id          = [2]requirement.Id{4, 6};
+    val either: [2]requirement.Alternative = [2]requirement.Alternative{
+        requirement.Alternative{all: requirement.Ids{at: ?i[0], len: 1}, none: requirement.NO_IDS},
+        requirement.Alternative{all: requirement.Ids{at: ?f_q[0], len: 2}, none: requirement.NO_IDS},
+    };
+    var two: register.Unavailable = u;
+    two.requires = requirement.Requirement{at: ?either[0], len: 2};
+    out          = vector.init[u8](testing.allocator_of(?t));
+    val both: err[A.Error] = spell_unavailable(?ctx, ?two, ?out);
+    if (sel both.err || !extension.t_spelled(?out, "x16 needs i, or f and q")) { ret 8; }
+    vector.dnit[u8](?out);
+    val s0: res[register.Id, register.Absent] = register.lookup(?v, view("s0", 2));
+    if (!(sel s0.ok && s0.ok == register.make(0, 8))) { ret 5; }
+    register.release(?v);
+    extension.release(?s);
+    if (testing.live_count(?t) != 0) { ret 6; }
+    ret 0;
+}
+
+# the width of the register `reg` under the selection `spelling`, in `bits` when known
+#[testing]
+fun t_width(spelling: str, reg: register.Id, known: *bool, bits: *u64) u8 {
+    var t: testing.Testing;
+    testing.make(?t);
+    var s:   extension.Selection;
+    var v:   register.Available;
+    var ctx: Context;
+    if (!t_open(testing.allocator_of(?t), spelling, ?s, ?v, ?ctx)) { ret 1; }
+    val read: res[opt[u64], register.Absent] = register.width(?v, reg);
+    if (sel read.err) { ret 3; }
+    @known = sel read.ok.some;
+    if (sel read.ok.some) { @bits = read.ok.some; }
+    register.release(?v);
+    extension.release(?s);
+    if (testing.live_count(?t) != 0) { ret 4; }
+    ret 0;
+}
+
+# the bounds that hold narrow a quantity to one multiplier where the selection fixes it, and leave it to the
+# implementation where none does
+test width__resolves_where_the_bounds_that_hold_fix_the_quantity {
+    var known: bool = false;
+    var bits:  u64  = 0;
+    if (t_width("i,rv32", register.make(0, 0), ?known, ?bits) != 0 || !known || bits != 32)    { ret 1; }
+    if (t_width("i,rv64", register.make(0, 0), ?known, ?bits) != 0 || !known || bits != 64)    { ret 2; }
+    if (t_width("i", register.make(0, 0), ?known, ?bits) != 0 || known)                        { ret 3; }
+    if (t_width("i,rv64,f", register.make(1, 0), ?known, ?bits) != 0 || !known || bits != 32)  { ret 4; }
+    if (t_width("i,rv64,d", register.make(1, 0), ?known, ?bits) != 0 || !known || bits != 64)  { ret 5; }
+    if (t_width("i,rv64,q", register.make(1, 0), ?known, ?bits) != 0 || !known || bits != 128) { ret 6; }
+    ret 0;
+}
+
+# bounds that leave a quantity nothing refuse the view, naming the quantity
+test select__bounds_that_leave_a_quantity_no_multiplier_are_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    val made: res[extension.Request, extension.Error] = extension.request(testing.allocator_of(?t), ?register.RISCV_CATALOG, "", diagnostic.START);
+    if (sel made.err) { ret 1; }
+    var r: extension.Request = made.ok;
+    extension.request_add(?r, 2);
+    extension.request_add(?r, 3);
+    # both widths, which the catalog's conflict keeps a closed selection from holding, so bounds of each hold
+    var both:  extension.Selection                     = extension.Selection{catalog: ?register.RISCV_CATALOG, members: r.named, stated: r.stated};
+    var ctx:   Context                                 = Context{selection: ?both, axes: ?T_AXES, values: initial(?T_AXES), view: nil, stream: nil};
+    val got:   res[register.Available, register.Error] = select(testing.allocator_of(?t), ?register.RISCV, ?ctx);
+    var empty: u32                                     = 99;
+    if (sel got.err) {
+        val e: register.Error = got.err;
+        if (sel e.empty) { empty = e.empty::u32; }
+    }
+    if (empty != 0) { ret 3; }
+    extension.release(?both);
+    if (testing.live_count(?t) != 0) { ret 4; }
+    ret 0;
+}
