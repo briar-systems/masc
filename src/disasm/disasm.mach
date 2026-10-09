@@ -665,9 +665,55 @@ fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
     ret res[bool, Refusal].ok{true};
 }
 
-# whether the expansion `ex` encoded at `at` as the builder writes it is the bytes of `data` up to `stop` and makes
-# exactly the relocations among `first` to `end`
-fun matches(d: *Disasm, ex: *relax.Expansion, data: *u8, len: usize, at: u64, stop: u64, first: usize, end: usize) bool {
+# the distance from `at` of section `section` to what handle `handle` plus `addend` names, as the assembler measures
+# it reading the text back: none when it names a symbol other objects may preempt or a place in another section
+fun reach_of(d: *Disasm, section: u32, at: u64, handle: u32, addend: i64) opt[i64] {
+    var place: u64 = 0;
+    if (handle <= d.count) {
+        val sym: *mink.object.Symbol = symbol_of(d, handle - 1);
+        if (!sel sym.def.placed)                                  { ret opt[i64].none{}; }
+        if (mink.symbol.binds(sym.binding, mink.symbol.EXTERNAL)) { ret opt[i64].none{}; }
+        val p: mink.object.Place = sym.def.placed;
+        if (p.section.index != section) { ret opt[i64].none{}; }
+        place = p.offset;
+    }
+    or {
+        val anchor: *Label = ?d.anchors.data[(handle - d.count - 1)::usize];
+        if (anchor.section != section) { ret opt[i64].none{}; }
+        place = anchor.offset;
+    }
+    ret opt[i64].some{place:~i64 + addend - at:~i64};
+}
+
+# the form instruction `chosen` at `at` of section `section` takes as the builder lays it out, into `out`: grown
+# through the set's relaxations while its relaxed operand's target, measured in the object, is out of reach or only
+# the linker knows it
+fun laid_out(d: *Disasm, section: u32, at: u64, chosen: *relax.Emitted, out: *relax.Expansion) bool {
+    var ins:   inst.Inst              = inst.Inst{row: chosen.row, values: ?chosen.values[0], count: chosen.row.operands.len};
+    var reach: opt[i64]               = opt[i64].none{};
+    val rx:    opt[*relax.Relaxation] = relax.find(d.s.relax, chosen.row);
+    if (sel rx.some) {
+        val v: *operand.Value = ?chosen.values[rx.some.operand];
+        if (sel v.symbol) { reach = reach_of(d, section, at, v.symbol.id, v.symbol.addend); }
+    }
+    var shortening: cmp.Shortening = cmp.Shortening{codec: d.s.codec, all: d.s.compress, available: d.v};
+    var levels:     u32            = 0;
+    for (levels <= d.s.relax.len) {
+        var target: u32      = 0;
+        val why:    opt[str] = relax.grown(d.s.codec, d.v, d.s.relax, ?ins, levels, opt[i64].none{}, cmp.shorten(?shortening), out, ?target, ?d.bytes, ?d.fixups);
+        if (sel why.some) { ret false; }
+        out.steps[0].marker = chosen.marker;
+        val reached: opt[bool] = relax.reaches(d.s.codec, d.v, d.s.relax, out, target, reach, ?d.bytes, ?d.fixups);
+        if (sel reached.none) { ret false; }
+        if (reached.some)     { ret true; }
+        levels = levels + 1;
+    }
+    ret false;
+}
+
+# whether the expansion `ex` encoded at `at` of section `section` as the builder writes it is the bytes of `data` up to
+# `stop` and makes exactly the relocations among `first` to `end`
+fun matches(d: *Disasm, section: u32, ex: *relax.Expansion, data: *u8, len: usize, at: u64, stop: u64, first: usize, end: usize) bool {
     var used:  [relax.MAX_STEPS * row.MAX_OPERANDS + relax.MAX_STEPS]bool;
     var total: usize = end - first;
     if (total > relax.MAX_STEPS::usize * (row.MAX_OPERANDS::usize + 1)) { ret false; }
@@ -687,71 +733,85 @@ fun matches(d: *Disasm, ex: *relax.Expansion, data: *u8, len: usize, at: u64, st
         i = i + 1;
     }
     var offset: u64 = at;
+    var laid:   relax.Expansion;
+    var l:      u32 = 0;
     i = 0;
     for (i < ex.count) {
         var chosen: relax.Emitted = ex.steps[i];
         var given:  inst.Inst     = inst.Inst{row: chosen.row, values: ?chosen.values[0], count: chosen.row.operands.len};
         var packed: relax.Emitted;
-        if (!fixed && cmp.compress(d.s.codec, d.s.compress, relax.NONE, d.v, ?given, ?packed)) { chosen = packed; }
-        var ins: inst.Inst = inst.Inst{row: chosen.row, values: ?chosen.values[0], count: chosen.row.operands.len};
-        d.bytes.len  = 0;
-        d.fixups.len = 0;
-        val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?ins, ?d.bytes, ?d.fixups);
-        if (sel done.err)                     { ret false; }
-        if (offset + done.ok::u64 > len::u64) { ret false; }
-        var b: usize = 0;
-        for (b < done.ok) {
-            if (d.bytes.data[b] != data[offset::usize + b]) { ret false; }
-            b = b + 1;
+        if (!fixed && cmp.compress(d.s.codec, d.s.compress, d.s.relax, d.v, ?given, ?packed)) {
+            packed.marker = chosen.marker;
+            chosen        = packed;
         }
-        var marker: operand.FixupKind = chosen.marker;
-        var f:      usize             = 0;
-        for (f < d.fixups.len) {
-            val fx: *field.Fixup   = ?d.fixups.data[f];
-            val sp: opt[*set.Span] = set.span_of(d.s.spans, fx.kind);
-            if (sel sp.some) { marker = sp.some.marker; }
-            var hit: bool  = false;
-            var j:   usize = 0;
-            for (j < total && !hit) {
-                if (!used[j]) {
-                    val site: *Site              = ?d.sites.data[first + j];
-                    val r:    *mink.object.Reloc = reloc_of(d, site);
-                    if (site.offset == offset + fx.offset::u64 && r.kind == kind_of(d, fx.kind) && sel r.minus.none) {
-                        val a: res[opt[Aimed], Refusal] = aim(d, r, site);
-                        if (sel a.ok) {
-                            val o: opt[Aimed] = a.ok;
-                            if (sel o.some) {
-                                if (o.some.handle == fx.symbol && o.some.addend == fx.addend) {
-                                    used[j] = true;
-                                    hit     = true;
+        # a sequence holding a symbol keeps the form its relocations fix, and anything else is laid out as the builder lays it
+        laid.count    = 1;
+        laid.steps[0] = chosen;
+        if (!fixed && !laid_out(d, section, offset, ?chosen, ?laid)) { ret false; }
+        i = i + 1;
+        l = 0;
+        for (l < laid.count) {
+            val step: *relax.Emitted = ?laid.steps[l];
+            l = l + 1;
+            var ins: inst.Inst = inst.Inst{row: step.row, values: ?step.values[0], count: step.row.operands.len};
+            d.bytes.len  = 0;
+            d.fixups.len = 0;
+            val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?ins, ?d.bytes, ?d.fixups);
+            if (sel done.err)                     { ret false; }
+            if (offset + done.ok::u64 > len::u64) { ret false; }
+            var b: usize = 0;
+            for (b < done.ok) {
+                if (d.bytes.data[b] != data[offset::usize + b]) { ret false; }
+                b = b + 1;
+            }
+            var marker: operand.FixupKind = step.marker;
+            var f:      usize             = 0;
+            for (f < d.fixups.len) {
+                val fx: *field.Fixup   = ?d.fixups.data[f];
+                val sp: opt[*set.Span] = set.span_of(d.s.spans, fx.kind);
+                if (sel sp.some) { marker = sp.some.marker; }
+                var hit: bool  = false;
+                var j:   usize = 0;
+                for (j < total && !hit) {
+                    if (!used[j]) {
+                        val site: *Site              = ?d.sites.data[first + j];
+                        val r:    *mink.object.Reloc = reloc_of(d, site);
+                        if (site.offset == offset + fx.offset::u64 && r.kind == kind_of(d, fx.kind) && sel r.minus.none) {
+                            val a: res[opt[Aimed], Refusal] = aim(d, r, site);
+                            if (sel a.ok) {
+                                val o: opt[Aimed] = a.ok;
+                                if (sel o.some) {
+                                    if (o.some.handle == fx.symbol && o.some.addend == fx.addend) {
+                                        used[j] = true;
+                                        hit     = true;
+                                    }
                                 }
                             }
                         }
                     }
+                    j = j + 1;
                 }
-                j = j + 1;
+                if (!hit) { ret false; }
+                f = f + 1;
             }
-            if (!hit) { ret false; }
-            f = f + 1;
-        }
-        if (marker != operand.NO_FIXUP) {
-            var hit: bool  = false;
-            var j:   usize = 0;
-            for (j < total && !hit) {
-                if (!used[j]) {
-                    val site: *Site              = ?d.sites.data[first + j];
-                    val r:    *mink.object.Reloc = reloc_of(d, site);
-                    if (site.offset == offset && sel r.target.none && r.kind == kind_of(d, marker)) {
-                        used[j] = true;
-                        hit     = true;
+            if (marker != operand.NO_FIXUP) {
+                var hit: bool  = false;
+                var j:   usize = 0;
+                for (j < total && !hit) {
+                    if (!used[j]) {
+                        val site: *Site              = ?d.sites.data[first + j];
+                        val r:    *mink.object.Reloc = reloc_of(d, site);
+                        if (site.offset == offset && sel r.target.none && r.kind == kind_of(d, marker)) {
+                            used[j] = true;
+                            hit     = true;
+                        }
                     }
+                    j = j + 1;
                 }
-                j = j + 1;
+                if (!hit) { ret false; }
             }
-            if (!hit) { ret false; }
+            offset = offset + done.ok::u64;
         }
-        offset = offset + done.ok::u64;
-        i      = i + 1;
     }
     u = 0;
     for (u < total) {
@@ -917,7 +977,7 @@ fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u
         }
     }
     var ex: relax.Expansion;
-    if (!printed || d.full || !reparse(d, text, ?ex) || !matches(d, ?ex, data, len, at, stop, d.ri, end)) {
+    if (!printed || d.full || !reparse(d, text, ?ex) || !matches(d, section, ?ex, data, len, at, stop, d.ri, end)) {
         d.out.len = start;
         ret res[u64, Refusal].ok{0};
     }
@@ -1974,6 +2034,26 @@ test disassemble__a_relocation_against_an_unnamed_undefined_symbol_is_refused {
     if (!sel done.err) { ret 4; }
     mink.object.release(?o);
     if (!t_done(?t)) { ret 5; }
+    ret 0;
+}
+
+test disassemble__branches_the_layout_compressed_or_grew_read_back_to_the_same_bytes {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    val a: *A.Allocator = testing.allocator_of(?t.t);
+    # local branches the layout compressed, one the layout grew past the reach of c.beqz, the inverted branch past a jal
+    # to a symbol only the linker knows, c.beqz across a call relocated, and a full-length branch across it under norvc,
+    # which is in reach of c.beqz and reads back only under the narrowing
+    val text: str               = "1:\tbeq a0, zero, 2f\n\tj 1b\n\tbeq a0, zero, 3f\n\t.zero 300\n3:\tbeq a2, zero, g\n\tbeq a0, zero, 2f\n\tcall h\n\t.option push\n\t.option norvc\n\tbeq a0, zero, 2f\n\t.option pop\n2:\tnop\n";
+    var want: vector.Vector[u8] = vector.init[u8](a);
+    var got:  vector.Vector[u8] = vector.init[u8](a);
+    if (!t_text(?t, text, str_len(text), ?want) || want.len != 332)           { ret 2; }
+    if (!t_disassemble(?t, text))                                             { ret 3; }
+    if (!t_holds(?t, "\n\t.option push\n\t.option norvc\n\tbeq"))             { ret 4; }
+    if (!t_text(?t, t.out.data, t.out.len - 1, ?got) || !t_same(?want, ?got)) { ret 5; }
+    vector.dnit[u8](?want);
+    vector.dnit[u8](?got);
+    if (!t_done(?t)) { ret 6; }
     ret 0;
 }
 
