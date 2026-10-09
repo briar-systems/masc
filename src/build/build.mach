@@ -11,15 +11,33 @@
 # operand is relative, its target is a label of the same section that cannot
 # be preempted, its relocation kind is plain pc-relative, and no instruction
 # the linker may resize lies between. every other fixup becomes a relocation
-# through the set's bindings. an instruction whose folded target is out of
-# range grows by the set's relaxation rows, and growth is the only change a
-# pass makes to an instruction, so the layout terminates. every length is the
-# length of an encoding, never a sum of field widths.
+# through the set's bindings. an instruction grows by the set's relaxation
+# rows when its target is out of range, measured by the layout whether or not
+# the fixup folds, or when only the linker knows the target, as llvm-mc grows
+# a branch to an undefined symbol. growth is the only change a pass makes to
+# an instruction, and every length is the length of an encoding, never a sum
+# of field widths.
 #
 # an instruction is written in the shortest form the set's compressions and
 # the selection admit when it is emitted, once, and relaxation then grows
 # that form, so a compressed branch relaxes through the set's rows like any
-# other. a datum, a symbol's address or distance as data, folds or relocates
+# other. a branch or jump to a label is written compressed when the set
+# relaxes the compressed row on that operand, so the layout starts it at its
+# shortest form and grows it to the shortest that reaches: `beq a0, zero, l`
+# is c.beqz while l is in reach and beq or the inverted branch past a jal
+# when it is not. the steps of a longer form that do not take the target are
+# written in their shortest form, as llvm-mc writes c.bnez past the jal.
+#
+# the layout ends within a stated bound of passes. it starts every
+# instruction at its shortest form and only ever grows one, so a pass that
+# does not end grows at least one instruction by one relaxation, and an
+# instruction grows at most as many times as its row's chain of relaxations
+# is long (`relax.depth`), which the set's check bounds. with n instructions
+# of chains d1..dn, the layout takes at most 1 + d1 + ... + dn passes, and a
+# layout that has not settled by then, which only a set whose lengths depend
+# on their values could make, is refused rather than run on.
+#
+# a datum, a symbol's address or distance as data, folds or relocates
 # by the rule an instruction's fixup does. code alignment after an
 # instruction the linker may resize pads its worst case and carries the set's
 # realign marker, so the linker can shrink it back. a fixup whose relocation
@@ -100,6 +118,7 @@ pub val UNBOUND:        str = "fixup kind has no relocation kind";
 pub val CHAIN:          str = "relaxation grows a step of a longer form";
 pub val EXPAND:         str = "longer form refused";
 pub val SHRANK:         str = "instruction encodes shorter than the layout reserved";
+pub val UNSETTLED:      str = "layout did not settle within its bound of passes";
 pub val MISSING_TRAIT:  str = "trait the set requires of a caller, not stated";
 pub val EXTRA_TRAIT:    str = "trait the set does not require of a caller, or stated twice";
 pub val TRAIT_VALUE:    str = "trait stated with a value its axis does not have";
@@ -538,6 +557,7 @@ rec Entry {
 # writers:   what writes more of the object after the layout, in the order they were added
 # taken:     while writers run, what existed when the layout was settled, which they may not change
 # modes:     the assembler modes the next statement is read under, each at its initial value until changed
+# passes:    how many passes the last layout took
 # finished:  whether the object was handed over
 pub rec Builder {
     a:         *A.Allocator;
@@ -571,6 +591,7 @@ pub rec Builder {
     writers:   vector.Vector[Writer];
     taken:     opt[Snapshot];
     modes:     mode.State;
+    passes:    u32;
     finished:  bool;
 }
 
@@ -1318,7 +1339,7 @@ fun shape(b: *Builder, v: *register.Available, steps: *relax.Emitted, count: u32
         out.chosen[i] = steps[i];
         var given:  inst.Inst = inst.Inst{row: steps[i].row, values: ?steps[i].values[0], count: steps[i].row.operands.len};
         var packed: relax.Emitted;
-        if (!fixed && compress.compress(b.set.codec, b.set.compress, v, ?given, ?packed)) {
+        if (!fixed && compress.compress(b.set.codec, b.set.compress, b.set.relax, v, ?given, ?packed)) {
             packed.marker = steps[i].marker;
             out.chosen[i] = packed;
         }
@@ -1629,20 +1650,27 @@ fun kind_of(b: *Builder, kind: operand.FixupKind) *mink.reloc.Kind {
     ret b.kinds.data[kind::usize];
 }
 
-# the distance from fragment `j` of section `s` to the target of operand `k`'s symbol, none when it does not fold
-fun fold(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value) opt[i64] {
+# the distance from fragment `j` of section `s` to the target of operand `k`'s symbol, none when it does not fold, and
+# with `across` none only when the layout cannot measure it
+fun fold(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value, across: bool) opt[i64] {
     if (!sel v.symbol) { ret opt[i64].none{}; }
     val desc: *operand.Operand = ?r.operands.at[k];
     if (!sel desc.shape.relative) { ret opt[i64].none{}; }
     var fixup: operand.FixupKind = desc.shape.relative.offset.fixup;
     if (v.symbol.fixup != operand.NO_FIXUP) { fixup = v.symbol.fixup; }
-    ret distance(b, s, j, v.symbol.id, v.symbol.addend, fixup);
+    ret measured(b, s, j, v.symbol.id, v.symbol.addend, fixup, across);
 }
 
 # the distance from fragment `j` of section `s` to label `id` plus `addend` under fixup kind `fixup`, none when the
 # assembler cannot know it: the label is elsewhere or undefined, other objects may preempt it, the kind is not plainly
 # pc-relative, or an instruction the linker may resize lies between
 fun distance(b: *Builder, s: u32, j: u32, id: u32, addend: i64, fixup: operand.FixupKind) opt[i64] {
+    ret measured(b, s, j, id, addend, fixup, false);
+}
+
+# the distance `distance` answers, and with `across` also one an instruction the linker may resize lies within, which
+# the layout measures to choose a form by but leaves to the linker, since the linker only ever shrinks code
+fun measured(b: *Builder, s: u32, j: u32, id: u32, addend: i64, fixup: operand.FixupKind, across: bool) opt[i64] {
     val aimed: opt[Aimed] = through(b, id, addend, false);
     if (sel aimed.none) { ret opt[i64].none{}; }
     val m: *Mark = ?b.labels.data[aimed.some.id::usize - 1];
@@ -1654,8 +1682,8 @@ fun distance(b: *Builder, s: u32, j: u32, id: u32, addend: i64, fixup: operand.F
     if ((kind.caps & (mink.reloc.GOT | mink.reloc.PAGE | mink.reloc.TLS | mink.reloc.PARTNER)) != 0) { ret opt[i64].none{}; }
     val area: *Area = ?b.areas.data[s::usize];
     var hi:   u32   = j + 1;
-    if (m.fragment > hi)                                         { hi = m.fragment; }
-    if (!settled(area, j, hi) || !settled(area, m.fragment, hi)) { ret opt[i64].none{}; }
+    if (m.fragment > hi)                                                      { hi = m.fragment; }
+    if (!across && (!settled(area, j, hi) || !settled(area, m.fragment, hi))) { ret opt[i64].none{}; }
     val to:   u64 = offset_at(area, m.fragment);
     val from: u64 = area.fragments.data[j::usize].offset;
     ret opt[i64].some{to:~i64 - from:~i64 + aimed.some.addend};
@@ -1722,21 +1750,6 @@ rec Formed {
     size: u64;
 }
 
-# the step of `rx`'s form that takes the target
-fun target_step(rx: *relax.Relaxation) u32 {
-    var i: u32 = 0;
-    for (i < rx.form.len) {
-        val step: *relax.Step = ?rx.form.at[i];
-        var k:    u32         = 0;
-        for (k < step.values.len) {
-            if (sel step.values.at[k].target) { ret i; }
-            k = k + 1;
-        }
-        i = i + 1;
-    }
-    ret 0;
-}
-
 # the instructions fragment `j` of section `s` is at depth `c.depth`, into `out`, with what they come to
 fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Formed, Refusal] {
     val codec: *walk.Codec         = b.set.codec;
@@ -1746,23 +1759,21 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
     var folded: [row.MAX_OPERANDS]opt[i64];
     var k:      u32 = 0;
     for (k < c.count) {
-        folded[k] = fold(b, s, j, c.row, k, ?given[k]);
+        folded[k] = fold(b, s, j, c.row, k, ?given[k], false);
         k         = k + 1;
     }
-    # the relaxation and the distance to its operand's target, when that folds
-    var rx0:  *relax.Relaxation = nil;
-    var near: i64               = 0;
-    var fits: bool              = false;
+    # the distance to the relaxed operand's target as the layout measures it, folded or not, none when only the
+    # linker knows it
+    var reach: opt[i64] = opt[i64].none{};
+    var near:  opt[i64] = opt[i64].none{};
     if (sel c.relax.some) {
-        rx0 = c.relax.some;
-        val d: opt[i64] = folded[rx0.operand];
-        if (sel d.some) {
-            near = d.some;
-            fits = true;
-        }
+        val op: u32 = c.relax.some.operand::u32;
+        reach = fold(b, s, j, c.row, op, ?given[op], true);
+        near  = folded[op];
     }
-    out.count = 1;
+    var target: u32 = 0;
     if (c.depth == 0) {
+        out.count           = 1;
         out.steps[0].row    = c.row;
         out.steps[0].marker = c.marker;
         k                   = 0;
@@ -1774,9 +1785,6 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
         var probe:  inst.Inst                 = inst.Inst{row: c.row, values: ?out.steps[0].values[0], count: c.count};
         val zeroed: res[usize, field.Refusal] = measure(b, v, ?probe);
         if (sel zeroed.err) { ret res[Formed, Refusal].err{encoding(zeroed.err)}; }
-        if (fits && relax.far(codec, rx0, near, zeroed.ok)) {
-            ret res[Formed, Refusal].ok{Formed{far: true, size: 0}};
-        }
         k = 0;
         for (k < c.count) {
             if (sel folded[k].some) {
@@ -1789,57 +1797,23 @@ fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Forme
         }
     }
     or {
-        # a grown form takes only its target from the layout, its other symbols stay relocations
-        var from:  inst.Inst         = inst.Inst{row: c.row, values: ?given[0], count: c.count};
-        var rx:    *relax.Relaxation = rx0;
-        var level: u32               = 1;
-        var held_: [row.MAX_OPERANDS]operand.Value;
-        for (level <= c.depth) {
-            if (!relax.expand(codec, v, rx, ?from, near, out, ?b.scratch, ?b.fixups)) { ret res[Formed, Refusal].err{refuse(EXPAND)}; }
-            if (level == 1)                                                           { out.steps[0].marker = c.marker; }
-            if (level < c.depth) {
-                if (out.count != 1) { ret res[Formed, Refusal].err{refuse(CHAIN)}; }
-                val next: opt[*relax.Relaxation] = relax.find(b.set.relax, out.steps[0].row);
-                if (sel next.none) { ret res[Formed, Refusal].err{refuse(EXPAND)}; }
-                k = 0;
-                for (k < out.steps[0].row.operands.len) {
-                    held_[k] = out.steps[0].values[k];
-                    k        = k + 1;
-                }
-                from = inst.Inst{row: out.steps[0].row, values: ?held_[0], count: out.steps[0].row.operands.len};
-                rx   = next.some;
-            }
-            level = level + 1;
+        # a grown form takes only its target from the layout, and only when it folds: its other symbols, and a target
+        # the linker resolves, stay relocations
+        var from:       inst.Inst           = inst.Inst{row: c.row, values: ?given[0], count: c.count};
+        var shortening: compress.Shortening = compress.Shortening{codec: codec, all: b.set.compress, available: v};
+        val why:        opt[str]            = relax.grown(codec, v, b.set.relax, ?from, c.depth, near, compress.shorten(?shortening), out, ?target, ?b.scratch, ?b.fixups);
+        if (sel why.some) {
+            if (str_equals(why.some, relax.CHAIN)) { ret res[Formed, Refusal].err{refuse(CHAIN)}; }
+            ret res[Formed, Refusal].err{refuse(EXPAND)};
         }
-        # the step taking the target may itself be out of range
-        val t:  u32 = target_step(rx);
-        var at: i64 = 0;
-        var i:  u32 = 0;
-        for (i < out.count) {
-            var step: inst.Inst = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
-            if (i == t) {
-                val further: opt[*relax.Relaxation] = relax.find(b.set.relax, out.steps[i].row);
-                if (sel further.some) {
-                    var zero: [row.MAX_OPERANDS]operand.Value;
-                    k = 0;
-                    for (k < step.count) {
-                        zero[k] = out.steps[i].values[k];
-                        k       = k + 1;
-                    }
-                    zero[further.some.operand] = operand.Value.relative{0};
-                    var probe: inst.Inst                 = inst.Inst{row: step.row, values: ?zero[0], count: step.count};
-                    val sized: res[usize, field.Refusal] = measure(b, v, ?probe);
-                    if (sel sized.err) { ret res[Formed, Refusal].err{encoding(sized.err)}; }
-                    if (relax.far(codec, further.some, near - at, sized.ok)) {
-                        if (out.count != 1) { ret res[Formed, Refusal].err{refuse(CHAIN)}; }
-                        ret res[Formed, Refusal].ok{Formed{far: true, size: 0}};
-                    }
-                }
-            }
-            val len: res[usize, field.Refusal] = measure(b, v, ?step);
-            if (sel len.err) { ret res[Formed, Refusal].err{encoding(len.err)}; }
-            at = at + len.ok::i64;
-            i  = i + 1;
+        out.steps[0].marker = c.marker;
+    }
+    if (sel c.relax.some) {
+        val reached: opt[bool] = relax.reaches(codec, v, b.set.relax, out, target, reach, ?b.scratch, ?b.fixups);
+        if (sel reached.none) { ret res[Formed, Refusal].err{refuse(EXPAND)}; }
+        if (!reached.some) {
+            if (out.count != 1) { ret res[Formed, Refusal].err{refuse(CHAIN)}; }
+            ret res[Formed, Refusal].ok{Formed{far: true, size: 0}};
         }
     }
     var size: u64 = 0;
@@ -1877,13 +1851,28 @@ fun settle(b: *Builder, s: u32, j: u32, out: *relax.Expansion) res[bool, Refusal
     ret res[bool, Refusal].ok{changed};
 }
 
-# every section laid out until no instruction grows. an instruction only grows, by a longer form or a longer
-# encoding, and each has a longest, so the loop ends
+# every section laid out until no instruction grows. an instruction only grows, by a longer form, and grows at most
+# as often as its row's chain of relaxations is long, so the passes are bounded by one more than the sum of those
+# chains, and a layout past the bound is refused
 fun lay(b: *Builder) err[Refusal] {
-    var out: relax.Expansion;
+    var out:   relax.Expansion;
+    var bound: u32   = 1;
+    var s:     usize = 0;
+    for (s < b.areas.len) {
+        var j: usize = 0;
+        for (j < b.areas.data[s].fragments.len) {
+            val f: *Fragment = ?b.areas.data[s].fragments.data[j];
+            if (sel f.body.code) { bound = bound + relax.depth(b.set.relax, b.set.codec, f.body.code.row); }
+            j = j + 1;
+        }
+        s = s + 1;
+    }
+    b.passes = 0;
     for {
+        if (b.passes >= bound) { ret refused(UNSETTLED); }
+        b.passes       = b.passes + 1;
         b.realigns.len = 0;
-        var s: usize = 0;
+        s              = 0;
         for (s < b.areas.len) {
             val placed: err[Refusal] = place(b, ?b.areas.data[s], s::u32);
             if (sel placed.err) { ret placed; }
@@ -3306,7 +3295,43 @@ test build__relaxation_grows_a_branch_out_of_range_and_reaches_a_fixed_point {
     val to:   operand.Value = jump.inst.values[1];
     if (!(sel to.relative && to.relative == 4096)) { ret 13; }
     if (o.relocs.count != 0)                       { ret 14; }
-    if (!t_done(?t, ?o))                           { ret 15; }
+    # each branch grows once, a pass apart, and a last pass finds nothing to grow: the bound, one more than the two
+    # chains of one relaxation each, is met exactly
+    if (t.b.passes != 3) { ret 16; }
+    if (!t_done(?t, ?o)) { ret 15; }
+    ret 0;
+}
+
+test build__branches_that_push_each_other_out_of_reach_settle_within_the_bound {
+    var t: T;
+    if (!t_make(?t, "rv64ic")) { ret 1; }
+    t_text(?t, ".text");
+    val back:  Label = t_anon(?t);
+    val ahead: Label = t_anon(?t);
+    # the first branch's target lies past the second, and the second's before the first, so each one growing moves the
+    # other's target away from it: c.beqz to beq to the inverted branch past a jal, both, as llvm-mc 23.1.1 lays them
+    if (!t_ok(define(?t.b, back)))                                 { ret 2; }
+    if (!t_ok(zero(?t.b, 4092)))                                   { ret 3; }
+    if (!t_emit(?t, "beq", t_reg(10), t_reg(0), target(ahead, 0))) { ret 4; }
+    if (!t_emit(?t, "beq", t_reg(12), t_reg(0), target(back, 0)))  { ret 5; }
+    if (!t_ok(zero(?t.b, 4088)))                                   { ret 6; }
+    if (!t_ok(define(?t.b, ahead)))                                { ret 7; }
+    val done: res[mink.object.Object, Refusal] = finish(?t.b);
+    if (sel done.err) { ret 8; }
+    var o: mink.object.Object = done.ok;
+    if (line_count(?t.b) != 4) { ret 9; }
+    val names: [4]str = [4]str{"c.bnez", "jal", "c.bnez", "jal"};
+    var i:     usize  = 0;
+    for (i < 4) {
+        if (!str_equals(line(?t.b, i).inst.row.mnemonic, names[i])) { ret 10; }
+        i = i + 1;
+    }
+    # both grow in the first pass, the first is pushed past beq's reach in the second and the second past it in the
+    # third, and the fourth finds nothing to grow: within the bound of one more than two chains of two relaxations
+    val bound: u32 = 1 + 2 * relax.depth(t.b.set.relax, t.b.set.codec, t_row("c.beqz"));
+    if (bound != 5 || t.b.passes != 4) { ret 11; }
+    if (o.relocs.count != 0)           { ret 12; }
+    if (!t_done(?t, ?o))               { ret 13; }
     ret 0;
 }
 
@@ -3587,7 +3612,8 @@ test build__an_instruction_is_written_in_the_shortest_form_the_selection_admits 
     t_text(?t, ".text");
     val far: Label = t_anon(?t);
     if (!t_emit(?t, "addi", t_reg(10), t_reg(10), operand.Value.immediate{1})) { ret 2; }
-    # a compressed branch out of range relaxes through the set's rows: c.beqz to beq to an inverted branch past a jump
+    # a compressed branch out of range relaxes through the set's rows: c.beqz to beq to an inverted branch past a jump,
+    # the inverted branch itself compressed
     if (!t_emit(?t, "c.beqz", t_reg(10), target(far, 0), operand.Value.none{})) { ret 3; }
     if (!t_ok(zero(?t.b, 6000)))                                                { ret 4; }
     if (!t_ok(define(?t.b, far)))                                               { ret 5; }
@@ -3596,9 +3622,11 @@ test build__an_instruction_is_written_in_the_shortest_form_the_selection_admits 
     var o: mink.object.Object = done.ok;
     if (line_count(?t.b) != 3) { ret 7; }
     val packed: Line = line(?t.b, 0);
-    if (!str_equals(packed.inst.row.mnemonic, "c.addi") || packed.length != 2)                                      { ret 8; }
-    if (!str_equals(line(?t.b, 1).inst.row.mnemonic, "bne") || !str_equals(line(?t.b, 2).inst.row.mnemonic, "jal")) { ret 9; }
-    if (!t_done(?t, ?o))                                                                                            { ret 10; }
+    if (!str_equals(packed.inst.row.mnemonic, "c.addi") || packed.length != 2)                                         { ret 8; }
+    if (!str_equals(line(?t.b, 1).inst.row.mnemonic, "c.bnez") || !str_equals(line(?t.b, 2).inst.row.mnemonic, "jal")) { ret 9; }
+    val past: operand.Value = line(?t.b, 1).inst.values[1];
+    if (!(sel past.relative && past.relative == 6)) { ret 9; }
+    if (!t_done(?t, ?o))                            { ret 10; }
     # without c the base form is written
     var plain: T;
     if (!t_make(?plain, "rv64i")) { ret 11; }
