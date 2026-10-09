@@ -104,6 +104,7 @@ pub val FINISHED:       str = "builder already finished";
 pub val OBJECT:         str = "object refused";
 pub val NO_INSTRUCTION: str = "place attached to the next instruction, and no instruction follows in its section";
 pub val SEALED:         str = "writer changed a section or label that existed when the layout was settled";
+pub val NAMELESS:       str = "source file has no name";
 
 # why the builder refused, leaving itself as it was
 # ---
@@ -382,6 +383,8 @@ rec Waiting {
 # literals: the bytes of every literal value
 # data:     the bytes of every data fragment
 # waiting:  the places waiting for an instruction
+# names:    the names interned
+# sources:  the source files stated
 # current:  the current section
 rec Snapshot {
     areas:    usize;
@@ -391,22 +394,31 @@ rec Snapshot {
     literals: usize;
     data:     usize;
     waiting:  usize;
+    names:    usize;
+    sources:  usize;
     current:  opt[usize];
 }
 
-# something that writes more of the object once the layout of the rest is settled, as the line program, which is made of
-# the final addresses of the places facts were attached to
+# something that writes more of the object once the layout of the rest is settled, from the final places of what facts
+# were attached to, as the line records are
 # ---
 # name:    what it writes
 # context: its state, which the caller owns and keeps until the builder is released
-# write:   what it writes, only into sections and labels it opens itself: what existed when the layout was settled has
-#          its addresses fixed, so a writer that adds to a section or restates a label of those is refused. a finish is
-#          all or none: when a writer, the layout after them or the encode fails, everything every writer added is taken
-#          back, so a writer is run again from a clean state and need not be idempotent
+# write:   what it writes into the builder, nil for nothing, only into sections and labels it opens itself: what existed
+#          when the layout was settled has its addresses fixed, so a writer that adds to a section or restates a label of
+#          those is refused
+# record:  what it states on the object once the object is made from the final layout, nil for nothing, as records of
+#          mink's model at the places `place_of` reads. the builder is closed while it runs, as a finished one is, so
+#          nothing it does can change what the object was made from
+#
+# a finish is all or none: when a writer, the layout after them, the encode or a record fails, everything every writer
+# added is taken back and the object with every record on it is released, so a writer is run again from a clean state
+# and need not be idempotent
 pub rec Writer {
     name:    str;
     context: ptr;
     write:   fun(ptr, *Builder) err[Refusal];
+    record:  fun(ptr, *Builder, *mink.object.Object) err[Refusal];
 }
 
 # a relocation found by the last encode, before the object exists
@@ -456,6 +468,7 @@ rec Entry {
 # entries:   the listing of the last encode
 # listed:    the values of the listing
 # traits:    the traits the caller stated, which the object states as given
+# sources:   the names of the source files the object states, in the order stated
 # waiting:   the places waiting for the next instruction of a section
 # writers:   what writes more of the object after the layout, in the order they were added
 # taken:     while writers run, what existed when the layout was settled, which they may not change
@@ -486,6 +499,7 @@ pub rec Builder {
     entries:   vector.Vector[Entry];
     listed:    vector.Vector[operand.Value];
     traits:    vector.Vector[mink.trait.Trait];
+    sources:   vector.Vector[mink.table.Id[mink.intern.Name]];
     waiting:   vector.Vector[Waiting];
     writers:   vector.Vector[Writer];
     taken:     opt[Snapshot];
@@ -596,6 +610,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, arch:
         entries:   vector.init[Entry](a),
         listed:    vector.init[operand.Value](a),
         traits:    vector.init[mink.trait.Trait](a),
+        sources:   vector.init[mink.table.Id[mink.intern.Name]](a),
         waiting:   vector.init[Waiting](a),
         writers:   vector.init[Writer](a),
         taken:     opt[Snapshot].none{},
@@ -689,14 +704,20 @@ pub fun release(b: *Builder) {
     vector.dnit[Entry](?b.entries);
     vector.dnit[operand.Value](?b.listed);
     vector.dnit[mink.trait.Trait](?b.traits);
+    vector.dnit[mink.table.Id[mink.intern.Name]](?b.sources);
     vector.dnit[Waiting](?b.waiting);
     vector.dnit[Writer](?b.writers);
 }
 
 # the id of `s`'s bytes among the builder's names, a new name interned, and every name given its label and section slots
 fun name_of(b: *Builder, s: str) res[mink.table.Id[mink.intern.Name], Refusal] {
+    ret name_bytes(b, s::*u8, str_len(s));
+}
+
+# the id of the `n` bytes at `p` among the builder's names, as `name_of` makes it
+fun name_bytes(b: *Builder, p: *u8, n: usize) res[mink.table.Id[mink.intern.Name], Refusal] {
     if (!held(vector.reserve[u32](?b.named, 1)) || !held(vector.reserve[u32](?b.titled, 1))) { ret res[mink.table.Id[mink.intern.Name], Refusal].err{memory()}; }
-    val id: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.intern.intern_str(?b.names, s);
+    val id: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.intern.intern(?b.names, p, n);
     if (sel id.err) { ret res[mink.table.Id[mink.intern.Name], Refusal].err{failed(id.err)}; }
     if (b.named.len <= id.ok.index::usize) {
         b.named.data[b.named.len]   = operand.NO_SYMBOL;
@@ -863,6 +884,18 @@ fun settle_waiting(b: *Builder) err[Refusal] {
 pub fun writer(b: *Builder, w: Writer) err[Refusal] {
     if (b.finished)                                { ret refused(FINISHED); }
     if (!held(vector.push[Writer](?b.writers, w))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# a source file the object names, stated as a local symbol of the source kind, as an ELF `STT_FILE` symbol. it is no
+# label, so its name is not one that a label can be found by
+pub fun source(b: *Builder, name: View) err[Refusal] {
+    if (b.finished)                                                            { ret refused(FINISHED); }
+    if (name.len == 0)                                                         { ret refused(NAMELESS); }
+    if (!held(vector.reserve[mink.table.Id[mink.intern.Name]](?b.sources, 1))) { ret err[Refusal].err{memory()}; }
+    val id: res[mink.table.Id[mink.intern.Name], Refusal] = name_bytes(b, name.data::*u8, name.len);
+    if (sel id.err) { ret err[Refusal].err{id.err}; }
+    vector.push[mink.table.Id[mink.intern.Name]](?b.sources, id.ok);
     ret err[Refusal].ok{};
 }
 
@@ -2060,6 +2093,21 @@ fun build_object(b: *Builder, o: *mink.object.Object) err[mink.fail.Fail] {
         if (sel added.err) { ret err[mink.fail.Fail].err{added.err}; }
         i = i + 1;
     }
+    # the source files come before the symbols, as the locals they name the file of follow them
+    i = 0;
+    for (i < b.sources.len) {
+        val name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = interned(o, mink.intern.bytes_of(?b.names, b.sources.data[i]));
+        if (sel name.err) { ret err[mink.fail.Fail].err{name.err}; }
+        val made: res[mink.table.Id[mink.object.Symbol], mink.fail.Fail] = mink.object.add_symbol(o, mink.object.Symbol{
+            name:       name.ok,
+            binding:    ?mink.symbol.LOCAL,
+            visibility: ?mink.symbol.DEFAULT,
+            kind:       ?mink.symbol.SOURCE,
+            def:        mink.object.Definition.absolute{0},
+        });
+        if (sel made.err) { ret err[mink.fail.Fail].err{made.err}; }
+        i = i + 1;
+    }
     i = 0;
     for (i < b.labels.len) {
         val m: *Mark = ?b.labels.data[i];
@@ -2174,12 +2222,13 @@ fun snapshot(b: *Builder) Snapshot {
         literals: b.literals.len,
         data:     b.data.len,
         waiting:  b.waiting.len,
+        names:    mink.intern.count(?b.names),
+        sources:  b.sources.len,
         current:  b.current,
     };
 }
 
-# everything added since `s` taken back by truncation, which is every effect of a writer, as it may only add. the names a
-# writer interned stay interned, with no label or section holding them
+# everything added since `s` taken back by truncation, which is every effect of a writer, as it may only add
 fun restore(b: *Builder, s: *Snapshot) {
     var i: usize = s.areas;
     for (i < b.areas.len) {
@@ -2203,19 +2252,43 @@ fun restore(b: *Builder, s: *Snapshot) {
     b.literals.len = s.literals;
     b.data.len     = s.data;
     b.waiting.len  = s.waiting;
-    b.current      = s.current;
+    b.sources.len  = s.sources;
+    # the mark is the interner's own count from `snapshot`, so truncating to it cannot be refused
+    val cut: err[mink.fail.Fail] = mink.intern.truncate(?b.names, s.names);
+    b.named.len  = s.names;
+    b.titled.len = s.names;
+    b.current    = s.current;
 }
 
 # every writer run in order, each writing from the final places, refused at the first that fails
 fun write_all(b: *Builder) err[Refusal] {
     var i: usize = 0;
     for (i < b.writers.len) {
-        val w:     *Writer      = ?b.writers.data[i];
-        val wrote: err[Refusal] = w.write(w.context, b);
-        if (sel wrote.err) { ret wrote; }
+        val w: *Writer = ?b.writers.data[i];
+        if (w.write != nil) {
+            val wrote: err[Refusal] = w.write(w.context, b);
+            if (sel wrote.err) { ret wrote; }
+        }
         i = i + 1;
     }
     ret err[Refusal].ok{};
+}
+
+# every writer's records stated on `o` in order, with the builder closed, refused at the first that fails
+fun record_all(b: *Builder, o: *mink.object.Object) err[Refusal] {
+    b.finished = true;
+    var made: err[Refusal] = err[Refusal].ok{};
+    var i:    usize        = 0;
+    for (i < b.writers.len) {
+        val w: *Writer = ?b.writers.data[i];
+        if (w.record != nil) {
+            made = w.record(w.context, b, o);
+            if (sel made.err) { brk; }
+        }
+        i = i + 1;
+    }
+    b.finished = false;
+    ret made;
 }
 
 # the object made of the layout as it stands
@@ -2230,13 +2303,19 @@ fun produce(b: *Builder) res[mink.object.Object, Refusal] {
         mink.object.release(?o);
         ret res[mink.object.Object, Refusal].err{failed(built.err)};
     }
+    val recorded: err[Refusal] = record_all(b, ?o);
+    if (sel recorded.err) {
+        mink.object.release(?o);
+        ret res[mink.object.Object, Refusal].err{recorded.err};
+    }
     ret res[mink.object.Object, Refusal].ok{o};
 }
 
 # the builder laid out to a fixed point and encoded, handed over as mink's neutral object, which the caller releases.
-# once the layout is settled every writer runs, in the order added, and what they added is laid out with the rest. a
-# finish is all or none: a refused one takes back everything the writers added and leaves the builder as it was, to be
-# emitted into and finished again, when the layout is made anew and every writer runs again from a clean state
+# once the layout is settled every writer runs, in the order added, and what they added is laid out with the rest, and
+# once the object is made every writer states its records on it. a finish is all or none: a refused one takes back
+# everything the writers added, releases the object with its records and leaves the builder as it was, to be emitted
+# into and finished again, when the layout is made anew and every writer runs again from a clean state
 pub fun finish(b: *Builder) res[mink.object.Object, Refusal] {
     if (b.finished) { ret res[mink.object.Object, Refusal].err{refuse(FINISHED)}; }
     val laid: err[Refusal] = layout(b);
@@ -2883,6 +2962,7 @@ test build__a_finish_that_fails_in_a_writer_leaves_no_trace_and_a_rerun_writes_o
     if (!t_emit(?t, "addi", t_reg(0), t_reg(0), operand.Value.immediate{0})) { ret 2; }
     var runs: u32 = 0;
     if (!t_ok(writer(?t.b, Writer{name: "extra", context: ?runs, write: t_extra}))) { ret 3; }
+    val names:  usize                            = mink.intern.count(?t.b.names);
     val failed: res[mink.object.Object, Refusal] = finish(?t.b);
     if (sel failed.ok) {
         mink.object.release(?failed.ok);
@@ -2891,6 +2971,10 @@ test build__a_finish_that_fails_in_a_writer_leaves_no_trace_and_a_rerun_writes_o
     if (t.b.areas.len != 1 || t.b.labels.len != 0 || t.b.data.len != 0) { ret 5; }
     if (sel t.b.current.none)                                           { ret 6; }
     if (t.b.current.some != text.index::usize)                          { ret 7; }
+    if (mink.intern.count(?t.b.names) != names)                         { ret 13; }
+    val next: res[mink.table.Id[mink.intern.Name], Refusal] = name_of(?t.b, ".extra");
+    if (!sel next.ok)                  { ret 14; }
+    if (next.ok.index::usize != names) { ret 15; }
     val done: res[mink.object.Object, Refusal] = finish(?t.b);
     if (sel done.err) { ret 8; }
     var o: mink.object.Object = done.ok;
