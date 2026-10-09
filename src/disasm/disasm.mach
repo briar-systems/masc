@@ -1,1 +1,1514 @@
-# disassembling encoded bytes back into text that assembles to the same bytes
+# disassembling mink's neutral object back into text that assembles to the same bytes
+#
+# the disassembler reads only the neutral model, so any format mink converts
+# to it disassembles alike. each code section is decoded through the set's
+# static decode dispatch and printed by `masc.syntax.print`, and every other
+# section, and the bytes of a code section no row decodes, prints as data
+# directives. symbols print as labels at their offsets, with their binding,
+# visibility, type and size stated before the sections. a relocation prints
+# as the symbol of the operand whose field it patches, under the specifier
+# the syntax spells its kind by, or as a datum of the set's data fixups.
+#
+# a statement is printed only when it reads back to the same bytes: its text
+# is parsed again as the assembler parses it, given the shortest form the
+# assembler would give it, and encoded, and the bytes and the relocations
+# must be the ones the object holds. a statement that does not is printed as
+# data in the set's parcels, never as a guessed instruction. a relocation
+# against a section symbol, or against a symbol with no name, names a label
+# the disassembler states at its place, spelled by the syntax's anonymous stem.
+#
+# what the text cannot state is refused, naming the section and offset, with
+# the output left as it was: line tables, groups, notes, format facts, index
+# entries, symbol versions, a marker relocation nothing printed rides beside,
+# and a relocation no operand or datum takes. the traits an object states are
+# the caller's to give the assembler again, as they are the caller's to give.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.sort;
+use std.collections.vector;
+
+use mink;
+
+use masc.asm.asm;
+use masc.asm.core;
+use masc.asm.model;
+use cmp: masc.core.compress;
+use masc.core.diagnostic;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.set;
+use masc.core.spelling;
+use masc.core.walk;
+use masc.syntax.parse;
+use masc.syntax.print;
+use seq: masc.syntax.sequence;
+
+use riscv_extension: masc.isa.riscv.extension;
+use riscv_register:  masc.isa.riscv.register;
+use riscv_set:       masc.isa.riscv.set;
+
+pub val ARCH:       str = "the set does not serve the object's architecture";
+pub val NO_SYNTAX:  str = "no syntax of the set at this index";
+pub val NO_PARCEL:  str = "the set states no parcel of its code";
+pub val NO_BYTE:    str = "the set's source dialect has no one-byte data directive";
+pub val MEMORY:     str = "out of memory";
+pub val LINES:      str = "the object states line tables, which disassembly does not write";
+pub val GROUPS:     str = "the object states section groups, which the assembler does not read";
+pub val NOTES:      str = "the object states notes, which disassembly does not write";
+pub val FACTS:      str = "the object states format facts, which disassembly does not write";
+pub val ENTRIES:    str = "the object states index entries, which disassembly does not write";
+pub val LIBRARY:    str = "the object describes a shared library, which has no source";
+pub val GROUPED:    str = "section in a group or owned by another, which the assembler does not read";
+pub val SECTION:    str = "section whose kind and flags no .section reads back to";
+pub val NAMELESS:   str = "symbol with no name that no label stands for";
+pub val QUOTED:     str = "name that cannot be written in a string";
+pub val VERSIONED:  str = "symbol version, which the assembler does not read";
+pub val BINDING:    str = "symbol binding no directive states";
+pub val VISIBILITY: str = "symbol visibility no directive states";
+pub val TYPE:       str = "symbol kind no .type states";
+pub val ENTRY:      str = "symbol that names an index entry";
+pub val MARKER:     str = "marker relocation that nothing printed rides beside";
+pub val UNTAKEN:    str = "relocation no instruction operand or datum of the set takes";
+pub val DIFFERENCE: str = "relocation that subtracts a symbol of its own";
+pub val UNPAIRED:   str = "relocation of one half of a difference without the other";
+pub val HELD:       str = "relocated field that holds bits of its own";
+pub val NO_WIDTH:   str = "the set's source dialect has no data directive of this width";
+pub val FILL:       str = "realigned padding that is not the set's code fill";
+pub val ZEROS:      str = "relocation in a section of zero fill";
+pub val PAST:       str = "label or relocation past its section's end";
+
+# the section of a refusal about the object as a whole
+pub val NO_SECTION: u32 = 0xFFFFFFFF;
+
+# why an object was not disassembled
+# ---
+# message: what was refused
+# section: the section it was found in, NO_SECTION for the object as a whole
+# offset:  where in that section
+pub rec Refusal {
+    message: str;
+    section: u32;
+    offset:  u64;
+}
+
+# operand values a decoded instruction holds, its list members included
+val STORE: u32 = 32;
+
+# alternatives a refused decode notes
+val ALTERNATIVES: u32 = 16;
+
+# literal bytes the parser cannot borrow from the text
+val LITERALS: u32 = 64;
+
+# bytes of raw data on one line
+val PER_LINE: usize = 16;
+
+# the handle a probe gives the operand it tries
+val PROBE: u32 = 1;
+
+# a place a label is printed at
+# ---
+# section: the section's index
+# offset:  the offset within it
+# handle:  the symbol handle the label spells, or for an anchor its number after the stem
+rec Label {
+    section: u32;
+    offset:  u64;
+    handle:  u32;
+}
+
+# a relocation at its place
+rec Site {
+    section: u32;
+    offset:  u64;
+    reloc:   u32;
+}
+
+# a relocation kind and a set-local fixup kind bound to it
+rec Bound {
+    kind:  *mink.reloc.Kind;
+    fixup: operand.FixupKind;
+}
+
+# what a relocation refers to, as the text names it
+rec Aimed {
+    handle: u32;
+    addend: i64;
+}
+
+# one instruction of a statement as decoded
+# ---
+# at:     its offset in the section
+# len:    its length
+# values: its operand values, then its list members
+rec Step {
+    at:     u64;
+    len:    usize;
+    ins:    inst.Inst;
+    values: [STORE]operand.Value;
+}
+
+# the state of one disassembly
+# ---
+# labels:  every label, in place order
+# sites:   every relocation, in place order
+# anchors: the labels the disassembler states, in place order, each numbered after the stem
+# bound:   the set's bindings in order of relocation kind
+# fills:   the code fill patterns the selection admits, longest first
+# count:   how many symbols the object has, the handles past it naming anchors
+# byte:    the one-byte data directive
+# li, ri:   the next label and the next relocation to print
+# full:  whether the output failed to grow
+# named: the handles the statement being verified names, which its parse resolves
+rec Disasm {
+    a:       *A.Allocator;
+    s:       *set.Set;
+    v:       *register.Available;
+    syntax:  *spelling.Syntax;
+    o:       *mink.object.Object;
+    out:     *vector.Vector[u8];
+    labels:  vector.Vector[Label];
+    sites:   vector.Vector[Site];
+    anchors: vector.Vector[Label];
+    bound:   vector.Vector[Bound];
+    fills:   vector.Vector[*set.Pattern];
+    bytes:   vector.Vector[u8];
+    fixups:  vector.Vector[field.Fixup];
+    symbols: spelling.Symbols;
+    count:   u32;
+    byte:    str;
+    li:      usize;
+    ri:      usize;
+    full:    bool;
+    named:   [relax.MAX_STEPS]u32;
+    names:   u32;
+    scratch: [spelling.MAX_ANONYMOUS + 10]u8;
+    steps:   [relax.MAX_STEPS]Step;
+    pool:    [STORE]operand.Value;
+    room:    [ALTERNATIVES]requirement.Ids;
+    lits:    [LITERALS]u8;
+}
+
+fun refusal(message: str, section: u32, offset: u64) err[Refusal] {
+    ret err[Refusal].err{Refusal{message: message, section: section, offset: offset}};
+}
+
+fun whole(message: str) err[Refusal] {
+    ret refusal(message, NO_SECTION, 0);
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# `n` bytes at `p` appended, noting a failure to grow
+fun put_bytes(d: *Disasm, p: *u8, n: usize) {
+    if (!held(vector.reserve[u8](d.out, n))) {
+        d.full = true;
+        ret;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        d.out.data[d.out.len] = p[i];
+        d.out.len             = d.out.len + 1;
+        i                     = i + 1;
+    }
+}
+
+fun put(d: *Disasm, s: str) {
+    put_bytes(d, s, str_len(s));
+}
+
+fun put_view(d: *Disasm, v: View) {
+    put_bytes(d, v.data, v.len);
+}
+
+fun put_char(d: *Disasm, c: u8) {
+    put_bytes(d, ?c, 1);
+}
+
+fun put_unsigned(d: *Disasm, value: u64) {
+    var digits: [20]u8;
+    var n:      u64 = value;
+    var at:     u32 = 20;
+    for {
+        at         = at - 1;
+        digits[at] = '0' + (n % 10)::u8;
+        n          = n / 10;
+        if (n == 0) { brk; }
+    }
+    put_bytes(d, ?digits[at], (20 - at)::usize);
+}
+
+fun put_signed(d: *Disasm, value: i64) {
+    if (value < 0) {
+        put_char(d, '-');
+        put_unsigned(d, ~(value:~u64) + 1);
+        ret;
+    }
+    put_unsigned(d, value:~u64);
+}
+
+fun put_hex(d: *Disasm, b: u8) {
+    put(d, "0x");
+    put_char(d, "0123456789abcdef"[(b >> 4)::usize]);
+    put_char(d, "0123456789abcdef"[(b & 15)::usize]);
+}
+
+# `name` written as a string, refused when it holds a quote, a backslash or a control character
+fun put_string(d: *Disasm, name: View) bool {
+    var i: usize = 0;
+    for (i < name.len) {
+        val c: u8 = name.data[i];
+        if (c == '"' || c == '\\' || c < 0x20) { ret false; }
+        i = i + 1;
+    }
+    put_char(d, '"');
+    put_view(d, name);
+    put_char(d, '"');
+    ret true;
+}
+
+fun by_place(x: *Label, y: *Label) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.offset != y.offset) {
+        if (x.offset < y.offset) { ret -1; }
+        ret 1;
+    }
+    if (x.handle < y.handle) { ret -1; }
+    if (x.handle > y.handle) { ret 1; }
+    ret 0;
+}
+
+fun by_site(x: *Site, y: *Site) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.offset != y.offset) {
+        if (x.offset < y.offset) { ret -1; }
+        ret 1;
+    }
+    if (x.reloc < y.reloc) { ret -1; }
+    if (x.reloc > y.reloc) { ret 1; }
+    ret 0;
+}
+
+fun by_kind(x: *Bound, y: *Bound) i64 {
+    val p: u64 = x.kind:~u64;
+    val q: u64 = y.kind:~u64;
+    if (p < q)             { ret -1; }
+    if (p > q)             { ret 1; }
+    if (x.fixup < y.fixup) { ret -1; }
+    if (x.fixup > y.fixup) { ret 1; }
+    ret 0;
+}
+
+fun section_of(d: *Disasm, i: u32) *mink.object.Section {
+    ret ?d.o.sections.items[i::usize];
+}
+
+fun symbol_of(d: *Disasm, i: u32) *mink.object.Symbol {
+    ret ?d.o.symbols.items[i::usize];
+}
+
+fun reloc_of(d: *Disasm, site: *Site) *mink.object.Reloc {
+    ret ?d.o.relocs.items[site.reloc::usize];
+}
+
+fun name_of(d: *Disasm, id: mink.table.Id[mink.intern.Name]) View {
+    ret mink.object.name_of(d.o, id);
+}
+
+# the size of section `i`, its zero fill or its bytes
+fun size_of(d: *Disasm, i: u32) u64 {
+    val sec: *mink.object.Section = section_of(d, i);
+    if (sel sec.contents.zero) { ret sec.contents.zero; }
+    ret mink.object.bytes(d.o, ?sec.contents).len::u64;
+}
+
+fun is_kind(k: *mink.symbol.Kind, caps: mink.symbol.Caps) bool {
+    ret (k.caps & caps) != 0;
+}
+
+# the stem followed by `number` in decimal, written to `to`, answering how long it is
+fun stemmed(stem: str, number: u32, to: *u8) usize {
+    var lead: usize = 0;
+    for (stem[lead] != 0) {
+        to[lead] = stem[lead];
+        lead     = lead + 1;
+    }
+    var digits: [10]u8;
+    var count:  usize = 0;
+    var left:   u32   = number;
+    for {
+        digits[count] = '0' + (left % 10)::u8;
+        count         = count + 1;
+        left          = left / 10;
+        if (left == 0) { brk; }
+    }
+    var k: usize = 0;
+    for (k < count) {
+        to[lead + k] = digits[count - 1 - k];
+        k            = k + 1;
+    }
+    ret lead + count;
+}
+
+# the spelling of handle `id`: an object symbol's name, or an anchor's stem and number
+fun named(context: ptr, id: u32) View {
+    val d: *Disasm = context::*Disasm;
+    if (id <= d.count) { ret name_of(d, symbol_of(d, id - 1).name); }
+    val number: u32 = d.anchors.data[(id - d.count - 1)::usize].handle;
+    ret view(?d.scratch[0], stemmed(d.syntax.anonymous, number, ?d.scratch[0]));
+}
+
+fun same_view(a: View, b: View) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a name the statement being verified prints, resolved to its handle
+fun resolved(context: ptr, name: View) res[spelling.Resolved, str] {
+    val d: *Disasm = context::*Disasm;
+    var i: u32     = 0;
+    for (i < d.names) {
+        if (same_view(named(context, d.named[i]), name)) { ret res[spelling.Resolved, str].ok{spelling.Resolved.symbol{d.named[i]}}; }
+        i = i + 1;
+    }
+    ret res[spelling.Resolved, str].err{UNTAKEN};
+}
+
+# the anchor at `offset` of section `section`, a binary search of the anchors
+fun anchor_at(d: *Disasm, section: u32, offset: u64) opt[u32] {
+    var want: Label = Label{section: section, offset: offset, handle: 0};
+    var lo:   usize = 0;
+    var hi:   usize = d.anchors.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        var at:  Label = d.anchors.data[mid];
+        at.handle = 0;
+        if (by_place(?at, ?want) < 0) { lo = mid + 1; }
+        or                            { hi = mid; }
+    }
+    if (lo >= d.anchors.len || d.anchors.data[lo].section != section || d.anchors.data[lo].offset != offset) { ret opt[u32].none{}; }
+    ret opt[u32].some{d.count + 1 + lo::u32};
+}
+
+# the place a reference to a section symbol plus `addend` is anchored at: the addend's own offset when it lies in the
+# section, else the section's start
+fun anchored(d: *Disasm, section: u32, addend: i64) u64 {
+    if (addend >= 0 && addend:~u64 <= size_of(d, section)) { ret addend:~u64; }
+    ret 0;
+}
+
+# what relocation `r` refers to as the text names it, none for a marker
+fun aim(d: *Disasm, r: *mink.object.Reloc, site: *Site) res[opt[Aimed], Refusal] {
+    if (sel r.target.entry)   { ret res[opt[Aimed], Refusal].err{Refusal{message: ENTRY, section: site.section, offset: site.offset}}; }
+    if (!sel r.target.symbol) { ret res[opt[Aimed], Refusal].ok{opt[Aimed].none{}}; }
+    val index: u32                 = r.target.symbol.index;
+    val sym:   *mink.object.Symbol = symbol_of(d, index);
+    if (sel sym.def.placed) {
+        val p: mink.object.Place = sym.def.placed;
+        if (is_kind(sym.kind, mink.symbol.SECTION)) {
+            val at:  u64      = anchored(d, p.section.index, r.addend);
+            val got: opt[u32] = anchor_at(d, p.section.index, at);
+            if (sel got.some) { ret res[opt[Aimed], Refusal].ok{opt[Aimed].some{Aimed{handle: got.some, addend: r.addend - at:~i64}}}; }
+        }
+        if (name_of(d, sym.name).len == 0) {
+            val got: opt[u32] = anchor_at(d, p.section.index, p.offset);
+            if (sel got.some) { ret res[opt[Aimed], Refusal].ok{opt[Aimed].some{Aimed{handle: got.some, addend: r.addend}}}; }
+        }
+    }
+    if (name_of(d, sym.name).len == 0) { ret res[opt[Aimed], Refusal].err{Refusal{message: NAMELESS, section: site.section, offset: site.offset}}; }
+    ret res[opt[Aimed], Refusal].ok{opt[Aimed].some{Aimed{handle: index + 1, addend: r.addend}}};
+}
+
+# the first of the bindings of relocation kind `kind`, a binary search of the bound kinds, len when none
+fun first_bound(d: *Disasm, kind: *mink.reloc.Kind) usize {
+    val want: u64   = kind:~u64;
+    var lo:   usize = 0;
+    var hi:   usize = d.bound.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (d.bound.data[mid].kind:~u64 < want) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    ret lo;
+}
+
+# the relocation kind fixup kind `fixup` is bound to, nil for none
+fun kind_of(d: *Disasm, fixup: operand.FixupKind) *mink.reloc.Kind {
+    var i: u32 = 0;
+    for (i < d.s.bindings.len) {
+        if (d.s.bindings.at[i].fixup == fixup) { ret d.s.bindings.at[i].kind; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the fixup kind relocation kind `kind` takes on an operand of default fixup kind `default`: the default itself, else
+# one a specifier of the syntax spells there, else the first bound to it, NO_FIXUP for none
+fun fixup_for(d: *Disasm, kind: *mink.reloc.Kind, default: operand.FixupKind) operand.FixupKind {
+    val first: usize             = first_bound(d, kind);
+    var found: operand.FixupKind = operand.NO_FIXUP;
+    var i:     usize             = first;
+    for (i < d.bound.len && d.bound.data[i].kind == kind) {
+        val f: operand.FixupKind = d.bound.data[i].fixup;
+        if (f == default) { ret f; }
+        var k: u32 = 0;
+        for (k < d.syntax.specifiers.len) {
+            val sp: *spelling.Specifier = ?d.syntax.specifiers.at[k];
+            if (sp.operand == default && sp.fixup == f) { ret f; }
+            k = k + 1;
+        }
+        if (found == operand.NO_FIXUP) { found = f; }
+        i = i + 1;
+    }
+    ret found;
+}
+
+# whether relocation kind `kind` is bound to fixup kind `fixup`
+fun binds(d: *Disasm, kind: *mink.reloc.Kind, fixup: operand.FixupKind) bool {
+    if (fixup == operand.NO_FIXUP) { ret false; }
+    var i: usize = first_bound(d, kind);
+    for (i < d.bound.len && d.bound.data[i].kind == kind) {
+        if (d.bound.data[i].fixup == fixup) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the default fixup kind of an operand that may hold a symbol, NO_FIXUP for one that may not
+fun default_fixup(desc: *operand.Operand) operand.FixupKind {
+    if (desc.quantity == operand.VARIADIC) { ret operand.NO_FIXUP; }
+    if (sel desc.shape.immediate)          { ret desc.shape.immediate.fixup; }
+    if (sel desc.shape.relative)           { ret desc.shape.relative.offset.fixup; }
+    if (sel desc.shape.memory)             { ret desc.shape.memory.disp.fixup; }
+    if (sel desc.shape.id)                 { ret desc.shape.id.fixup; }
+    ret operand.NO_FIXUP;
+}
+
+# `v` holding symbol `sym` in place of its number: a memory value's displacement, any other value whole
+fun symbolic(v: operand.Value, sym: operand.Symbol) operand.Value {
+    if (sel v.memory) {
+        var a: operand.Address = v.memory;
+        a.disp   = 0;
+        a.symbol = sym;
+        ret operand.Value.memory{a};
+    }
+    ret operand.Value.symbol{sym};
+}
+
+# whether `v` names a symbol
+fun holds_symbol(v: *operand.Value) bool {
+    if (sel v.symbol) { ret true; }
+    if (sel v.memory) { ret v.memory.symbol.id != operand.NO_SYMBOL; }
+    ret false;
+}
+
+# the offset from its start of the field operand `k` of `ins` is relocated at, none when it holds no symbol there
+fun probe(d: *Disasm, ins: *inst.Inst, k: u32) opt[usize] {
+    val desc: *operand.Operand = ?ins.row.operands.at[k];
+    if (default_fixup(desc) == operand.NO_FIXUP) { ret opt[usize].none{}; }
+    var values: [row.MAX_OPERANDS]operand.Value;
+    var i:      u32 = 0;
+    for (i < ins.count) {
+        values[i] = ins.values[i];
+        i         = i + 1;
+    }
+    values[k] = symbolic(values[k], operand.Symbol{id: PROBE, addend: 0, fixup: operand.NO_FIXUP});
+    var tried: inst.Inst = inst.Inst{row: ins.row, values: ?values[0], count: ins.count};
+    d.bytes.len  = 0;
+    d.fixups.len = 0;
+    val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?tried, ?d.bytes, ?d.fixups);
+    if (sel done.err) { ret opt[usize].none{}; }
+    var hits:   u32   = 0;
+    var offset: usize = 0;
+    var f:      usize = 0;
+    for (f < d.fixups.len) {
+        if (d.fixups.data[f].operand == k::u8) {
+            hits   = hits + 1;
+            offset = d.fixups.data[f].offset;
+        }
+        f = f + 1;
+    }
+    if (hits != 1) { ret opt[usize].none{}; }
+    ret opt[usize].some{offset};
+}
+
+# the handle `h` noted as one the statement names
+fun note(d: *Disasm, h: u32) bool {
+    var i: u32 = 0;
+    for (i < d.names) {
+        if (d.named[i] == h) { ret true; }
+        i = i + 1;
+    }
+    if (d.names >= relax.MAX_STEPS) { ret false; }
+    d.named[d.names] = h;
+    d.names          = d.names + 1;
+    ret true;
+}
+
+# each relocation of the decoded step `st` among `first` to `end` given to the operand whose field it patches
+fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
+    var i: usize = first;
+    for (i < end) {
+        val site: *Site = ?d.sites.data[i];
+        i = i + 1;
+        if (site.offset < st.at || site.offset >= st.at + st.len::u64) { cnt; }
+        val r:     *mink.object.Reloc       = reloc_of(d, site);
+        val aimed: res[opt[Aimed], Refusal] = aim(d, r, site);
+        if (sel aimed.err)     { ret res[bool, Refusal].err{aimed.err}; }
+        if (sel aimed.ok.none) { cnt; }
+        if (sel r.minus.some)  { ret res[bool, Refusal].ok{false}; }
+        val off:   usize = (site.offset - st.at)::usize;
+        var given: bool  = false;
+        var k:     u32   = 0;
+        for (k < st.ins.count && !given) {
+            val at: opt[usize] = probe(d, ?st.ins, k);
+            if (sel at.some && at.some == off) {
+                val f: operand.FixupKind = fixup_for(d, r.kind, default_fixup(?st.ins.row.operands.at[k]));
+                if (f == operand.NO_FIXUP || holds_symbol(?st.values[k])) { ret res[bool, Refusal].ok{false}; }
+                if (!note(d, aimed.ok.some.handle))                       { ret res[bool, Refusal].ok{false}; }
+                st.values[k] = symbolic(st.values[k], operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: f});
+                given        = true;
+            }
+            k = k + 1;
+        }
+        if (!given) { ret res[bool, Refusal].ok{false}; }
+    }
+    ret res[bool, Refusal].ok{true};
+}
+
+# whether the expansion `ex` encoded at `at` as the builder writes it is the bytes of `data` up to `stop` and makes
+# exactly the relocations among `first` to `end`
+fun matches(d: *Disasm, ex: *relax.Expansion, data: *u8, len: usize, at: u64, stop: u64, first: usize, end: usize) bool {
+    var used:  [relax.MAX_STEPS * row.MAX_OPERANDS + relax.MAX_STEPS]bool;
+    var total: usize = end - first;
+    if (total > relax.MAX_STEPS::usize * (row.MAX_OPERANDS::usize + 1)) { ret false; }
+    var u: usize = 0;
+    for (u < total) {
+        used[u] = false;
+        u       = u + 1;
+    }
+    var fixed: bool = false;
+    var i:     u32  = 0;
+    for (i < ex.count && ex.count > 1) {
+        var k: u32 = 0;
+        for (k < ex.steps[i].row.operands.len) {
+            fixed = fixed || holds_symbol(?ex.steps[i].values[k]);
+            k     = k + 1;
+        }
+        i = i + 1;
+    }
+    var offset: u64 = at;
+    i = 0;
+    for (i < ex.count) {
+        var chosen: relax.Emitted = ex.steps[i];
+        var given:  inst.Inst     = inst.Inst{row: chosen.row, values: ?chosen.values[0], count: chosen.row.operands.len};
+        var packed: relax.Emitted;
+        if (!fixed && cmp.compress(d.s.codec, d.s.compress, d.v, ?given, ?packed)) { chosen = packed; }
+        var ins: inst.Inst = inst.Inst{row: chosen.row, values: ?chosen.values[0], count: chosen.row.operands.len};
+        d.bytes.len  = 0;
+        d.fixups.len = 0;
+        val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?ins, ?d.bytes, ?d.fixups);
+        if (sel done.err)                     { ret false; }
+        if (offset + done.ok::u64 > len::u64) { ret false; }
+        var b: usize = 0;
+        for (b < done.ok) {
+            if (d.bytes.data[b] != data[offset::usize + b]) { ret false; }
+            b = b + 1;
+        }
+        var marker: operand.FixupKind = chosen.marker;
+        var f:      usize             = 0;
+        for (f < d.fixups.len) {
+            val fx: *field.Fixup   = ?d.fixups.data[f];
+            val sp: opt[*set.Span] = set.span_of(d.s.spans, fx.kind);
+            if (sel sp.some) { marker = sp.some.marker; }
+            var hit: bool  = false;
+            var j:   usize = 0;
+            for (j < total && !hit) {
+                if (!used[j]) {
+                    val site: *Site              = ?d.sites.data[first + j];
+                    val r:    *mink.object.Reloc = reloc_of(d, site);
+                    if (site.offset == offset + fx.offset::u64 && r.kind == kind_of(d, fx.kind) && sel r.minus.none) {
+                        val a: res[opt[Aimed], Refusal] = aim(d, r, site);
+                        if (sel a.ok) {
+                            val o: opt[Aimed] = a.ok;
+                            if (sel o.some) {
+                                if (o.some.handle == fx.symbol && o.some.addend == fx.addend) {
+                                    used[j] = true;
+                                    hit     = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+            if (!hit) { ret false; }
+            f = f + 1;
+        }
+        if (marker != operand.NO_FIXUP) {
+            var hit: bool  = false;
+            var j:   usize = 0;
+            for (j < total && !hit) {
+                if (!used[j]) {
+                    val site: *Site              = ?d.sites.data[first + j];
+                    val r:    *mink.object.Reloc = reloc_of(d, site);
+                    if (site.offset == offset && sel r.target.none && r.kind == kind_of(d, marker)) {
+                        used[j] = true;
+                        hit     = true;
+                    }
+                }
+                j = j + 1;
+            }
+            if (!hit) { ret false; }
+        }
+        offset = offset + done.ok::u64;
+        i      = i + 1;
+    }
+    u = 0;
+    for (u < total) {
+        if (!used[u]) { ret false; }
+        u = u + 1;
+    }
+    ret offset == stop;
+}
+
+# the text from `start` to the output's end parsed as the assembler parses a statement, into `ex`
+fun reparse(d: *Disasm, start: usize, ex: *relax.Expansion) bool {
+    var rd: spelling.Reader = spelling.Reader{
+        text:      d.out.data,
+        start:     start,
+        at:        start,
+        end:       d.out.len,
+        origin:    diagnostic.START,
+        codec:     d.s.codec,
+        available: d.v,
+        syntax:    d.syntax,
+        symbols:   ?d.symbols,
+        context:   nil,
+        row:       nil,
+        pool:      ?d.pool[0],
+        cap:       STORE,
+        used:      0,
+        bytes:     ?d.lits[0],
+        room:      LITERALS,
+        taken:     0,
+        refused:   field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0},
+    };
+    val got: err[diagnostic.Diagnostic] = parse.statement(?rd, ex);
+    ret sel got.ok;
+}
+
+# step `i` decoded at `at` of the `len` bytes at `data`, ending by `limit`
+fun decode_step(d: *Disasm, i: u32, data: *u8, len: usize, at: u64, limit: u64) bool {
+    val st:   *Step                            = ?d.steps[i];
+    var alts: field.Admissions                 = field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0};
+    val got:  res[walk.Decoded, field.Refusal] = walk.decode(d.s.codec, d.v, data, len, at::usize, ?st.values[0], STORE, ?alts);
+    if (sel got.err)                  { ret false; }
+    if (at + got.ok.len::u64 > limit) { ret false; }
+    st.at  = at;
+    st.len = got.ok.len;
+    st.ins = inst.Inst{row: got.ok.inst.row, values: ?st.values[0], count: got.ok.inst.count};
+    ret true;
+}
+
+# the end of the relocations from the cursor that lie before `end`
+fun sites_before(d: *Disasm, section: u32, end: u64) usize {
+    var j: usize = d.ri;
+    for (j < d.sites.len && d.sites.data[j].section == section && d.sites.data[j].offset < end) {
+        j = j + 1;
+    }
+    ret j;
+}
+
+# the span the relocations among `first` to `end` at `at` state, none when none of them covers more than its own
+fun span_at(d: *Disasm, at: u64, first: usize, end: usize) opt[*set.Span] {
+    var j: usize = first;
+    for (j < end) {
+        val site: *Site              = ?d.sites.data[j];
+        val r:    *mink.object.Reloc = reloc_of(d, site);
+        j = j + 1;
+        if (site.offset != at || sel r.target.none) { cnt; }
+        var i: usize = first_bound(d, r.kind);
+        for (i < d.bound.len && d.bound.data[i].kind == r.kind) {
+            val sp: opt[*set.Span] = set.span_of(d.s.spans, d.bound.data[i].fixup);
+            if (sel sp.some) { ret sp; }
+            i = i + 1;
+        }
+    }
+    ret opt[*set.Span].none{};
+}
+
+# the steps of a span's statement given the symbol of its relocation where sequence `q` places it
+fun spanned(d: *Disasm, q: *spelling.Sequence, sp: *set.Span, aimed: Aimed, count: u32, out: *inst.Inst, values: *operand.Value) bool {
+    if (q.steps.len != count) { ret false; }
+    var i: u32 = 0;
+    for (i < count) {
+        val st:   *Step          = ?d.steps[i];
+        val step: *spelling.Step = ?q.steps.at[i];
+        if (step.row != st.ins.row) { ret false; }
+        val held_: *operand.Value = ?values[i * row.MAX_OPERANDS::u32];
+        var k:     u32            = 0;
+        for (k < st.ins.count) {
+            held_[k] = st.values[k];
+            k        = k + 1;
+        }
+        k = 0;
+        for (k < step.parts.len && k < st.ins.count) {
+            val part: spelling.Part = step.parts.at[k];
+            if (sel part.symbol && part.symbol.fixup == sp.fixup) {
+                held_[k] = operand.Value.symbol{operand.Symbol{id: aimed.handle, addend: aimed.addend, fixup: sp.fixup}};
+            }
+            k = k + 1;
+        }
+        out[i] = inst.Inst{row: st.ins.row, values: held_, count: st.ins.count};
+        i      = i + 1;
+    }
+    ret true;
+}
+
+# the statement at `at` printed, answering how many bytes it takes, 0 when none reads back to them
+fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u64) res[u64, Refusal] {
+    if (!decode_step(d, 0, data, len, at, limit)) { ret res[u64, Refusal].ok{0}; }
+    d.names = 0;
+    var count: u32            = 1;
+    var end:   usize          = sites_before(d, section, at + d.steps[0].len::u64);
+    val sp:    opt[*set.Span] = span_at(d, at, d.ri, end);
+    if (sel sp.some) {
+        if (sp.some.count > relax.MAX_STEPS) { ret res[u64, Refusal].ok{0}; }
+        for (count < sp.some.count) {
+            val prior: *Step = ?d.steps[count - 1];
+            if (!decode_step(d, count, data, len, prior.at + prior.len::u64, limit)) { ret res[u64, Refusal].ok{0}; }
+            count = count + 1;
+        }
+    }
+    val last: *Step = ?d.steps[count - 1];
+    val stop: u64   = last.at + last.len::u64;
+    end = sites_before(d, section, stop);
+    val start: usize = d.out.len;
+    put_char(d, '\t');
+    val text:    usize           = d.out.len;
+    var w:       spelling.Writer = spelling.Writer{out: d.out, codec: d.s.codec, selection: d.v.selection, syntax: d.syntax, symbols: ?d.symbols, context: nil, row: nil};
+    var printed: bool            = false;
+    if (sel sp.some) {
+        var aimed: opt[Aimed] = opt[Aimed].none{};
+        var j:     usize      = d.ri;
+        for (j < end && sel aimed.none) {
+            val site: *Site              = ?d.sites.data[j];
+            val r:    *mink.object.Reloc = reloc_of(d, site);
+            if (site.offset == at && binds(d, r.kind, sp.some.fixup)) {
+                val a: res[opt[Aimed], Refusal] = aim(d, r, site);
+                if (sel a.err) { ret res[u64, Refusal].err{a.err}; }
+                aimed = a.ok;
+            }
+            j = j + 1;
+        }
+        if (sel aimed.some) {
+            var steps:  [relax.MAX_STEPS]inst.Inst;
+            var values: [relax.MAX_STEPS * row.MAX_OPERANDS]operand.Value;
+            var i:      u32 = seq.first_of(d.syntax, d.s.codec.rows, d.steps[0].ins.row);
+            for (i < d.syntax.sequences.len && !printed) {
+                val q: *spelling.Sequence = ?d.syntax.sequences.at[i];
+                i = i + 1;
+                if (q.steps.at[0].row != d.steps[0].ins.row)                                                          { brk; }
+                if (!note(d, aimed.some.handle) || !spanned(d, q, sp.some, aimed.some, count, ?steps[0], ?values[0])) { cnt; }
+                val got: res[bool, field.Refusal] = print.sequence(?w, ?steps[0], count);
+                printed = sel got.ok && got.ok;
+            }
+        }
+    }
+    or {
+        val given: res[bool, Refusal] = take(d, ?d.steps[0], d.ri, end);
+        if (sel given.err) { ret res[u64, Refusal].err{given.err}; }
+        if (given.ok) {
+            val got: err[field.Refusal] = print.instruction(?w, ?d.steps[0].ins);
+            printed = sel got.ok;
+        }
+    }
+    var ex: relax.Expansion;
+    if (!printed || d.full || !reparse(d, text, ?ex) || !matches(d, ?ex, data, len, at, stop, d.ri, end)) {
+        d.out.len = start;
+        ret res[u64, Refusal].ok{0};
+    }
+    put_char(d, '\n');
+    d.ri = end;
+    ret res[u64, Refusal].ok{stop - at};
+}
+
+# the directive that writes data of `width` bytes, none when the dialect has none
+fun width_directive(d: *Disasm, width: u8) opt[str] {
+    var i: u32 = 0;
+    for (i < d.s.source.widths.len) {
+        if (d.s.source.widths.at[i].width == width) { ret opt[str].some{d.s.source.widths.at[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the expression naming `aimed`
+fun put_aimed(d: *Disasm, aimed: Aimed) {
+    put_view(d, named(d::ptr, aimed.handle));
+    if (aimed.addend > 0)  { put_char(d, '+'); }
+    if (aimed.addend != 0) { put_signed(d, aimed.addend); }
+}
+
+# the relocated datum at the cursor, at `at` of the `len` bytes at `data`, written by `limit`, answering its width
+fun datum(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u64) res[u64, Refusal] {
+    val site:  *Site                    = ?d.sites.data[d.ri];
+    val r:     *mink.object.Reloc       = reloc_of(d, site);
+    val aimed: res[opt[Aimed], Refusal] = aim(d, r, site);
+    if (sel aimed.err)     { ret res[u64, Refusal].err{aimed.err}; }
+    if (sel aimed.ok.none) { ret res[u64, Refusal].err{Refusal{message: MARKER, section: section, offset: at}}; }
+    if (sel r.minus.some)  { ret res[u64, Refusal].err{Refusal{message: DIFFERENCE, section: section, offset: at}}; }
+    var width: u8         = 0;
+    var basis: set.Basis  = set.ABSOLUTE;
+    var minus: opt[Aimed] = opt[Aimed].none{};
+    var taken: usize      = 1;
+    var i:     u32        = 0;
+    for (i < d.s.data.len && width == 0) {
+        val row_: *set.Datum = ?d.s.data.at[i];
+        if (binds(d, r.kind, row_.fixup)) {
+            width = row_.width;
+            basis = row_.basis;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.s.pairs.len && width == 0) {
+        val p: *set.Pair = ?d.s.pairs.at[i];
+        if (binds(d, r.kind, p.add)) {
+            if (d.ri + 1 >= d.sites.len) { ret res[u64, Refusal].err{Refusal{message: UNPAIRED, section: section, offset: at}}; }
+            val other: *Site              = ?d.sites.data[d.ri + 1];
+            val sub:   *mink.object.Reloc = reloc_of(d, other);
+            if (other.section != section || other.offset != at || !binds(d, sub.kind, p.sub) || sel sub.minus.some) { ret res[u64, Refusal].err{Refusal{message: UNPAIRED, section: section, offset: at}}; }
+            val m: res[opt[Aimed], Refusal] = aim(d, sub, other);
+            if (sel m.err)     { ret res[u64, Refusal].err{m.err}; }
+            if (sel m.ok.none) { ret res[u64, Refusal].err{Refusal{message: UNPAIRED, section: section, offset: at}}; }
+            width = p.width;
+            minus = m.ok;
+            taken = 2;
+        }
+        i = i + 1;
+    }
+    if (width == 0)              { ret res[u64, Refusal].err{Refusal{message: UNTAKEN, section: section, offset: at}}; }
+    if (at + width::u64 > limit) { ret res[u64, Refusal].err{Refusal{message: UNTAKEN, section: section, offset: at}}; }
+    var b: u64 = 0;
+    for (b < width::u64) {
+        if (data[(at + b)::usize] != 0) { ret res[u64, Refusal].err{Refusal{message: HELD, section: section, offset: at}}; }
+        b = b + 1;
+    }
+    val directive: opt[str] = width_directive(d, width);
+    if (sel directive.none) { ret res[u64, Refusal].err{Refusal{message: NO_WIDTH, section: section, offset: at}}; }
+    put_char(d, '\t');
+    put(d, directive.some);
+    put_char(d, ' ');
+    var plus: Aimed = aimed.ok.some;
+    if (sel minus.some) { plus.addend = plus.addend - minus.some.addend; }
+    put_aimed(d, plus);
+    if (sel minus.some) {
+        put(d, " - ");
+        put_view(d, named(d::ptr, minus.some.handle));
+    }
+    or (basis == set.RELATIVE) { put(d, " - ."); }
+    put_char(d, '\n');
+    d.ri = d.ri + taken;
+    ret res[u64, Refusal].ok{width::u64};
+}
+
+# the bytes from `at` to `end` of `data` written as one-byte data
+fun raw(d: *Disasm, data: *u8, at: u64, end: u64) {
+    var i: u64 = at;
+    for (i < end) {
+        put_char(d, '\t');
+        put(d, d.byte);
+        put_char(d, ' ');
+        var n: usize = 0;
+        for (i < end && n < PER_LINE) {
+            if (n > 0) { put(d, ", "); }
+            put_hex(d, data[i::usize]);
+            i = i + 1;
+            n = n + 1;
+        }
+        put_char(d, '\n');
+    }
+}
+
+# the offset of the relocation at the cursor in `section`, `none` when it has no more
+fun next_site(d: *Disasm, section: u32, none: u64) u64 {
+    if (d.ri < d.sites.len && d.sites.data[d.ri].section == section) { ret d.sites.data[d.ri].offset; }
+    ret none;
+}
+
+# data from `at` up to `end`, a datum at each relocation, which may run on to `limit`, answering how many bytes it took
+fun data_run(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, end: u64, limit: u64) res[u64, Refusal] {
+    var i: u64 = at;
+    for (i < end) {
+        val next: u64 = next_site(d, section, limit);
+        if (next == i) {
+            val put_: res[u64, Refusal] = datum(d, section, data, len, i, limit);
+            if (sel put_.err) { ret put_; }
+            i = i + put_.ok;
+            cnt;
+        }
+        var stop: u64 = end;
+        if (next < stop) { stop = next; }
+        raw(d, data, i, stop);
+        i = stop;
+    }
+    ret res[u64, Refusal].ok{i - at};
+}
+
+# the shortest fill pattern the selection admits, 0 for none
+fun shortest(d: *Disasm) u64 {
+    if (d.fills.len == 0) { ret 0; }
+    ret d.fills.data[d.fills.len - 1].len::u64;
+}
+
+# whether the `size` bytes at `at` of `data` are the code fill the builder pads with: the longest pattern that fits,
+# in turn
+fun is_fill(d: *Disasm, data: *u8, at: u64, size: u64) bool {
+    var left: u64   = size;
+    var o:    u64   = at;
+    var p:    usize = 0;
+    for (p < d.fills.len && left > 0) {
+        val pattern: *set.Pattern = d.fills.data[p];
+        if (pattern.len::u64 > left) {
+            p = p + 1;
+            cnt;
+        }
+        var i: u32 = 0;
+        for (i < pattern.len) {
+            if (data[(o + i::u64)::usize] != pattern.bytes[i]) { ret false; }
+            i = i + 1;
+        }
+        o    = o + pattern.len::u64;
+        left = left - pattern.len::u64;
+    }
+    ret left == 0;
+}
+
+# the realigned padding the marker at the cursor states, as the alignment that writes it, answering its size
+fun realign(d: *Disasm, section: u32, data: *u8, at: u64, limit: u64) res[u64, Refusal] {
+    val r:     *mink.object.Reloc = reloc_of(d, ?d.sites.data[d.ri]);
+    val least: u64                = shortest(d);
+    if (r.addend < 0 || least == 0) { ret res[u64, Refusal].err{Refusal{message: FILL, section: section, offset: at}}; }
+    val size:     u64 = r.addend:~u64;
+    val boundary: u64 = size + least;
+    if ((boundary & (boundary - 1)) != 0 || at + size > limit || !is_fill(d, data, at, size)) { ret res[u64, Refusal].err{Refusal{message: FILL, section: section, offset: at}}; }
+    put(d, "\t.balign ");
+    put_unsigned(d, boundary);
+    put_char(d, '\n');
+    d.ri = d.ri + 1;
+    ret res[u64, Refusal].ok{size};
+}
+
+# whether the relocation at the cursor is the set's realign marker at `at`
+fun realigns(d: *Disasm, section: u32, at: u64) bool {
+    if (d.s.realign == operand.NO_FIXUP || next_site(d, section, at + 1) != at) { ret false; }
+    val r: *mink.object.Reloc = reloc_of(d, ?d.sites.data[d.ri]);
+    ret sel r.target.none && binds(d, r.kind, d.s.realign);
+}
+
+# the labels at `at` of `section` written
+fun labels_at(d: *Disasm, section: u32, at: u64) {
+    for (d.li < d.labels.len && d.labels.data[d.li].section == section && d.labels.data[d.li].offset == at) {
+        put_view(d, named(d::ptr, d.labels.data[d.li].handle));
+        put(d, ":\n");
+        d.li = d.li + 1;
+    }
+}
+
+# the offset of the next label of `section`, `none` when it has no more
+fun next_label(d: *Disasm, section: u32, none: u64) u64 {
+    if (d.li < d.labels.len && d.labels.data[d.li].section == section && d.labels.data[d.li].offset < none) { ret d.labels.data[d.li].offset; }
+    ret none;
+}
+
+# whether every byte of `name` is one a section name is written with unquoted
+fun plain(name: View) bool {
+    if (name.len == 0) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        val c: u8 = name.data[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the `.section` that opens section `i`, and its alignment
+fun header(d: *Disasm, i: u32) err[Refusal] {
+    val sec:  *mink.object.Section = section_of(d, i);
+    val name: View                 = name_of(d, sec.name);
+    if (sel sec.group.some || sel sec.owner.some) { ret refusal(GROUPED, i, 0); }
+    val t: opt[str] = core.section_type(name, sec.kind, sec.flags);
+    if (sel t.none) { ret refusal(SECTION, i, 0); }
+    var letters: [core.FLAG_LETTERS]u8;
+    val n:       opt[usize] = core.flag_string(sec.flags, ?letters[0]);
+    if (sel n.none) { ret refusal(SECTION, i, 0); }
+    put(d, "\t.section ");
+    if (plain(name))          { put_view(d, name); }
+    or (!put_string(d, name)) { ret refusal(QUOTED, i, 0); }
+    put(d, ", \"");
+    put_bytes(d, ?letters[0], n.some);
+    put(d, "\", ");
+    put_char(d, d.s.source.types[0]);
+    put(d, t.some);
+    if (sec.entsize != 0) {
+        put(d, ", ");
+        put_unsigned(d, sec.entsize);
+    }
+    put_char(d, '\n');
+    if (sec.align > 1) {
+        put(d, "\t.balign ");
+        put_unsigned(d, sec.align);
+        put_char(d, '\n');
+    }
+    ret err[Refusal].ok{};
+}
+
+# section `i` written: its header, then its labels, statements and data in offset order
+fun section(d: *Disasm, i: u32) err[Refusal] {
+    val opened: err[Refusal] = header(d, i);
+    if (sel opened.err) { ret opened; }
+    val sec:  *mink.object.Section = section_of(d, i);
+    val size: u64                  = size_of(d, i);
+    val code: bool                 = (sec.flags & mink.section.EXEC) != 0;
+    var data: *u8                  = nil;
+    var len:  usize                = 0;
+    if (sel sec.contents.held) {
+        val b: mink.store.Bytes = mink.object.bytes(d.o, ?sec.contents);
+        data = b.data;
+        len  = b.len;
+    }
+    var at: u64 = 0;
+    for (at < size) {
+        labels_at(d, i, at);
+        val limit: u64 = next_label(d, i, size);
+        if (sel sec.contents.zero) {
+            if (next_site(d, i, limit) < limit) { ret refusal(ZEROS, i, next_site(d, i, limit)); }
+            put(d, "\t.zero ");
+            put_unsigned(d, limit - at);
+            put_char(d, '\n');
+            at = limit;
+            cnt;
+        }
+        if (code && realigns(d, i, at)) {
+            val padded: res[u64, Refusal] = realign(d, i, data, at, limit);
+            if (sel padded.err) { ret err[Refusal].err{padded.err}; }
+            at = at + padded.ok;
+            cnt;
+        }
+        if (code) {
+            val took: res[u64, Refusal] = statement(d, i, data, len, at, limit);
+            if (sel took.err) { ret err[Refusal].err{took.err}; }
+            if (took.ok > 0) {
+                at = at + took.ok;
+                cnt;
+            }
+            var unit: u64 = d.s.parcel(data, len, at::usize)::u64;
+            if (at + unit > limit) { unit = limit - at; }
+            val next: u64 = next_site(d, i, limit);
+            if (next > at && next < at + unit) { unit = next - at; }
+            val run: res[u64, Refusal] = data_run(d, i, data, len, at, at + unit, limit);
+            if (sel run.err) { ret err[Refusal].err{run.err}; }
+            at = at + run.ok;
+            cnt;
+        }
+        val run: res[u64, Refusal] = data_run(d, i, data, len, at, limit, limit);
+        if (sel run.err) { ret err[Refusal].err{run.err}; }
+        at = at + run.ok;
+    }
+    labels_at(d, i, size);
+    if (d.li < d.labels.len && d.labels.data[d.li].section == i) { ret refusal(PAST, i, d.labels.data[d.li].offset); }
+    if (d.ri < d.sites.len && d.sites.data[d.ri].section == i)   { ret refusal(PAST, i, d.sites.data[d.ri].offset); }
+    ret err[Refusal].ok{};
+}
+
+# `.name` followed by the symbol's name
+fun directive(d: *Disasm, name: str, sym: View) {
+    put_char(d, '\t');
+    put(d, name);
+    put_char(d, ' ');
+    put_view(d, sym);
+}
+
+# the declarations of symbol `i`: its source file, binding, visibility, type, size, and a value it is given
+fun declare(d: *Disasm, i: u32) err[Refusal] {
+    val sym:  *mink.object.Symbol = symbol_of(d, i);
+    val name: View                = name_of(d, sym.name);
+    if (is_kind(sym.kind, mink.symbol.FILE)) {
+        put(d, "\t.file ");
+        if (!put_string(d, name)) { ret whole(QUOTED); }
+        put_char(d, '\n');
+        ret err[Refusal].ok{};
+    }
+    if (is_kind(sym.kind, mink.symbol.SECTION)) { ret err[Refusal].ok{}; }
+    if (sel sym.version.some)                   { ret whole(VERSIONED); }
+    if (name.len == 0) {
+        # an anchor stands for it, which states nothing else
+        if (!sel sym.def.placed || sym.binding != ?mink.symbol.LOCAL || sym.kind != ?mink.symbol.NOTYPE || sel sym.size.some) { ret whole(NAMELESS); }
+        ret err[Refusal].ok{};
+    }
+    if (sym.binding != ?mink.symbol.LOCAL) {
+        val b: opt[str] = core.binding_directive(sym.binding);
+        if (sel b.none) { ret whole(BINDING); }
+        directive(d, b.some, name);
+        put_char(d, '\n');
+    }
+    if (sym.visibility != ?mink.symbol.DEFAULT) {
+        val v: opt[str] = core.visibility_directive(sym.visibility);
+        if (sel v.none) { ret whole(VISIBILITY); }
+        directive(d, v.some, name);
+        put_char(d, '\n');
+    }
+    if (sym.kind != ?mink.symbol.NOTYPE) {
+        val t: opt[str] = core.type_spelling(sym.kind);
+        if (sel t.none) { ret whole(TYPE); }
+        directive(d, ".type", name);
+        put(d, ", ");
+        put_char(d, d.s.source.types[0]);
+        put(d, t.some);
+        put_char(d, '\n');
+    }
+    if (sel sym.def.entry) { ret whole(ENTRY); }
+    if (sel sym.def.absolute) {
+        directive(d, ".set", name);
+        put(d, ", ");
+        put_unsigned(d, sym.def.absolute);
+        put_char(d, '\n');
+    }
+    if (sel sym.def.common) {
+        directive(d, ".comm", name);
+        put(d, ", ");
+        put_unsigned(d, sym.def.common.size);
+        put(d, ", ");
+        put_unsigned(d, sym.def.common.align);
+        put_char(d, '\n');
+        ret err[Refusal].ok{};
+    }
+    if (sel sym.size.some) {
+        directive(d, ".size", name);
+        put(d, ", ");
+        put_unsigned(d, sym.size.some);
+        put_char(d, '\n');
+    }
+    ret err[Refusal].ok{};
+}
+
+# the facts of the object no text states, refused
+fun stated(o: *mink.object.Object) err[Refusal] {
+    if (o.sequences.count > 0 || o.files.count > 0) { ret whole(LINES); }
+    if (o.groups.count > 0)                         { ret whole(GROUPS); }
+    if (o.notes.count > 0)                          { ret whole(NOTES); }
+    if (o.facts.count > 0)                          { ret whole(FACTS); }
+    if (o.entries.count > 0)                        { ret whole(ENTRIES); }
+    if (sel o.library.some)                         { ret whole(LIBRARY); }
+    ret err[Refusal].ok{};
+}
+
+# whether the set serves `arch`
+fun serves(s: *set.Set, arch: *mink.arch.Arch) bool {
+    var i: u32 = 0;
+    for (i < s.arches.len) {
+        if (s.arches.at[i] == arch) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the anchors, labels, relocations and bindings indexed in place order
+fun index(d: *Disasm) err[Refusal] {
+    var i: u32 = 0;
+    for (i < d.s.bindings.len) {
+        if (!held(vector.push[Bound](?d.bound, Bound{kind: d.s.bindings.at[i].kind, fixup: d.s.bindings.at[i].fixup}))) { ret whole(MEMORY); }
+        i = i + 1;
+    }
+    sort.sort_by[Bound](d.bound.data, d.bound.len, by_kind);
+    if (d.s.fill != nil) {
+        i = 0;
+        for (i < d.s.fill.count) {
+            val p: *set.Pattern = ?d.s.fill.patterns[i];
+            if (extension.admits(d.v.selection, p.requires) && !held(vector.push[*set.Pattern](?d.fills, p))) { ret whole(MEMORY); }
+            i = i + 1;
+        }
+    }
+    val sections: u32 = d.o.sections.count::u32;
+    i = 0;
+    for (i < d.o.relocs.count::u32) {
+        val r: *mink.object.Reloc = ?d.o.relocs.items[i::usize];
+        if (r.section.index >= sections)                                                                    { ret whole(PAST); }
+        if (!held(vector.push[Site](?d.sites, Site{section: r.section.index, offset: r.offset, reloc: i}))) { ret whole(MEMORY); }
+        if (sel r.target.symbol) {
+            val sym: *mink.object.Symbol = symbol_of(d, r.target.symbol.index);
+            if (sel sym.def.placed) {
+                val sec: u32 = sym.def.placed.section.index;
+                if (sec >= sections)                                                                                                                                     { ret whole(PAST); }
+                if (is_kind(sym.kind, mink.symbol.SECTION) && !held(vector.push[Label](?d.anchors, Label{section: sec, offset: anchored(d, sec, r.addend), handle: 0}))) { ret whole(MEMORY); }
+            }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Site](d.sites.data, d.sites.len, by_site);
+    i = 0;
+    for (i < d.count) {
+        val sym:    *mink.object.Symbol = symbol_of(d, i);
+        var p:      mink.object.Place   = mink.object.Place{section: mink.table.Id[mink.object.Section]{index: 0}, offset: 0};
+        var placed: bool                = false;
+        if (sel sym.def.placed) {
+            p      = sym.def.placed;
+            placed = true;
+        }
+        if (placed && !is_kind(sym.kind, mink.symbol.SECTION) && !is_kind(sym.kind, mink.symbol.FILE)) {
+            if (p.section.index >= sections) { ret whole(PAST); }
+            if (name_of(d, sym.name).len == 0) {
+                if (!held(vector.push[Label](?d.anchors, Label{section: p.section.index, offset: p.offset, handle: 0}))) { ret whole(MEMORY); }
+            }
+            or {
+                if (!held(vector.push[Label](?d.labels, Label{section: p.section.index, offset: p.offset, handle: i + 1}))) { ret whole(MEMORY); }
+            }
+        }
+        i = i + 1;
+    }
+    # the anchors kept once per place, each numbered by the lowest number no name of the object spells with the stem
+    sort.sort_by[Label](d.anchors.data, d.anchors.len, by_place);
+    var kept: usize = 0;
+    var k:    usize = 0;
+    for (k < d.anchors.len) {
+        val a: Label = d.anchors.data[k];
+        if (kept == 0 || d.anchors.data[kept - 1].section != a.section || d.anchors.data[kept - 1].offset != a.offset) {
+            d.anchors.data[kept] = a;
+            kept                 = kept + 1;
+        }
+        k = k + 1;
+    }
+    d.anchors.len = kept;
+    var next: u32 = 0;
+    k = 0;
+    for (k < d.anchors.len) {
+        for {
+            val n: usize = stemmed(d.syntax.anonymous, next, ?d.scratch[0]);
+            next = next + 1;
+            val spelled: opt[mink.table.Id[mink.intern.Name]] = mink.intern.find(?d.o.names, ?d.scratch[0], n);
+            if (sel spelled.none) { brk; }
+        }
+        d.anchors.data[k].handle = next - 1;
+        val a: Label = d.anchors.data[k];
+        if (!held(vector.push[Label](?d.labels, Label{section: a.section, offset: a.offset, handle: d.count + 1 + k::u32}))) { ret whole(MEMORY); }
+        k = k + 1;
+    }
+    sort.sort_by[Label](d.labels.data, d.labels.len, by_place);
+    ret err[Refusal].ok{};
+}
+
+fun released(d: *Disasm) {
+    vector.dnit[Label](?d.labels);
+    vector.dnit[Site](?d.sites);
+    vector.dnit[Label](?d.anchors);
+    vector.dnit[Bound](?d.bound);
+    vector.dnit[*set.Pattern](?d.fills);
+    vector.dnit[u8](?d.bytes);
+    vector.dnit[field.Fixup](?d.fixups);
+}
+
+fun written(d: *Disasm) err[Refusal] {
+    val indexed: err[Refusal] = index(d);
+    if (sel indexed.err) { ret indexed; }
+    var i: u32 = 0;
+    for (i < d.count) {
+        val declared: err[Refusal] = declare(d, i);
+        if (sel declared.err) { ret declared; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.o.sections.count::u32) {
+        val done: err[Refusal] = section(d, i);
+        if (sel done.err) { ret done; }
+        i = i + 1;
+    }
+    if (d.full) { ret whole(MEMORY); }
+    ret err[Refusal].ok{};
+}
+
+# the object `o` appended to `out` as assembly text in syntax `syntax` of the set `s`, decoded under the selection
+# `available` views
+# ---
+# a:   the allocator of the disassembler's own indices, given back before it returns
+# ret: ok, or the first refusal with `out` as it was
+pub fun disassemble(a: *A.Allocator, s: *set.Set, available: *register.Available, syntax: u32, o: *mink.object.Object, out: *vector.Vector[u8]) err[Refusal] {
+    if (!serves(s, o.arch))       { ret whole(ARCH); }
+    if (syntax >= s.syntaxes.len) { ret whole(NO_SYNTAX); }
+    if (s.parcel == nil)          { ret whole(NO_PARCEL); }
+    val facts: err[Refusal] = stated(o);
+    if (sel facts.err) { ret facts; }
+    var i:   u32      = 0;
+    var one: opt[str] = opt[str].none{};
+    for (i < s.source.widths.len && sel one.none) {
+        if (s.source.widths.at[i].width == 1) { one = opt[str].some{s.source.widths.at[i].name}; }
+        i = i + 1;
+    }
+    if (sel one.none) { ret whole(NO_BYTE); }
+    var d: Disasm = Disasm{
+        a:       a,
+        s:       s,
+        v:       available,
+        syntax:  ?s.syntaxes.at[syntax],
+        o:       o,
+        out:     out,
+        labels:  vector.init[Label](a),
+        sites:   vector.init[Site](a),
+        anchors: vector.init[Label](a),
+        bound:   vector.init[Bound](a),
+        fills:   vector.init[*set.Pattern](a),
+        bytes:   vector.init[u8](a),
+        fixups:  vector.init[field.Fixup](a),
+        count:   o.symbols.count::u32,
+        byte:    one.some,
+        li:      0,
+        ri:      0,
+        full:    false,
+        names:   0,
+    };
+    d.symbols = spelling.Symbols{context: (?d)::ptr, resolve: resolved, name: named};
+    val start: usize        = out.len;
+    val done:  err[Refusal] = written(?d);
+    released(?d);
+    if (sel done.err) { out.len = start; }
+    ret done;
+}
+
+# a test's allocator, selection, register view and output
+#[testing]
+rec T {
+    t:   testing.Testing;
+    s:   extension.Selection;
+    v:   register.Available;
+    out: vector.Vector[u8];
+}
+
+#[testing]
+fun t_make(t: *T, isa: str) bool {
+    testing.make(?t.t);
+    val a:    *A.Allocator                              = testing.allocator_of(?t.t);
+    val made: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, isa, diagnostic.START);
+    if (sel made.err) { ret false; }
+    t.s = made.ok;
+    val viewed: res[register.Available, register.Error] = register.select(a, ?riscv_register.FILE, ?t.s);
+    if (sel viewed.err) { ret false; }
+    t.v   = viewed.ok;
+    t.out = vector.init[u8](a);
+    ret true;
+}
+
+# the double float abi, as `-mabi=lp64d` states it
+#[testing]
+val T_DOUBLE: [1]mink.trait.Trait = [1]mink.trait.Trait{mink.trait.Trait{axis: ?mink.arch.RISCV_FLOAT_ABI, setting: mink.trait.Setting.choice{?mink.arch.RISCV_DOUBLE}}};
+
+# `text` assembled into an object in memory and disassembled into the test's output, ending in a nul
+#[testing]
+fun t_disassemble(t: *T, text: str) bool {
+    val a:       *A.Allocator                           = testing.allocator_of(?t.t);
+    val options: model.Options                          = model.Options{arch: ?mink.arch.RISCV64, syntax: 0, traits: set.Traits{at: ?T_DOUBLE[0], len: 1}, private: ".L", layers: model.NO_LAYERS};
+    var got:     res[mink.object.Object, model.Refusal] = asm.assemble(a, ?riscv_set.SET, ?t.v, options, text, str_len(text), diagnostic.START);
+    if (sel got.err) { ret false; }
+    var o: mink.object.Object = got.ok;
+    t.out.len = 0;
+    val done: err[Refusal] = disassemble(a, ?riscv_set.SET, ?t.v, 0, ?o, ?t.out);
+    mink.object.release(?o);
+    if (sel done.err) { ret false; }
+    ret held(vector.push[u8](?t.out, 0));
+}
+
+# whether the output holds `want`
+#[testing]
+fun t_holds(t: *T, want: str) bool {
+    val n: usize = str_len(want);
+    var i: usize = 0;
+    for (i + n < t.out.len) {
+        var k: usize = 0;
+        for (k < n && t.out.data[i + k] == want[k]) {
+            k = k + 1;
+        }
+        if (k == n) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun t_done(t: *T) bool {
+    vector.dnit[u8](?t.out);
+    register.release(?t.v);
+    extension.release(?t.s);
+    ret testing.live_count(?t.t) == 0;
+}
+
+test disassemble__a_relocation_prints_as_its_specifier {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                                                        { ret 1; }
+    if (!t_disassemble(?t, "\tlui a0, %hi(x)\n\taddi a0, a0, %lo(x+4)\n\tcall f\n")) { ret 2; }
+    if (!t_holds(?t, "\n\tlui a0, %hi(x)\n\taddi a0, a0, %lo(x+4)\n\tcall f\n"))     { ret 3; }
+    if (!t_done(?t))                                                                 { ret 4; }
+    ret 0;
+}
+
+test disassemble__a_symbol_prints_as_a_label_at_its_offset {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                                                                            { ret 1; }
+    if (!t_disassemble(?t, "\t.globl f\n\t.type f, @function\n\tnop\nf:\n\tnop\n\tret\n\t.size f, 8\n")) { ret 2; }
+    if (!t_holds(?t, "\t.globl f\n\t.type f, @function\n\t.size f, 8\n"))                                { ret 3; }
+    if (!t_holds(?t, "\n\tnop\nf:\n\tnop\n\tret\n"))                                                     { ret 4; }
+    if (!t_done(?t))                                                                                     { ret 5; }
+    ret 0;
+}
+
+test disassemble__undecodable_bytes_print_as_data {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    # a zero parcel is reserved as illegal, and without c the selection decodes no 16-bit instruction
+    if (!t_disassemble(?t, "\tnop\n\t.byte 0, 0, 0xff, 0x7f\n\tnop\n"))           { ret 2; }
+    if (!t_holds(?t, "\n\tnop\n\t.byte 0x00, 0x00\n\t.byte 0xff, 0x7f\n\tnop\n")) { ret 3; }
+    if (!t_done(?t))                                                              { ret 4; }
+    ret 0;
+}
+
+test disassemble__a_data_section_prints_as_data_directives {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                                                                                    { ret 1; }
+    if (!t_disassemble(?t, "\t.data\nv:\n\t.byte 1, 2\n\t.quad x\n\t.word y - .\n\t.bss\n\t.zero 16\n"))         { ret 2; }
+    if (!t_holds(?t, "\t.section .data, \"aw\", @progbits\nv:\n\t.byte 0x01, 0x02\n\t.quad x\n\t.word y - .\n")) { ret 3; }
+    if (!t_holds(?t, "\t.section .bss, \"aw\", @nobits\n\t.zero 16\n"))                                          { ret 4; }
+    if (!t_done(?t))                                                                                             { ret 5; }
+    ret 0;
+}
