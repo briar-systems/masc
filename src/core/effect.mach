@@ -151,9 +151,15 @@ pub rec Terms {
 
 pub val NO_TERMS: Terms = Terms{at: nil, len: 0};
 
-# registers an instruction reads and writes
+# registers an instruction reads and writes. a register in written is certainly written and given a new value, and a
+# write that may keep any of a register's old value, as a vector destination's tail or inactive elements or an accrued
+# register's flags, is in read as well, since the new value depends on the old. a reader takes the read of a decided
+# Answer as live in and its written as a kill and a definition after it, and an undecided one, whose values do not yet
+# choose the rule, as Registers.may's read live in and Registers.must's written killed. check refuses a row that breaks
+# this where the register file states the facts that decide it, an ACCRUED register or a vector register written while
+# the LENGTH register is read
 # ---
-# read:    the registers it reads
+# read:    the registers it reads, or writes keeping some of their old value
 # written: the registers it writes
 pub rec Touched {
     read:    Set;
@@ -186,15 +192,19 @@ pub val NO_REGISTER_RULES: RegisterRules = RegisterRules{at: nil, len: 0};
 # registers an instruction reads and writes that no operand names, as rsp of
 # x86 push or the link register of aarch64 bl. flag rows are stated under flags.
 # a reader asks `implicit` with operand values, or `may` or `must` without
-# them, and never reads `otherwise` itself, which alone fails open whenever a
-# rule holds. the generator derives `may` and `must`, and check proves them
+# them or when `implicit` is undecided, and never reads `otherwise` itself,
+# which alone fails open whenever a rule holds. the generator derives `may` and
+# `must`, and check proves them
 # ---
 # otherwise: the registers it touches when no rule holds
 # rules:     the registers it touches instead for some operand values, as a risc-v rounding
 #            mode of dyn reading frm, or an x86 repeat prefix reading and writing rcx. no two
 #            rules can both hold, so their order means nothing
-# may:       the union of otherwise and every rule's, what some operand values touch
-# must:      the intersection of otherwise and every rule's, what every operand value touches
+# may:       the union of otherwise and every rule's, what some operand values touch. a write some values make keeping
+#            some of the old value is in may.read, as it is in that rule's read
+# must:      the intersection of otherwise and every rule's, what every operand value touches. a register in may.written
+#            and not in must.written is written by some values only, so a reader with no values, or with an undecided
+#            answer, kills must.written alone
 pub rec Registers {
     otherwise: Touched;
     rules:     RegisterRules;
@@ -393,9 +403,35 @@ pub fun exclusive(a: Terms, b: Terms) bool {
     ret false;
 }
 
-# whether `term` holds over the operand values of an instruction. check
-# guarantees the operand is one the instruction has and of the test's kind, so
-# the false for any other is a guard that no registered set reaches
+# the rule a query over operand values cannot decide, and the operand left open
+# ---
+# rule:    the position of the first rule no term of which is false but one tests an operand with no value
+# operand: the operand that term tests
+pub rec Pending {
+    rule:    u32;
+    operand: u8;
+}
+
+# what a query over operand values answers, decided only when every rule that may hold is decided
+# ---
+# decided:   the answer
+# undecided: the rule left open, since an operand it tests has no value yet, as a register operand before allocation
+pub tag Answer[T]: u8 {
+    decided:   T;
+    undecided: Pending;
+}
+
+# whether the value of the operand `term` tests is known: given, and not none for an operand that always takes one.
+# an optional operand whose value is none is absent, which is a value
+pub fun known(operands: *operand.Operand, values: operand.Values, term: *Term) bool {
+    if (term.operand::u32 >= values.len) { ret false; }
+    val v: operand.Value = values.at[term.operand];
+    ret !sel v.none || operands[term.operand].quantity != operand.ONE;
+}
+
+# whether `term`, whose operand's value is known, holds over the operand values of an instruction. check guarantees
+# the operand is one the instruction has and of the test's kind, so the false for any other is a guard that no
+# registered set reaches
 fun holds(file: *register.File, term: *Term, values: operand.Values) bool {
     if (term.operand >= values.len) { ret false; }
     val v: operand.Value = values.at[term.operand];
@@ -409,7 +445,7 @@ fun holds(file: *register.File, term: *Term, values: operand.Values) bool {
     ret sel term.test.id && (sel v.id && v.id == term.test.id);
 }
 
-# whether every one of `terms` holds over the operand values of an instruction
+# whether every one of `terms` holds over the operand values of an instruction, every value they test known
 pub fun meets(file: *register.File, terms: Terms, values: operand.Values) bool {
     var k: u32 = 0;
     for (k < terms.len) {
@@ -419,33 +455,71 @@ pub fun meets(file: *register.File, terms: Terms, values: operand.Values) bool {
     ret true;
 }
 
-# the control transfer of the instruction whose operand values are `values`:
-# the effect's one rule whose terms all hold, else the effect's own
-pub fun control(file: *register.File, e: *Effect, values: operand.Values) Control {
-    var i: u32 = 0;
+# whether `terms` hold over the operand values of an instruction whose operands are `operands`: false when a term
+# whose operand's value is known fails, else undecided naming the first term whose operand's value is not known
+fun decide(file: *register.File, operands: *operand.Operand, terms: Terms, values: operand.Values, rule: u32) Answer[bool] {
+    var open: u8  = field.NO_OPERAND;
+    var k:    u32 = 0;
+    for (k < terms.len) {
+        val term: *Term = ?terms.at[k];
+        if (!known(operands, values, term)) {
+            if (open == field.NO_OPERAND) { open = term.operand; }
+        }
+        or (!holds(file, term, values)) { ret Answer[bool].decided{false}; }
+        k = k + 1;
+    }
+    if (open != field.NO_OPERAND) { ret Answer[bool].undecided{Pending{rule: rule, operand: open}}; }
+    ret Answer[bool].decided{true};
+}
+
+# the control transfer of the instruction whose operands are `operands` and operand values `values`: the effect's one
+# rule whose terms all hold, else the effect's own when every rule is false, else undecided naming the first rule an
+# operand with no value leaves open
+pub fun control(file: *register.File, operands: *operand.Operand, e: *Effect, values: operand.Values) Answer[Control] {
+    var open:    bool    = false;
+    var pending: Pending = Pending{rule: 0, operand: field.NO_OPERAND};
+    var i:       u32     = 0;
     for (i < e.control.rules.len) {
-        val rule: *Rule = ?e.control.rules.at[i];
-        if (meets(file, rule.terms, values)) {
-            var at: u8 = e.control.operand;
-            if (rule.target == UNTARGETED) { at = field.NO_OPERAND; }
-            ret Control{transfer: rule.transfer, target: rule.target, conditional: rule.conditional, operand: at, rules: NO_RULES};
+        val rule: *Rule        = ?e.control.rules.at[i];
+        val met:  Answer[bool] = decide(file, operands, rule.terms, values, i);
+        if (sel met.undecided) {
+            if (!open) { pending = met.undecided; }
+            open = true;
+        }
+        if (sel met.decided) {
+            if (met.decided) {
+                var at: u8 = e.control.operand;
+                if (rule.target == UNTARGETED) { at = field.NO_OPERAND; }
+                ret Answer[Control].decided{Control{transfer: rule.transfer, target: rule.target, conditional: rule.conditional, operand: at, rules: NO_RULES}};
+            }
         }
         i = i + 1;
     }
-    ret e.control;
+    if (open) { ret Answer[Control].undecided{pending}; }
+    ret Answer[Control].decided{e.control};
 }
 
-# the registers no operand names that the instruction whose operand values are
-# `values` reads and writes: the effect's one register rule whose terms all
-# hold, else the effect's own
-pub fun implicit(file: *register.File, e: *Effect, values: operand.Values) Touched {
-    var i: u32 = 0;
+# the registers no operand names that the instruction whose operands are `operands` and operand values `values`
+# reads and writes: the effect's one register rule whose terms all hold, else the effect's own when every rule is
+# false, else undecided naming the first rule an operand with no value leaves open
+pub fun implicit(file: *register.File, operands: *operand.Operand, e: *Effect, values: operand.Values) Answer[Touched] {
+    var open:    bool    = false;
+    var pending: Pending = Pending{rule: 0, operand: field.NO_OPERAND};
+    var i:       u32     = 0;
     for (i < e.implicit.rules.len) {
         val rule: *RegisterRule = ?e.implicit.rules.at[i];
-        if (meets(file, rule.terms, values)) { ret rule.touched; }
+        val met:  Answer[bool]  = decide(file, operands, rule.terms, values, i);
+        if (sel met.undecided) {
+            if (!open) { pending = met.undecided; }
+            open = true;
+        }
+        if (sel met.decided) {
+            if (met.decided) { ret Answer[Touched].decided{rule.touched}; }
+        }
         i = i + 1;
     }
-    ret e.implicit.otherwise;
+    if (open) { ret Answer[Touched].undecided{pending}; }
+    ret Answer[Touched].decided{e.implicit.otherwise};
 }
 
 # the registers no operand names that some instruction of the effect's row
@@ -501,6 +575,22 @@ pub fun fixed(file: *register.File, e: *Effect, op: u8) opt[register.Id] {
         i = i + 1;
     }
     ret opt[register.Id].none{};
+}
+
+# the transfer `control` decides, 0xFF when it is undecided
+#[testing]
+fun t_transfer(file: *register.File, operands: *operand.Operand, e: *Effect, values: operand.Values) Transfer {
+    val a: Answer[Control] = control(file, operands, e, values);
+    if (sel a.undecided) { ret 0xFF; }
+    ret a.decided.transfer;
+}
+
+# whether the registers `implicit` decides read `reg`, false when it is undecided
+#[testing]
+fun t_reads(file: *register.File, operands: *operand.Operand, e: *Effect, values: operand.Values, reg: register.Id) bool {
+    val a: Answer[Touched] = implicit(file, operands, e, values);
+    if (sel a.decided) { ret has(file, a.decided.read, reg); }
+    ret false;
 }
 
 test has__a_set_covers_a_file_past_64_registers {
@@ -561,24 +651,45 @@ test control__the_rule_that_holds_decides_and_a_fixed_kind_keeps_its_own {
     e.control = Control{transfer: JUMP, target: INDIRECT, conditional: false, operand: 0, rules: Rules{at: ?rules[0], len: 2}};
     var vals:   [2]operand.Value = [2]operand.Value{operand.Value.register{register.make(0, 1)}, operand.Value.immediate{7}};
     val values: operand.Values   = operand.Values{at: ?vals[0], len: 2};
-    var c:      Control          = control(?file, ?e, values);
-    if (c.transfer != RETURN || c.operand != field.NO_OPERAND) { ret 4; }
+    var ops:    [2]operand.Operand;
+    ops[0].quantity = operand.ONE;
+    ops[1].quantity = operand.ONE;
+    val a: Answer[Control] = control(?file, ?ops[0], ?e, values);
+    if (!sel a.decided)                                                        { ret 4; }
+    if (a.decided.transfer != RETURN || a.decided.operand != field.NO_OPERAND) { ret 4; }
     # the other register meets the other rule, which keeps the target operand
     vals[0] = operand.Value.register{register.make(0, 0)};
-    c       = control(?file, ?e, values);
-    if (c.transfer != CALL || !c.conditional || c.operand != 0) { ret 5; }
+    val b: Answer[Control] = control(?file, ?ops[0], ?e, values);
+    if (!sel b.decided)                                                                 { ret 5; }
+    if (b.decided.transfer != CALL || !b.decided.conditional || b.decided.operand != 0) { ret 5; }
     # the register meets the first rule's but its immediate does not
     vals[0] = operand.Value.register{register.make(0, 1)};
     vals[1] = operand.Value.immediate{8};
-    if (control(?file, ?e, values).transfer != JUMP) { ret 6; }
-    # an operand of another kind than its test, or past the values, meets neither
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 6; }
+    # an operand of another kind than its test meets neither
     vals[0] = operand.Value.immediate{1};
-    if (control(?file, ?e, operand.Values{at: ?vals[0], len: 1}).transfer != JUMP) { ret 7; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 7; }
+    # a register operand with no value leaves the first rule open, though its immediate is decided
+    vals[0] = operand.Value.none{};
+    vals[1] = operand.Value.immediate{7};
+    val u: Answer[Control] = control(?file, ?ops[0], ?e, values);
+    if (!sel u.undecided)                                  { ret 12; }
+    if (u.undecided.rule != 0 || u.undecided.operand != 0) { ret 12; }
+    # a term decided false skips its rule whatever the open register, and the open one names the second
+    vals[1] = operand.Value.immediate{8};
+    val w: Answer[Control] = control(?file, ?ops[0], ?e, values);
+    if (!sel w.undecided)      { ret 13; }
+    if (w.undecided.rule != 1) { ret 13; }
+    # so does an operand past the values, while an optional operand with no value is absent and decided
+    vals[0] = operand.Value.register{register.make(0, 1)};
+    if (t_transfer(?file, ?ops[0], ?e, operand.Values{at: ?vals[0], len: 1}) != 0xFF) { ret 14; }
+    vals[0]         = operand.Value.none{};
+    ops[0].quantity = operand.OPTIONAL;
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 15; }
     # a fixed kind states no rules and is returned as it stands
     e.control.rules = NO_RULES;
-    vals[0]         = operand.Value.register{register.make(0, 1)};
-    vals[1]         = operand.Value.immediate{7};
-    if (control(?file, ?e, values).transfer != JUMP) { ret 8; }
+    ops[0].quantity = operand.ONE;
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 8; }
     ret 0;
 }
 
@@ -603,9 +714,18 @@ test implicit__a_repeat_rule_reads_rcx_that_may_holds_and_must_does_not {
     if (!has(?file, must(?e).written, register.make(0, 2)))                  { ret 4; }
     var vals:   [1]operand.Value = [1]operand.Value{operand.Value.enumerant{1}};
     val values: operand.Values   = operand.Values{at: ?vals[0], len: 1};
-    if (!has(?file, implicit(?file, ?e, values).written, rcx)) { ret 5; }
+    var ops:    [1]operand.Operand;
+    ops[0].quantity = operand.ONE;
+    if (!t_reads(?file, ?ops[0], ?e, values, rcx)) { ret 5; }
     vals[0] = operand.Value.enumerant{0};
-    if (has(?file, implicit(?file, ?e, values).written, rcx)) { ret 6; }
+    val off: Answer[Touched] = implicit(?file, ?ops[0], ?e, values);
+    if (!sel off.decided)                                                                        { ret 6; }
+    if (has(?file, off.decided.read, rcx) || !has(?file, off.decided.read, register.make(0, 2))) { ret 6; }
+    # with the prefix unchosen the rule is open, and otherwise is not given in its place
+    vals[0] = operand.Value.none{};
+    val open: Answer[Touched] = implicit(?file, ?ops[0], ?e, values);
+    if (!sel open.undecided)                                     { ret 9; }
+    if (open.undecided.rule != 0 || open.undecided.operand != 0) { ret 9; }
     # a must that claims rcx, or a may that lacks it, does not bound the rule
     e.implicit.must = rep;
     if (bounded(?e.implicit, words(?file))) { ret 7; }
@@ -640,31 +760,33 @@ test control_and_implicit__a_condition_or_id_value_decides_two_values_are_exclus
     e.control = Control{transfer: JUMP, target: INDIRECT, conditional: false, operand: 0, rules: Rules{at: ?rules[0], len: 4}};
     var vals:   [1]operand.Value = [1]operand.Value{operand.Value.condition{1}};
     val values: operand.Values   = operand.Values{at: ?vals[0], len: 1};
-    if (control(?file, ?e, values).transfer != RETURN) { ret 4; }
+    var ops:    [1]operand.Operand;
+    ops[0].quantity = operand.ONE;
+    if (t_transfer(?file, ?ops[0], ?e, values) != RETURN) { ret 4; }
     vals[0] = operand.Value.condition{0};
-    if (control(?file, ?e, values).transfer != CALL) { ret 5; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != CALL) { ret 5; }
     vals[0] = operand.Value.condition{2};
-    if (control(?file, ?e, values).transfer != JUMP) { ret 6; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 6; }
     vals[0] = operand.Value.id{4};
-    if (control(?file, ?e, values).transfer != RETURN) { ret 7; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != RETURN) { ret 7; }
     vals[0] = operand.Value.id{3};
-    if (control(?file, ?e, values).transfer != CALL) { ret 8; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != CALL) { ret 8; }
     # a condition test is not met by an id of the same number, nor an id test by a condition
     vals[0] = operand.Value.id{0};
-    if (control(?file, ?e, values).transfer != JUMP) { ret 9; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 9; }
     vals[0] = operand.Value.condition{3};
-    if (control(?file, ?e, values).transfer != JUMP) { ret 10; }
+    if (t_transfer(?file, ?ops[0], ?e, values) != JUMP) { ret 10; }
     val cond: [1]RegisterRule = [1]RegisterRule{RegisterRule{terms: Terms{at: ?terms[1], len: 1}, touched: on}};
     val ids:  [1]RegisterRule = [1]RegisterRule{RegisterRule{terms: Terms{at: ?terms[3], len: 1}, touched: on}};
     e.implicit.rules = RegisterRules{at: ?cond[0], len: 1};
     vals[0]          = operand.Value.condition{1};
-    if (!has(?file, implicit(?file, ?e, values).read, register.make(0, 1))) { ret 11; }
+    if (!t_reads(?file, ?ops[0], ?e, values, register.make(0, 1))) { ret 11; }
     vals[0] = operand.Value.condition{0};
-    if (has(?file, implicit(?file, ?e, values).read, register.make(0, 1))) { ret 12; }
+    if (t_reads(?file, ?ops[0], ?e, values, register.make(0, 1))) { ret 12; }
     e.implicit.rules = RegisterRules{at: ?ids[0], len: 1};
     vals[0]          = operand.Value.id{4};
-    if (!has(?file, implicit(?file, ?e, values).read, register.make(0, 1))) { ret 13; }
+    if (!t_reads(?file, ?ops[0], ?e, values, register.make(0, 1))) { ret 13; }
     vals[0] = operand.Value.id{3};
-    if (has(?file, implicit(?file, ?e, values).read, register.make(0, 1))) { ret 14; }
+    if (t_reads(?file, ?ops[0], ?e, values, register.make(0, 1))) { ret 14; }
     ret 0;
 }
