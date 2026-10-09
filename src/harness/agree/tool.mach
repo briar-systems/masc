@@ -1,0 +1,285 @@
+# running the external tools: finding them at their pin, one run with its output captured, and its errors by line
+#
+# a tool is found by the first of its program names on the path and its
+# version read from `--version`, which must hold the tool's pin. a run writes
+# its standard output and error to files in the work directory and reads
+# them back whole. an assembler's errors are read in the `file:line:` form
+# both llvm-mc and the gnu assembler write, so a refused vector is known by
+# its line.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use std.collections.vector;
+use fs: std.filesystem;
+use std.io.error;
+use std.process.env;
+use std.process.exec;
+
+use masc.harness.agree.agreement;
+use masc.harness.agree.text;
+
+# a tool as it was found
+# ---
+# tool:    the tool
+# path:    the program run, nil when no program of the tool is on the path
+# version: the line of its version output that holds the pin, or its first line when none does
+# pinned:  whether its version output holds the pin
+pub rec Found {
+    tool:    *agreement.Tool;
+    path:    str;
+    version: str;
+    pinned:  bool;
+}
+
+# whether the tool was found at its pin, so it runs
+pub fun usable(f: *Found) bool {
+    ret f.path != nil && f.pinned;
+}
+
+# what one run gave back
+# ---
+# ok:  whether it exited with status zero
+# out: its standard output
+# err: its standard error
+pub rec Ran {
+    ok:  bool;
+    out: str;
+    err: str;
+}
+
+# `x`, `y` and `z` joined, or none when the allocator refuses
+fun join(a: *A.Allocator, x: str, y: str, z: str) opt[str] {
+    val r: res[str, StrError] = str_join(a, x, y, z);
+    if (sel r.err) { ret opt[str].none{}; }
+    ret opt[str].some{r.ok};
+}
+
+# the file at `path` read whole as a terminated string, empty when it cannot be read
+fun slurp(a: *A.Allocator, path: str) res[str, str] {
+    val got: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel got.err) { ret res[str, str].err{"a tool's output cannot be read back"}; }
+    var bytes:  vector.Vector[u8]   = got.ok;
+    val pushed: res[usize, A.Error] = vector.push[u8](?bytes, 0);
+    if (sel pushed.err) { ret res[str, str].err{"out of memory"}; }
+    ret res[str, str].ok{bytes.data::str};
+}
+
+# whether a push was given its storage
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the program `path` run over `args`, its output captured in files named after `name` in `work`
+# ---
+# ret: what it gave back, or why it could not be run
+pub fun run(a: *A.Allocator, path: str, args: *agreement.Args, work: str, name: str) res[Ran, str] {
+    if (args.failed) { ret res[Ran, str].err{"out of memory"}; }
+    var argv: vector.Vector[str] = vector.init[str](a);
+    var held: bool               = pushed(vector.push[str](?argv, path));
+    var i:    usize              = 0;
+    for (i < args.list.len && held) {
+        held = pushed(vector.push[str](?argv, args.list.data[i]));
+        i    = i + 1;
+    }
+    if (held)  { held = pushed(vector.push[str](?argv, nil)); }
+    if (!held) { ret res[Ran, str].err{"out of memory"}; }
+    val base: opt[str] = join(a, work, "/", name);
+    if (sel base.none) { ret res[Ran, str].err{"out of memory"}; }
+    val out_path: opt[str] = join(a, base.some, ".stdout", "");
+    if (sel out_path.none) { ret res[Ran, str].err{"out of memory"}; }
+    val err_path: opt[str] = join(a, base.some, ".stderr", "");
+    if (sel err_path.none) { ret res[Ran, str].err{"out of memory"}; }
+    val out_file: res[fs.File, error.Error] = fs.create(out_path.some, 0o644);
+    if (sel out_file.err) { ret res[Ran, str].err{"a tool's output file cannot be created"}; }
+    var out_f:    fs.File                   = out_file.ok;
+    val err_file: res[fs.File, error.Error] = fs.create(err_path.some, 0o644);
+    if (sel err_file.err) {
+        fs.close(?out_f);
+        ret res[Ran, str].err{"a tool's error file cannot be created"};
+    }
+    var err_f: fs.File                     = err_file.ok;
+    val child: res[exec.Child, exec.Error] = exec.spawn_redirected(path, argv.data::**u8, env.environ(), out_f.handle.value, err_f.handle.value);
+    fs.close(?out_f);
+    fs.close(?err_f);
+    if (sel child.err) { ret res[Ran, str].err{exec.error_message(child.err)}; }
+    val waited: res[exec.ExitStatus, exec.Error] = exec.wait(child.ok);
+    if (sel waited.err) { ret res[Ran, str].err{exec.error_message(waited.err)}; }
+    val out: res[str, str] = slurp(a, out_path.some);
+    if (sel out.err) { ret res[Ran, str].err{out.err}; }
+    val err_: res[str, str] = slurp(a, err_path.some);
+    if (sel err_.err) { ret res[Ran, str].err{err_.err}; }
+    val ok: bool = exec.exited(waited.ok) && exec.code(waited.ok) == 0;
+    ret res[Ran, str].ok{Ran{ok: ok, out: out.ok, err: err_.ok}};
+}
+
+# the line of `s` starting at `at`, copied, and where the next one starts
+fun line_at(a: *A.Allocator, s: str, at: usize, next: *usize) opt[str] {
+    var end: usize = at;
+    for (s[end] != 0 && s[end] != '\n') { end = end + 1; }
+    @next = end;
+    if (s[end] == '\n') { @next = end + 1; }
+    var t: text.Text = text.make(a);
+    text.bytes(?t, ?s[at], end - at);
+    ret text.copy(?t, a);
+}
+
+# the tool found by the first of its programs on the path, its version read from its output
+# ---
+# work: the directory its version output is captured in
+# ret:  what was found, its path nil when no program is on the path, or why it could not be asked
+pub fun find(a: *A.Allocator, tool: *agreement.Tool, work: str) res[Found, str] {
+    var found: Found = Found{tool: tool, path: nil, version: "", pinned: false};
+    var i:     u32   = 0;
+    for (i < tool.programs.len && found.path == nil) {
+        val got: res[str, exec.Error] = exec.resolve(a, tool.programs.at[i]);
+        if (sel got.ok) { found.path = got.ok; }
+        i = i + 1;
+    }
+    if (found.path == nil) { ret res[Found, str].ok{found}; }
+    var args: agreement.Args = agreement.Args{a: a, list: vector.init[str](a), failed: false};
+    agreement.arg(?args, "--version");
+    val name: opt[str] = join(a, "version-", tool.name, "");
+    if (sel name.none) { ret res[Found, str].err{"out of memory"}; }
+    val ran: res[Ran, str] = run(a, found.path, ?args, work, name.some);
+    if (sel ran.err) { ret res[Found, str].err{ran.err}; }
+    var at:    usize = 0;
+    var first: str   = nil;
+    for (ran.ok.out[at] != 0) {
+        var next: usize    = 0;
+        val line: opt[str] = line_at(a, ran.ok.out, at, ?next);
+        if (sel line.none)                          { ret res[Found, str].err{"out of memory"}; }
+        if (first == nil && str_len(line.some) > 0) { first = line.some; }
+        if (str_contains(line.some, tool.pin)) {
+            found.version = line.some;
+            found.pinned  = true;
+            ret res[Found, str].ok{found};
+        }
+        at = next;
+    }
+    if (first != nil) { found.version = first; }
+    ret res[Found, str].ok{found};
+}
+
+# an error a tool stated at a line of its source
+# ---
+# line:    the line, from 1
+# message: what it said
+pub rec Located {
+    line:    u32;
+    message: str;
+}
+
+# what a run's standard error says
+# ---
+# located: the errors stated at a line of the source
+# general: the first error or fatal line that names no line of the source, nil for none
+# notes:   every other warning, one at a line of the source without its place
+pub rec Said {
+    located: vector.Vector[Located];
+    general: str;
+    notes:   vector.Vector[str];
+}
+
+# whether `s` holds `word` at `at`, read without regard to case
+fun word_at(s: str, at: usize, word: str) bool {
+    var i: usize = 0;
+    for (word[i] != 0) {
+        var c: u8 = s[at + i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        if (c != word[i])         { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# where `word` first appears in `s`, read without regard to case, none when it does not
+fun find_word(s: str, word: str) opt[usize] {
+    var at: usize = 0;
+    for (s[at] != 0) {
+        if (word_at(s, at, word)) { ret opt[usize].some{at}; }
+        at = at + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# whether `word` appears in `s`, read without regard to case
+fun has_word(s: str, word: str) bool {
+    val at: opt[usize] = find_word(s, word);
+    ret sel at.some;
+}
+
+# the text after the first `error:` of `s`, past the spaces after it
+fun after_error(s: str) str {
+    val at: opt[usize] = find_word(s, "error:");
+    if (sel at.none) { ret s; }
+    var i: usize = at.some + 6;
+    for (s[i] == ' ') { i = i + 1; }
+    ret ?s[i];
+}
+
+# the decimal number at `s[at]`, its end in `end`, none when no digit is there
+fun number_at(s: str, at: usize, end: *usize) opt[u32] {
+    var i: usize = at;
+    var n: u32   = 0;
+    for (s[i] >= '0' && s[i] <= '9') {
+        n = n * 10 + (s[i] - '0')::u32;
+        i = i + 1;
+    }
+    @end = i;
+    if (i == at) { ret opt[u32].none{}; }
+    ret opt[u32].some{n};
+}
+
+# what the standard error `err` of a run over `source` says
+pub fun said(a: *A.Allocator, err: str, source: str) res[Said, str] {
+    var s:  Said  = Said{located: vector.init[Located](a), general: nil, notes: vector.init[str](a)};
+    val n:  usize = str_len(source);
+    var at: usize = 0;
+    for (err[at] != 0) {
+        var next: usize    = 0;
+        val line: opt[str] = line_at(a, err, at, ?next);
+        if (sel line.none) { ret res[Said, str].err{"out of memory"}; }
+        at = next;
+        val l:       str  = line.some;
+        val error_:  bool = has_word(l, "error");
+        val warning: bool = has_word(l, "warning");
+        var said_:   str  = l;
+        if (str_starts_with(l, source) && l[n] == ':') {
+            var end: usize    = 0;
+            val num: opt[u32] = number_at(l, n + 1, ?end);
+            if (sel num.some) {
+                if (error_) {
+                    val added: res[usize, A.Error] = vector.push[Located](?s.located, Located{line: num.some, message: after_error(l)});
+                    if (sel added.err) { ret res[Said, str].err{"out of memory"}; }
+                    cnt;
+                }
+                # a warning at a line is noted by what it says, wherever it was said
+                if (l[end] == ':') { number_at(l, end + 1, ?end); }
+                if (l[end] == ':') { end = end + 1; }
+                for (l[end] == ' ') { end = end + 1; }
+                said_ = ?l[end];
+            }
+        }
+        if (error_ && s.general == nil) {
+            s.general = l;
+            cnt;
+        }
+        if (warning) {
+            val added: res[usize, A.Error] = vector.push[str](?s.notes, said_);
+            if (sel added.err) { ret res[Said, str].err{"out of memory"}; }
+        }
+    }
+    ret res[Said, str].ok{s};
+}
