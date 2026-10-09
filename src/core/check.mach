@@ -110,6 +110,8 @@ pub val RULE_TERMS:        str = "effect rule has no terms";
 pub val RULE_OVERLAP:      str = "two rules of one effect field can both hold";
 pub val RULE_OPERAND:      str = "effect rule tests an operand the row does not have, or of another kind than its test";
 pub val RULE_BOUNDS:       str = "implicit registers' may or must set is not the union or intersection of its own and its rules' sets";
+pub val ACCRUED_WRITE:     str = "write of an accrued register that is not also a read";
+pub val TAIL_WRITE:        str = "row reading the vector length writes a vector register it does not also read";
 pub val FIXED_OPERAND:     str = "fixed operand is not a register operand";
 pub val FIXED_CLASS:       str = "fixed register outside its operand's classes or range";
 pub val KEPT_OPERAND:      str = "register constraint names an operand the row does not have, one holding no register of its part, or nothing to keep apart";
@@ -997,12 +999,102 @@ fun register_rules(s: *S.Set, r: *row.Row, g: *effect.Registers) opt[str] {
     ret opt[str].none{};
 }
 
+# whether `set` holds row `at`
+fun in_set(set: effect.Set, at: u32) bool {
+    val w: u32 = at / 64;
+    ret w < set.len && ((set.words[w] >> (at % 64)::u64) & 1) != 0;
+}
+
+# whether register row `at` of the file has every bit of `flag`
+fun flagged(s: *S.Set, at: u32, flag: register.Flags) bool {
+    ret (s.codec.registers.registers[at].flags & flag) == flag;
+}
+
+# whether `set` holds a row of the file flagged `flag`
+fun holds_flagged(s: *S.Set, set: effect.Set, flag: register.Flags) bool {
+    val count: u32 = register_count(s);
+    var at:    u32 = 0;
+    for (at < count) {
+        if (in_set(set, at) && flagged(s, at, flag)) { ret true; }
+        at = at + 1;
+    }
+    ret false;
+}
+
+# whether register row `at` of the file is of a vector class
+fun vector_row(s: *S.Set, at: u32) bool {
+    val file: *register.File = s.codec.registers;
+    ret file.classes[file.registers[at].class].kind == register.VECTOR;
+}
+
+# whether `t` writes a register it may keep some of without reading it: an accrued register, or a vector register while
+# it reads the vector length, past which elements may keep their values
+fun kept(s: *S.Set, t: effect.Touched) opt[str] {
+    val length: bool = holds_flagged(s, t.read, register.LENGTH);
+    val count:  u32  = register_count(s);
+    var at:     u32  = 0;
+    for (at < count) {
+        if (in_set(t.written, at) && !in_set(t.read, at)) {
+            if (flagged(s, at, register.ACCRUED)) { ret opt[str].some{ACCRUED_WRITE}; }
+            if (length && vector_row(s, at))      { ret opt[str].some{TAIL_WRITE}; }
+        }
+        at = at + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether a register operand `reg` admits register row `at` of the file
+fun admits_row(s: *S.Set, reg: *operand.Register, at: u32) bool {
+    val file: *register.File     = s.codec.registers;
+    val x:    *register.Register = ?file.registers[at];
+    ret operand.find(reg.classes, x.class) >= 0 && operand.within(reg, x.number::u32, file.classes[x.class].count) && !operand.excludes_number(reg, x.number::u32);
+}
+
+# whether the writes of `r` that may keep some of a register's old value are reads too, wherever the file states the
+# facts that decide it: no implicit set or rule writes an accrued register it does not read, or a vector register while
+# it reads the vector length, and no operand that writes and does not read admits an accrued register, or a vector
+# register while some values read the vector length. the contract of effect.Touched
+fun merged(s: *S.Set, r: *row.Row) opt[str] {
+    val g:   *effect.Registers = ?r.effect.implicit;
+    val own: opt[str]          = kept(s, g.otherwise);
+    if (sel own.some) { ret own; }
+    var i: u32 = 0;
+    for (i < g.rules.len) {
+        val ruled: opt[str] = kept(s, g.rules.at[i].touched);
+        if (sel ruled.some) { ret ruled; }
+        i = i + 1;
+    }
+    val length: bool = holds_flagged(s, g.may.read, register.LENGTH);
+    val count:  u32  = register_count(s);
+    var k:      u32  = 0;
+    for (k < r.operands.len) {
+        val op:  *operand.Operand  = ?r.operands.at[k];
+        var reg: *operand.Register = nil;
+        if (sel op.shape.register) { reg = ?op.shape.register; }
+        or (sel op.shape.list)     { reg = ?op.shape.list.member; }
+        if (reg != nil && (op.role & operand.WRITE) != 0 && (op.role & operand.READ) == 0) {
+            var at: u32 = 0;
+            for (at < count) {
+                if (admits_row(s, reg, at)) {
+                    if (flagged(s, at, register.ACCRUED)) { ret opt[str].some{ACCRUED_WRITE}; }
+                    if (length && vector_row(s, at))      { ret opt[str].some{TAIL_WRITE}; }
+                }
+                at = at + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
 fun effects(s: *S.Set, r: *row.Row) opt[str] {
     if (r.effect == nil || r.ct == nil) { ret opt[str].some{NO_EFFECT}; }
     val e:         *effect.Effect = r.effect;
     val flag_sets: [4]effect.Set  = [4]effect.Set{e.flags.read, e.flags.written, e.flags.undefined, e.flags.kept};
     val switched:  opt[str]       = register_rules(s, r, ?e.implicit);
     if (sel switched.some) { ret switched; }
+    val partial: opt[str] = merged(s, r);
+    if (sel partial.some) { ret partial; }
     var i: u32 = 0;
     for (i < 4) {
         val held: opt[str] = holds(s, flag_sets[i], true);
@@ -1987,6 +2079,89 @@ test one__effect_rules_that_can_both_hold_or_test_what_the_row_lacks_are_refused
     switches[0].terms        = effect.Terms{at: ?dyn[0], len: 1};
     switches[0].touched.read = effect.Set{words: nil, len: 0};
     if (!t_refused(one(?s), RULE_OPERAND, "row", 0)) { ret 9; }
+    ret 0;
+}
+
+# a file of x0, v1, an accrued csr and a vector length csr, for the tests of writes that may keep their old values
+#[testing]
+val T_KEEP_CLASSES: [3]register.Class = [3]register.Class{
+    register.Class{name: "x", kind: register.GENERAL, width: register.Scaled{fixed: 64, per: 0, scale: 0}, count: 32},
+    register.Class{name: "v", kind: register.VECTOR, width: register.Scaled{fixed: 128, per: 0, scale: 0}, count: 32},
+    register.Class{name: "csr", kind: register.SYSTEM, width: register.Scaled{fixed: 64, per: 0, scale: 0}, count: 4096},
+};
+
+#[testing]
+val T_KEEP_REGISTERS: [4]register.Register = [4]register.Register{
+    register.Register{name: "x0", class: 0, number: 0, bank: 0, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: register.ZERO, requires: requirement.NONE},
+    register.Register{name: "v1", class: 1, number: 1, bank: 1, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: 0, requires: requirement.NONE},
+    register.Register{name: "fflags", class: 2, number: 1, bank: 2, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: register.ACCRUED, requires: requirement.NONE},
+    register.Register{name: "vl", class: 2, number: 0xC20, bank: 3, offset: register.Scaled{fixed: 0, per: 0, scale: 0}, stride: register.Scaled{fixed: 0, per: 0, scale: 0}, count: register.Scaled{fixed: 1, per: 0, scale: 0}, flags: register.LENGTH, requires: requirement.NONE},
+};
+
+#[testing]
+val T_KEEP_FILE: register.File = register.File{
+    scales:         nil,
+    scale_count:    0,
+    classes:        ?T_KEEP_CLASSES[0],
+    class_count:    3,
+    class_names:    index.EMPTY,
+    registers:      ?T_KEEP_REGISTERS[0],
+    register_count: 4,
+    aliases:        nil,
+    alias_count:    0,
+    names:          index.EMPTY,
+    columns:        nil,
+    column_count:   0,
+};
+
+# what check finds of the test row with its destination of class `class` and role `role`, reading `read` and writing
+# `written` of T_KEEP_FILE implicitly
+#[testing]
+fun t_kept(class: *u16, role: operand.Role, read: effect.Set, written: effect.Set) opt[str] {
+    var operands: [2]operand.Operand = T_OPERANDS;
+    operands[0].shape = operand.Shape.register{operand.Register{classes: operand.Classes{at: class, len: 1}, first: 0, count: 0, excluded: operand.NO_NUMBERS, fields: 1, element: operand.Element.none{}, span: operand.Span.fixed{0}}};
+    operands[0].role  = role;
+    var e:  effect.Effect  = T_EFFECT;
+    val on: effect.Touched = effect.Touched{read: read, written: written};
+    e.implicit = effect.Registers{otherwise: on, rules: effect.NO_REGISTER_RULES, may: on, must: on};
+    var r: row.Row = T_ROWS[0];
+    r.operands = row.Operands{at: ?operands[0], len: 2};
+    r.effect   = ?e;
+    var rows:  row.Row;
+    var codec: walk.Codec;
+    var s:     S.Set;
+    t_with_row(r, ?rows, ?codec, ?s);
+    codec.registers = ?T_KEEP_FILE;
+    ret effects(?s, ?rows);
+}
+
+# whether `got` is the refusal `message`, or clear when `message` is nil
+#[testing]
+fun t_found(got: opt[str], message: str) bool {
+    if (message == nil) { ret sel got.none; }
+    ret sel got.some && got.some == message;
+}
+
+test effects__a_write_that_may_keep_its_old_value_and_is_not_a_read_is_refused {
+    val x:       [1]u16     = [1]u16{0};
+    val v:       [1]u16     = [1]u16{1};
+    val csr:     [1]u16     = [1]u16{2};
+    val vector:  [1]u64     = [1]u64{0x2};
+    val accrued: [1]u64     = [1]u64{0x4};
+    val length:  [1]u64     = [1]u64{0x8};
+    val both:    [1]u64     = [1]u64{0xA};
+    val none:    effect.Set = effect.Set{words: nil, len: 0};
+    # an accrued register written and not read, implicitly or by an operand that admits it
+    if (!t_found(t_kept(?x[0], operand.WRITE, none, effect.Set{words: ?accrued[0], len: 1}), ACCRUED_WRITE))                         { ret 1; }
+    if (!t_found(t_kept(?x[0], operand.WRITE, effect.Set{words: ?accrued[0], len: 1}, effect.Set{words: ?accrued[0], len: 1}), nil)) { ret 2; }
+    if (!t_found(t_kept(?csr[0], operand.WRITE, none, none), ACCRUED_WRITE))                                                         { ret 3; }
+    if (!t_found(t_kept(?csr[0], operand.READ_WRITE, none, none), nil))                                                              { ret 4; }
+    # a vector register written and not read while the vector length is read, by an operand or implicitly
+    if (!t_found(t_kept(?v[0], operand.WRITE, effect.Set{words: ?length[0], len: 1}, none), TAIL_WRITE))                                  { ret 5; }
+    if (!t_found(t_kept(?v[0], operand.READ_WRITE, effect.Set{words: ?length[0], len: 1}, none), nil))                                    { ret 6; }
+    if (!t_found(t_kept(?v[0], operand.WRITE, none, none), nil))                                                                          { ret 7; }
+    if (!t_found(t_kept(?x[0], operand.WRITE, effect.Set{words: ?length[0], len: 1}, effect.Set{words: ?vector[0], len: 1}), TAIL_WRITE)) { ret 8; }
+    if (!t_found(t_kept(?x[0], operand.WRITE, effect.Set{words: ?both[0], len: 1}, effect.Set{words: ?vector[0], len: 1}), nil))          { ret 9; }
     ret 0;
 }
 
