@@ -53,6 +53,7 @@ use masc.build.build;
 use masc.core.diagnostic;
 use masc.core.extension;
 use masc.core.field;
+use masc.core.mode;
 use masc.core.narrow;
 use masc.core.operand;
 use masc.core.register;
@@ -89,12 +90,13 @@ pub val NO_PREVIOUS:       str = "no previous section";
 pub val NOT_A_NAME:        str = "expected a symbol name";
 pub val NOT_A_STRING:      str = "expected a string";
 pub val NOT_A_NUMBER:      str = "expected a number";
+pub val MODE_TWICE:        str = "assembler mode stated twice";
 pub val UNKNOWN_FORM:      str = "the dialect states no such form";
 pub val NOTHING_PUSHED:    str = "no narrowing pushed to pop";
 pub val WIDENS:            str = "lifts the selection past the object's, which does not hold what it states";
 
 # the handle `.` resolves to, which every operand binds to the place it is written before the builder sees it
-pub val HERE: u32 = 0xFFFF_FFFF;
+pub val HERE: u32 = spelling.HERE;
 
 # what one operand of a directive is
 # ---
@@ -224,12 +226,15 @@ pub fun finished(context: ptr, a: *Assembler) err[Refusal] {
 # traits:  the traits the set requires of its caller (`set.Set.supplied`), as the float abi `-mabi` states, with no default
 # private: the spelling that starts the names the object's format keeps out of its symbol table, as elf's `.L`
 # layers:  the directive layers beyond the core rows and the set's data rows
+# modes:   the assembler modes the source starts at, as `--pic` states, each mode at most once and every other at its
+#          initial value
 pub rec Options {
     arch:    *mink.arch.Arch;
     syntax:  u32;
     traits:  set.Traits;
     private: str;
     layers:  Layers;
+    modes:   mode.Settings;
 }
 
 # why assembly stopped
@@ -280,11 +285,14 @@ rec Entry {
     layer:     *Layer;
 }
 
-# what the form directive's push saves of the statement state, which its pop restores
+# what the form directive's push saves of the statement state, which its pop restores. a narrowing and a mode stay
+# apart: a narrowing changes what the selection admits, a mode what the spellings and rows read
 # ---
 # active: the narrowings in force
+# modes:  the assembler modes
 rec Saved {
     active: u64;
+    modes:  mode.State;
 }
 
 # the view of the narrowings `active` marks, made the first time they are in force
@@ -404,13 +412,31 @@ pub fun make(a: *A.Allocator, s: *set.Set, available: *register.Available, optio
     if (options.syntax >= s.syntaxes.len) { ret res[Assembler, Refusal].err{nowhere(NO_SYNTAX)}; }
     val built: res[build.Builder, build.Refusal] = build.make(a, s, available, options.arch, options.traits);
     if (sel built.err) { ret res[Assembler, Refusal].err{refused_build(built.err)}; }
+    var b: build.Builder = built.ok;
+    var n: u32           = 0;
+    for (n < options.modes.len) {
+        var j: u32 = 0;
+        for (j < n) {
+            if (options.modes.at[j].mode == options.modes.at[n].mode) {
+                build.release(?b);
+                ret res[Assembler, Refusal].err{nowhere(MODE_TWICE)};
+            }
+            j = j + 1;
+        }
+        val started: err[build.Refusal] = build.set_mode(?b, options.modes.at[n]);
+        if (sel started.err) {
+            build.release(?b);
+            ret res[Assembler, Refusal].err{refused_build(started.err)};
+        }
+        n = n + 1;
+    }
     var m: Assembler = Assembler{
         a:         a,
         set:       s,
         available: available,
         syntax:    ?s.syntaxes.at[options.syntax],
         private:   options.private,
-        b:         built.ok,
+        b:         b,
         layers:    vector.init[*Layer](a),
         rows:      vector.init[Directive](a),
         own:       vector.init[Layer](a),
@@ -672,6 +698,28 @@ fun bound_here(m: *Assembler, id: u32, here_: *u32) res[u32, str] {
         @here_ = l.ok.id;
     }
     ret res[u32, str].ok{@here_};
+}
+
+# the labels one statement's operands bind at its place, operand.NO_SYMBOL until one is needed
+# ---
+# here: the label `.` names
+# own:  the label a sequence's part names at its first instruction, spelled by the syntax's own stem
+rec Places {
+    here: u32;
+    own:  u32;
+}
+
+# `id` with HERE and spelling.OWN bound to labels at the cursor, each made the first time it is needed
+fun bound_at(m: *Assembler, id: u32, p: *Places) res[u32, str] {
+    if (id != spelling.OWN) { ret bound_here(m, id, ?p.here); }
+    if (p.own == operand.NO_SYMBOL) {
+        val made: res[build.Label, build.Refusal] = build.stemmed(?m.b, m.syntax.own);
+        if (sel made.err) { ret res[u32, str].err{made.err.message}; }
+        val placed: err[build.Refusal] = build.define(?m.b, made.ok);
+        if (sel placed.err) { ret res[u32, str].err{placed.err.message}; }
+        p.own = made.ok.id;
+    }
+    ret res[u32, str].ok{p.own};
 }
 
 # `e` with `.` bound to the cursor and its labels noted as referred to at `at`
@@ -947,6 +995,17 @@ fun in_force(m: *Assembler, active: u64) err[str] {
     ret err[str].ok{};
 }
 
+# every mode of `saved` put back through the builder, as a pop restores what its push saved
+fun modes_back(m: *Assembler, saved: *mode.State) err[str] {
+    var i: u32 = 0;
+    for (i < saved.modes.len) {
+        val back: err[build.Refusal] = build.set_mode(?m.b, mode.Setting{mode: saved.modes.at[i], value: saved.values[i]});
+        if (sel back.err) { ret err[str].err{back.err.message}; }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
 # the set's form directive: its push saves the narrowings in force and its pop restores them, a narrowing's operand puts
 # it in force and its lift takes it out, never past the object's selection
 fun form_directive(m: *Assembler, args: *Args) err[diagnostic.Diagnostic] {
@@ -955,7 +1014,7 @@ fun form_directive(m: *Assembler, args: *Args) err[diagnostic.Diagnostic] {
     if (!sel v.name) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, NOT_A_NAME)}; }
     val name: View = v.name;
     if (spells(name, forms.push)) {
-        if (!held(vector.push[Saved](?m.pushed, Saved{active: m.active}))) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, field.MEMORY)}; }
+        if (!held(vector.push[Saved](?m.pushed, Saved{active: m.active, modes: @build.modes_of(?m.b)}))) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, field.MEMORY)}; }
         ret err[diagnostic.Diagnostic].ok{};
     }
     var active: u64  = m.active;
@@ -981,8 +1040,12 @@ fun form_directive(m: *Assembler, args: *Args) err[diagnostic.Diagnostic] {
     }
     if (!known) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, UNKNOWN_FORM)}; }
     val put: err[str] = in_force(m, active);
-    if (sel put.err)             { ret err[diagnostic.Diagnostic].err{refuse(args, 0, put.err)}; }
-    if (spells(name, forms.pop)) { m.pushed.len = m.pushed.len - 1; }
+    if (sel put.err) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, put.err)}; }
+    if (spells(name, forms.pop)) {
+        val restored: err[str] = modes_back(m, ?m.pushed.data[m.pushed.len - 1].modes);
+        if (sel restored.err) { ret err[diagnostic.Diagnostic].err{refuse(args, 0, restored.err)}; }
+        m.pushed.len = m.pushed.len - 1;
+    }
     ret err[diagnostic.Diagnostic].ok{};
 }
 
@@ -998,6 +1061,7 @@ fun reader(m: *Assembler, st: *source.Statement, at: usize, len: usize, origin: 
         codec:     m.set.codec,
         available: build.view(?m.b),
         syntax:    m.syntax,
+        modes:     build.modes_of(?m.b),
         symbols:   ?m.names,
         context:   nil,
         row:       nil,
@@ -1222,17 +1286,17 @@ fun label_statement(m: *Assembler, st: *source.Statement) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
-# a symbolic operand value with `.` bound to the instruction's place and its label noted
-fun claim(m: *Assembler, v: *operand.Value, at: diagnostic.Position, here_: *u32) err[str] {
+# a symbolic operand value with `.` and a sequence's own label bound to the instruction's place and its label noted
+fun claim(m: *Assembler, v: *operand.Value, at: diagnostic.Position, places: *Places) err[str] {
     if (sel v.symbol) {
-        val id: res[u32, str] = bound_here(m, v.symbol.id, here_);
+        val id: res[u32, str] = bound_at(m, v.symbol.id, places);
         if (sel id.err) { ret err[str].err{id.err}; }
         v.symbol.id = id.ok;
         ret note(m, id.ok, at);
     }
     if (sel v.memory) {
         if (v.memory.symbol.id != operand.NO_SYMBOL) {
-            val id: res[u32, str] = bound_here(m, v.memory.symbol.id, here_);
+            val id: res[u32, str] = bound_at(m, v.memory.symbol.id, places);
             if (sel id.err) { ret err[str].err{id.err}; }
             v.memory.symbol.id = id.ok;
             ret note(m, id.ok, at);
@@ -1241,7 +1305,7 @@ fun claim(m: *Assembler, v: *operand.Value, at: diagnostic.Position, here_: *u32
     if (sel v.list) {
         var i: u32 = 0;
         for (i < v.list.len) {
-            val done: err[str] = claim(m, ?v.list.at[i], at, here_);
+            val done: err[str] = claim(m, ?v.list.at[i], at, places);
             if (sel done.err) { ret done; }
             i = i + 1;
         }
@@ -1257,12 +1321,12 @@ fun instruction_statement(m: *Assembler, st: *source.Statement) err[Refusal] {
     var ex:  relax.Expansion;
     val got: err[diagnostic.Diagnostic] = parse.statement(?rd, ?ex);
     if (sel got.err) { ret stop(st, got.err); }
-    var here_: u32 = operand.NO_SYMBOL;
-    var i:     u32 = 0;
+    var places: Places = Places{here: operand.NO_SYMBOL, own: operand.NO_SYMBOL};
+    var i:      u32    = 0;
     for (i < ex.count) {
         var k: u32 = 0;
         for (k < ex.steps[i].row.operands.len) {
-            val claimed: err[str] = claim(m, ?ex.steps[i].values[k], st.head.position, ?here_);
+            val claimed: err[str] = claim(m, ?ex.steps[i].values[k], st.head.position, ?places);
             if (sel claimed.err) { ret stop_at(st, claimed.err, st.head); }
             k = k + 1;
         }
