@@ -1,0 +1,842 @@
+# the reader of Arm's feature model, AARCHMRS Features.json
+#
+# every parameter of the model is a FEAT_* feature or an architecture
+# version, and its constraints are formulas over them, written as an AST.
+# a formula of names alone is read as the catalog reads it:
+#   `A ==> B && C` is A implying B and C
+#   `A && B ==> C` is a combination carried by the version among the
+#     conditions, or else by the first condition as written
+#   `A && !B ==> !C` is the combination `A && C ==> B`
+#   `A ==> !B` is a conflict
+#   `FEAT_X ==> vNApM`, the version a feature is permitted from, is the
+#     feature's revision and no implication
+#   `A <=> B` is `A ==> B` and `B ==> A`
+#   a disjunctive consequent keeps only the literals every alternative
+#     shares, and a disjunctive condition is each of its alternatives
+# a feature equivalent to an ID register field at least k, as
+# `FEAT_AA64EL1 ==> (FEAT_X <=> UInt(REG.F) >= k)`, implies every feature
+# that the same field, under the same conditions and signedness, gives at a
+# lower k. every other constraint, over ID register fields or functions, is
+# no selection's, and is not read.
+#
+# the future architecture versions vFATAp* and the features permitted only
+# from one are left out, with every constraint that names them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use json;
+
+use gen.diag;
+use gen.document;
+use gen.source;
+
+pub val NO_FIRST: str = "feature the register file names first is not in the model";
+pub val BAD_NODE: str = "constraint node is malformed";
+
+# the features whose ids come first, in order, as the register file names them
+# the condition of the ID register fields of AArch64, which an A64 catalog always meets
+val AARCH64: str = "FEAT_AA64EL1";
+
+val FIRST: [4]str = [4]str{"FEAT_SVE", "FEAT_SME", "FEAT_FP", "FEAT_AdvSIMD"};
+
+# a feature or version, held or negated
+rec Lit {
+    pos:  bool;
+    name: str;
+}
+
+# one combination as read: `by` and `when` together imply `then`
+pub rec Combination {
+    by:   u32;
+    when: vector.Vector[u32];
+    then: vector.Vector[u32];
+}
+
+# two rows that conflict, a below b
+pub rec Conflict {
+    a: u32;
+    b: u32;
+}
+
+# the catalog as the model gives it
+# ---
+# rows:         the names of the rows, by id: the first features, the versions in order, then the other features by name
+# versions:     how many versions follow the first features
+# revisions:    each row's revision, the latest version it is permitted from, or ""
+# implies:      each row's implications, ascending
+# combinations: ascending by carrier, conditions and implications
+# conflicts:    ascending
+pub rec Model {
+    rows:         vector.Vector[str];
+    versions:     u32;
+    revisions:    vector.Vector[str];
+    implies:      vector.Vector[vector.Vector[u32]];
+    combinations: vector.Vector[Combination];
+    conflicts:    vector.Vector[Conflict];
+    ids:          map.Map[str, u32];
+}
+
+# the formulas read before rows are known, by name
+rec Implication {
+    from: str;
+    to:   vector.Vector[str];
+}
+
+rec Combined {
+    pos:  vector.Vector[str];
+    then: vector.Vector[str];
+}
+
+rec Excluded {
+    pos: vector.Vector[str];
+    x:   str;
+}
+
+rec Minimum {
+    feature: str;
+    version: str;
+}
+
+# a feature equivalent to field `key` at least `k`
+rec Rung {
+    key:     str;
+    k:       i64;
+    feature: str;
+    cond:    vector.Vector[str];
+}
+
+rec Reader {
+    alloc:        *A.Allocator;
+    doc:          *document.Document;
+    failed:       bool;
+    failure:      diag.Refusal;
+    implications: vector.Vector[Implication];
+    combined:     vector.Vector[Combined];
+    excluded:     vector.Vector[Excluded];
+    minimums:     vector.Vector[Minimum];
+    rungs:        vector.Vector[Rung];
+}
+
+fun fail(r: *Reader, message: str, subject: str) {
+    if (r.failed) { ret; }
+    r.failed  = true;
+    r.failure = diag.refusal(r.doc.file.path, 0, message, subject);
+}
+
+fun pushed(r: *Reader, got: res[usize, A.Error]) {
+    if (sel got.err) { fail(r, diag.MEMORY, nil); }
+}
+
+# whether string member `key` of `v` is `text`
+fun is(v: *json.Value, key: str, text: str) bool {
+    if (v.kind != json.OBJECT) { ret false; }
+    val m: opt[*json.Value] = json.value_find(v, key);
+    if (sel m.none) { ret false; }
+    val got: *json.Value = m.some;
+    if (got.kind != json.STRING) { ret false; }
+    var i: usize = 0;
+    for (i < got.str_len) {
+        if (text[i] == 0 || text[i] != got.str_val[i]) { ret false; }
+        i = i + 1;
+    }
+    ret text[i] == 0;
+}
+
+fun kind(v: *json.Value, t: str) bool {
+    ret is(v, "_type", t);
+}
+
+# member `key` of `v`, nil when absent
+fun at(v: *json.Value, key: str) *json.Value {
+    if (v.kind != json.OBJECT) { ret nil; }
+    val m: opt[*json.Value] = json.value_find(v, key);
+    if (sel m.none) { ret nil; }
+    ret m.some;
+}
+
+# the decoded string member `key` of `v`, nil when it is not one
+fun text(r: *Reader, v: *json.Value, key: str) str {
+    val m: *json.Value = at(v, key);
+    if (m == nil || m.kind != json.STRING) { ret nil; }
+    val got: res[str, diag.Refusal] = document.text(r.alloc, r.doc, m, key);
+    if (sel got.err) {
+        fail(r, got.err.message, key);
+        ret nil;
+    }
+    ret got.ok;
+}
+
+# whether `name` is a version v8Ap0 to v9Ap9
+pub fun version(name: str) bool {
+    ret name[0] == 'v' && (name[1] == '8' || name[1] == '9') && name[2] == 'A' && name[3] == 'p' && name[4] >= '0' && name[4] <= '9' && name[5] == 0;
+}
+
+fun fat(name: str) bool {
+    ret str_starts_with(name, "vFAT");
+}
+
+fun any_version(name: str) bool {
+    ret version(name) || fat(name);
+}
+
+# `v` in disjunctive normal form when it is a formula of names alone, none otherwise
+fun dnf(r: *Reader, v: *json.Value) opt[vector.Vector[vector.Vector[Lit]]] {
+    var out: vector.Vector[vector.Vector[Lit]] = vector.init[vector.Vector[Lit]](r.alloc);
+    if (kind(v, "AST.Identifier")) {
+        var one: vector.Vector[Lit] = vector.init[Lit](r.alloc);
+        pushed(r, vector.push[Lit](?one, Lit{pos: true, name: text(r, v, "value")}));
+        pushed(r, vector.push[vector.Vector[Lit]](?out, one));
+        ret opt[vector.Vector[vector.Vector[Lit]]].some{out};
+    }
+    if (kind(v, "AST.UnaryOp")) {
+        val e: *json.Value = at(v, "expr");
+        if (!is(v, "op", "!") || e == nil || !kind(e, "AST.Identifier")) { ret opt[vector.Vector[vector.Vector[Lit]]].none{}; }
+        var one: vector.Vector[Lit] = vector.init[Lit](r.alloc);
+        pushed(r, vector.push[Lit](?one, Lit{pos: false, name: text(r, e, "value")}));
+        pushed(r, vector.push[vector.Vector[Lit]](?out, one));
+        ret opt[vector.Vector[vector.Vector[Lit]]].some{out};
+    }
+    if (!kind(v, "AST.BinaryOp")) { ret opt[vector.Vector[vector.Vector[Lit]]].none{}; }
+    val any: bool = is(v, "op", "||");
+    val all: bool = is(v, "op", "&&");
+    if (!any && !all) { ret opt[vector.Vector[vector.Vector[Lit]]].none{}; }
+    val left:  *json.Value = at(v, "left");
+    val right: *json.Value = at(v, "right");
+    if (left == nil || right == nil) { ret opt[vector.Vector[vector.Vector[Lit]]].none{}; }
+    val a: opt[vector.Vector[vector.Vector[Lit]]] = dnf(r, left);
+    if (sel a.none) { ret a; }
+    val b: opt[vector.Vector[vector.Vector[Lit]]] = dnf(r, right);
+    if (sel b.none) { ret b; }
+    var i: usize = 0;
+    if (any) {
+        for (i < a.some.len) {
+            pushed(r, vector.push[vector.Vector[Lit]](?out, a.some.data[i]));
+            i = i + 1;
+        }
+        i = 0;
+        for (i < b.some.len) {
+            pushed(r, vector.push[vector.Vector[Lit]](?out, b.some.data[i]));
+            i = i + 1;
+        }
+        ret opt[vector.Vector[vector.Vector[Lit]]].some{out};
+    }
+    for (i < a.some.len) {
+        var j: usize = 0;
+        for (j < b.some.len) {
+            var both: vector.Vector[Lit] = vector.init[Lit](r.alloc);
+            var k:    usize              = 0;
+            for (k < a.some.data[i].len) {
+                pushed(r, vector.push[Lit](?both, a.some.data[i].data[k]));
+                k = k + 1;
+            }
+            k = 0;
+            for (k < b.some.data[j].len) {
+                pushed(r, vector.push[Lit](?both, b.some.data[j].data[k]));
+                k = k + 1;
+            }
+            pushed(r, vector.push[vector.Vector[Lit]](?out, both));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret opt[vector.Vector[vector.Vector[Lit]]].some{out};
+}
+
+fun holds(c: *vector.Vector[Lit], l: Lit) bool {
+    var i: usize = 0;
+    for (i < c.len) {
+        if (c.data[i].pos == l.pos && str_equals(c.data[i].name, l.name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun names(r: *Reader, c: *vector.Vector[Lit], pos: bool) vector.Vector[str] {
+    var out: vector.Vector[str] = vector.init[str](r.alloc);
+    var i:   usize              = 0;
+    for (i < c.len) {
+        if (c.data[i].pos == pos) { pushed(r, vector.push[str](?out, c.data[i].name)); }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# `left ==> right`, both in disjunctive normal form
+fun implication(r: *Reader, left: *vector.Vector[vector.Vector[Lit]], right: *vector.Vector[vector.Vector[Lit]]) {
+    var shared: vector.Vector[Lit] = vector.init[Lit](r.alloc);
+    var i:      usize              = 0;
+    for (i < right.data[0].len) {
+        val l:     Lit   = right.data[0].data[i];
+        var every: bool  = true;
+        var j:     usize = 1;
+        for (j < right.len) {
+            if (!holds(?right.data[j], l)) { every = false; }
+            j = j + 1;
+        }
+        if (every) { pushed(r, vector.push[Lit](?shared, l)); }
+        i = i + 1;
+    }
+    if (shared.len == 0) { ret; }
+    i = 0;
+    for (i < left.len) {
+        var pos: vector.Vector[str] = names(r, ?left.data[i], true);
+        val neg: vector.Vector[str] = names(r, ?left.data[i], false);
+        var rp:  vector.Vector[str] = names(r, ?shared, true);
+        val rn:  vector.Vector[str] = names(r, ?shared, false);
+        if (neg.len > 0) {
+            if (neg.len == 1 && rp.len == 0 && rn.len == 1) {
+                pushed(r, vector.push[str](?pos, rn.data[0]));
+                var then: vector.Vector[str] = vector.init[str](r.alloc);
+                pushed(r, vector.push[str](?then, neg.data[0]));
+                pushed(r, vector.push[Combined](?r.combined, Combined{pos: pos, then: then}));
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (pos.len == 1 && !any_version(pos.data[0])) {
+            var plain: vector.Vector[str] = vector.init[str](r.alloc);
+            var k:     usize              = 0;
+            for (k < rp.len) {
+                if (any_version(rp.data[k])) { pushed(r, vector.push[Minimum](?r.minimums, Minimum{feature: pos.data[0], version: rp.data[k]})); }
+                or                           { pushed(r, vector.push[str](?plain, rp.data[k])); }
+                k = k + 1;
+            }
+            rp = plain;
+        }
+        if (rp.len > 0) {
+            if (pos.len == 1) { pushed(r, vector.push[Implication](?r.implications, Implication{from: pos.data[0], to: rp})); }
+            or                { pushed(r, vector.push[Combined](?r.combined, Combined{pos: pos, then: rp})); }
+        }
+        var k: usize = 0;
+        for (k < rn.len) {
+            pushed(r, vector.push[Excluded](?r.excluded, Excluded{pos: pos, x: rn.data[k]}));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun by_text(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+# `body` read as a rung of an ID register field ladder under each conjunction of `cond`
+fun rung(r: *Reader, cond: *vector.Vector[vector.Vector[Lit]], body: *json.Value) {
+    if (!kind(body, "AST.BinaryOp") || !is(body, "op", "<=>")) { ret; }
+    val feature: *json.Value = at(body, "left");
+    val bound:   *json.Value = at(body, "right");
+    if (feature == nil || bound == nil || !kind(feature, "AST.Identifier") || !kind(bound, "AST.BinaryOp") || !is(bound, "op", ">=")) { ret; }
+    val f: *json.Value = at(bound, "left");
+    val k: *json.Value = at(bound, "right");
+    if (f == nil || k == nil || !kind(f, "AST.Function") || !kind(k, "AST.Integer")) { ret; }
+    if (!is(f, "name", "UInt") && !is(f, "name", "SInt"))                            { ret; }
+    val args: *json.Value = at(f, "arguments");
+    if (args == nil || args.kind != json.ARRAY || args.count != 1) { ret; }
+    val field: *json.Value = at(?args.children[0], "value");
+    if (!kind(?args.children[0], "Types.Field") || field == nil) { ret; }
+    val value: *json.Value = at(k, "value");
+    if (value == nil || value.kind != json.NUMBER || json.value_is_float(value)) { ret; }
+    val fname: str = text(r, f, "name");
+    val reg:   str = text(r, field, "name");
+    val fld:   str = text(r, field, "field");
+    val feat:  str = text(r, feature, "value");
+    if (fname == nil || reg == nil || fld == nil || feat == nil) { ret; }
+    var i: usize = 0;
+    for (i < cond.len) {
+        var held: vector.Vector[str] = names(r, ?cond.data[i], true);
+        if (held.len != cond.data[i].len) { ret; }
+        sort.sort_by[str](held.data, held.len, by_text);
+        var key: str   = "";
+        var j:   usize = 0;
+        for (j < held.len) {
+            val joined: res[str, StrError] = str_join(r.alloc, key, held.data[j], "&");
+            if (sel joined.err) {
+                fail(r, diag.MEMORY, nil);
+                ret;
+            }
+            key = joined.ok;
+            j   = j + 1;
+        }
+        val whole: res[str, StrError] = str_join(r.alloc, key, "|", fname, "|", reg, ".", fld);
+        if (sel whole.err) {
+            fail(r, diag.MEMORY, nil);
+            ret;
+        }
+        pushed(r, vector.push[Rung](?r.rungs, Rung{key: whole.ok, k: json.value_number(value), feature: feat, cond: held}));
+        i = i + 1;
+    }
+}
+
+# one constraint
+fun constraint(r: *Reader, c: *json.Value) {
+    if (!kind(c, "AST.BinaryOp")) { ret; }
+    val implies:    bool = is(c, "op", "==>");
+    val equivalent: bool = is(c, "op", "<=>");
+    if (!implies && !equivalent) { ret; }
+    val left:  *json.Value = at(c, "left");
+    val right: *json.Value = at(c, "right");
+    if (left == nil || right == nil) {
+        fail(r, BAD_NODE, nil);
+        ret;
+    }
+    var a: opt[vector.Vector[vector.Vector[Lit]]] = dnf(r, left);
+    var b: opt[vector.Vector[vector.Vector[Lit]]] = dnf(r, right);
+    if (sel a.some) {
+        if (sel b.some) {
+            implication(r, ?a.some, ?b.some);
+            if (equivalent) { implication(r, ?b.some, ?a.some); }
+            ret;
+        }
+        if (implies) { rung(r, ?a.some, right); }
+        ret;
+    }
+    if (equivalent) {
+        var none: vector.Vector[vector.Vector[Lit]] = vector.init[vector.Vector[Lit]](r.alloc);
+        pushed(r, vector.push[vector.Vector[Lit]](?none, vector.init[Lit](r.alloc)));
+        rung(r, ?none, c);
+    }
+}
+
+fun row_of(m: *Model, name: str) opt[u32] {
+    var key: str       = name;
+    val got: opt[*u32] = map.get[str, u32](?m.ids, ?key);
+    if (sel got.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{@got.some};
+}
+
+fun has(v: *vector.Vector[u32], id: u32) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun by_id(a: *u32, b: *u32) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+fun lists(a: *vector.Vector[u32], b: *vector.Vector[u32]) i64 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        if (a.data[i] != b.data[i]) { ret by_id(?a.data[i], ?b.data[i]); }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+fun by_combination(a: *Combination, b: *Combination) i64 {
+    if (a.by != b.by) { ret by_id(?a.by, ?b.by); }
+    val w: i64 = lists(?a.when, ?b.when);
+    if (w != 0) { ret w; }
+    ret lists(?a.then, ?b.then);
+}
+
+fun by_conflict(a: *Conflict, b: *Conflict) i64 {
+    if (a.a != b.a) { ret by_id(?a.a, ?b.a); }
+    ret by_id(?a.b, ?b.b);
+}
+
+fun by_version(a: *str, b: *str) i64 {
+    val x: str = @a;
+    val y: str = @b;
+    if (x[1] != y[1]) { ret x[1]::i64 - y[1]::i64; }
+    ret x[4]::i64 - y[4]::i64;
+}
+
+fun first(name: str) bool {
+    var i: u32 = 0;
+    for (i < 4) {
+        if (str_equals(FIRST[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun add_row(r: *Reader, m: *Model, name: str) {
+    val id: u32 = m.rows.len::u32;
+    pushed(r, vector.push[str](?m.rows, name));
+    val inserted: res[bool, A.Error] = map.insert[str, u32](?m.ids, name, id);
+    if (sel inserted.err) { fail(r, diag.MEMORY, name); }
+}
+
+# the rows: the first features, the versions in order, every other feature not permitted only from a future version by name
+fun order(r: *Reader, m: *Model, params: *vector.Vector[str]) {
+    var fats:     vector.Vector[str] = vector.init[str](r.alloc);
+    var versions: vector.Vector[str] = vector.init[str](r.alloc);
+    var features: vector.Vector[str] = vector.init[str](r.alloc);
+    var i:        usize              = 0;
+    for (i < r.minimums.len) {
+        if (fat(r.minimums.data[i].version)) { pushed(r, vector.push[str](?fats, r.minimums.data[i].feature)); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < params.len) {
+        val p: str = params.data[i];
+        if (version(p)) { pushed(r, vector.push[str](?versions, p)); }
+        or (str_starts_with(p, "FEAT_") && !first(p)) {
+            var excluded: bool  = false;
+            var j:        usize = 0;
+            for (j < fats.len) {
+                if (str_equals(fats.data[j], p)) { excluded = true; }
+                j = j + 1;
+            }
+            if (!excluded) { pushed(r, vector.push[str](?features, p)); }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[str](versions.data, versions.len, by_version);
+    sort.sort_by[str](features.data, features.len, by_text);
+    i = 0;
+    for (i < 4) {
+        var present: bool  = false;
+        var j:       usize = 0;
+        for (j < params.len) {
+            if (str_equals(params.data[j], FIRST[i])) { present = true; }
+            j = j + 1;
+        }
+        if (!present) {
+            fail(r, NO_FIRST, FIRST[i]);
+            ret;
+        }
+        add_row(r, m, FIRST[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < versions.len) {
+        add_row(r, m, versions.data[i]);
+        i = i + 1;
+    }
+    m.versions = versions.len::u32;
+    i          = 0;
+    for (i < features.len) {
+        add_row(r, m, features.data[i]);
+        i = i + 1;
+    }
+}
+
+fun imply(r: *Reader, m: *Model, from: u32, to: u32) {
+    if (from == to || has(?m.implies.data[from], to)) { ret; }
+    pushed(r, vector.push[u32](?m.implies.data[from], to));
+}
+
+# each rung implying every lower rung of its field, plainly or, under conditions besides FEAT_AA64EL1, as a combination it carries
+fun ladders(r: *Reader) {
+    var i: usize = 0;
+    for (i < r.rungs.len) {
+        val hi: *Rung = ?r.rungs.data[i];
+        var j:  usize = 0;
+        for (j < r.rungs.len) {
+            val lo: *Rung = ?r.rungs.data[j];
+            if (lo.k < hi.k && str_equals(lo.key, hi.key) && !str_equals(lo.feature, hi.feature)) {
+                var to: vector.Vector[str] = vector.init[str](r.alloc);
+                pushed(r, vector.push[str](?to, lo.feature));
+                var pos: vector.Vector[str] = vector.init[str](r.alloc);
+                pushed(r, vector.push[str](?pos, hi.feature));
+                var k: usize = 0;
+                for (k < hi.cond.len) {
+                    if (!str_equals(hi.cond.data[k], AARCH64)) { pushed(r, vector.push[str](?pos, hi.cond.data[k])); }
+                    k = k + 1;
+                }
+                if (pos.len == 1) { pushed(r, vector.push[Implication](?r.implications, Implication{from: hi.feature, to: to})); }
+                or                { pushed(r, vector.push[Combined](?r.combined, Combined{pos: pos, then: to})); }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the implications, combinations, conflicts and revisions over the rows
+fun resolve(r: *Reader, m: *Model) {
+    ladders(r);
+    var i: usize = 0;
+    for (i < m.rows.len) {
+        pushed(r, vector.push[vector.Vector[u32]](?m.implies, vector.init[u32](r.alloc)));
+        pushed(r, vector.push[str](?m.revisions, ""));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < r.implications.len) {
+        val imp:  *Implication = ?r.implications.data[i];
+        val from: opt[u32]     = row_of(m, imp.from);
+        if (sel from.some) {
+            var k: usize = 0;
+            for (k < imp.to.len) {
+                val to: opt[u32] = row_of(m, imp.to.data[k]);
+                if (sel to.some) { imply(r, m, from.some, to.some); }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    i = 0;
+    for (i < m.implies.len) {
+        sort.sort_by[u32](m.implies.data[i].data, m.implies.data[i].len, by_id);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < r.combined.len) {
+        val c:    *Combined          = ?r.combined.data[i];
+        var pos:  vector.Vector[u32] = vector.init[u32](r.alloc);
+        var kept: bool               = true;
+        var k:    usize              = 0;
+        for (k < c.pos.len) {
+            val id: opt[u32] = row_of(m, c.pos.data[k]);
+            if (sel id.some) {
+                if (!has(?pos, id.some)) { pushed(r, vector.push[u32](?pos, id.some)); }
+            }
+            or { kept = false; }
+            k = k + 1;
+        }
+        if (!kept) {
+            i = i + 1;
+            cnt;
+        }
+        var by:    u32  = pos.data[0];
+        var found: bool = false;
+        k = 0;
+        for (k < pos.len) {
+            if (!found && version(m.rows.data[pos.data[k]])) {
+                by    = pos.data[k];
+                found = true;
+            }
+            k = k + 1;
+        }
+        var then: vector.Vector[u32] = vector.init[u32](r.alloc);
+        k = 0;
+        for (k < c.then.len) {
+            val id: opt[u32] = row_of(m, c.then.data[k]);
+            if (sel id.some) {
+                if (!has(?pos, id.some) && !has(?then, id.some) && !has(?m.implies.data[by], id.some)) { pushed(r, vector.push[u32](?then, id.some)); }
+            }
+            k = k + 1;
+        }
+        if (then.len == 0) {
+            i = i + 1;
+            cnt;
+        }
+        var when: vector.Vector[u32] = vector.init[u32](r.alloc);
+        k = 0;
+        for (k < pos.len) {
+            if (pos.data[k] != by) { pushed(r, vector.push[u32](?when, pos.data[k])); }
+            k = k + 1;
+        }
+        sort.sort_by[u32](when.data, when.len, by_id);
+        var merged: bool = false;
+        k = 0;
+        for (k < m.combinations.len) {
+            val x: *Combination = ?m.combinations.data[k];
+            if (!merged && x.by == by && lists(?x.when, ?when) == 0) {
+                var t: usize = 0;
+                for (t < then.len) {
+                    if (!has(?x.then, then.data[t])) { pushed(r, vector.push[u32](?x.then, then.data[t])); }
+                    t = t + 1;
+                }
+                sort.sort_by[u32](x.then.data, x.then.len, by_id);
+                merged = true;
+            }
+            k = k + 1;
+        }
+        if (!merged) {
+            sort.sort_by[u32](then.data, then.len, by_id);
+            pushed(r, vector.push[Combination](?m.combinations, Combination{by: by, when: when, then: then}));
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Combination](m.combinations.data, m.combinations.len, by_combination);
+    i = 0;
+    for (i < r.excluded.len) {
+        val e: *Excluded = ?r.excluded.data[i];
+        if (e.pos.len == 1) {
+            val a: opt[u32] = row_of(m, e.pos.data[0]);
+            val b: opt[u32] = row_of(m, e.x);
+            if (sel a.some) {
+                if (sel b.some) {
+                    var pair: Conflict = Conflict{a: a.some, b: b.some};
+                    if (b.some < a.some) { pair = Conflict{a: b.some, b: a.some}; }
+                    var twice: bool  = false;
+                    var k:     usize = 0;
+                    for (k < m.conflicts.len) {
+                        if (by_conflict(?m.conflicts.data[k], ?pair) == 0) { twice = true; }
+                        k = k + 1;
+                    }
+                    if (!twice && pair.a != pair.b) { pushed(r, vector.push[Conflict](?m.conflicts, pair)); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Conflict](m.conflicts.data, m.conflicts.len, by_conflict);
+    i = 0;
+    for (i < r.minimums.len) {
+        val x:  *Minimum = ?r.minimums.data[i];
+        val id: opt[u32] = row_of(m, x.feature);
+        if (sel id.some) {
+            if (version(x.version)) {
+                var have: str = m.revisions.data[id.some];
+                if (have[0] == 0 || by_version(?have, ?x.version) < 0) { m.revisions.data[id.some] = x.version; }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the model of Features.json
+# ---
+# a:   allocator for the model, which outlives every reader of it
+# f:   the Features.json file
+# ret: the model, or the refusal of the file
+pub fun read(a: *A.Allocator, f: *source.File) res[Model, diag.Refusal] {
+    val parsed: res[document.Document, diag.Refusal] = document.read(a, f);
+    if (sel parsed.err) { ret res[Model, diag.Refusal].err{parsed.err}; }
+    var doc: document.Document = parsed.ok;
+    var r:   Reader            = Reader{
+        alloc:        a,
+        doc:          ?doc,
+        failed:       false,
+        failure:      diag.refusal(nil, 0, nil, nil),
+        implications: vector.init[Implication](a),
+        combined:     vector.init[Combined](a),
+        excluded:     vector.init[Excluded](a),
+        minimums:     vector.init[Minimum](a),
+        rungs:        vector.init[Rung](a),
+    };
+    val params: res[*json.Value, diag.Refusal] = document.member(?doc, ?doc.root, "parameters");
+    if (sel params.err) { ret res[Model, diag.Refusal].err{params.err}; }
+    val count: res[usize, diag.Refusal] = document.count(?doc, params.ok, "parameters");
+    if (sel count.err) { ret res[Model, diag.Refusal].err{count.err}; }
+    var names: vector.Vector[str] = vector.init[str](a);
+    var i:     usize              = 0;
+    for (i < count.ok) {
+        val p:    *json.Value = document.item(params.ok, i);
+        val name: str         = text(?r, p, "name");
+        if (name == nil) { ret res[Model, diag.Refusal].err{diag.refusal(f.path, 0, document.MISSING, "name")}; }
+        pushed(?r, vector.push[str](?names, name));
+        val cs: *json.Value = at(p, "constraints");
+        if (cs != nil && cs.kind == json.ARRAY) {
+            var k: usize = 0;
+            for (k < cs.count) {
+                constraint(?r, document.item(cs, k));
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val top: *json.Value = at(?doc.root, "constraints");
+    if (top != nil && top.kind == json.ARRAY) {
+        i = 0;
+        for (i < top.count) {
+            constraint(?r, document.item(top, i));
+            i = i + 1;
+        }
+    }
+    var m: Model = Model{
+        rows:         vector.init[str](a),
+        versions:     0,
+        revisions:    vector.init[str](a),
+        implies:      vector.init[vector.Vector[u32]](a),
+        combinations: vector.init[Combination](a),
+        conflicts:    vector.init[Conflict](a),
+        ids:          map.init[str, u32](a),
+    };
+    order(?r, ?m, ?names);
+    if (!r.failed) { resolve(?r, ?m); }
+    if (r.failed)  { ret res[Model, diag.Refusal].err{r.failure}; }
+    ret res[Model, diag.Refusal].ok{m};
+}
+
+# the row named `name`
+pub fun row(m: *Model, name: str) opt[u32] {
+    ret row_of(m, name);
+}
+
+# a model of the first features, two versions, three features, a feature of a future version and one of AArch64
+#[testing]
+fun t_model(a: *A.Allocator) res[Model, diag.Refusal] {
+    val text: res[str, StrError] = str_join(
+        a,
+        "{\"parameters\":[{\"name\":\"FEAT_SVE\",\"constraints\":[]},{\"name\":\"FEAT_SME\",\"constraints\":[]},",
+        "{\"name\":\"FEAT_FP\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"FEAT_AA64EL1\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"FEAT_FP\"},\"op\":\"<=>\",\"right\":{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.Function\",",
+        "\"name\":\"SInt\",\"arguments\":[{\"_type\":\"Types.Field\",\"value\":{\"name\":\"R\",\"field\":\"F\"}}]},",
+        "\"op\":\">=\",\"right\":{\"_type\":\"AST.Integer\",\"value\":0}}}}]},{\"name\":\"FEAT_AdvSIMD\",\"constraints\":[]},",
+        "{\"name\":\"v8Ap0\",\"constraints\":[]},{\"name\":\"v8Ap1\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"v8Ap1\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"v8Ap0\"},\"op\":\"&&\",\"right\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"FEAT_A\"}}}]},{\"name\":\"FEAT_A\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_A\"},\"op\":\"&&\",\"right\":{\"_type\":\"AST.UnaryOp\",",
+        "\"op\":\"!\",\"expr\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_C\"}}},\"op\":\"==>\",\"right\":{\"_type\":\"AST.UnaryOp\",",
+        "\"op\":\"!\",\"expr\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_B\"}}}]},{\"name\":\"FEAT_B\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_B\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"v8Ap1\"}},{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"v8Ap1\"},\"op\":\"&&\",\"right\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_FP\"}},\"op\":\"==>\",",
+        "\"right\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_B\"}}]},{\"name\":\"FEAT_C\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_C\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.UnaryOp\",",
+        "\"op\":\"!\",\"expr\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_SME\"}}},{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_AA64EL1\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Identifier\",\"value\":\"FEAT_C\"},\"op\":\"<=>\",\"right\":{\"_type\":\"AST.BinaryOp\",",
+        "\"left\":{\"_type\":\"AST.Function\",\"name\":\"SInt\",\"arguments\":[{\"_type\":\"Types.Field\",\"value\":{\"name\":\"R\",",
+        "\"field\":\"F\"}}]},\"op\":\">=\",\"right\":{\"_type\":\"AST.Integer\",\"value\":1}}}}]},{\"name\":\"FEAT_AA64EL1\",",
+        "\"constraints\":[]},{\"name\":\"FEAT_X\",\"constraints\":[{\"_type\":\"AST.BinaryOp\",\"left\":{\"_type\":\"AST.Identifier\",",
+        "\"value\":\"FEAT_X\"},\"op\":\"==>\",\"right\":{\"_type\":\"AST.Identifier\",\"value\":\"vFATAp0\"}}]},",
+        "{\"name\":\"vFATAp0\",\"constraints\":[]}],\"constraints\":[]}");
+    if (sel text.err) { ret res[Model, diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, nil)}; }
+    var f: source.File = source.File{path: "Features.json", data: text.ok, len: str_len(text.ok)};
+    ret read(a, ?f);
+}
+
+#[testing]
+fun t_ids(v: *vector.Vector[u32], a: u32, b: u32, len: usize) bool {
+    if (v.len != len)              { ret false; }
+    if (len > 0 && v.data[0] != a) { ret false; }
+    ret len < 2 || v.data[1] == b;
+}
+
+# a version's implications, a version as the carrier, a negated condition as a combination, a conflict, a revision, a field
+# ladder under FEAT_AA64EL1 as an implication, and a future version's feature left out
+test read__the_model_reads_each_kind_of_constraint {
+    var t: testing.Testing;
+    testing.make(?t);
+    val got: res[Model, diag.Refusal] = t_model(testing.allocator_of(?t));
+    if (sel got.err) { ret 1; }
+    var m: Model = got.ok;
+    if (m.rows.len != 10 || m.versions != 2)                                                 { ret 2; }
+    if (!str_equals(m.rows.data[4], "v8Ap0") || !str_equals(m.rows.data[7], "FEAT_AA64EL1")) { ret 3; }
+    if (!t_ids(?m.implies.data[5], 4, 6, 2) || !t_ids(?m.implies.data[9], 2, 0, 1))          { ret 4; }
+    if (!str_equals(m.revisions.data[8], "v8Ap1") || !str_equals(m.revisions.data[6], ""))   { ret 5; }
+    if (m.combinations.len != 2)                                                             { ret 6; }
+    val c0: *Combination = ?m.combinations.data[0];
+    val c1: *Combination = ?m.combinations.data[1];
+    if (c0.by != 5 || !t_ids(?c0.when, 2, 0, 1) || !t_ids(?c0.then, 8, 0, 1))             { ret 7; }
+    if (c1.by != 6 || !t_ids(?c1.when, 8, 0, 1) || !t_ids(?c1.then, 9, 0, 1))             { ret 8; }
+    if (m.conflicts.len != 1 || m.conflicts.data[0].a != 1 || m.conflicts.data[0].b != 9) { ret 9; }
+    val x: opt[u32] = row(?m, "FEAT_X");
+    if (sel x.some) { ret 10; }
+    ret 0;
+}
