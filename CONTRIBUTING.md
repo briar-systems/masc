@@ -15,7 +15,7 @@ out of the tree.
 ```bash
 git init mach-dev
 git -C mach-dev remote add origin https://github.com/briar-systems/mach.git
-git -C mach-dev fetch --depth 1 origin ac39ae9f12a6075605ef2670f1638d8418c87839
+git -C mach-dev fetch --depth 1 origin 6b2b0788eb5066461c958e97e72889f5cf2e97cd
 git -C mach-dev checkout FETCH_HEAD
 cd mach-dev
 mkdir -p ../mach-bin
