@@ -1,8 +1,10 @@
 # the risc-v vector type, as vsetvli and vsetivli set it and the vtype csr holds it
 #
 # a consumer that chooses a vector type states it as a `Vtype` and asks
-# `grouping` how many registers each operand of a row covers under it, which
-# constraint.violated reads. the encoding is "csr:vtype[] encoding" in the
+# `grouping` how many registers each operand of a row covers under it and a
+# context, which constraint.violated reads. the context's view resolves the
+# implementation bounds the grouping needs: ELEN, the narrowest element width
+# and VLEN, as the register file's quantities. the encoding is "csr:vtype[] encoding" in the
 # riscv-isa-manual at 36fdac54a526 (src/unpriv/vector-common.adoc): vlmul in
 # bits 2 to 0, vsew in bits 5 to 3, vta in bit 6 and vma in bit 7. the text
 # is the vendor syntax's, `e32, m2, ta, ma`, every field after the element
@@ -17,8 +19,12 @@ use std.types.view.View;
 use std.types.view.view_eq_str;
 
 use masc.core.constraint;
+use masc.core.quantity;
+use masc.core.register;
 use masc.core.row;
-use syntax_read: masc.syntax.read;
+use masc.core.state;
+use riscv_register: masc.isa.riscv.register;
+use syntax_read:    masc.syntax.read;
 
 # a vector type
 # ---
@@ -43,13 +49,13 @@ pub rec Read {
 pub val SEW_NAMES:  [4]str = [4]str{"e8", "e16", "e32", "e64"};
 pub val LMUL_NAMES: [8]str = [8]str{"m1", "m2", "m4", "m8", "", "mf8", "mf4", "mf2"};
 
-# the bounds of the groups a vector type forms, from "Vector Operands" (emul_rsv), "Vector Load/Store Width Encoding"
-# (vector_ls_emul_rsv, EMUL past 8 or under 1/8 reserved) and "Vector Integer Extension" (an element width no setting
-# supports reserved): element widths of 8 to ELEN, 64 under the V extension
-val LEAST:     i8  = -3;
-val MOST:      i8  = 3;
-val NARROWEST: u16 = 8;
-val WIDEST:    u16 = 64;
+# the most a group's multiplier may be, 8 registers, from "Vector Operands" (emul_rsv) and "Vector Load/Store Width
+# Encoding" (vector_ls_emul_rsv, EMUL past 8 reserved), which no implementation bound changes. the least is
+# SEW_MIN/ELEN (vtype_lmul_fval) and the element widths run from SEW_MIN to ELEN, read from the context
+val MOST: i8 = 3;
+
+# the multiplier encodings a vector type may name, whatever the implementation
+val LEAST_ENCODED: i8 = -3;
 
 # the bits of `v`'s encoding, none when it names a width or multiplier no encoding has
 pub fun encode(v: Vtype) opt[u64] {
@@ -57,7 +63,7 @@ pub fun encode(v: Vtype) opt[u64] {
     for (sew < 4 && (8::u64 << sew) != v.sew::u64) {
         sew = sew + 1;
     }
-    if (sew == 4 || v.lmul < LEAST || v.lmul > MOST) { ret opt[u64].none{}; }
+    if (sew == 4 || v.lmul < LEAST_ENCODED || v.lmul > MOST) { ret opt[u64].none{}; }
     val lmul: u64 = (v.lmul::i64 & 7):~u64;
     var bits: u64 = lmul | (sew << 3);
     if (v.ta) { bits = bits | 0x40; }
@@ -147,11 +153,42 @@ pub fun read(text: View) opt[Read] {
     ret opt[Read].some{Read{vtype: v, len: done}};
 }
 
-# how many registers each operand of row `r` covers under `v`: constraint.Grouped.state when `v` has no encoding, and
-# the first operand whose groups `v` reserves when one has
-pub fun grouping(r: *row.Row, v: Vtype) constraint.Grouped {
+# the bits quantity `q` of the risc-v file is at its least under the view
+fun least_bits(v: *register.Available, q: u8) u32 {
+    ret riscv_register.FILE.quantities.at[q].unit * register.range(v, q).least;
+}
+
+# the bits quantity `q` of the risc-v file is at its most under the view
+fun most_bits(v: *register.Available, q: u8) u32 {
+    ret riscv_register.FILE.quantities.at[q].unit * register.range(v, q).most;
+}
+
+# the exponent of n, a power of two
+fun log2(n: u32) i8 {
+    var e: i8 = 0;
+    for ((1::u32 << e::u32) < n) {
+        e = e + 1;
+    }
+    ret e;
+}
+
+# the implementation bounds of a vector state under `ctx`, the vector type's element width and multiplier unset: element
+# widths of SEW_MIN to ELEN, multipliers of SEW_MIN/ELEN to 8, and the least VLEN the context's view admits. ELEN is its
+# most where the selection fixes none
+pub fun bounds(ctx: *state.Context) constraint.State {
+    val widest:    u32 = most_bits(ctx.view, riscv_register.ELEN);
+    val narrowest: u32 = least_bits(ctx.view, riscv_register.SEW_MIN);
+    ret constraint.State{element: 0, multiplier: 0, least: log2(narrowest) - log2(widest), most: MOST, narrowest: narrowest::u16, widest: widest::u16, length: least_bits(ctx.view, riscv_register.VLEN)};
+}
+
+# how many registers each operand of row `r` covers under `v` and the context `ctx`: constraint.Grouped.state when `v`
+# has no encoding or sets a width or multiplier the context's implementation bounds reserve, and the first operand whose
+# groups `v` reserves when one has
+pub fun grouping(r: *row.Row, v: Vtype, ctx: *state.Context) constraint.Grouped {
     val bits: opt[u64] = encode(v);
     if (sel bits.none) { ret constraint.Grouped.state{}; }
-    val s: constraint.State = constraint.State{element: v.sew, multiplier: v.lmul, least: LEAST, most: MOST, narrowest: NARROWEST, widest: WIDEST};
+    var s: constraint.State = bounds(ctx);
+    s.element    = v.sew;
+    s.multiplier = v.lmul;
     ret constraint.grouping(r.operands.at, r.operands.len, opt[constraint.State].some{s});
 }

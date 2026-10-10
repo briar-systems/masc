@@ -1,0 +1,423 @@
+# the decode patterns of XED: an instruction's PATTERN and a nonterminal rule's conditions
+#
+# a pattern is a list of tokens, each a state macro standing for its tokens or one of:
+#   0x0F         fixed bits of the instruction stream, the value's bits padded to whole bytes
+#   0b1001_0     fixed bits, exactly as many as written
+#   nnn, wrxb    bits of the stream a later token names, one a letter
+#   MOD[mm]      bits of the stream captured into a field, letters for bits any value takes and
+#                0 and 1 for fixed ones, `0b` written or not
+#   MOD=3        a test of a field, `!=` for its negation, the value a number or an XED enumerant
+#   MODRM()      the rules of a nonterminal, matched there
+#   otherwise    in a rule, what no other rule of its nonterminal matches
+# (pysrc/generator.py parse_opcode_spec). a pattern resolves to these pieces in order: the fixed
+# and captured bits of the stream, the field each capture binds and every test. a field must be
+# one the fields files state and a capture no wider than it. a test's value is not held to the
+# field's width, as XED does not hold it, and avx512-disp8.txt tests ELEMENT_SIZE=512 of a 9-bit
+# field. a
+# test of a field the decoder skips (DS), such as ENC_DELETE, is kept, and the field says so
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use gen.diag;
+use gen.isa.x86.xed.table;
+use gen.isa.x86.xed.text;
+use gen.lines;
+
+# what a piece is
+# ---
+# BITS:      bits of the instruction stream, fixed or named by a letter
+# CAPTURE:   bits of the stream bound to a field
+# TEST:      a test of a field
+# CALL:      a nonterminal matched in place
+# OTHERWISE: what no other rule of the nonterminal matches
+pub def Kind: u8;
+
+pub val BITS:      Kind = 0;
+pub val CAPTURE:   Kind = 1;
+pub val TEST:      Kind = 2;
+pub val CALL:      Kind = 3;
+pub val OTHERWISE: Kind = 4;
+
+# one piece of a pattern
+# ---
+# kind:    what it is
+# name:    the field of a capture or test, the nonterminal of a call
+# len:     how many bits of the stream it is, for bits and a capture
+# value:   its fixed bits, the last written lowest, or the value a test compares with
+# fixed:   which of its bits are fixed
+# letters: its bits as written, each 0, 1 or a letter, for bits and a capture
+# equal:   whether a test is `=` rather than `!=`
+# symbol:  the enumerant a test compares with, spelled as written, nil for a number
+pub rec Piece {
+    kind:    Kind;
+    name:    str;
+    len:     u8;
+    value:   u64;
+    fixed:   u64;
+    letters: str;
+    equal:   bool;
+    symbol:  str;
+}
+
+# a resolved pattern
+pub rec Pattern {
+    pieces: vector.Vector[Piece];
+}
+
+pub val MALFORMED:   str = "pattern token is not bits, a capture, a test, a nonterminal or a state macro";
+pub val NO_FIELD:    str = "field is not one the fields files state";
+pub val TOO_WIDE:    str = "bits wider than their field";
+pub val TOO_LONG:    str = "fixed bits wider than 64";
+pub val UPPER:       str = "capture bits hold an upper case letter";
+pub val NO_REGISTER: str = "register is not one the register files state";
+pub val RANGE:       str = "a range capture outside an instruction pattern";
+
+fun upper_letter(c: u8) bool {
+    ret c >= 'A' && c <= 'Z';
+}
+
+fun lower_letter(c: u8) bool {
+    ret c >= 'a' && c <= 'z';
+}
+
+fun digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+fun name_char(c: u8) bool {
+    ret upper_letter(c) || lower_letter(c) || digit(c) || c == '_';
+}
+
+fun memory(l: *lines.Line) err[diag.Refusal] {
+    ret err[diag.Refusal].err{text.memory(l)};
+}
+
+fun push(l: *lines.Line, p: *Pattern, piece: Piece) err[diag.Refusal] {
+    if (!text.pushed(vector.push[Piece](?p.pieces, piece))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the piece of the bits written in `w`, 0, 1 or a letter each, underscores dropped
+fun bits(a: *A.Allocator, l: *lines.Line, kind: Kind, name: str, w: View) res[Piece, diag.Refusal] {
+    var out: vector.Vector[u8] = vector.init[u8](a);
+    var p:   Piece             = Piece{kind: kind, name: name, len: 0, value: 0, fixed: 0, letters: nil, equal: true, symbol: nil};
+    var i:   usize             = 0;
+    for (i < w.len) {
+        val c: u8 = w.data[i];
+        if (c != '_') {
+            if (out.len >= 64) { ret res[Piece, diag.Refusal].err{lines.refuse(l, TOO_LONG, nil)}; }
+            p.value = p.value << 1;
+            p.fixed = p.fixed << 1;
+            if (c == '0' || c == '1') {
+                p.value = p.value | (c - '0')::u64;
+                p.fixed = p.fixed | 1;
+            }
+            if (!text.pushed(vector.push[u8](?out, c))) { ret res[Piece, diag.Refusal].err{text.memory(l)}; }
+        }
+        i = i + 1;
+    }
+    if (!text.pushed(vector.push[u8](?out, 0))) { ret res[Piece, diag.Refusal].err{text.memory(l)}; }
+    p.len     = (out.len - 1)::u8;
+    p.letters = out.data;
+    ret res[Piece, diag.Refusal].ok{p};
+}
+
+# `n` as `len` binary digits into a scratch buffer
+fun binary(a: *A.Allocator, l: *lines.Line, n: u64, len: u32) res[View, diag.Refusal] {
+    val got: res[*u8, A.Error] = A.allocate[u8](a, len::usize + 1);
+    if (sel got.err) { ret res[View, diag.Refusal].err{text.memory(l)}; }
+    var i: u32 = 0;
+    for (i < len) {
+        got.ok[i] = '0' + ((n >> (len - 1 - i)::u64) & 1)::u8;
+        i         = i + 1;
+    }
+    ret res[View, diag.Refusal].ok{view(got.ok, len::usize)};
+}
+
+fun bit_length(n: u64) u32 {
+    var len: u32 = 1;
+    for (len < 64 && (n >> len::u64) != 0) {
+        len = len + 1;
+    }
+    ret len;
+}
+
+fun field(a: *A.Allocator, x: *table.Tables, l: *lines.Line, name: str) res[*table.Field, diag.Refusal] {
+    val f: opt[*table.Field] = table.field(a, x, name);
+    if (sel f.none) { ret res[*table.Field, diag.Refusal].err{lines.refuse(l, NO_FIELD, name)}; }
+    ret res[*table.Field, diag.Refusal].ok{f.some};
+}
+
+# where the `[` of a capture `NAME[...]` is, if `w` is one
+fun capture_at(w: str) opt[usize] {
+    val n: usize = str_len(w);
+    var i: usize = 0;
+    for (i < n && name_char(w[i])) {
+        i = i + 1;
+    }
+    if (i == 0 || i + 2 >= n || w[i] != '[' || w[n - 1] != ']') { ret opt[usize].none{}; }
+    ret opt[usize].some{i};
+}
+
+# the bounds of a range capture `NAME[lo-hi]`
+pub fun range(w: str, lo: *u64, hi: *u64) opt[usize] {
+    val at: opt[usize] = capture_at(w);
+    if (sel at.none) { ret opt[usize].none{}; }
+    val n:   usize      = str_len(w);
+    val in:  View       = view(?w[at.some + 1], n - at.some - 2);
+    val cut: opt[usize] = text.find(in, '-');
+    if (sel cut.none) { ret opt[usize].none{}; }
+    val a: opt[u64] = text.number(text.part(in, 0, cut.some));
+    val b: opt[u64] = text.number(text.part(in, cut.some + 1, in.len - cut.some - 1));
+    if (sel a.none) { ret opt[usize].none{}; }
+    if (sel b.none) { ret opt[usize].none{}; }
+    @lo = a.some;
+    @hi = b.some;
+    ret opt[usize].some{at.some};
+}
+
+fun capture(a: *A.Allocator, x: *table.Tables, l: *lines.Line, w: str, at: usize, p: *Pattern) err[diag.Refusal] {
+    val n:    usize              = str_len(w);
+    val head: res[str, StrError] = str_copy_slice(a, w, 0, at);
+    if (sel head.err) { ret memory(l); }
+    var in: View       = view(?w[at + 1], n - at - 2);
+    var lo: u64        = 0;
+    var hi: u64        = 0;
+    val r:  opt[usize] = range(w, ?lo, ?hi);
+    if (sel r.some) { ret err[diag.Refusal].err{lines.refuse(l, RANGE, w)}; }
+    var i: usize = 0;
+    for (i < in.len) {
+        if (upper_letter(in.data[i]))                                                                   { ret err[diag.Refusal].err{lines.refuse(l, UPPER, w)}; }
+        if (!(lower_letter(in.data[i]) || in.data[i] == '0' || in.data[i] == '1' || in.data[i] == '_')) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+        i = i + 1;
+    }
+    # a value written without 0b is a decimal number, as XED reads it
+    if (text.starts(in, "0b")) { in = text.part(in, 2, in.len - 2); }
+    or {
+        var numeric: bool = true;
+        i = 0;
+        for (i < in.len) {
+            if (!digit(in.data[i])) { numeric = false; }
+            i = i + 1;
+        }
+        if (numeric) {
+            val v: opt[u64] = text.number(in);
+            if (sel v.none) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+            val b: res[View, diag.Refusal] = binary(a, l, v.some, bit_length(v.some));
+            if (sel b.err) { ret err[diag.Refusal].err{b.err}; }
+            in = b.ok;
+        }
+    }
+    val f: res[*table.Field, diag.Refusal] = field(a, x, l, head.ok);
+    if (sel f.err) { ret err[diag.Refusal].err{f.err}; }
+    val piece: res[Piece, diag.Refusal] = bits(a, l, CAPTURE, head.ok, in);
+    if (sel piece.err)                 { ret err[diag.Refusal].err{piece.err}; }
+    if (piece.ok.len::u32 > f.ok.bits) { ret err[diag.Refusal].err{lines.refuse(l, TOO_WIDE, w)}; }
+    ret push(l, p, piece.ok);
+}
+
+# where the `=` or `!` of a test `FIELD=VALUE` or `FIELD!=VALUE` is, if `w` is one
+fun test_at(w: str) opt[usize] {
+    val n: usize = str_len(w);
+    var i: usize = 0;
+    for (i < n && (upper_letter(w[i]) || digit(w[i]) || w[i] == '_')) {
+        i = i + 1;
+    }
+    if (i == 0 || i >= n) { ret opt[usize].none{}; }
+    var v: usize = 0;
+    if (w[i] == '=')                                 { v = i + 1; }
+    or (w[i] == '!' && i + 1 < n && w[i + 1] == '=') { v = i + 2; }
+    or                                               { ret opt[usize].none{}; }
+    if (v >= n)                                      { ret opt[usize].none{}; }
+    var k: usize = v;
+    for (k < n) {
+        val c: u8 = w[k];
+        if (!(upper_letter(c) || digit(c) || c == '_' || c == 'x' || c == 'b')) { ret opt[usize].none{}; }
+        k = k + 1;
+    }
+    ret opt[usize].some{i};
+}
+
+fun test(a: *A.Allocator, x: *table.Tables, l: *lines.Line, w: str, at: usize, p: *Pattern) err[diag.Refusal] {
+    val n:    usize              = str_len(w);
+    val head: res[str, StrError] = str_copy_slice(a, w, 0, at);
+    if (sel head.err) { ret memory(l); }
+    val f: res[*table.Field, diag.Refusal] = field(a, x, l, head.ok);
+    if (sel f.err) { ret err[diag.Refusal].err{f.err}; }
+    var piece: Piece = Piece{kind: TEST, name: head.ok, len: 0, value: 0, fixed: 0, letters: nil, equal: w[at] == '=', symbol: nil};
+    var from:  usize = at + 1;
+    if (!piece.equal) { from = at + 2; }
+    val value: View     = view(?w[from], n - from);
+    val num:   opt[u64] = text.number(value);
+    if (sel num.some) {
+        piece.value = num.some;
+    }
+    or {
+        val s: res[str, diag.Refusal] = text.owned(a, l, value);
+        if (sel s.err) { ret err[diag.Refusal].err{s.err}; }
+        if (str_starts_with(s.ok, "XED_REG_")) {
+            val r: opt[*table.Register] = table.register(a, x, ?s.ok[8]);
+            if (sel r.none) { ret err[diag.Refusal].err{lines.refuse(l, NO_REGISTER, s.ok)}; }
+        }
+        piece.symbol = s.ok;
+    }
+    ret push(l, p, piece);
+}
+
+# the nonterminal a call `Name()` names, if `w` is one, any underscores after it dropped
+pub fun call(a: *A.Allocator, w: str) opt[str] {
+    val n:   usize = str_len(w);
+    var end: usize = n;
+    for (end > 0 && w[end - 1] == '_') {
+        end = end - 1;
+    }
+    if (end < 3 || w[end - 1] != ')' || w[end - 2] != '(') { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < end - 2) {
+        if (!name_char(w[i])) { ret opt[str].none{}; }
+        i = i + 1;
+    }
+    val got: res[str, StrError] = str_copy_slice(a, w, 0, end - 2);
+    if (sel got.err) { ret opt[str].none{}; }
+    ret opt[str].some{got.ok};
+}
+
+# the one token `w`, not a state macro, resolved onto `p`
+fun token(a: *A.Allocator, x: *table.Tables, l: *lines.Line, w: str, p: *Pattern) err[diag.Refusal] {
+    val n: usize = str_len(w);
+    if (str_equals(w, "otherwise")) { ret push(l, p, Piece{kind: OTHERWISE, name: nil, len: 0, value: 0, fixed: 0, letters: nil, equal: true, symbol: nil}); }
+    if (n > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
+        val v: opt[u64] = text.number(view(w, n));
+        if (sel v.none) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+        # the value's bits, padded to whole bytes as XED pads them
+        var len: u32 = bit_length(v.some);
+        len = (len + 7) / 8 * 8;
+        val b: res[View, diag.Refusal] = binary(a, l, v.some, len);
+        if (sel b.err) { ret err[diag.Refusal].err{b.err}; }
+        val piece: res[Piece, diag.Refusal] = bits(a, l, BITS, nil, b.ok);
+        if (sel piece.err) { ret err[diag.Refusal].err{piece.err}; }
+        ret push(l, p, piece.ok);
+    }
+    val at: opt[usize] = capture_at(w);
+    if (sel at.some) { ret capture(a, x, l, w, at.some, p); }
+    val nt: opt[str] = call(a, w);
+    if (sel nt.some) { ret push(l, p, Piece{kind: CALL, name: nt.some, len: 0, value: 0, fixed: 0, letters: nil, equal: true, symbol: nil}); }
+    val t: opt[usize] = test_at(w);
+    if (sel t.some) { ret test(a, x, l, w, t.some, p); }
+    # 0b and its bits, or bits and letters as written
+    var raw:    View = view(w, n);
+    val formal: bool = n > 2 && w[0] == '0' && w[1] == 'b';
+    if (formal) { raw = view(?w[2], n - 2); }
+    var i: usize = 0;
+    for (i < raw.len) {
+        val c: u8 = raw.data[i];
+        if (!(c == '0' || c == '1' || c == '_' || (!formal && lower_letter(c)))) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+        i = i + 1;
+    }
+    val piece: res[Piece, diag.Refusal] = bits(a, l, BITS, nil, raw);
+    if (sel piece.err)     { ret err[diag.Refusal].err{piece.err}; }
+    if (piece.ok.len == 0) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, w)}; }
+    ret push(l, p, piece.ok);
+}
+
+# the pattern of the tokens `words`, each state macro standing for its tokens
+# ---
+# a:     allocator for the pieces
+# x:     the flat tables, for the state macros, fields and registers
+# l:     the line the tokens are on
+# words: the tokens
+# ret:   the pattern, or the refusal of a token at the line
+pub fun parse(a: *A.Allocator, x: *table.Tables, l: *lines.Line, words: *vector.Vector[str]) res[Pattern, diag.Refusal] {
+    var p: Pattern = Pattern{pieces: vector.init[Piece](a)};
+    var i: usize   = 0;
+    for (i < words.len) {
+        val w: str               = words.data[i];
+        val m: opt[*table.Macro] = table.macro(a, x, w);
+        if (sel m.some) {
+            var k: usize = 0;
+            for (k < m.some.tokens.len) {
+                val got: err[diag.Refusal] = token(a, x, l, m.some.tokens.data[k], ?p);
+                if (sel got.err) { ret res[Pattern, diag.Refusal].err{got.err}; }
+                k = k + 1;
+            }
+        }
+        or {
+            val got: err[diag.Refusal] = token(a, x, l, w, ?p);
+            if (sel got.err) { ret res[Pattern, diag.Refusal].err{got.err}; }
+        }
+        i = i + 1;
+    }
+    ret res[Pattern, diag.Refusal].ok{p};
+}
+
+# the value `p` fixes the field `name` to, by a capture of fixed bits or a test for equality with a number
+pub fun fixes(p: *Pattern, name: str) opt[u64] {
+    var i: usize = 0;
+    for (i < p.pieces.len) {
+        val q: *Piece = ?p.pieces.data[i];
+        if (q.name != nil && str_equals(q.name, name)) {
+            var all: u64 = ~0::u64;
+            if (q.len < 64)                                   { all = (1::u64 << q.len::u64) - 1; }
+            if (q.kind == CAPTURE && q.fixed == all)          { ret opt[u64].some{q.value}; }
+            if (q.kind == TEST && q.equal && q.symbol == nil) { ret opt[u64].some{q.value}; }
+        }
+        i = i + 1;
+    }
+    ret opt[u64].none{};
+}
+
+#[testing]
+fun t_parse(a: *A.Allocator, x: *table.Tables, spelled: str) res[Pattern, diag.Refusal] {
+    var l: lines.Line                            = lines.Line{file: "datafiles/isa.txt", number: 7, text: view(spelled, str_len(spelled))};
+    val w: res[vector.Vector[str], diag.Refusal] = table.words(a, ?l);
+    if (sel w.err) { ret res[Pattern, diag.Refusal].err{w.err}; }
+    var words: vector.Vector[str] = w.ok;
+    ret parse(a, x, ?l, ?words);
+}
+
+test parse__a_pattern_resolves_to_fixed_bits_and_fields {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a:   *A.Allocator               = testing.allocator_of(?t);
+    var x:   table.Tables               = table.t_tables(a);
+    val got: res[Pattern, diag.Refusal] = t_parse(a, ?x, "0x0F 0x58 MOD[0b11] MOD=3 REG[rrr] RM[nnn] MODRM()");
+    if (sel got.err) { ret 1; }
+    var p: Pattern = got.ok;
+    if (p.pieces.len != 7) { ret 2; }
+    val q: *Piece = p.pieces.data;
+    if (q[0].kind != BITS || q[0].len != 8 || q[0].value != 0x0F || q[0].fixed != 0xFF)                                                { ret 3; }
+    if (q[1].kind != BITS || q[1].len != 8 || q[1].value != 0x58)                                                                      { ret 4; }
+    if (q[2].kind != CAPTURE || !str_equals(q[2].name, "MOD") || q[2].len != 2 || q[2].value != 3 || q[2].fixed != 3)                  { ret 5; }
+    if (q[3].kind != TEST || !str_equals(q[3].name, "MOD") || !q[3].equal || q[3].value != 3)                                          { ret 6; }
+    if (q[4].kind != CAPTURE || !str_equals(q[4].name, "REG") || q[4].len != 3 || q[4].fixed != 0 || !str_equals(q[4].letters, "rrr")) { ret 7; }
+    if (q[5].kind != CAPTURE || !str_equals(q[5].name, "RM") || q[5].len != 3)                                                         { ret 8; }
+    if (q[6].kind != CALL || !str_equals(q[6].name, "MODRM"))                                                                          { ret 9; }
+    val mod: opt[u64] = fixes(?p, "MOD");
+    if (!(sel mod.some && mod.some == 3)) { ret 10; }
+    val reg: opt[u64] = fixes(?p, "REG");
+    if (sel reg.some) { ret 11; }
+    # a capture wider than its field, and a field the fields files do not state, are refused at the line
+    val wide: res[Pattern, diag.Refusal] = t_parse(a, ?x, "0x0F REG[rrrr]");
+    if (!(sel wide.err && (wide.err.message == TOO_WIDE && wide.err.line == 7))) { ret 12; }
+    val none: res[Pattern, diag.Refusal] = t_parse(a, ?x, "0x0F VEX_PREFIX=1");
+    if (!(sel none.err && none.err.message == NO_FIELD)) { ret 13; }
+    ret 0;
+}

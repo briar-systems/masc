@@ -11,6 +11,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -21,18 +22,20 @@ use A: std.allocator;
 use std.allocator.testing;
 use std.collections.vector;
 
+use masc.codec.walk;
 use masc.core.constraint;
 use masc.core.diagnostic;
 use masc.core.effect;
 use masc.core.extension;
 use masc.core.field;
+use masc.core.index;
 use masc.core.inst;
 use masc.core.operand;
 use masc.core.register;
 use masc.core.relax;
 use masc.core.requirement;
 use masc.core.row;
-use masc.core.walk;
+use masc.core.state;
 
 use riscv_csr:       masc.isa.riscv.csr;
 use riscv_extension: masc.isa.riscv.extension;
@@ -51,21 +54,22 @@ use masc.isa.riscv.gen_register;
 use masc.isa.riscv.gen_relax;
 use masc.isa.riscv.gen_row;
 
-# a test's selection of one row's extensions, its register view and output buffers
+# a test's selection of one row's extensions, its register view, its context and output buffers
 #[testing]
 rec T {
     t:      testing.Testing;
     s:      extension.Selection;
     v:      register.Available;
+    ctx:    state.Context;
     out:    vector.Vector[u8];
     fixups: vector.Vector[field.Fixup];
 }
 
 #[testing]
 fun t_view(t: *T) bool {
-    val viewed: res[register.Available, register.Error] = register.select(testing.allocator_of(?t.t), ?riscv_register.FILE, ?t.s);
-    if (sel viewed.err) { ret false; }
-    t.v      = viewed.ok;
+    val opened: res[state.Context, state.Opened] = state.open(testing.allocator_of(?t.t), ?riscv_register.FILE, ?t.s, ?riscv_extension.AXES, state.initial(?riscv_extension.AXES), ?t.v);
+    if (sel opened.err) { ret false; }
+    t.ctx    = opened.ok;
     t.out    = vector.init[u8](testing.allocator_of(?t.t));
     t.fixups = vector.init[field.Fixup](testing.allocator_of(?t.t));
     ret true;
@@ -81,25 +85,27 @@ fun t_make(t: *T, spelling: str) bool {
     ret t_view(t);
 }
 
-# a test over the first alternative of `r`'s requirement, the i base and a width: rv32 when the alternative names it, else rv64
+# a test over the first alternative of `r`'s requirement, the i base and a width: xlen=32 when the alternative names it,
+# else xlen=64
 #[testing]
 fun t_make_for(t: *T, r: *row.Row) bool {
     testing.make(?t.t);
     val made: res[extension.Request, extension.Error] = extension.request(testing.allocator_of(?t.t), ?riscv_extension.CATALOG, "", diagnostic.START);
     if (sel made.err) { ret false; }
     var req:   extension.Request = made.ok;
-    var width: requirement.Id    = riscv_extension.RV64;
+    var width: requirement.Id    = riscv_extension.id.XLEN_64;
     if (r.requires.len > 0) {
-        val alt: requirement.Ids = r.requires.at[0];
+        val alt: requirement.Ids = r.requires.at[0].all;
         var i:   u32             = 0;
         for (i < alt.len) {
             extension.request_add(?req, alt.at[i]);
-            if (alt.at[i] == riscv_extension.RV32) { width = riscv_extension.RV32; }
+            if (alt.at[i] == riscv_extension.id.XLEN_32) { width = riscv_extension.id.XLEN_32; }
             i = i + 1;
         }
     }
     extension.request_add(?req, width);
-    extension.request_add(?req, riscv_extension.I);
+    extension.request_add(?req, riscv_extension.id.BASE_I);
+    extension.request_add(?req, riscv_extension.id.I);
     val closed: res[extension.Selection, extension.Error] = extension.close(req);
     if (sel closed.err) { ret false; }
     t.s = closed.ok;
@@ -120,7 +126,7 @@ fun t_row(mnemonic: str) u32 {
 #[testing]
 fun t_encode(t: *T, r: u32, values: *operand.Value, count: u32) res[usize, field.Refusal] {
     var ins: inst.Inst = inst.Inst{row: ?CODEC.rows.at[r], values: values, count: count};
-    ret walk.encode(?CODEC, ?t.v, ?ins, ?t.out, ?t.fixups);
+    ret walk.encode(?CODEC, ?t.ctx, ?ins, ?t.out, ?t.fixups);
 }
 
 #[testing]
@@ -149,7 +155,7 @@ fun t_x(n: u16) operand.Value {
 #[testing]
 fun t_immediate(imm: *operand.Immediate, k: u32) i64 {
     var top: i64 = field.ones(imm.bits)::i64;
-    if (imm.signed) { top = (1::i64 << (imm.bits - 1)::i64) - 1; }
+    if (imm.sign == operand.SIGNED) { top = (1::i64 << (imm.bits - 1)::i64) - 1; }
     val step: i64 = 1::i64 << imm.scale::i64;
     top = top - (top % step);
     ret top - k::i64 * step + imm.bias;
@@ -163,7 +169,7 @@ fun t_value(desc: *operand.Operand, k: u32) opt[operand.Value] {
     if (sel shape.register) {
         val r:     *operand.Register = ?shape.register;
         val class: u16               = r.classes.at[0];
-        val count: u32               = riscv_register.FILE.classes[class].count;
+        val count: u32               = register.count_most(?riscv_register.FILE, class)::u32;
         val span:  u32               = operand.span(r, count);
         if (k >= span) { ret opt[operand.Value].none{}; }
         ret opt[operand.Value].some{operand.Value.register{register.make(class, (r.first + span - 1 - k)::u16)}};
@@ -241,9 +247,9 @@ test walk__every_row_encodes_and_decodes_back_to_itself {
         val written: i32 = t_admitted(?t, i, ?values[0]);
         if (written != 0) { ret written; }
         var store: [32]operand.Value;
-        var room1: [8]requirement.Ids;
+        var room1: [8]requirement.Alternative;
         var alts1: field.Admissions                 = field.Admissions{at: ?room1[0], cap: 8, used: 0};
-        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, t.out.data, t.out.len, 0, ?store[0], 32, ?alts1);
+        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, t.out.data, t.out.len, 0, ?store[0], 32, ?alts1);
         if (sel got.err)             { ret 6; }
         if (got.ok.inst.row != r)    { ret 7; }
         if (got.ok.len != t.out.len) { ret 8; }
@@ -275,9 +281,9 @@ test walk__each_hint_row_is_selected_over_its_parent {
         val written: i32 = t_admitted(?t, i, ?values[0]);
         if (written != 0) { ret 10 + written; }
         var store: [32]operand.Value;
-        var room1: [8]requirement.Ids;
+        var room1: [8]requirement.Alternative;
         var alts1: field.Admissions                 = field.Admissions{at: ?room1[0], cap: 8, used: 0};
-        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, t.out.data, t.out.len, 0, ?store[0], 32, ?alts1);
+        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, t.out.data, t.out.len, 0, ?store[0], 32, ?alts1);
         if (!(sel got.ok && got.ok.inst.row == r)) { ret 20; }
         var k: u32 = 0;
         for (k < r.operands.len) {
@@ -286,9 +292,9 @@ test walk__each_hint_row_is_selected_over_its_parent {
         }
         var base: T;
         if (!t_make(?base, "rv64ic")) { ret 22; }
-        var room2:  [8]requirement.Ids;
+        var room2:  [8]requirement.Alternative;
         var alts2:  field.Admissions                 = field.Admissions{at: ?room2[0], cap: 8, used: 0};
-        val parent: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?base.v, t.out.data, t.out.len, 0, ?store[0], 32, ?alts2);
+        val parent: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?base.ctx, t.out.data, t.out.len, 0, ?store[0], 32, ?alts2);
         if (sel parent.ok && (parent.ok.inst.row == r || parent.ok.len != t.out.len)) { ret 23; }
         i = i + 1;
     }
@@ -440,13 +446,16 @@ fun t_overlaps(a: u16, b: u16) bool {
 # the csr state rows: the csr operand, the csr table and the implicit effects reach one row each, and the rows overlap where their bits do
 #[testing]
 fun t_state() i32 {
-    val file: *register.File = CODEC.registers;
-    var i:    u32            = 0;
+    val file:  *register.File = CODEC.registers;
+    var words: [16]u64;
+    var s:     extension.Selection;
+    var ctx:   state.Context  = state.t_bare(?riscv_extension.CATALOG, ?riscv_extension.AXES, state.initial(?riscv_extension.AXES), ?words[0], 16, ?s);
+    var i:     u32            = 0;
     for (i < file.register_count) {
         val r: *register.Register = ?file.registers[i];
         if (r.class == gen_register.CSR_CLASS) {
             if (t_csr(r.number) != register.id_of(r)) { ret 1; }
-            val dwarf: opt[u32] = register.debug_number(file, register.id_of(r), register.DWARF);
+            val dwarf: opt[u32] = state.debug_number(file, register.id_of(r), register.DWARF, ?ctx);
             if (!(sel dwarf.some && dwarf.some == 4096 + r.number::u32)) { ret 2; }
             var k: u32 = 0;
             for (k < gen_csr.TABLE.len) {
@@ -626,6 +635,62 @@ test encode__an_immediate_out_of_range_is_refused {
     ret 0;
 }
 
+# an immediate of either reading admits its signed and its unsigned range, as x86's imm8 takes -1 and 0xff
+test encode__an_immediate_of_either_reading_admits_both_ranges {
+    val either: operand.Immediate = operand.Immediate{bits: 8, sign: operand.EITHER, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS};
+    val low:    opt[str]          = walk.unrepresentable(?either, -128);
+    val high:   opt[str]          = walk.unrepresentable(?either, 255);
+    val under:  opt[str]          = walk.unrepresentable(?either, -129);
+    val over:   opt[str]          = walk.unrepresentable(?either, 256);
+    if (sel low.some || sel high.some)   { ret 1; }
+    if (sel under.none || sel over.none) { ret 2; }
+    ret 0;
+}
+
+#[testing]
+val T_EXTENDS: [2]operand.Enumerant = [2]operand.Enumerant{operand.Enumerant{name: "uxtw", value: 2}, operand.Enumerant{name: "sxtw", value: 6}};
+
+# a memory operand admits only the index extends, broadcasts and register post-index it states
+test walk__a_memory_operand_admits_only_the_extends_broadcasts_and_post_index_it_states {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val lw:  *row.Row           = ?CODEC.rows.at[t_row("lw")];
+    var ops: [2]operand.Operand = [2]operand.Operand{lw.operands.at[0], lw.operands.at[0]};
+    val sh:  operand.Shape      = ops[0].shape;
+    if (!sel sh.register) { ret 2; }
+    var m: operand.Memory = operand.Memory{base: sh.register, index: sh.register, segment: operand.Register{}, scales: 1, disp: operand.Immediate{bits: 12, sign: operand.SIGNED}, forms: operand.POST_REGISTER, anchor: operand.UNSTATED};
+    m.extends    = operand.Enumeration{members: ?T_EXTENDS[0], count: 2, mask: false, names: index.NO_ENTRIES};
+    m.broadcasts = 0x8;
+    ops[1].shape = operand.Shape.memory{m};
+    ops[1].role  = operand.READ;
+    var r: row.Row = @lw;
+    r.operands = row.Operands{at: ?ops[0], len: 2};
+    var a:    operand.Address    = operand.Address{base: register.make(0, 2), index: register.make(0, 3), scale: 0, disp: 0, segment: register.NONE, mode: operand.OFFSET, symbol: operand.Symbol{id: operand.NO_SYMBOL, addend: 0, fixup: operand.NO_FIXUP}, extend: 6, broadcast: 3};
+    var v:    operand.Value      = operand.Value.memory{a};
+    val fine: err[field.Refusal] = walk.admits_operand(?CODEC, ?t.ctx, ?r, 1, ?v);
+    if (sel fine.err) { ret 3; }
+    a.extend = 5;
+    v        = operand.Value.memory{a};
+    val unknown: err[field.Refusal] = walk.admits_operand(?CODEC, ?t.ctx, ?r, 1, ?v);
+    if (!sel unknown.err) { ret 4; }
+    a.extend    = 2;
+    a.broadcast = 2;
+    v           = operand.Value.memory{a};
+    val wide: err[field.Refusal] = walk.admits_operand(?CODEC, ?t.ctx, ?r, 1, ?v);
+    if (!sel wide.err) { ret 5; }
+    a.broadcast = 0;
+    a.mode      = operand.POSTINDEX_REGISTER;
+    v           = operand.Value.memory{a};
+    val posted: err[field.Refusal] = walk.admits_operand(?CODEC, ?t.ctx, ?r, 1, ?v);
+    if (sel posted.err) { ret 6; }
+    a.index  = register.NONE;
+    a.extend = 0;
+    v        = operand.Value.memory{a};
+    val bare: err[field.Refusal] = walk.admits_operand(?CODEC, ?t.ctx, ?r, 1, ?v);
+    if (!sel bare.err) { ret 7; }
+    ret 0;
+}
+
 test encode__a_misaligned_scaled_immediate_is_refused {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
@@ -655,7 +720,7 @@ test walk__a_register_range_refuses_outside_it_and_round_trips_inside_it {
     val want:  [2]u8                     = [2]u8{0xE5, 0x8C};
     if (!(sel wrote.ok && t_wrote(?t, ?want[0], 2))) { ret 4; }
     var store: [2]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[cand], t.out.data, t.out.len, 0, ?store[0], 2);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[cand], t.out.data, t.out.len, 0, ?store[0], 2);
     if (sel got.err)                                                          { ret 5; }
     if (!(sel store[0].register && store[0].register == register.make(0, 9))) { ret 6; }
     ret 0;
@@ -678,7 +743,7 @@ test walk__signed_boundary_values_encode_and_decode {
     var store: [3]operand.Value;
     i = 0;
     for (i < 2) {
-        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[addi], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[addi], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
         if (sel got.err)                                                  { ret 4; }
         if (!(sel store[2].immediate && store[2].immediate == bounds[i])) { ret 5; }
         i = i + 1;
@@ -701,7 +766,7 @@ test walk__register_constraints_refuse_the_forms_they_reserve {
     if (t.out.len != 0 || t.fixups.len != 0)                                            { ret 3; }
     val bytes: [4]u8                            = [4]u8{0x57, 0x01, 0x22, 0x32};
     var store: [4]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[t_row("vrgather.vv")], ?bytes[0], 4, 0, ?store[0], 4);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[t_row("vrgather.vv")], ?bytes[0], 4, 0, ?store[0], 4);
     if (!(sel got.err && got.err.message == field.SHARED)) { ret 4; }
     # a widening destination may overlap a single-width source in its highest register, never its lowest
     val high: [4]operand.Value          = [4]operand.Value{t_v(2), t_v(3), t_v(4), unmasked};
@@ -718,6 +783,14 @@ test walk__register_constraints_refuse_the_forms_they_reserve {
     # a masked instruction reads no source from the mask register v0
     val masked: [4]operand.Value = [4]operand.Value{t_v(1), t_v(0), t_v(2), operand.Value.enumerant{riscv_field.MASKED}};
     if (!t_refused(t_encode(?t, t_row("vadd.vv"), ?masked[0], 4), field.SHARED, 1)) { ret 9; }
+    # vcompress reads vs1 as a mask and vs2 at sew, which is never below the set's least element width of 8, so the two
+    # in one register are reserved under every vector type and refused at the unit grouping (#196)
+    val compress: [3]operand.Value          = [3]operand.Value{t_v(2), t_v(4), t_v(4)};
+    val packed:   res[usize, field.Refusal] = t_encode(?t, t_row("vcompress.vm"), ?compress[0], 3);
+    if (!(sel packed.err && packed.err.message == field.SHARED)) { ret 10; }
+    val spread: [3]operand.Value          = [3]operand.Value{t_v(2), t_v(4), t_v(6)};
+    val apart_: res[usize, field.Refusal] = t_encode(?t, t_row("vcompress.vm"), ?spread[0], 3);
+    if (sel apart_.err) { ret 11; }
     ret 0;
 }
 
@@ -734,10 +807,11 @@ fun t_clear(v: constraint.Verdict) bool {
     ret sel v.clear;
 }
 
-# the grouping of row `r` under the vector type of element width `sew` and multiplier `lmul`, UNIT when it reserves one
+# the grouping of row `r` under the vector type of element width `sew` and multiplier `lmul` in the test's context,
+# UNIT when it reserves one
 #[testing]
-fun t_grouping(r: u32, sew: u16, lmul: i8) constraint.Grouping {
-    val got: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[r], riscv_vtype.Vtype{sew: sew, lmul: lmul, ta: true, ma: true});
+fun t_grouping(t: *T, r: u32, sew: u16, lmul: i8) constraint.Grouping {
+    val got: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[r], riscv_vtype.Vtype{sew: sew, lmul: lmul, ta: true, ma: true}, ?t.ctx);
     if (sel got.grouping) { ret got.grouping; }
     ret constraint.UNIT;
 }
@@ -750,9 +824,9 @@ test violated__a_rule_the_state_decides_answers_inexact_and_a_group_the_grouping
     val gather: u32                = t_row("vrgatherei16.vv");
     val shared: [4]operand.Value   = [4]operand.Value{t_v(2), t_v(4), t_v(4), unmasked};
     val unit:   constraint.Verdict = t_verdict(gather, ?shared[0], 4, constraint.UNIT);
-    if (!(sel unit.inexact && unit.inexact.permit == constraint.SAME_WIDTH))   { ret 2; }
-    if (!t_clear(t_verdict(gather, ?shared[0], 4, t_grouping(gather, 16, 0)))) { ret 3; }
-    val wider: constraint.Verdict = t_verdict(gather, ?shared[0], 4, t_grouping(gather, 32, 0));
+    if (!(sel unit.inexact && unit.inexact.permit == constraint.SAME_WIDTH))       { ret 2; }
+    if (!t_clear(t_verdict(gather, ?shared[0], 4, t_grouping(?t, gather, 16, 0)))) { ret 3; }
+    val wider: constraint.Verdict = t_verdict(gather, ?shared[0], 4, t_grouping(?t, gather, 32, 0));
     if (!sel wider.broken) { ret 4; }
     # the walks admit it, as e16 allows it
     val wrote: res[usize, field.Refusal] = t_encode(?t, gather, ?shared[0], 4);
@@ -760,14 +834,14 @@ test violated__a_rule_the_state_decides_answers_inexact_and_a_group_the_grouping
     # four fields of one register from v30 run past v31 under a stated grouping, and the walks state none
     val segment: u32                = t_row("vlseg4e8.v");
     val high:    [3]operand.Value   = [3]operand.Value{t_v(30), t_x(10), unmasked};
-    val past:    constraint.Verdict = t_verdict(segment, ?high[0], 3, t_grouping(segment, 8, 0));
+    val past:    constraint.Verdict = t_verdict(segment, ?high[0], 3, t_grouping(?t, segment, 8, 0));
     if (!(sel past.outside && past.outside == 0))                   { ret 6; }
     if (!t_clear(t_verdict(segment, ?high[0], 3, constraint.UNIT))) { ret 7; }
     val low: [3]operand.Value = [3]operand.Value{t_v(28), t_x(10), unmasked};
-    if (!t_clear(t_verdict(segment, ?low[0], 3, t_grouping(segment, 8, 0)))) { ret 8; }
+    if (!t_clear(t_verdict(segment, ?low[0], 3, t_grouping(?t, segment, 8, 0)))) { ret 8; }
     # at e32 m2 every group of vadd.vv covers two registers, so one named off an even register is not admitted
     val add:  u32                 = t_row("vadd.vv");
-    val pair: constraint.Grouping = t_grouping(add, 32, 1);
+    val pair: constraint.Grouping = t_grouping(?t, add, 32, 1);
     val odd:  [4]operand.Value    = [4]operand.Value{t_v(1), t_v(2), t_v(4), unmasked};
     val off:  constraint.Verdict  = t_verdict(add, ?odd[0], 4, pair);
     if (!(sel off.outside && off.outside == 0)) { ret 9; }
@@ -777,7 +851,7 @@ test violated__a_rule_the_state_decides_answers_inexact_and_a_group_the_grouping
     # a compare's mask destination is one register at any multiplier, so it needs no alignment
     val compare: u32              = t_row("vmseq.vv");
     val mask:    [4]operand.Value = [4]operand.Value{t_v(1), t_v(2), t_v(4), unmasked};
-    if (!t_clear(t_verdict(compare, ?mask[0], 4, t_grouping(compare, 32, 1)))) { ret 12; }
+    if (!t_clear(t_verdict(compare, ?mask[0], 4, t_grouping(?t, compare, 32, 1)))) { ret 12; }
     ret 0;
 }
 
@@ -787,14 +861,14 @@ test grouping__a_vector_type_sizes_each_operand_by_its_element_width {
     val unmasked: operand.Value = operand.Value.enumerant{riscv_field.UNMASKED};
     # vwadd.vv at e32 m2: vd of 2*SEW covers four registers, each source two
     val wadd: u32                 = t_row("vwadd.vv");
-    val wide: constraint.Grouping = t_grouping(wadd, 32, 1);
+    val wide: constraint.Grouping = t_grouping(?t, wadd, 32, 1);
     if (wide.len != 4 || wide.lengths[0] != 2 || wide.lengths[1] != 1 || wide.lengths[2] != 1) { ret 2; }
     # and at m8 vd would cover sixteen, which the type reserves
-    val past: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[wadd], riscv_vtype.Vtype{sew: 32, lmul: 3, ta: true, ma: true});
+    val past: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[wadd], riscv_vtype.Vtype{sew: 32, lmul: 3, ta: true, ma: true}, ?t.ctx);
     if (!(sel past.reserved && past.reserved == 0)) { ret 3; }
     # vzext.vf4 at e32 m4: vs2 of SEW/4 covers one register, which may end vd's four but not start them
     val zext: u32                 = t_row("vzext.vf4");
-    val four: constraint.Grouping = t_grouping(zext, 32, 2);
+    val four: constraint.Grouping = t_grouping(?t, zext, 32, 2);
     if (four.lengths[0] != 2 || four.lengths[1] != 0) { ret 4; }
     val top: [3]operand.Value = [3]operand.Value{t_v(4), t_v(7), unmasked};
     if (!t_clear(t_verdict(zext, ?top[0], 3, four))) { ret 5; }
@@ -802,13 +876,13 @@ test grouping__a_vector_type_sizes_each_operand_by_its_element_width {
     val low:    constraint.Verdict = t_verdict(zext, ?bottom[0], 3, four);
     if (!sel low.broken) { ret 6; }
     # at e32 m1 its source is a quarter of one register, which overlaps vd nowhere legally
-    val one: constraint.Grouping = t_grouping(zext, 32, 0);
+    val one: constraint.Grouping = t_grouping(?t, zext, 32, 0);
     if (one.lengths[1] != -2) { ret 7; }
     val inside: [3]operand.Value   = [3]operand.Value{t_v(4), t_v(4), unmasked};
     val part:   constraint.Verdict = t_verdict(zext, ?inside[0], 3, one);
     if (!sel part.broken) { ret 8; }
     # at e16 its source would be of 4 bits, a width no setting supports
-    val narrow: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[zext], riscv_vtype.Vtype{sew: 16, lmul: 0, ta: true, ma: true});
+    val narrow: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[zext], riscv_vtype.Vtype{sew: 16, lmul: 0, ta: true, ma: true}, ?t.ctx);
     if (!(sel narrow.reserved && narrow.reserved == 1)) { ret 9; }
     ret 0;
 }
@@ -823,9 +897,34 @@ test constraint__covers_counts_the_registers_one_value_of_an_operand_spans {
     if (!t_make(?t, "rv64iv")) { ret 3; }
     # vadd.vv at e32 m4: vd covers four registers, and its mask operand one
     val add: u32                 = t_row("vadd.vv");
-    val g:   constraint.Grouping = t_grouping(add, 32, 2);
+    val g:   constraint.Grouping = t_grouping(?t, add, 32, 2);
     if (constraint.covers(CODEC.rows.at[add].operands.at, 0, g) != 4) { ret 4; }
     if (constraint.covers(CODEC.rows.at[add].operands.at, 3, g) != 1) { ret 5; }
+    ret 0;
+}
+
+# whether row `r` groups under the vector type of `sew` and `lmul` in the test's context, which its bounds do not reserve
+#[testing]
+fun t_groups(t: *T, r: u32, sew: u16, lmul: i8) bool {
+    val got: constraint.Grouped = riscv_vtype.grouping(?CODEC.rows.at[r], riscv_vtype.Vtype{sew: sew, lmul: lmul, ta: true, ma: true}, ?t.ctx);
+    ret sel got.grouping;
+}
+
+# zve32x's elen of 32 reserves e64, an eew of 64 and lmul 1/8, which v's elen of 64 admits, and a scalar element group
+# covers the registers its width needs at the least vlen the selection states: a .vs round's 128 bits one register at
+# v's 128 and four at zve32x's 32 (#193)
+test grouping__the_selections_elen_and_vlen_bound_the_groups {
+    var v: T;
+    var x: T;
+    if (!t_make(?v, "rv64iv_zvkned") || !t_make(?x, "rv64i_zve32x_zvkned")) { ret 1; }
+    val add:  u32 = t_row("vadd.vv");
+    val wadd: u32 = t_row("vwadd.vv");
+    if (!t_groups(?v, add, 64, 0) || t_groups(?x, add, 64, 0))                                 { ret 2; }
+    if (!t_groups(?v, wadd, 32, 0) || t_groups(?x, wadd, 32, 0) || !t_groups(?x, wadd, 16, 0)) { ret 3; }
+    if (!t_groups(?v, add, 8, -3) || t_groups(?x, add, 8, -3) || !t_groups(?x, add, 8, -2))    { ret 4; }
+    val round: u32 = t_row("vaesef.vs");
+    if (constraint.covers(CODEC.rows.at[round].operands.at, 1, t_grouping(?v, round, 32, 0)) != 1) { ret 5; }
+    if (constraint.covers(CODEC.rows.at[round].operands.at, 1, t_grouping(?x, round, 32, 0)) != 4) { ret 6; }
     ret 0;
 }
 
@@ -874,7 +973,7 @@ test walk__a_split_immediate_reassembles {
     var store: [3]operand.Value;
     i = 0;
     for (i < 2) {
-        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[beq], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[beq], t.out.data, t.out.len, i::usize * 4, ?store[0], 3);
         if (sel got.err)                                                 { ret 4; }
         if (!(sel store[2].relative && store[2].relative == offsets[i])) { ret 5; }
         i = i + 1;
@@ -887,7 +986,7 @@ test decode_row__fixed_bits_that_do_not_match_refuse {
     if (!t_make(?t, "rv64i")) { ret 1; }
     val beq:   [4]u8                            = [4]u8{0xE3, 0x85, 0x20, 0x2A};
     var store: [3]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[t_row("addi")], ?beq[0], 4, 0, ?store[0], 3);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[t_row("addi")], ?beq[0], 4, 0, ?store[0], 3);
     if (!(sel got.err && got.err.message == field.MISMATCH)) { ret 2; }
     ret 0;
 }
@@ -897,11 +996,11 @@ test decode__a_truncated_stream_is_refused {
     if (!t_make(?t, "rv64i")) { ret 1; }
     val addi:  [3]u8                            = [3]u8{0x93, 0x00, 0x01};
     var store: [3]operand.Value;
-    var room2: [8]requirement.Ids;
+    var room2: [8]requirement.Alternative;
     var alts2: field.Admissions                 = field.Admissions{at: ?room2[0], cap: 8, used: 0};
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?addi[0], 3, 0, ?store[0], 3, ?alts2);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, ?addi[0], 3, 0, ?store[0], 3, ?alts2);
     if (!(sel got.err && got.err.message == field.TRUNCATED)) { ret 2; }
-    val one: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[t_row("addi")], ?addi[0], 3, 0, ?store[0], 3);
+    val one: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[t_row("addi")], ?addi[0], 3, 0, ?store[0], 3);
     if (!(sel one.err && one.err.message == field.TRUNCATED)) { ret 3; }
     ret 0;
 }
@@ -916,9 +1015,9 @@ test decode__dispatch_selects_the_row_whose_fixed_bits_match {
     var at:     usize  = 0;
     var i:      u32    = 0;
     for (i < 3) {
-        var room3: [8]requirement.Ids;
+        var room3: [8]requirement.Alternative;
         var alts3: field.Admissions                 = field.Admissions{at: ?room3[0], cap: 8, used: 0};
-        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?stream[0], 10, at, ?store[0], 3, ?alts3);
+        val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, ?stream[0], 10, at, ?store[0], 3, ?alts3);
         if (sel got.err)                                { ret 2; }
         if (got.ok.inst.row != ?CODEC.rows.at[rows[i]]) { ret 3; }
         at = at + got.ok.len;
@@ -939,24 +1038,24 @@ test encode__a_fixed_operand_refuses_any_other_register {
     val wrote: res[usize, field.Refusal] = t_encode(?t, spadd, ?values[0], 2);
     if (!(sel wrote.ok && wrote.ok == 2)) { ret 3; }
     var store: [2]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[spadd], t.out.data, t.out.len, 0, ?store[0], 2);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[spadd], t.out.data, t.out.len, 0, ?store[0], 2);
     if (sel got.err)                                                          { ret 4; }
     if (!(sel store[0].register && store[0].register == register.make(0, 2))) { ret 5; }
     ret 0;
 }
 
-# whether `got` was refused as naming a register the selection lacks, which it would admit holding the i base alone
+# whether `got` was refused as naming a register the context lacks, which it would admit under the i base alone
 #[testing]
 fun t_needs_i(got: res[usize, field.Refusal], op: u8) bool {
     if (!t_refused(got, field.UNAVAILABLE, op)) { ret false; }
     if (sel got.err) {
         val needs: requirement.Requirement = got.err.requires;
-        ret sel got.err.cause.unavailable && (needs.len == 1 && needs.at[0].len == 1 && needs.at[0].at[0] == riscv_extension.I);
+        ret sel got.err.cause.unavailable && (needs.len == 1 && needs.at[0].all.len == 1 && needs.at[0].all.at[0] == riscv_extension.id.BASE_I);
     }
     ret false;
 }
 
-# x16 to x31 exist only with the i base, which the e base conflicts with, so a register operand naming one and a zcmp
+# x16 to x31 exist only under the i base, which the e base takes the place of, so a register operand naming one and a zcmp
 # register list reaching past s1 are refused under the e base, encoding and decoding
 test walk__a_register_is_excluded_by_a_selection_lacking_its_condition_and_admitted_by_one_meeting_it {
     var with_i: T;
@@ -968,7 +1067,7 @@ test walk__a_register_is_excluded_by_a_selection_lacking_its_condition_and_admit
     if (!(sel wrote.ok && wrote.ok == 4))                      { ret 2; }
     if (!t_needs_i(t_encode(?with_e, addi, ?values[0], 3), 0)) { ret 3; }
     var store: [3]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?with_e.v, ?CODEC.rows.at[addi], with_i.out.data, with_i.out.len, 0, ?store[0], 3);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?with_e.ctx, ?CODEC.rows.at[addi], with_i.out.data, with_i.out.len, 0, ?store[0], 3);
     if (!(sel got.err && (got.err.message == field.UNAVAILABLE && got.err.operand == 0))) { ret 4; }
     # {ra, s0-s2} is list 7, whose rv32 stack base is 16 bytes, and s2 is x18
     var push_i: T;
@@ -980,7 +1079,7 @@ test walk__a_register_is_excluded_by_a_selection_lacking_its_condition_and_admit
     if (!(sel pushed.ok && pushed.ok == 2))                    { ret 6; }
     if (!t_needs_i(t_encode(?push_e, push, ?listed[0], 2), 0)) { ret 7; }
     var popped: [2]operand.Value;
-    val read:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?push_e.v, ?CODEC.rows.at[push], push_i.out.data, push_i.out.len, 0, ?popped[0], 2);
+    val read:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?push_e.ctx, ?CODEC.rows.at[push], push_i.out.data, push_i.out.len, 0, ?popped[0], 2);
     if (!(sel read.err && read.err.message == field.UNAVAILABLE)) { ret 8; }
     val short: [2]operand.Value          = [2]operand.Value{operand.Value.enumerant{6}, operand.Value.immediate{-16}};
     val kept:  res[usize, field.Refusal] = t_encode(?push_e, push, ?short[0], 2);
@@ -1005,9 +1104,9 @@ fun t_decoded(spelling: str, data: *u8, len: usize) *row.Row {
     var t: T;
     if (!t_make(?t, spelling)) { ret nil; }
     var store: [8]operand.Value;
-    var room:  [8]requirement.Ids;
+    var room:  [8]requirement.Alternative;
     var alts:  field.Admissions                 = field.Admissions{at: ?room[0], cap: 8, used: 0};
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, data, len, 0, ?store[0], 8, ?alts);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, data, len, 0, ?store[0], 8, ?alts);
     if (sel got.err) { ret nil; }
     ret got.ok.inst.row;
 }
@@ -1023,7 +1122,7 @@ fun t_restated(spelling: str, key: str, values: *operand.Value, count: u32, want
     val wrote: res[usize, field.Refusal] = t_encode(?t, at, values, count);
     if (!(sel wrote.ok && t_wrote(?t, want, 4))) { ret 3; }
     var store: [8]operand.Value;
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[at], want, 4, 0, ?store[0], 8);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[at], want, 4, 0, ?store[0], 8);
     if (sel got.err) { ret 4; }
     var k: u32 = 0;
     for (k < count) {
@@ -1060,7 +1159,7 @@ test walk__a_restated_floating_point_row_takes_x_registers_and_an_rv32_double_an
     if (!t_refused(t_encode(?t, narrow, ?odd[0], 4), field.EXCLUDED, 1)) { ret 6; }
     val odd_bytes: [4]u8                            = [4]u8{0x53, 0xF5, 0xE5, 0x02};
     var store:     [4]operand.Value;
-    val got:       res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[narrow], ?odd_bytes[0], 4, 0, ?store[0], 4);
+    val got:       res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[narrow], ?odd_bytes[0], 4, 0, ?store[0], 4);
     if (!(sel got.err && (got.err.message == field.EXCLUDED && got.err.operand == 1))) { ret 7; }
     # at rv64 a double fits one register, odd or even
     if (t_decoded("rv64i_zdinx", ?odd_bytes[0], 4) != ?CODEC.rows.at[t_keyed("fadd.d.zdinx.rv64")]) { ret 8; }
@@ -1085,6 +1184,15 @@ fun t_covers(t: effect.Touched, lo: u16, hi: u16, written: bool) bool {
 fun t_answer(key: str, values: *operand.Value, count: u32, read: *u64, written: *u64) effect.Answer[effect.Touched] {
     val r: *row.Row = ?CODEC.rows.at[t_keyed(key)];
     ret constraint.touched(CODEC.registers, r.operands.at, r.effect, operand.Values{at: values, len: count}, constraint.UNIT, read, written);
+}
+
+# whether `u` is a rule an operand `op` with no known value leaves open
+#[testing]
+fun t_left_by(u: effect.Answer[effect.Touched], op: u8) bool {
+    if (!sel u.undecided) { ret false; }
+    val why: effect.Undecided = u.undecided;
+    if (sel why.open) { ret why.open.operand == op; }
+    ret false;
 }
 
 # what row `key` holding `values` decidedly reads and writes at `UNIT`, nothing when they leave it undecided
@@ -1130,8 +1238,7 @@ test touched__an_even_pair_operand_reads_or_writes_and_kills_both_of_its_registe
     # with the rounding mode unchosen the frm rule is open, and touched passes that up
     val open: [4]operand.Value              = [4]operand.Value{t_x(10), t_x(12), t_x(14), operand.Value.none{}};
     val u:    effect.Answer[effect.Touched] = t_answer("fadd.d.zdinx.rv64", ?open[0], 4, ?read[0], ?written[0]);
-    if (!sel u.undecided)         { ret 9; }
-    if (u.undecided.operand != 3) { ret 9; }
+    if (!t_left_by(u, 3)) { ret 9; }
     ret 0;
 }
 
@@ -1184,8 +1291,7 @@ test touched__a_write_that_may_keep_its_old_value_is_also_a_read {
     var n:    u32              = 0;
     for (n < 4) {
         val u: effect.Answer[effect.Touched] = t_answer(keys[n], ?open[0], 2, ?read[0], ?written[0]);
-        if (!sel u.undecided)         { ret 14; }
-        if (u.undecided.operand != 0) { ret 14; }
+        if (!t_left_by(u, 0)) { ret 14; }
         n = n + 1;
     }
     var jal: [2]operand.Value = [2]operand.Value{t_x(0), operand.Value.relative{0}};
@@ -1212,21 +1318,21 @@ test walk__an_excluded_value_is_refused_and_decode_tries_the_next_candidate {
     val own:   [2]u8                            = [2]u8{0x05, 0x64};
     val zero:  [2]u8                            = [2]u8{0x01, 0x64};
     var store: [2]operand.Value;
-    var room4: [8]requirement.Ids;
+    var room4: [8]requirement.Alternative;
     var alts4: field.Admissions                 = field.Admissions{at: ?room4[0], cap: 8, used: 0};
-    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?spadd[0], 2, 0, ?store[0], 2, ?alts4);
+    val got:   res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, ?spadd[0], 2, 0, ?store[0], 2, ?alts4);
     if (!(sel got.ok && got.ok.inst.row == ?CODEC.rows.at[t_row("c.addi16sp")])) { ret 6; }
     if (!(sel store[1].immediate && store[1].immediate == 32))                   { ret 7; }
-    var room5:   [8]requirement.Ids;
+    var room5:   [8]requirement.Alternative;
     var alts5:   field.Admissions                 = field.Admissions{at: ?room5[0], cap: 8, used: 0};
-    val got_own: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?own[0], 2, 0, ?store[0], 2, ?alts5);
+    val got_own: res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, ?own[0], 2, 0, ?store[0], 2, ?alts5);
     if (!(sel got_own.ok && got_own.ok.inst.row == ?CODEC.rows.at[lui])) { ret 8; }
     # c.lui x8, 0 is excluded and no other candidate holds it
-    var room6: [8]requirement.Ids;
+    var room6: [8]requirement.Alternative;
     var alts6: field.Admissions                 = field.Admissions{at: ?room6[0], cap: 8, used: 0};
-    val none:  res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.v, ?zero[0], 2, 0, ?store[0], 2, ?alts6);
+    val none:  res[walk.Decoded, field.Refusal] = walk.decode(?CODEC, ?t.ctx, ?zero[0], 2, 0, ?store[0], 2, ?alts6);
     if (!sel none.err) { ret 9; }
-    val row: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.v, ?CODEC.rows.at[lui], ?zero[0], 2, 0, ?store[0], 2);
+    val row: res[walk.Decoded, field.Refusal] = walk.decode_row(?CODEC, ?t.ctx, ?CODEC.rows.at[lui], ?zero[0], 2, 0, ?store[0], 2);
     if (!(sel row.err && (row.err.message == field.EXCLUDED && row.err.operand == 1))) { ret 10; }
     ret 0;
 }
@@ -1234,7 +1340,7 @@ test walk__an_excluded_value_is_refused_and_decode_tries_the_next_candidate {
 # the length of the encoding of `ins`, the buffers left empty
 #[testing]
 fun t_length(t: *T, ins: *inst.Inst) usize {
-    val done: res[usize, field.Refusal] = walk.encode(?CODEC, ?t.v, ins, ?t.out, ?t.fixups);
+    val done: res[usize, field.Refusal] = walk.encode(?CODEC, ?t.ctx, ins, ?t.out, ?t.fixups);
     t.out.len    = 0;
     t.fixups.len = 0;
     if (sel done.err) { ret 0; }
@@ -1257,8 +1363,8 @@ test relax__an_out_of_range_branch_becomes_the_inverted_branch_over_a_jal {
     if (relax.far(?CODEC, rx.some, -4096, len))  { ret 5; }
     if (!relax.far(?CODEC, rx.some, -4098, len)) { ret 6; }
     var out: relax.Expansion;
-    if (!relax.expand(?CODEC, ?t.v, rx.some, ?ins, opt[i64].some{5000}, relax.AS_IS, ?out, ?t.out, ?t.fixups)) { ret 7; }
-    if (out.count != 2)                                                                                        { ret 8; }
+    if (!relax.expand(?CODEC, ?t.ctx, rx.some, ?ins, opt[i64].some{5000}, relax.AS_IS, ?out, ?t.out, ?t.fixups)) { ret 7; }
+    if (out.count != 2)                                                                                          { ret 8; }
     # bne a0, a1 over the jal, whose target is measured from the jal
     if (!str_equals(out.steps[0].row.mnemonic, "bne") || !str_equals(out.steps[1].row.mnemonic, "jal")) { ret 9; }
     val first: operand.Value = out.steps[0].values[2];
@@ -1274,7 +1380,7 @@ test relax__an_out_of_range_branch_becomes_the_inverted_branch_over_a_jal {
     var i:     u32   = 0;
     for (i < out.count) {
         var step: inst.Inst                 = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
-        val done: res[usize, field.Refusal] = walk.encode(?CODEC, ?t.v, ?step, ?t.out, ?t.fixups);
+        val done: res[usize, field.Refusal] = walk.encode(?CODEC, ?t.ctx, ?step, ?t.out, ?t.fixups);
         if (sel done.err) { ret 14; }
         total = total + done.ok;
         i     = i + 1;
@@ -1296,8 +1402,8 @@ test relax__a_compressed_branch_becomes_the_full_branch_against_zero {
     if (relax.far(?CODEC, rx.some, 254, len))  { ret 3; }
     if (!relax.far(?CODEC, rx.some, 300, len)) { ret 4; }
     var out: relax.Expansion;
-    if (!relax.expand(?CODEC, ?t.v, rx.some, ?ins, opt[i64].some{300}, relax.AS_IS, ?out, ?t.out, ?t.fixups)) { ret 5; }
-    if (out.count != 1 || !str_equals(out.steps[0].row.mnemonic, "beq"))                                      { ret 6; }
+    if (!relax.expand(?CODEC, ?t.ctx, rx.some, ?ins, opt[i64].some{300}, relax.AS_IS, ?out, ?t.out, ?t.fixups)) { ret 5; }
+    if (out.count != 1 || !str_equals(out.steps[0].row.mnemonic, "beq"))                                        { ret 6; }
     val zero: operand.Value = out.steps[0].values[1];
     val to:   operand.Value = out.steps[0].values[2];
     if (!(sel zero.register && zero.register == register.make(0, 0))) { ret 7; }

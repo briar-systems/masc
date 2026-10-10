@@ -32,13 +32,15 @@ use std.io.writer;
 use mink;
 
 use masc.asm.asm;
-use masc.asm.dialect;
 use masc.asm.model;
 use masc.core.diagnostic;
 use masc.core.extension;
 use masc.core.mode;
+use masc.core.register;
 use masc.core.set;
+use masc.core.state;
 use masc.disasm.disasm;
+use masc.format.dialect;
 use masc.isa.isa;
 use masc.tool.help;
 use masc.tool.info;
@@ -49,6 +51,9 @@ use masc.tool.text;
 
 val PROGRAM: str = "masc";
 val TITLE:   str = "masc - the assembler of the mach toolchain";
+
+# the permissions of a text file the cli writes, as a disassembly listing
+val TEXT_MODE: i32 = 0o644;
 
 val F_HELP:    args.Flag = args.Flag{name: "--help", short: "-h", kind: args.SWITCH, negatable: false, occurs: args.Occurs.once{}, value: "", doc: "show the overview, or a command's page in place of running it"};
 val F_TARGET:  args.Flag = args.Flag{name: "--target", short: "-t", kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "arch", doc: "the architecture, by its name in mink's catalog"};
@@ -352,6 +357,14 @@ fun refuse_target(r: *Run, why: target.Refusal, spelling: str) render.Exit {
     if (sel why.mode)      { ret refuse(r, "target.mode", "the set has no assembler mode the flag chooses", why.mode); }
     if (sel why.twice)     { ret refuse(r, "target.mode", "another flag chooses a value of the same mode as", why.twice); }
     if (sel why.selection) { ret refuse_selection(r, why.selection, spelling); }
+    if (sel why.context)   { ret refuse_context(r, why.context, spelling); }
+    ret memory(r);
+}
+
+fun refuse_context(r: *Run, why: state.Opened, spelling: str) render.Exit {
+    if (sel why.state) { ret refuse(r, "target.selection", "the selection states two values of one state axis, or one no axis takes", spelling); }
+    val e: register.Error = why.view;
+    if (sel e.empty) { ret refuse(r, "target.selection", "the selection bounds a quantity of the register file to no value", spelling); }
     ret memory(r);
 }
 
@@ -368,16 +381,32 @@ fun failed(r: *Run, code: str, f: mink.fail.Fail) render.Exit {
     ret render.exit_of(f);
 }
 
-# the refusal `why` to assemble `src[0..len]`, the file `path`, under the selection `s`
-fun refused(r: *Run, path: str, src: *u8, len: usize, s: *extension.Selection, why: *model.Refusal) {
+# the refusal `why` to assemble `src[0..len]`, the file `path`
+fun refused(r: *Run, path: str, src: *u8, len: usize, why: *model.Refusal) {
     if (sel why.mode.some) {
         render.mode(?r.err, "asm.mode", ?why.mode.some);
         ret;
     }
-    render.refusal(?r.err, "asm.refused", path, src, len, s, ?why.diagnostic);
+    render.refusal(?r.err, "asm.refused", path, src, len, why.message, why.span, ?why.unmet);
+}
+
+# the command `run` runs with mink's built in format registry, given back once it has run
+fun with_formats(r: *Run, run: fun(*Run, *mink.registry.Registry) render.Exit) render.Exit {
+    val made: res[mink.registry.Registry, mink.fail.Fail] = mink.registry.builtin(r.a);
+    if (sel made.err) { ret failed(r, "object.formats", made.err); }
+    var formats:  mink.registry.Registry = made.ok;
+    val exit:     render.Exit            = run(r, ?formats);
+    val released: err[mink.fail.Fail]    = mink.registry.release(?formats);
+    if (exit != render.SUCCESS) { ret exit; }
+    if (sel released.err)       { ret failed(r, "object.formats", released.err); }
+    ret exit;
 }
 
 fun assemble(r: *Run) render.Exit {
+    ret with_formats(r, assemble_with);
+}
+
+fun assemble_with(r: *Run, formats: *mink.registry.Registry) render.Exit {
     val path:    str                     = r.operands[0];
     val output:  res[str, args.Misread]  = args.value(r.reader, ?F_OUTPUT);
     val named:   res[str, args.Misread]  = args.value(r.reader, ?F_FORMAT);
@@ -394,7 +423,7 @@ fun assemble(r: *Run) render.Exit {
     var t:      target.Target;
     val opened: err[target.Refusal] = target.open(r.a, ?isa.REGISTRY, q, ?t);
     if (sel opened.err) { ret refuse_target(r, opened.err, q.selection); }
-    val format: res[*mink.format.Format, object.Refusal] = object.format_for(t.arch, named.ok);
+    val format: res[*mink.format.Format, object.Refusal] = object.format_for(formats, t.arch, named.ok);
     if (sel format.err) {
         target.release(?t);
         ret refuse_object(r, format.err);
@@ -404,21 +433,22 @@ fun assemble(r: *Run) render.Exit {
         target.release(?t);
         ret refuse_object(r, spoken.err);
     }
-    val loaded: res[mink.file.Loaded, mink.fail.Fail] = mink.file.load(r.a, path);
+    val loaded: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(r.a, path);
     if (sel loaded.err) {
         target.release(?t);
-        ret failed(r, "io.read", loaded.err);
+        render.quoted(?r.err, "io.read", "cannot read the file", path);
+        ret render.ENVIRONMENT;
     }
-    var source: mink.file.Loaded                       = loaded.ok;
-    val built:  res[mink.object.Object, model.Refusal] = asm.assemble(r.a, t.set, ?t.available, target.assembler(?t, spoken.ok), source.input.data, source.input.len, diagnostic.START);
+    var source: vector.Vector[u8]                      = loaded.ok;
+    val built:  res[mink.object.Object, model.Refusal] = asm.assemble(r.a, t.set, ?t.context, target.assembler(?t, formats, spoken.ok), source.data, source.len, diagnostic.START);
     if (sel built.err) {
-        refused(r, path, source.input.data, source.input.len, ?t.selection, ?built.err);
-        mink.file.unload(?source);
+        refused(r, path, source.data, source.len, ?built.err);
+        vector.dnit[u8](?source);
         target.release(?t);
         ret render.USER;
     }
     var o:     mink.object.Object  = built.ok;
-    val saved: err[mink.fail.Fail] = object.save(r.a, ?o, format.ok, out);
+    val saved: err[mink.fail.Fail] = object.save(formats, r.a, ?o, format.ok, out);
     var exit:  render.Exit         = render.SUCCESS;
     if (sel saved.err) { exit = failed(r, "object.write", saved.err); }
     or (verbose.ok) {
@@ -436,7 +466,7 @@ fun assemble(r: *Run) render.Exit {
         text.byte(?r.out, '\n');
     }
     mink.object.release(?o);
-    mink.file.unload(?source);
+    vector.dnit[u8](?source);
     target.release(?t);
     ret exit;
 }
@@ -448,6 +478,10 @@ fun spelling(aliased: bool) disasm.Spelling {
 }
 
 fun disassemble(r: *Run) render.Exit {
+    ret with_formats(r, disassemble_with);
+}
+
+fun disassemble_with(r: *Run, formats: *mink.registry.Registry) render.Exit {
     val path:    str                     = r.operands[0];
     val written: res[str, args.Misread]  = args.value(r.reader, ?F_OUTPUT);
     val aliased: res[bool, args.Misread] = aliases(r);
@@ -463,7 +497,7 @@ fun disassemble(r: *Run) render.Exit {
     var t:      target.Target;
     val opened: err[target.Refusal] = target.open(r.a, ?isa.REGISTRY, q, ?t);
     if (sel opened.err) { ret refuse_target(r, opened.err, q.selection); }
-    val got: res[disasm.File, mink.fail.Fail] = disasm.open(r.a, path);
+    val got: res[disasm.File, mink.fail.Fail] = disasm.open(formats, r.a, path);
     if (sel got.err) {
         target.release(?t);
         ret failed(r, "object.read", got.err);
@@ -479,14 +513,14 @@ fun disassemble(r: *Run) render.Exit {
     var into:    *vector.Vector[u8] = ?r.out.out;
     if (output != nil) { into = ?printed; }
     val options: disasm.Options      = disasm.Options{syntax: t.syntax, spelling: spelling(aliased.ok), dialect: spoken.ok};
-    val done:    err[disasm.Refusal] = disasm.disassemble(r.a, t.set, ?t.available, options, ?f.object, into);
+    val done:    err[disasm.Refusal] = disasm.disassemble(r.a, t.set, ?t.context, options, ?f.object, into);
     var exit:    render.Exit         = render.SUCCESS;
     if (sel done.err) {
         render.unprinted(?r.err, "disasm.refused", path, ?f.object, ?done.err);
         exit = render.USER;
     }
     or (output != nil) {
-        val written: err[fs.FsError] = fs.write_bytes(output, printed.data, printed.len, mink.file.MODE);
+        val written: err[fs.FsError] = fs.write_bytes(output, printed.data, printed.len, TEXT_MODE);
         if (sel written.err) {
             render.quoted(?r.err, "io.write", "cannot write the file", output);
             exit = render.ENVIRONMENT;
@@ -642,7 +676,8 @@ val T_SOURCE: str = "nop\n";
 #[testing]
 val T_INPUT: str = "mode-refusal-test.s";
 
-test assemble__a_selection_of_another_mode_names_both_modes {
+# an rv32 selection does not enter riscv64, and the refusal names the architecture and the state its entry needs
+test assemble__a_selection_that_does_not_enter_the_architecture_names_what_it_needs {
     var tt: testing.Testing;
     testing.make(?tt);
     val a:     *A.Allocator    = testing.allocator_of(?tt);
@@ -653,7 +688,7 @@ test assemble__a_selection_of_another_mode_names_both_modes {
     val exit: render.Exit         = t_line(a, 13, ?line[0], ?got);
     val gone: err[io_error.Error] = fs.remove_file(T_INPUT);
     var ok:   bool                = exit == render.USER && !sel gone.err;
-    ok = ok && t_has(?got, "error[asm.mode]") && t_has(?got, "'riscv64'") && t_has(?got, "'rv64'") && t_has(?got, "'rv32'");
+    ok = ok && t_has(?got, "error[asm.mode]") && t_has(?got, "'riscv64'") && t_has(?got, "needs xlen=64");
     vector.dnit[u8](?got);
     if (!ok)                          { ret 2; }
     if (testing.live_count(?tt) != 0) { ret 3; }
