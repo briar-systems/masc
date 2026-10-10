@@ -1,0 +1,506 @@
+# the instruction records of XED
+#
+# an instruction section holds records `{ KEY : value ... }`, each with its ICLASS, CATEGORY,
+# EXTENSION and at least one PATTERN, an OPERANDS after every PATTERN and optionally an IFORM, and
+# the rest once: UNAME, CPL, ISA_SET, which is the EXTENSION when not given, ATTRIBUTES, FLAGS,
+# EXCEPTIONS, REAL_OPCODE, VERSION, COMMENT and the disassembly spellings. a record of several
+# patterns is one instruction per pattern. a pattern capturing a range, `REG[1-7]`, is one
+# instruction per value. `UDELETE : uname` drops the record of that UNAME and `DELETE : iclass`
+# every record of the ICLASS, wherever they are, and of the records of one ICLASS only those of
+# the highest VERSION are kept (pysrc/generator.py read_structured_flexible and
+# expand_range_capture_records, pysrc/read_xed_db.py)
+#
+# FLAGS is a comma-separated list of `[qualifier] MAY|MUST|READONLY [ flag-action ... ]`, the
+# qualifier REP, NOREP, IMM0, IMM1 or IMMx and each action mod, tst, u, 0, 1, ah or pop, or the
+# list `[ nothing ]` (pysrc/flag_gen.py flags_rec_t)
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_to_lower;
+use std.types.string.str_to_upper;
+use std.types.view.View;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.map;
+use std.collections.vector;
+
+use gen.diag;
+use gen.isa.x86.xed.nonterminal;
+use gen.isa.x86.xed.operand;
+use gen.isa.x86.xed.pattern;
+use gen.isa.x86.xed.section;
+use gen.isa.x86.xed.table;
+use gen.isa.x86.xed.text;
+use gen.lines;
+use gen.source;
+
+# one flag and what an instruction does to it
+pub rec FlagAction {
+    flag:   str;
+    action: str;
+}
+
+# one list of FLAGS
+# ---
+# qualifier: REP, NOREP, IMM0, IMM1 or IMMx, nil for none
+# semantics: MAY, MUST or READONLY
+# actions:   each flag's action, none for `nothing`
+pub rec Flags {
+    qualifier: str;
+    semantics: str;
+    actions:   vector.Vector[FlagAction];
+}
+
+# one instruction: a record's fields and one of its patterns
+# ---
+# table:      the instruction section it is in, such as INSTRUCTIONS or EVEX_INSTRUCTIONS
+# iclass:     its ICLASS
+# uname:      its UNAME, nil for none
+# category:   its CATEGORY
+# extension:  its EXTENSION
+# isa_set:    its ISA_SET, or its EXTENSION when the record gives none
+# cpl:        its CPL as written, nil for none
+# attributes: its ATTRIBUTES, in upper case
+# flags:      its FLAGS lists
+# exceptions: its EXCEPTIONS, nil for none
+# opcode:     its REAL_OPCODE, nil for none
+# version:    its VERSION, 0 for none
+# comment:    its COMMENT, nil for none
+# intel:      its Intel disassembly spelling, nil for none
+# att:        its AT&T disassembly spelling, nil for none
+# iform:      the IFORM of its pattern, nil for none
+# pattern:    its pattern, resolved
+# operands:   its operands, in order
+# line:       the line of its PATTERN
+pub rec Instruction {
+    table:      str;
+    iclass:     str;
+    uname:      str;
+    category:   str;
+    extension:  str;
+    isa_set:    str;
+    cpl:        str;
+    attributes: vector.Vector[str];
+    flags:      vector.Vector[Flags];
+    exceptions: str;
+    opcode:     str;
+    version:    u32;
+    comment:    str;
+    intel:      str;
+    att:        str;
+    iform:      str;
+    pattern:    pattern.Pattern;
+    operands:   vector.Vector[operand.Operand];
+    line:       lines.Line;
+}
+
+# what the records dropped
+pub rec Drops {
+    unames:   map.Map[str, u32];
+    iclasses: map.Map[str, u32];
+}
+
+pub val NO_COLON:    str = "instruction line is not a key, a colon and a value";
+pub val UNKNOWN_KEY: str = "instruction key is not one XED reads";
+pub val KEY_TWICE:   str = "instruction key given twice";
+pub val MISSING:     str = "instruction record lacks ICLASS, CATEGORY, EXTENSION or a PATTERN";
+pub val NO_OPERANDS: str = "instruction pattern has no OPERANDS after it";
+pub val STRAY:       str = "instruction line outside a record";
+pub val UNCLOSED:    str = "instruction record is not closed";
+pub val BAD_FLAGS:   str = "FLAGS list is not a qualifier, MAY, MUST or READONLY and bracketed flag actions";
+pub val BAD_VERSION: str = "VERSION is not a number";
+
+val KEYS: [19]str = [19]str{
+    "ICLASS", "UNAME", "CATEGORY", "EXTENSION", "ISA_SET", "STATE", "PATTERN", "ATTRIBUTES", "OPERANDS", "UCODE", "FLAGS", "VERSION",
+    "CPL", "COMMENT", "EXCEPTIONS", "DISASM", "DISASM_INTEL", "DISASM_ATTSV", "REAL_OPCODE",
+};
+
+val FLAG_NAMES: [21]str = [21]str{
+    "cf", "pf", "af", "zf", "sf", "tf", "if", "df", "of", "iopl", "nt", "rf", "vm", "ac", "vif", "vip", "id", "fc0", "fc1", "fc2", "fc3",
+};
+
+val FLAG_ACTIONS: [7]str = [7]str{"mod", "tst", "u", "0", "1", "ah", "pop"};
+
+val QUALIFIERS: [5]str = [5]str{"REP", "NOREP", "IMM0", "IMM1", "IMMx"};
+
+val SEMANTICS: [3]str = [3]str{"MAY", "MUST", "READONLY"};
+
+fun one_of(s: str, names: *str, count: u32) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (str_equals(s, names[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun drops(a: *A.Allocator) Drops {
+    ret Drops{unames: map.init[str, u32](a), iclasses: map.init[str, u32](a)};
+}
+
+# one record's key and value lines, as read
+rec Record {
+    keys:   vector.Vector[str];
+    values: vector.Vector[View];
+    at:     vector.Vector[lines.Line];
+}
+
+fun flag_list(a: *A.Allocator, l: *lines.Line, v: View) res[Flags, diag.Refusal] {
+    val bad:   res[Flags, diag.Refusal] = res[Flags, diag.Refusal].err{lines.refuse(l, BAD_FLAGS, nil)};
+    var f:     Flags                    = Flags{qualifier: nil, semantics: nil, actions: vector.init[FlagAction](a)};
+    val open:  opt[usize]               = text.find(v, '[');
+    val close: opt[usize]               = text.find(v, ']');
+    if (sel open.none)                                                            { ret bad; }
+    if (sel close.none)                                                           { ret bad; }
+    if (close.some < open.some)                                                   { ret bad; }
+    if (text.trim(text.part(v, close.some + 1, v.len - close.some - 1)).len != 0) { ret bad; }
+    var head: lines.Line                            = lines.Line{file: l.file, number: l.number, text: text.part(v, 0, open.some)};
+    var body: lines.Line                            = lines.Line{file: l.file, number: l.number, text: text.part(v, open.some + 1, close.some - open.some - 1)};
+    val hw:   res[vector.Vector[str], diag.Refusal] = table.words(a, ?head);
+    if (sel hw.err) { ret res[Flags, diag.Refusal].err{hw.err}; }
+    val bw: res[vector.Vector[str], diag.Refusal] = table.words(a, ?body);
+    if (sel bw.err) { ret res[Flags, diag.Refusal].err{bw.err}; }
+    var i: usize = 0;
+    if (hw.ok.len == 2 && one_of(hw.ok.data[0], ?QUALIFIERS[0], 5)) {
+        f.qualifier = hw.ok.data[0];
+        i           = 1;
+    }
+    if (hw.ok.len != i + 1 || !one_of(hw.ok.data[i], ?SEMANTICS[0], 3)) { ret bad; }
+    f.semantics = hw.ok.data[i];
+    i           = 0;
+    for (i < bw.ok.len) {
+        val low: res[str, StrError] = str_to_lower(a, bw.ok.data[i]);
+        if (sel low.err) { ret res[Flags, diag.Refusal].err{text.memory(l)}; }
+        val s: str = low.ok;
+        if (!str_equals(s, "nothing")) {
+            var dash: usize = 0;
+            for (s[dash] != 0 && s[dash] != '-') {
+                dash = dash + 1;
+            }
+            if (s[dash] != '-') { ret bad; }
+            val flag: res[str, StrError] = str_copy_slice(a, s, 0, dash);
+            if (sel flag.err) { ret res[Flags, diag.Refusal].err{text.memory(l)}; }
+            val action: str = ?s[dash + 1];
+            if (!one_of(flag.ok, ?FLAG_NAMES[0], 21))                                                         { ret bad; }
+            if (!one_of(action, ?FLAG_ACTIONS[0], 7))                                                         { ret bad; }
+            if (!text.pushed(vector.push[FlagAction](?f.actions, FlagAction{flag: flag.ok, action: action}))) { ret res[Flags, diag.Refusal].err{text.memory(l)}; }
+        }
+        i = i + 1;
+    }
+    ret res[Flags, diag.Refusal].ok{f};
+}
+
+fun flags(a: *A.Allocator, l: *lines.Line, v: View, out: *vector.Vector[Flags]) err[diag.Refusal] {
+    var from: usize = 0;
+    var i:    usize = 0;
+    for (i <= v.len) {
+        if (i == v.len || v.data[i] == ',') {
+            val f: res[Flags, diag.Refusal] = flag_list(a, l, text.part(v, from, i - from));
+            if (sel f.err)                                   { ret err[diag.Refusal].err{f.err}; }
+            if (!text.pushed(vector.push[Flags](out, f.ok))) { ret err[diag.Refusal].err{text.memory(l)}; }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun value(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    ret text.owned(a, l, v);
+}
+
+# the patterns `words` stands for: itself, or one per value of its range capture
+fun ranges(a: *A.Allocator, x: *table.Tables, l: *lines.Line, words: *vector.Vector[str], out: *vector.Vector[vector.Vector[str]]) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < words.len) {
+        var lo: u64        = 0;
+        var hi: u64        = 0;
+        val at: opt[usize] = pattern.range(words.data[i], ?lo, ?hi);
+        if (sel at.some) {
+            val name: res[str, StrError] = str_copy_slice(a, words.data[i], 0, at.some);
+            if (sel name.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+            val f: opt[*table.Field] = table.field(a, x, name.ok);
+            if (sel f.none)                                                   { ret err[diag.Refusal].err{lines.refuse(l, pattern.NO_FIELD, name.ok)}; }
+            if (lo > hi || f.some.bits > 63 || (hi >> f.some.bits::u64) != 0) { ret err[diag.Refusal].err{lines.refuse(l, pattern.TOO_WIDE, words.data[i])}; }
+            var v: u64 = lo;
+            for (v <= hi) {
+                # the value as fixed bits as wide as its field
+                val got: res[*u8, A.Error] = A.allocate[u8](a, f.some.bits::usize + 1);
+                if (sel got.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+                var b: u32 = 0;
+                for (b < f.some.bits) {
+                    got.ok[b] = '0' + ((v >> (f.some.bits - 1 - b)::u64) & 1)::u8;
+                    b         = b + 1;
+                }
+                val word: res[str, StrError] = str_join(a, name.ok, "[0b", got.ok, "]");
+                if (sel word.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+                var each: vector.Vector[str] = vector.init[str](a);
+                var k:    usize              = 0;
+                for (k < words.len) {
+                    var w: str = words.data[k];
+                    if (k == i)                                   { w = word.ok; }
+                    if (!text.pushed(vector.push[str](?each, w))) { ret err[diag.Refusal].err{text.memory(l)}; }
+                    k = k + 1;
+                }
+                val inner: err[diag.Refusal] = ranges(a, x, l, ?each, out);
+                if (sel inner.err) { ret inner; }
+                v = v + 1;
+            }
+            ret err[diag.Refusal].ok{};
+        }
+        i = i + 1;
+    }
+    if (!text.pushed(vector.push[vector.Vector[str]](out, @words))) { ret err[diag.Refusal].err{text.memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the instructions of the record `r`
+fun record(a: *A.Allocator, x: *table.Tables, table_name: str, open: *lines.Line, r: *Record, out: *vector.Vector[Instruction]) err[diag.Refusal] {
+    var base:     Instruction          = Instruction{table: table_name, attributes: vector.init[str](a), flags: vector.init[Flags](a), pattern: pattern.Pattern{pieces: vector.init[pattern.Piece](a)}, operands: vector.init[operand.Operand](a), line: @open};
+    var patterns: vector.Vector[usize] = vector.init[usize](a);
+    var operands: vector.Vector[usize] = vector.init[usize](a);
+    var iforms:   vector.Vector[usize] = vector.init[usize](a);
+    var seen:     vector.Vector[str]   = vector.init[str](a);
+    var i:        usize                = 0;
+    for (i < r.keys.len) {
+        val key: str         = r.keys.data[i];
+        val v:   View        = r.values.data[i];
+        val l:   *lines.Line = ?r.at.data[i];
+        if (str_equals(key, "PATTERN")) {
+            if (!text.pushed(vector.push[usize](?patterns, i))) { ret err[diag.Refusal].err{text.memory(l)}; }
+            if (!text.pushed(vector.push[usize](?operands, 0))) { ret err[diag.Refusal].err{text.memory(l)}; }
+            if (!text.pushed(vector.push[usize](?iforms, 0)))   { ret err[diag.Refusal].err{text.memory(l)}; }
+        }
+        or (str_equals(key, "OPERANDS")) {
+            if (patterns.len == 0) { ret err[diag.Refusal].err{lines.refuse(l, NO_OPERANDS, nil)}; }
+            operands.data[patterns.len - 1] = i + 1;
+        }
+        or (str_equals(key, "IFORM")) {
+            if (patterns.len == 0) { ret err[diag.Refusal].err{lines.refuse(l, NO_OPERANDS, nil)}; }
+            iforms.data[patterns.len - 1] = i + 1;
+        }
+        or {
+            var k: usize = 0;
+            for (k < seen.len) {
+                if (str_equals(seen.data[k], key)) { ret err[diag.Refusal].err{lines.refuse(l, KEY_TWICE, key)}; }
+                k = k + 1;
+            }
+            if (!text.pushed(vector.push[str](?seen, key))) { ret err[diag.Refusal].err{text.memory(l)}; }
+            val s: res[str, diag.Refusal] = value(a, l, v);
+            if (sel s.err)                      { ret err[diag.Refusal].err{s.err}; }
+            if (str_equals(key, "ICLASS"))      { base.iclass = s.ok; }
+            or (str_equals(key, "UNAME"))       { base.uname = s.ok; }
+            or (str_equals(key, "CATEGORY"))    { base.category = s.ok; }
+            or (str_equals(key, "EXTENSION"))   { base.extension = s.ok; }
+            or (str_equals(key, "ISA_SET"))     { base.isa_set = s.ok; }
+            or (str_equals(key, "CPL"))         { base.cpl = s.ok; }
+            or (str_equals(key, "EXCEPTIONS"))  { base.exceptions = s.ok; }
+            or (str_equals(key, "REAL_OPCODE")) { base.opcode = s.ok; }
+            or (str_equals(key, "COMMENT"))     { base.comment = s.ok; }
+            or (str_equals(key, "DISASM")) {
+                base.intel = s.ok;
+                base.att   = s.ok;
+            }
+            or (str_equals(key, "DISASM_INTEL")) { base.intel = s.ok; }
+            or (str_equals(key, "DISASM_ATTSV")) { base.att = s.ok; }
+            or (str_equals(key, "VERSION")) {
+                val n: opt[u64] = text.number(v);
+                if (sel n.none)          { ret err[diag.Refusal].err{lines.refuse(l, BAD_VERSION, s.ok)}; }
+                if (n.some > 0xFFFFFFFF) { ret err[diag.Refusal].err{lines.refuse(l, BAD_VERSION, s.ok)}; }
+                base.version = n.some::u32;
+            }
+            or (str_equals(key, "ATTRIBUTES")) {
+                val up: res[str, StrError] = str_to_upper(a, s.ok);
+                if (sel up.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+                var one: lines.Line                            = lines.Line{file: l.file, number: l.number, text: view(up.ok, str_len(up.ok))};
+                val w:   res[vector.Vector[str], diag.Refusal] = table.words(a, ?one);
+                if (sel w.err) { ret err[diag.Refusal].err{w.err}; }
+                base.attributes = w.ok;
+            }
+            or (str_equals(key, "FLAGS")) {
+                val f: err[diag.Refusal] = flags(a, l, v, ?base.flags);
+                if (sel f.err) { ret f; }
+            }
+        }
+        i = i + 1;
+    }
+    if (base.iclass == nil || base.category == nil || base.extension == nil || patterns.len == 0) { ret err[diag.Refusal].err{lines.refuse(open, MISSING, base.iclass)}; }
+    if (base.isa_set == nil)                                                                      { base.isa_set = base.extension; }
+    var p: usize = 0;
+    for (p < patterns.len) {
+        val pl: *lines.Line = ?r.at.data[patterns.data[p]];
+        if (operands.data[p] == 0) { ret err[diag.Refusal].err{lines.refuse(pl, NO_OPERANDS, base.iclass)}; }
+        var each: Instruction = base;
+        each.line = @pl;
+        if (iforms.data[p] != 0) {
+            val f: res[str, diag.Refusal] = value(a, pl, r.values.data[iforms.data[p] - 1]);
+            if (sel f.err) { ret err[diag.Refusal].err{f.err}; }
+            each.iform = f.ok;
+        }
+        var ol: lines.Line = r.at.data[operands.data[p] - 1];
+        ol.text = r.values.data[operands.data[p] - 1];
+        val ow: res[vector.Vector[str], diag.Refusal] = table.words(a, ?ol);
+        if (sel ow.err) { ret err[diag.Refusal].err{ow.err}; }
+        each.operands = vector.init[operand.Operand](a);
+        var k: usize = 0;
+        for (k < ow.ok.len) {
+            val op: res[operand.Operand, diag.Refusal] = operand.parse(a, x, ?ol, ow.ok.data[k]);
+            if (sel op.err)                                                        { ret err[diag.Refusal].err{op.err}; }
+            if (!text.pushed(vector.push[operand.Operand](?each.operands, op.ok))) { ret err[diag.Refusal].err{text.memory(?ol)}; }
+            k = k + 1;
+        }
+        var pt: lines.Line = @pl;
+        pt.text = r.values.data[patterns.data[p]];
+        val pw: res[vector.Vector[str], diag.Refusal] = table.words(a, ?pt);
+        if (sel pw.err) { ret err[diag.Refusal].err{pw.err}; }
+        var expanded: vector.Vector[vector.Vector[str]] = vector.init[vector.Vector[str]](a);
+        val ex:       err[diag.Refusal]                 = ranges(a, x, pl, ?pw.ok, ?expanded);
+        if (sel ex.err) { ret ex; }
+        var e: usize = 0;
+        for (e < expanded.len) {
+            val parsed: res[pattern.Pattern, diag.Refusal] = pattern.parse(a, x, pl, ?expanded.data[e]);
+            if (sel parsed.err) { ret err[diag.Refusal].err{parsed.err}; }
+            var one: Instruction = each;
+            one.pattern = parsed.ok;
+            if (!text.pushed(vector.push[Instruction](out, one))) { ret err[diag.Refusal].err{text.memory(pl)}; }
+            e = e + 1;
+        }
+        p = p + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# a drop line `KEY : name` noted in `d`
+fun drop(a: *A.Allocator, l: *lines.Line, d: *Drops, key: str, name: str) err[diag.Refusal] {
+    var m: *map.Map[str, u32] = ?d.unames;
+    if (str_equals(key, "DELETE")) { m = ?d.iclasses; }
+    val put: res[bool, A.Error] = map.insert[str, u32](m, name, 1);
+    if (sel put.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the key and value of the line `l`
+fun split(a: *A.Allocator, l: *lines.Line, key: *str, v: *View) err[diag.Refusal] {
+    val colon: opt[usize] = text.find(l.text, ':');
+    if (sel colon.none) { ret err[diag.Refusal].err{lines.refuse(l, NO_COLON, nil)}; }
+    val k: res[str, diag.Refusal] = text.owned(a, l, text.trim(text.part(l.text, 0, colon.some)));
+    if (sel k.err) { ret err[diag.Refusal].err{k.err}; }
+    @key = k.ok;
+    @v   = text.trim(text.part(l.text, colon.some + 1, l.text.len - colon.some - 1));
+    if (v.len > 0 && v.data[0] == ':') { ret err[diag.Refusal].err{lines.refuse(l, NO_COLON, nil)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the instructions of the section `s`, its drops noted in `d`
+pub fun read(a: *A.Allocator, x: *table.Tables, s: *section.Section, d: *Drops, out: *vector.Vector[Instruction]) err[diag.Refusal] {
+    var open: *lines.Line = nil;
+    var r:    Record      = Record{keys: vector.init[str](a), values: vector.init[View](a), at: vector.init[lines.Line](a)};
+    var i:    usize       = 0;
+    for (i < s.lines.len) {
+        val l: *lines.Line = ?s.lines.data[i];
+        if (view_eq_str(l.text, "{")) {
+            if (open != nil) { ret err[diag.Refusal].err{lines.refuse(l, UNCLOSED, nil)}; }
+            open = l;
+            r    = Record{keys: vector.init[str](a), values: vector.init[View](a), at: vector.init[lines.Line](a)};
+        }
+        or (view_eq_str(l.text, "}")) {
+            if (open == nil) { ret err[diag.Refusal].err{lines.refuse(l, STRAY, nil)}; }
+            val made: err[diag.Refusal] = record(a, x, s.name, open, ?r, out);
+            if (sel made.err) { ret made; }
+            open = nil;
+        }
+        or {
+            var key: str               = nil;
+            var v:   View              = view(nil, 0);
+            val got: err[diag.Refusal] = split(a, l, ?key, ?v);
+            if (sel got.err) { ret got; }
+            if (open == nil) {
+                if (!str_equals(key, "UDELETE") && !str_equals(key, "DELETE")) { ret err[diag.Refusal].err{lines.refuse(l, STRAY, key)}; }
+                val name: res[str, diag.Refusal] = text.owned(a, l, v);
+                if (sel name.err) { ret err[diag.Refusal].err{name.err}; }
+                val noted: err[diag.Refusal] = drop(a, l, d, key, name.ok);
+                if (sel noted.err) { ret noted; }
+            }
+            or {
+                if (!one_of(key, ?KEYS[0], 19) && !str_equals(key, "IFORM")) { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN_KEY, key)}; }
+                if (!text.pushed(vector.push[str](?r.keys, key)))            { ret err[diag.Refusal].err{text.memory(l)}; }
+                if (!text.pushed(vector.push[View](?r.values, v)))           { ret err[diag.Refusal].err{text.memory(l)}; }
+                if (!text.pushed(vector.push[lines.Line](?r.at, @l)))        { ret err[diag.Refusal].err{text.memory(l)}; }
+            }
+        }
+        i = i + 1;
+    }
+    if (open != nil) { ret err[diag.Refusal].err{lines.refuse(open, UNCLOSED, nil)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# `all` without what `d` drops, and of each ICLASS only its highest VERSION
+pub fun settle(a: *A.Allocator, all: *vector.Vector[Instruction], d: *Drops) err[diag.Refusal] {
+    var highest: map.Map[str, u32] = map.init[str, u32](a);
+    var i:       usize             = 0;
+    for (i < all.len) {
+        val n:    *Instruction = ?all.data[i];
+        val seen: opt[*u32]    = map.get[str, u32](?highest, ?n.iclass);
+        if (sel seen.some) {
+            if (@seen.some < n.version) { @seen.some = n.version; }
+        }
+        or {
+            val put: res[bool, A.Error] = map.insert[str, u32](?highest, n.iclass, n.version);
+            if (sel put.err) { ret err[diag.Refusal].err{text.memory(?n.line)}; }
+        }
+        i = i + 1;
+    }
+    var kept: usize = 0;
+    i = 0;
+    for (i < all.len) {
+        val n:    *Instruction = ?all.data[i];
+        var keep: bool         = true;
+        if (n.uname != nil && map.contains[str, u32](?d.unames, ?n.uname)) { keep = false; }
+        if (map.contains[str, u32](?d.iclasses, ?n.iclass))                { keep = false; }
+        val top: opt[*u32] = map.get[str, u32](?highest, ?n.iclass);
+        if (sel top.some && @top.some != n.version) { keep = false; }
+        if (keep) {
+            all.data[kept] = @n;
+            kept           = kept + 1;
+        }
+        i = i + 1;
+    }
+    all.len = kept;
+    ret err[diag.Refusal].ok{};
+}
+
+#[testing]
+val T_RECORDS: str = "INSTRUCTIONS()::\n{\nICLASS    : ADDPS\nCPL       : 3\nCATEGORY  : SSE\nEXTENSION : SSE\nPATTERN   : 0x0F 0x58 MOD[0b11] MOD=3 REG[rrr] RM[nnn]\nOPERANDS  : REG0=XMM_R():rw:ps\n}\n{\nICLASS    : MULPS\nCATEGORY    SSE\n}\n";
+
+test read__a_malformed_record_is_refused_with_its_file_and_line {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a:   *A.Allocator                                      = testing.allocator_of(?t);
+    var x:   table.Tables                                      = table.t_tables(a);
+    var f:   source.File                                       = table.t_file("datafiles/isa.txt", T_RECORDS);
+    val got: res[vector.Vector[section.Section], diag.Refusal] = section.read(a, ?f, nil);
+    if (sel got.err)     { ret 1; }
+    if (got.ok.len != 1) { ret 2; }
+    var d:    Drops                      = drops(a);
+    var out:  vector.Vector[Instruction] = vector.init[Instruction](a);
+    val done: err[diag.Refusal]          = read(a, ?x, ?got.ok.data[0], ?d, ?out);
+    if (sel done.ok)                                                                                            { ret 3; }
+    if (done.err.message != NO_COLON || !str_equals(done.err.file, "datafiles/isa.txt") || done.err.line != 12) { ret 4; }
+    # the well-formed record before it is read whole
+    if (out.len != 1 || !str_equals(out.data[0].iclass, "ADDPS") || out.data[0].operands.len != 1) { ret 5; }
+    ret 0;
+}
