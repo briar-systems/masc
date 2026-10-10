@@ -30,6 +30,7 @@ use masc.core.diagnostic;
 use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.field;
+use masc.core.form;
 use masc.core.index;
 use masc.core.inst;
 use masc.core.operand;
@@ -58,7 +59,7 @@ fun refuse(message: str, op: u8) err[field.Refusal] {
 
 fun mark(p: *field.Parts, part: field.Part, bits: u64) {
     p.bits[part] = bits;
-    p.present    = p.present | (1::u8 << part);
+    p.present    = p.present | (1::u16 << part);
 }
 
 # why `imm` cannot hold the operand value `v` whatever it excludes, none when it can
@@ -70,10 +71,13 @@ pub fun unrepresentable(imm: *operand.Immediate, v: i64) opt[str] {
     }
     val d: i64 = v - imm.bias;
     if (imm.scale > 0 && (d & field.ones(imm.scale)::i64) != 0) { ret opt[str].some{field.MISALIGNED}; }
-    if (imm.bits < 64) {
-        if (imm.signed) {
-            val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+    if (imm.bits > 0 && imm.bits < 64) {
+        val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+        if (imm.sign == operand.SIGNED) {
             if (d < -half || d >= half) { ret opt[str].some{field.OUT_OF_RANGE}; }
+        }
+        or (imm.sign == operand.EITHER) {
+            if (d < -half || (d >= 0 && d::u64 > field.ones(imm.bits))) { ret opt[str].some{field.OUT_OF_RANGE}; }
         }
         or (d < 0 || d::u64 > field.ones(imm.bits)) {
             ret opt[str].some{field.OUT_OF_RANGE};
@@ -138,9 +142,19 @@ fun admit_register(codec: *dispatch.Codec, v: *register.Available, r: *operand.R
 }
 
 fun admit_memory(codec: *dispatch.Codec, v: *register.Available, m: *operand.Memory, a: *operand.Address, p: *field.Parts, op: u8) err[field.Refusal] {
-    if ((a.mode == operand.RELATIVE_PC && (m.forms & operand.PCREL) == 0) || (a.mode == operand.PREINDEX && (m.forms & operand.PRE) == 0) || (a.mode == operand.POSTINDEX && (m.forms & operand.POST) == 0) || a.mode > operand.POSTINDEX) {
+    if ((a.mode == operand.RELATIVE_PC && (m.forms & operand.PCREL) == 0) || (a.mode == operand.PREINDEX && (m.forms & operand.PRE) == 0) || (a.mode == operand.POSTINDEX && (m.forms & operand.POST) == 0) || a.mode > operand.POSTINDEX_REGISTER) {
         ret refuse(field.FORM, op);
     }
+    if (a.mode == operand.POSTINDEX_REGISTER && ((m.forms & operand.POST_REGISTER) == 0 || a.index == register.NONE)) { ret refuse(field.FORM, op); }
+    if (a.broadcast != 0 && (a.broadcast >= 8 || ((m.broadcasts >> a.broadcast) & 1) == 0))                           { ret refuse(field.FORM, op); }
+    if (m.extends.count == 0) {
+        if (a.extend != 0) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.index == register.NONE || !operand.member(?m.extends, a.extend)) { ret refuse(field.FORM, op); }
+        mark(p, field.EXTEND, a.extend::u64);
+    }
+    if (a.broadcast != 0) { mark(p, field.BROADCAST, a.broadcast::u64); }
     if (a.base == register.NONE) {
         if (!(a.mode == operand.RELATIVE_PC || (a.mode == operand.OFFSET && (m.forms & operand.ABSOLUTE) != 0))) { ret refuse(field.FORM, op); }
     }
@@ -206,7 +220,8 @@ fun admit_list(codec: *dispatch.Codec, v: *register.Available, l: *operand.List,
 }
 
 # one value admitted against `shape` into its parts
-fun admit_one(codec: *dispatch.Codec, v: *register.Available, shape: *operand.Shape, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+fun admit_one(codec: *dispatch.Codec, ctx: *state.Context, shape: *operand.Shape, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+    val v: *register.Available = ctx.view;
     if (sel shape.register) {
         if (!sel value.register) { ret refuse(field.WRONG_KIND, op); }
         ret admit_register(codec, v, ?shape.register, value.register, p, field.NUMBER, field.CLASS, op);
@@ -228,6 +243,8 @@ fun admit_one(codec: *dispatch.Codec, v: *register.Available, shape: *operand.Sh
     if (sel shape.enumerant) {
         if (!sel value.enumerant)                               { ret refuse(field.WRONG_KIND, op); }
         if (!operand.member(?shape.enumerant, value.enumerant)) { ret refuse(field.NOT_A_MEMBER, op); }
+        val needed: err[field.Refusal] = enumerant_admitted(ctx, ?shape.enumerant, value.enumerant, op);
+        if (sel needed.err) { ret needed; }
         mark(p, field.NUMBER, value.enumerant::u64);
         ret err[field.Refusal].ok{};
     }
@@ -267,22 +284,49 @@ fun admit_one(codec: *dispatch.Codec, v: *register.Available, shape: *operand.Sh
         mark(p, field.COUNT, bytes.len::u64);
         ret err[field.Refusal].ok{};
     }
+    if (sel shape.group) {
+        # a group's members are admitted by their own shapes, and the set's kinds place them
+        if (!sel value.group) { ret refuse(field.WRONG_KIND, op); }
+        val members: operand.Values = value.group;
+        if (members.len != shape.group.len) { ret refuse(field.WRONG_KIND, op); }
+        var i: u32 = 0;
+        for (i < shape.group.len) {
+            var scratch:  field.Parts;
+            val admitted: err[field.Refusal] = admit(codec, ctx, ?shape.group.at[i], ?members.at[i], ?scratch, op);
+            if (sel admitted.err) { ret admitted; }
+            i = i + 1;
+        }
+        mark(p, field.COUNT, members.len::u64);
+        ret err[field.Refusal].ok{};
+    }
     ret refuse(field.WRONG_KIND, op);
 }
 
+# the enumerant `value` of `e` admitted under `ctx`: a member's requirement, or every set bit's of a mask, held
+fun enumerant_admitted(ctx: *state.Context, e: *operand.Enumeration, value: u32, op: u8) err[field.Refusal] {
+    var i: u32 = 0;
+    for (i < e.count) {
+        val m:     *operand.Enumerant = ?e.members[i];
+        val named: bool               = m.value == value || (e.mask && m.value != 0 && (value & m.value) == m.value);
+        if (named && !state.admits(ctx, m.requires)) { ret err[field.Refusal].err{field.unadmitted(m.requires, 0)}; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
 # operand `op`'s value admitted against its row operand into its parts
-fun admit(codec: *dispatch.Codec, v: *register.Available, desc: *operand.Operand, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+fun admit(codec: *dispatch.Codec, ctx: *state.Context, desc: *operand.Operand, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
     if (sel value.none) {
         if (desc.quantity == operand.OPTIONAL) { ret err[field.Refusal].ok{}; }
         ret refuse(field.WRONG_KIND, op);
     }
-    if (desc.quantity != operand.VARIADIC) { ret admit_one(codec, v, ?desc.shape, value, p, op); }
+    if (desc.quantity != operand.VARIADIC) { ret admit_one(codec, ctx, ?desc.shape, value, p, op); }
     if (!sel value.list)                   { ret refuse(field.WRONG_KIND, op); }
     val members: operand.Values = value.list;
     var i:       u32            = 0;
     for (i < members.len) {
         var scratch:  field.Parts;
-        val admitted: err[field.Refusal] = admit_one(codec, v, ?desc.shape, ?members.at[i], ?scratch, op);
+        val admitted: err[field.Refusal] = admit_one(codec, ctx, ?desc.shape, ?members.at[i], ?scratch, op);
         if (sel admitted.err) { ret admitted; }
         i = i + 1;
     }
@@ -296,20 +340,20 @@ pub fun fixed(codec: *dispatch.Codec, r: *row.Row, op: u8) opt[register.Id] {
 }
 
 # operand `op` of `r` holding `value`, admitted as encode admits it into `parts`: the row's fixed register and the operand's shape
-fun admit_at(codec: *dispatch.Codec, v: *register.Available, r: *row.Row, op: u8, value: *operand.Value, parts: *field.Parts) err[field.Refusal] {
+fun admit_at(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, op: u8, value: *operand.Value, parts: *field.Parts) err[field.Refusal] {
     val held: opt[register.Id] = fixed(codec, r, op);
     if (sel held.some) {
         val given: operand.Value = @value;
         if (sel given.register && given.register != held.some) { ret err[field.Refusal].err{field.refusal(field.NOT_FIXED, op, 0)}; }
     }
-    ret admit(codec, v, ?r.operands.at[op], value, parts, op);
+    ret admit(codec, ctx, ?r.operands.at[op], value, parts, op);
 }
 
 # whether operand `op` of `r` admits `value` under the context `ctx` as encode admits it, on its own, which is how an
 # instruction is refused an operand of the wrong kind as it is built
 pub fun admits_operand(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, op: u8, value: *operand.Value) err[field.Refusal] {
     var parts: field.Parts;
-    ret admit_at(codec, ctx.view, r, op, value, ?parts);
+    ret admit_at(codec, ctx, r, op, value, ?parts);
 }
 
 # the row's own checks and every operand's admission of `ins` under `ctx`, the encoded parts into `parts`
@@ -321,7 +365,7 @@ fun admit_all(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, part
     if (ins.count != r.operands.len)      { ret err[field.Refusal].err{field.refusal(field.OPERAND_COUNT, field.NO_OPERAND, 0)}; }
     var i: u32 = 0;
     for (i < r.operands.len) {
-        val admitted: err[field.Refusal] = admit_at(codec, v, r, i::u8, ?ins.values[i], ?parts[i]);
+        val admitted: err[field.Refusal] = admit_at(codec, ctx, r, i::u8, ?ins.values[i], ?parts[i]);
         if (sel admitted.err) { ret admitted; }
         i = i + 1;
     }
@@ -335,7 +379,7 @@ fun admit_all(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, part
 # what each field's kind refuses of the values of `ins` beyond their shapes, encoded into `parts`, without writing
 fun kinds_admit(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts) err[field.Refusal] {
     val r:   *row.Row      = ins.row;
-    var enc: field.Encoder = field.Encoder{ctx: ctx, table: codec.fields, operands: r.operands.at, values: ins.values, parts: parts, count: r.operands.len, out: nil, fixups: nil, start: 0, field: 0};
+    var enc: field.Encoder = field.Encoder{ctx: ctx, table: codec.fields, operands: r.operands.at, values: ins.values, parts: parts, count: r.operands.len, form: ?ins.form, out: nil, fixups: nil, start: 0, field: 0};
     var j:   u32           = 0;
     for (j < r.encoding.len) {
         val f:    *field.Field = ?r.encoding.at[j];
@@ -451,6 +495,7 @@ pub fun encode(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, out
         values:   ins.values,
         parts:    ?parts[0],
         count:    r.operands.len,
+        form:     ?ins.form,
         out:      out,
         fixups:   fixups,
         start:    out.len,
@@ -520,7 +565,7 @@ fun settle_immediate(imm: *operand.Immediate, bits: u64, op: u8, offset: usize) 
     var raw: u64 = bits & field.ones(imm.bits);
     var v:   i64 = raw:~i64;
     if (imm.format != operand.FLOAT) {
-        if (imm.signed && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
+        if (imm.sign == operand.SIGNED && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
         v = raw:~i64 + imm.bias;
     }
     if (operand.excludes_value(imm, v)) { ret res[i64, field.Refusal].err{field.refusal(field.EXCLUDED, op, offset)}; }
@@ -533,7 +578,7 @@ fun settle(codec: *dispatch.Codec, v: *register.Available, dec: *field.Decoder, 
     val desc: *operand.Operand = ?dec.operands[op];
     val at:   usize            = dec.start;
     # an operand no field holds is implicit, an absent optional one is none, and kinds place literals and variadic operands themselves
-    if (p.direct || p.present == 0 || desc.quantity == operand.VARIADIC || sel desc.shape.literal) { ret err[field.Refusal].ok{}; }
+    if (p.direct || p.present == 0 || desc.quantity == operand.VARIADIC || sel desc.shape.literal || sel desc.shape.group) { ret err[field.Refusal].ok{}; }
     val shape: *operand.Shape = ?desc.shape;
     if (sel shape.register) {
         val reg: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.register, p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
@@ -570,12 +615,23 @@ fun settle(codec: *dispatch.Codec, v: *register.Available, dec: *field.Decoder, 
         }
         val disp: res[i64, field.Refusal] = settle_immediate(?shape.memory.disp, p.bits[field.DISP], op, at);
         if (sel disp.err) { ret err[field.Refusal].err{disp.err}; }
-        a.disp         = disp.ok;
-        a.mode         = p.bits[field.MODE]::u8;
+        a.disp = disp.ok;
+        a.mode = p.bits[field.MODE]::u8;
+        if (field.has(p, field.EXTEND)) {
+            if (!operand.member(?shape.memory.extends, p.bits[field.EXTEND]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+            a.extend = p.bits[field.EXTEND]::u32;
+        }
+        if (field.has(p, field.BROADCAST)) { a.broadcast = p.bits[field.BROADCAST]::u8; }
         dec.values[op] = operand.Value.memory{a};
     }
     or (sel shape.enumerant) {
         if (!operand.member(?shape.enumerant, p.bits[field.NUMBER]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+        val needed: err[field.Refusal] = enumerant_admitted(dec.ctx, ?shape.enumerant, p.bits[field.NUMBER]::u32, op);
+        if (sel needed.err) {
+            var refused: field.Refusal = needed.err;
+            refused.at = at;
+            ret err[field.Refusal].err{refused};
+        }
         dec.values[op] = operand.Value.enumerant{p.bits[field.NUMBER]::u32};
     }
     or (sel shape.condition) {
@@ -628,13 +684,15 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
         store[i] = operand.Value.none{};
         i        = i + 1;
     }
-    var dec: field.Decoder = field.Decoder{
+    var read: form.Form     = form.PREFERRED;
+    var dec:  field.Decoder = field.Decoder{
         ctx:      ctx,
         table:    codec.fields,
         operands: r.operands.at,
         values:   store,
         parts:    ?parts[0],
         count:    count,
+        form:     ?read,
         in:       field.Stream{data: data, len: len, order: codec.fields.order},
         start:    at,
         at:       at,
@@ -644,11 +702,24 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
         used:     0,
         cap:      cap - count,
     };
-    var j: u32 = 0;
+    var offsets: [row.MAX_FIELDS]usize;
+    var j:       u32 = 0;
     for (j < r.encoding.len) {
-        val f:    *field.Field       = ?r.encoding.at[j];
+        val f: *field.Field = ?r.encoding.at[j];
+        offsets[j] = dec.at;
         val done: err[field.Refusal] = codec.fields.kinds[f.kind].decode(?dec, f);
         if (sel done.err) { ret res[Decoded, field.Refusal].err{done.err}; }
+        j = j + 1;
+    }
+    # a kind completes the parts it decides once every field is read
+    j = 0;
+    for (j < r.encoding.len) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.complete != nil) {
+            val done: err[field.Refusal] = kind.complete(?dec, f, offsets[j]);
+            if (sel done.err) { ret res[Decoded, field.Refusal].err{done.err}; }
+        }
         j = j + 1;
     }
     if (dec.declared && dec.at != dec.end) { ret res[Decoded, field.Refusal].err{field.refusal(field.LENGTH, field.NO_OPERAND, dec.at)}; }
@@ -671,7 +742,7 @@ pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, dat
     if (sel keeps.err) { ret res[Decoded, field.Refusal].err{keeps.err}; }
     val touched: err[field.Refusal] = touches_held(codec, v, r, store, at);
     if (sel touched.err) { ret res[Decoded, field.Refusal].err{touched.err}; }
-    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count}, len: dec.at - at}};
+    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count, form: read}, len: dec.at - at}};
 }
 
 # the entry of `node` whose value is `key`

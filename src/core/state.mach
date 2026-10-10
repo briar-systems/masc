@@ -31,10 +31,12 @@ use std.types.view.view_eq_str;
 
 use A: std.allocator;
 use std.allocator.testing;
+use std.collections.bitset;
 use std.collections.vector;
 
 use masc.core.diagnostic;
 use masc.core.extension;
+use masc.core.index;
 use masc.core.quantity;
 use masc.core.register;
 use masc.core.requirement;
@@ -343,6 +345,35 @@ pub fun select(a: *A.Allocator, file: *register.File, ctx: *Context) res[registe
     ret res[register.Available, register.Error].ok{v};
 }
 
+# the column of `file` for `format` the context reads: the first of the format whose flavour it holds, none when the
+# file has none it holds
+pub fun column(file: *register.File, format: register.Format, ctx: *Context) opt[*register.Column] {
+    var i: u32 = register.first_column(file, format);
+    for (i < file.column_count && file.columns[i].format == format) {
+        if (admits(ctx, file.columns[i].flavour)) { ret opt[*register.Column].some{?file.columns[i]}; }
+        i = i + 1;
+    }
+    ret opt[*register.Column].none{};
+}
+
+# the number `format` gives `reg` under the context, by the column whose flavour it holds, as 32-bit x86 code numbers
+# esp 4 where 64-bit code numbers rsp 7. none when the file has no such column or the format leaves it unnumbered
+pub fun debug_number(file: *register.File, reg: register.Id, format: register.Format, ctx: *Context) opt[u32] {
+    val at: opt[u32] = register.index_of(file, reg);
+    if (sel at.none) { ret opt[u32].none{}; }
+    val col: opt[*register.Column] = column(file, format, ctx);
+    if (sel col.none) { ret opt[u32].none{}; }
+    ret register.numbered_in(col.some, at.some);
+}
+
+# the register `format` gives the number `number` under the context, none when the file has no such column or no
+# register has the number
+pub fun from_debug_number(file: *register.File, number: u32, format: register.Format, ctx: *Context) opt[register.Id] {
+    val col: opt[*register.Column] = column(file, format, ctx);
+    if (sel col.none) { ret opt[register.Id].none{}; }
+    ret register.numbered_by(file, col.some, number);
+}
+
 # a context of `selection` under `axes` at `start` with its view of `file` made into `view`, which the caller keeps for
 # as long as the context, as `select` makes it
 # ---
@@ -479,17 +510,79 @@ fun keep(out: *Unmet, used: *u32, id: requirement.Id, without: bool) bool {
     ret true;
 }
 
-# `required` resolved against the context into `out`, every alternative kept with the atoms of its `all` the context
-# lacks and those of its `none` it holds. a requirement the context meets resolves to nothing
+# whether the catalog's rows bring atom `to` from atom `from`: the atom itself, or one its implications reach
+fun reaches(catalog: *extension.Catalog, from: requirement.Id, to: requirement.Id, depth: u32) bool {
+    if (from == to)                          { ret true; }
+    if (from >= catalog.count || depth == 0) { ret false; }
+    val implies: requirement.Ids = catalog.extensions[from].implies;
+    var i:       u32             = 0;
+    for (i < implies.len) {
+        if (reaches(catalog, implies.at[i], to, depth - 1)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether `ids` lists atom `id`
+fun lists(ids: requirement.Ids, id: requirement.Id) bool {
+    var i: u32 = 0;
+    for (i < ids.len) {
+        if (ids.at[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether alternative `x` meets alternative `y` wherever it is met: what x needs brings all y needs, and x excludes all
+# y excludes
+fun stronger(catalog: *extension.Catalog, x: requirement.Alternative, y: requirement.Alternative) bool {
+    var k: u32 = 0;
+    for (k < y.all.len) {
+        var brought: bool = false;
+        var j:       u32  = 0;
+        for (j < x.all.len && !brought) {
+            brought = reaches(catalog, x.all.at[j], y.all.at[k], catalog.count);
+            j       = j + 1;
+        }
+        if (!brought) { ret false; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < y.none.len) {
+        if (!lists(x.none, y.none.at[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether alternative `i` of `required` is redundant, as a refusal words it: another meets it wherever it is met, the
+# first of two equivalent ones kept. a requirement is stored as its source states it and minimized only here
+fun redundant(catalog: *extension.Catalog, required: requirement.Requirement, i: u32) bool {
+    var j: u32 = 0;
+    for (j < required.len) {
+        if (j != i && stronger(catalog, required.at[i], required.at[j]) && (j < i || !stronger(catalog, required.at[j], required.at[i]))) { ret true; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+# `required` resolved against the context into `out`, every alternative no other makes redundant kept with the atoms of
+# its `all` the context lacks and those of its `none` it holds. a requirement the context meets resolves to nothing
 # ---
 # ret: false when `required` is met, or has more alternatives or unmet atoms than an unmet requirement holds, with
 #      `out` then holding nothing
 pub fun unmet(ctx: *Context, required: requirement.Requirement, out: *Unmet) bool {
     @out = nothing_unmet();
     if (required.len > UNMET_ALTERNATIVES || admits(ctx, required)) { ret false; }
-    var used: u32 = 0;
-    var i:    u32 = 0;
+    val catalog: *extension.Catalog = ctx.selection.catalog;
+    var used:    u32                = 0;
+    var kept:    u32                = 0;
+    var i:       u32                = 0;
     for (i < required.len) {
+        if (redundant(catalog, required, i)) {
+            i = i + 1;
+            cnt;
+        }
         val alt: requirement.Alternative = required.at[i];
         var k:   u32                     = 0;
         for (k < alt.all.len) {
@@ -507,12 +600,13 @@ pub fun unmet(ctx: *Context, required: requirement.Requirement, out: *Unmet) boo
             }
             k = k + 1;
         }
-        out.ends[i] = used;
-        i           = i + 1;
+        out.ends[kept] = used;
+        kept           = kept + 1;
+        i              = i + 1;
     }
-    out.catalog = ctx.selection.catalog;
+    out.catalog = catalog;
     out.axes    = ctx.axes;
-    out.len     = required.len;
+    out.len     = kept;
     ret true;
 }
 
@@ -673,6 +767,16 @@ test lookup__an_unavailable_register_is_refused_naming_every_alternative {
     val both: err[A.Error] = spell_unavailable(?ctx, ?two, ?out);
     if (sel both.err || !extension.t_spelled(?out, "x16 needs i, or f and q")) { ret 8; }
     vector.dnit[u8](?out);
+    # a requirement is stored as stated and minimized as it is worded: q brings f, so `q, or f` needs f
+    val q_or_f: [2]requirement.Alternative = [2]requirement.Alternative{
+        requirement.Alternative{all: requirement.Ids{at: ?f_q[1], len: 1}, none: requirement.NO_IDS},
+        requirement.Alternative{all: requirement.Ids{at: ?f_q[0], len: 1}, none: requirement.NO_IDS},
+    };
+    two.requires = requirement.Requirement{at: ?q_or_f[0], len: 2};
+    out          = vector.init[u8](testing.allocator_of(?t));
+    val least: err[A.Error] = spell_unavailable(?ctx, ?two, ?out);
+    if (sel least.err || !extension.t_spelled(?out, "x16 needs f")) { ret 9; }
+    vector.dnit[u8](?out);
     val s0: res[register.Id, register.Absent] = register.lookup(?v, view("s0", 2));
     if (!(sel s0.ok && s0.ok == register.make(0, 8))) { ret 5; }
     register.release(?v);
@@ -735,5 +839,50 @@ test select__bounds_that_leave_a_quantity_no_multiplier_are_refused {
     if (empty != 0) { ret 3; }
     extension.release(?both);
     if (testing.live_count(?t) != 0) { ret 4; }
+    ret 0;
+}
+
+# a context of `catalog`'s empty selection into `s` under `axes` at `start`, with no view, its members the `nwords` zeroed
+# words at `words`, which the caller keeps for as long as the context
+#[testing]
+pub fun t_bare(catalog: *extension.Catalog, axes: *Axes, start: Settings, words: *u64, nwords: u32, s: *extension.Selection) Context {
+    var i: u32 = 0;
+    for (i < nwords) {
+        words[i] = 0;
+        i        = i + 1;
+    }
+    @s = extension.Selection{catalog: catalog, members: bitset.Bitset{alloc: nil, words: words, nbits: catalog.count::usize, nwords: nwords::usize}, stated: extension.Stated{len: 0}};
+    ret Context{selection: s, axes: axes, values: start, view: nil, stream: nil};
+}
+
+# each format's column numbers its own registers, and the one a context's flavour holds is the one read
+test debug_number__a_context_reads_the_column_its_flavour_holds {
+    var word: [1]u64   = [1]u64{0};
+    var s:    extension.Selection;
+    var ctx:  Context  = t_bare(?register.RISCV_CATALOG, ?T_AXES, initial(?T_AXES), ?word[0], 1, ?s);
+    val rax:  opt[u32] = debug_number(?register.X86, register.make(0, 0), register.DWARF, ?ctx);
+    val al:   opt[u32] = debug_number(?register.X86, register.make(2, 0), register.DWARF, ?ctx);
+    val cv:   opt[u32] = debug_number(?register.X86, register.make(2, 0), register.CODEVIEW, ?ctx);
+    if (!(sel rax.some && rax.some == 0) || !sel al.none || !(sel cv.some && cv.some == 1)) { ret 1; }
+    val rsp: opt[register.Id] = from_debug_number(?register.X86, 7, register.DWARF, ?ctx);
+    val ah:  opt[register.Id] = from_debug_number(?register.X86, 5, register.CODEVIEW, ?ctx);
+    val gap: opt[register.Id] = from_debug_number(?register.X86, 1, register.DWARF, ?ctx);
+    if (!(sel rsp.some && rsp.some == register.make(0, 4)) || !(sel ah.some && ah.some == register.make(3, 4)) || !sel gap.none) { ret 2; }
+    # a dwarf column for mode=on numbering rax 9 comes first, so mode=on reads it and mode=off the plain column
+    val nine:    [12]u32                    = [12]u32{9, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED, register.UNNUMBERED};
+    val keyed:   [1]index.Number            = [1]index.Number{index.Number{key: 9, row: 0}};
+    val on:      [1]requirement.Id          = [1]requirement.Id{atom(?register.RISCV_CATALOG, ?T_AXES, 0, 1)};
+    val when:    [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?on[0], len: 1}, none: requirement.NO_IDS}};
+    var columns: [3]register.Column         = [3]register.Column{register.X86.columns[0], register.X86.columns[0], register.X86.columns[1]};
+    columns[0].flavour  = requirement.Requirement{at: ?when[0], len: 1};
+    columns[0].numbers  = ?nine[0];
+    columns[0].numbered = index.Numbers{at: ?keyed[0], len: 1};
+    var file: register.File = register.X86;
+    file.columns      = ?columns[0];
+    file.column_count = 3;
+    val off: opt[u32] = debug_number(?file, register.make(0, 0), register.DWARF, ?ctx);
+    ctx.values.at[0] = 1;
+    val in_mode: opt[u32] = debug_number(?file, register.make(0, 0), register.DWARF, ?ctx);
+    if (!(sel off.some && off.some == 0) || !(sel in_mode.some && in_mode.some == 9)) { ret 3; }
     ret 0;
 }

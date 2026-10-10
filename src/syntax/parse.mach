@@ -29,9 +29,11 @@ use stdprint: std.print;
 
 use masc.codec.walk;
 use masc.core.diagnostic;
+use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.extension;
 use masc.core.field;
+use core_form: masc.core.form;
 use masc.core.inst;
 use masc.core.mode;
 use masc.core.operand;
@@ -60,6 +62,8 @@ use masc.syntax.alias;
 use masc.syntax.print;
 use masc.syntax.read;
 use seq: masc.syntax.sequence;
+#[testing]
+use masc.syntax.write;
 
 # the refusal of an instruction directive's text that starts with the name of none of its formats
 pub val UNKNOWN_FORMAT: str = "instruction format the directive states none of";
@@ -131,9 +135,39 @@ fun one(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *oper
         @out = operand.Value.condition{c.ok};
         ret err[diagnostic.Diagnostic].ok{};
     }
+    if (sel shape.group) { ret group(r, ?shape.group, format, out); }
     val h: *core_syntax.Hook = core_syntax.hook(r.syntax, shape);
     if (h == nil) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
     ret h.parse(r, desc, format, out);
+}
+
+# the most members a group holds
+val GROUP_MEMBERS: u32 = 16;
+
+# a group's members read in order, joined by the syntax's variadic text, into the pool as one run
+fun group(r: *core_syntax.Reader, g: *operand.Group, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (g.len > GROUP_MEMBERS) { ret err[diagnostic.Diagnostic].err{read.refuse(r, field.STORAGE, r.at, 0)}; }
+    var held: [GROUP_MEMBERS]operand.Value;
+    var i:    u32 = 0;
+    for (i < g.len) {
+        if (i > 0) {
+            if (!read.take(r, r.syntax.variadic)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+            read.skip(r);
+        }
+        val got: err[diagnostic.Diagnostic] = one(r, ?g.at[i], format, ?held[i]);
+        if (sel got.err) { ret got; }
+        i = i + 1;
+    }
+    var first: *operand.Value = nil;
+    i = 0;
+    for (i < g.len) {
+        val slot: res[*operand.Value, diagnostic.Diagnostic] = read.push(r, held[i]);
+        if (sel slot.err) { ret err[diagnostic.Diagnostic].err{slot.err}; }
+        if (i == 0)       { first = slot.ok; }
+        i = i + 1;
+    }
+    @out = operand.Value.group{operand.Values{at: first, len: g.len}};
+    ret err[diagnostic.Diagnostic].ok{};
 }
 
 # operand `desc`'s value read by its hole, a variadic operand as members joined by the syntax's text
@@ -193,9 +227,12 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
     var used:  u32   = 0;
     var open:  bool  = false;
     read.skip(r);
+    if (r.at < r.lead) { r.at = r.lead; }
     for {
         val p: core_syntax.Piece = core_syntax.piece(template, at);
         at = p.at + p.len;
+        # the marker after the mnemonic is the form's, read before any template was tried
+        if (r.at == r.marked) { r.at = r.at + r.skipped; }
         var failed: opt[diagnostic.Diagnostic] = opt[diagnostic.Diagnostic].none{};
         if (p.kind == core_syntax.END) {
             read.skip(r);
@@ -270,7 +307,7 @@ fun admit(rd: *core_syntax.Reader, r: *row.Row, values: *operand.Value, spans: *
         keep_unmet(rd, best, r.requires, rd.start, read.token(rd, rd.start));
         ret opt[inst.Inst].none{};
     }
-    var ins:      inst.Inst          = inst.Inst{row: r, values: values, count: r.operands.len};
+    var ins:      inst.Inst          = inst.Inst{row: r, values: values, count: r.operands.len, form: rd.form};
     val admitted: err[field.Refusal] = walk.admits(rd.codec, rd.ctx, ?ins);
     if (sel admitted.err) {
         var at: usize = rd.start;
@@ -283,7 +320,7 @@ fun admit(rd: *core_syntax.Reader, r: *row.Row, values: *operand.Value, spans: *
         rd.pool[i] = values[i];
         i          = i + 1;
     }
-    ret opt[inst.Inst].some{inst.Inst{row: r, values: rd.pool, count: r.operands.len}};
+    ret opt[inst.Inst].some{inst.Inst{row: r, values: rd.pool, count: r.operands.len, form: rd.form}};
 }
 
 # the row `index` read by its own template
@@ -439,6 +476,62 @@ fun next(rd: *core_syntax.Reader, head: usize, started: bool, last: core_syntax.
     ret found;
 }
 
+# whether the text at `at` is `marker`, a whole token
+fun spells(rd: *core_syntax.Reader, at: usize, marker: str) bool {
+    val len: usize = str_len(marker);
+    if (len == 0 || at + len > rd.end) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (!read.same(rd, rd.text[at + i], marker[i])) { ret false; }
+        i = i + 1;
+    }
+    ret !(read.word(marker[len - 1]) && at + len < rd.end && read.word(rd.text[at + len]));
+}
+
+# the reader with no form markers read, as a statement that spells none starts
+fun unmarked(rd: *core_syntax.Reader) {
+    rd.form    = core_form.PREFERRED;
+    rd.lead    = rd.start;
+    rd.marked  = rd.end;
+    rd.skipped = 0;
+}
+
+# the form markers at the reader's position read into its form: those before the mnemonic, the reader left past them at
+# `lead`, then the one its mnemonic ends with, which `marked` and `skipped` hop
+fun markers(rd: *core_syntax.Reader) {
+    val forms: *core_form.FormFields = ?rd.codec.forms;
+    unmarked(rd);
+    var moved: bool = true;
+    for (moved) {
+        moved = false;
+        var i: u32 = 0;
+        for (i < forms.len && !moved) {
+            val f: *core_form.FormField = ?forms.at[i];
+            if (f.marker != nil && !f.suffix && spells(rd, rd.at, f.marker)) {
+                rd.form = core_form.with(rd.form, f);
+                rd.at   = rd.at + str_len(f.marker);
+                read.skip(rd);
+                moved = true;
+            }
+            i = i + 1;
+        }
+    }
+    rd.lead = rd.at;
+    val end: usize = rd.at + read.token(rd, rd.at);
+    var i:   u32   = 0;
+    for (i < forms.len) {
+        val f:   *core_form.FormField = ?forms.at[i];
+        val len: usize                = str_len(f.marker);
+        if (f.marker != nil && f.suffix && len > 0 && end >= rd.at + len + 1 && spells(rd, end - len, f.marker)) {
+            rd.form    = core_form.with(rd.form, f);
+            rd.marked  = end - len;
+            rd.skipped = len;
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
 # the instruction at the reader's text, read in its syntax
 # ---
 # rd:  the reader over the instruction's text, its pool holding the values first and then list members
@@ -449,6 +542,7 @@ pub fun instruction(rd: *core_syntax.Reader) res[inst.Inst, diagnostic.Diagnosti
     rd.at           = rd.start;
     rd.refused.used = 0;
     read.skip(rd);
+    markers(rd);
     val head:    usize = rd.at;
     var last:    core_syntax.Candidate;
     var current: core_syntax.Candidate;
@@ -497,6 +591,7 @@ pub fun format(rd: *core_syntax.Reader, formats: source.Formats) res[Taken, diag
     var keyed_any: bool = false;
     rd.at           = rd.start;
     rd.refused.used = 0;
+    unmarked(rd);
     read.skip(rd);
     val head: usize = rd.at;
     var i:    u32   = 0;
@@ -578,6 +673,7 @@ pub fun statement(rd: *core_syntax.Reader, out: *relax.Expansion) err[diagnostic
     var moded:     bool = false;
     rd.at           = rd.start;
     rd.refused.used = 0;
+    unmarked(rd);
     read.skip(rd);
     val head: usize                  = rd.at;
     val word: View                   = read.span(rd, head, read.token(rd, head));
@@ -604,6 +700,7 @@ pub fun statement(rd: *core_syntax.Reader, out: *relax.Expansion) err[diagnostic
     out.count           = 1;
     out.steps[0].row    = one.ok.row;
     out.steps[0].marker = operand.NO_FIXUP;
+    out.steps[0].form   = one.ok.form;
     var k: u32 = 0;
     for (k < one.ok.count) {
         out.steps[0].values[k] = one.ok.values[k];
@@ -624,6 +721,7 @@ rec T {
     store:      [16]operand.Value;
     admissions: [8]requirement.Alternative;
     out:        vector.Vector[u8];
+    codec:      *dispatch.Codec;
 }
 
 # a test over the selection the risc-v `isa` string spells
@@ -645,6 +743,7 @@ fun t_view(t: *T) bool {
     t.modes  = mode.initial(?riscv_mode.MODES);
     t.out    = vector.init[u8](testing.allocator_of(?t.t));
     t.syntax = ?riscv_syntax.SYNTAX;
+    t.codec  = ?riscv_catalog.CODEC;
     ret true;
 }
 
@@ -656,13 +755,13 @@ fun t_make_for(t: *T, r: *row.Row, extra: requirement.Requirement) bool {
     val made: res[extension.Request, extension.Error] = extension.request(testing.allocator_of(?t.t), ?riscv_extension.CATALOG, "", diagnostic.START);
     if (sel made.err) { ret false; }
     var req:   extension.Request = made.ok;
-    var width: requirement.Id    = riscv_extension.XLEN_64;
+    var width: requirement.Id    = riscv_extension.id.XLEN_64;
     if (r.requires.len > 0) {
         val alt: requirement.Ids = r.requires.at[0].all;
         var i:   u32             = 0;
         for (i < alt.len) {
             extension.request_add(?req, alt.at[i]);
-            if (alt.at[i] == riscv_extension.XLEN_32) { width = riscv_extension.XLEN_32; }
+            if (alt.at[i] == riscv_extension.id.XLEN_32) { width = riscv_extension.id.XLEN_32; }
             i = i + 1;
         }
     }
@@ -672,13 +771,13 @@ fun t_make_for(t: *T, r: *row.Row, extra: requirement.Requirement) bool {
         var i:   u32             = 0;
         for (i < alt.len) {
             extension.request_add(?req, alt.at[i]);
-            if (alt.at[i] == riscv_extension.XLEN_32) { width = riscv_extension.XLEN_32; }
+            if (alt.at[i] == riscv_extension.id.XLEN_32) { width = riscv_extension.id.XLEN_32; }
             i = i + 1;
         }
     }
     extension.request_add(?req, width);
-    extension.request_add(?req, riscv_extension.BASE_I);
-    extension.request_add(?req, riscv_extension.I);
+    extension.request_add(?req, riscv_extension.id.BASE_I);
+    extension.request_add(?req, riscv_extension.id.I);
     val closed: res[extension.Selection, extension.Error] = extension.close(req);
     if (sel closed.err) { ret false; }
     t.s = closed.ok;
@@ -711,7 +810,7 @@ fun t_reader(t: *T, text: str, origin: diagnostic.Position) core_syntax.Reader {
         at:      0,
         end:     str_len(text),
         origin:  origin,
-        codec:   ?riscv_catalog.CODEC,
+        codec:   t.codec,
         ctx:     ?t.ctx,
         syntax:  t.syntax,
         modes:   ?t.modes,
@@ -739,7 +838,7 @@ fun t_parse(t: *T, text: str, origin: diagnostic.Position) res[inst.Inst, diagno
 #[testing]
 fun t_print(t: *T, ins: *inst.Inst) bool {
     t.out.len = 0;
-    var w:       core_syntax.Writer = core_syntax.Writer{out: ?t.out, codec: ?riscv_catalog.CODEC, ctx: ?t.ctx, syntax: t.syntax, modes: ?t.modes, symbols: ?T_SYMBOLS, context: nil, row: nil};
+    var w:       core_syntax.Writer = core_syntax.Writer{out: ?t.out, codec: t.codec, ctx: ?t.ctx, syntax: t.syntax, modes: ?t.modes, symbols: ?T_SYMBOLS, context: nil, row: nil};
     val printed: err[field.Refusal] = print.instruction(?w, ins);
     if (sel printed.err) { ret false; }
     val pushed: res[usize, A.Error] = vector.push[u8](?t.out, 0);
@@ -869,6 +968,87 @@ test instruction__the_row_the_selection_admits_is_the_one_read {
     # a shift past rv32's five bits is refused there and read by rv64's row
     val far: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?narrow, "slli a0, a0, 40", diagnostic.START);
     if (!sel far.err) { ret 6; }
+    ret 0;
+}
+
+# a hook reading `r<n>` as x register n, and writing a register no row names as `r<class>.<number>`
+#[testing]
+fun t_hook_read(r: *core_syntax.Reader) opt[register.Id] {
+    if (r.at + 1 >= r.end || r.text[r.at] != 'r') { ret opt[register.Id].none{}; }
+    var at: usize = r.at + 1;
+    var n:  u16   = 0;
+    for (at < r.end && r.text[at] >= '0' && r.text[at] <= '9') {
+        n  = n * 10 + (r.text[at] - '0')::u16;
+        at = at + 1;
+    }
+    if (at == r.at + 1 || n >= 32) { ret opt[register.Id].none{}; }
+    r.at = at;
+    ret opt[register.Id].some{register.make(0, n)};
+}
+
+#[testing]
+fun t_hook_write(w: *core_syntax.Writer, reg: register.Id, op: u8) err[field.Refusal] {
+    var digits: [3]u8              = [3]u8{'r', '0' + (register.class_of(reg) % 10)::u8, 0};
+    val head:   err[field.Refusal] = write.text(w, ?digits[0]);
+    if (sel head.err) { ret head; }
+    var tail: [3]u8 = [3]u8{'.', '0' + (register.number_of(reg) % 10)::u8, 0};
+    ret write.text(w, ?tail[0]);
+}
+
+#[testing]
+val T_REGISTER_HOOK: core_syntax.RegisterHook = core_syntax.RegisterHook{read: t_hook_read, write: t_hook_write};
+
+# a syntax's register hook reads what no name spells and writes what no row names, after the name table
+test instruction__a_register_hook_spells_what_no_row_name_does {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var hooked: core_syntax.Syntax = riscv_syntax.SYNTAX;
+    hooked.hooks.register = ?T_REGISTER_HOOK;
+    t.syntax              = ?hooked;
+    val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add r5, a0, r31", diagnostic.START);
+    if (sel got.err) { ret 2; }
+    val ins: inst.Inst = got.ok;
+    if (!(sel ins.values[0].register && ins.values[0].register == register.make(0, 5)))  { ret 3; }
+    if (!(sel ins.values[1].register && ins.values[1].register == register.make(0, 10))) { ret 4; }
+    if (!(sel ins.values[2].register && ins.values[2].register == register.make(0, 31))) { ret 5; }
+    val unknown: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add r40, a0, a1", diagnostic.START);
+    if (!sel unknown.err) { ret 6; }
+    t.out.len = 0;
+    var w:     core_syntax.Writer = core_syntax.Writer{out: ?t.out, codec: ?riscv_catalog.CODEC, ctx: ?t.ctx, syntax: t.syntax, modes: ?t.modes, symbols: ?T_SYMBOLS, context: nil, row: nil};
+    val named: err[field.Refusal] = write.register_name(?w, register.make(0, 5), 0);
+    val raw:   err[field.Refusal] = write.register_name(?w, register.make(9, 3), 0);
+    if (sel named.err || sel raw.err) { ret 7; }
+    val ended: res[usize, A.Error] = vector.push[u8](?t.out, 0);
+    if (sel ended.err)                     { ret 10; }
+    if (!str_equals(t.out.data, "t0r9.3")) { ret 8; }
+    t.syntax = ?riscv_syntax.SYNTAX;
+    w.syntax = t.syntax;
+    val bare: err[field.Refusal] = write.register_name(?w, register.make(9, 3), 0);
+    if (!sel bare.err) { ret 9; }
+    ret 0;
+}
+
+# form markers of a test codec: thumb-like `.w` after the mnemonic, and the exact form's `{exact}` before it
+#[testing]
+val T_MARKERS: [2]core_form.FormField = [2]core_form.FormField{
+    core_form.FormField{name: "wide", mask: 0x1, value: 0x1, marker: ".w", suffix: true},
+    core_form.FormField{name: "exact", mask: core_form.EXACT, value: core_form.EXACT, marker: "{exact}", suffix: false},
+};
+
+# a form marker before or after the mnemonic reads into the instruction's form, and prints back where it was read
+test instruction__form_markers_read_into_the_form_and_print_back {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var codec: dispatch.Codec = riscv_catalog.CODEC;
+    codec.forms = core_form.FormFields{at: ?T_MARKERS[0], len: 2};
+    t.codec     = ?codec;
+    val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "{exact}  addi.w a0, a0, 1", diagnostic.START);
+    if (sel got.err) { ret 2; }
+    var ins: inst.Inst = got.ok;
+    if (ins.form.bits != (core_form.EXACT | 0x1) || ins.row != gen_row.ADDI)       { ret 3; }
+    if (!t_print(?t, ?ins) || !str_equals(t.out.data, "{exact} addi.w a0, a0, 1")) { ret 4; }
+    if (!t_prints_as(?t, "addi a0, a0, 1", "addi a0, a0, 1"))                      { ret 5; }
+    if (!t_prints_as(?t, "addi.w a0, a0, 1", "addi.w a0, a0, 1"))                  { ret 6; }
     ret 0;
 }
 

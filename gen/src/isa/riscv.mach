@@ -22,7 +22,9 @@ use std.types.string.str_compare;
 use std.types.string.str_equals;
 use std.types.string.str_join;
 use std.types.string.str_len;
+use std.types.view.View;
 use std.types.view.view;
+use std.types.view.view_eq_str;
 
 use A: std.allocator;
 use std.collections.map;
@@ -205,7 +207,8 @@ fun immediate(t: *Tables, imm: *operand.Immediate, fixup: str) res[emit.Value, d
     val f: *emit.File   = t.rows;
     val r: *emit.Record = record(f, "operand.Immediate");
     member(f, r, "bits", number(imm.bits::i64));
-    member(f, r, "signed", boolean(imm.signed));
+    if (imm.sign == operand.SIGNED) { member(f, r, "sign", name("operand.SIGNED")); }
+    or                              { member(f, r, "sign", name("operand.UNSIGNED")); }
     member(f, r, "scale", number(imm.scale::i64));
     member(f, r, "bias", number(imm.bias));
     if (fixup == nil) { member(f, r, "fixup", name("operand.NO_FIXUP")); }
@@ -334,7 +337,7 @@ fun requirement(t: *Tables, row: *mapping.Row, at: *u32, len: *u32) {
         var k:   usize                     = 0;
         for (k < alt.ids.len) {
             val n: str = mapping.atom_name(f.alloc, alt.ids.data[k]);
-            vector.push[emit.Value](?ids, name(emit.concat(f, "riscv_extension.", emit.ident(f, n))));
+            vector.push[emit.Value](?ids, name(emit.concat(f, "riscv_extension.id.", emit.ident(f, n))));
             k = k + 1;
         }
         val first: u32 = emit.pooled(f, ?t.ids, ids.data, ids.len::u32);
@@ -582,10 +585,50 @@ fun constraints_of(t: *Tables, row: *mapping.Row) emit.Value {
     ret span(f, "constraint.Constraints", "CONSTRAINTS", emit.pooled(f, ?t.keeps, items.data, items.len::u32), items.len::u32);
 }
 
-# what an operand's write leaves in the rest of its register's bank. no risc-v encoding family decides it, as x86 vex
-# does, so every operand writes as its register's row states
-fun write_of(f: *emit.File) emit.Value {
-    ret emit.Value.variant{emit.bare(f, "register.Write.row")};
+# the bits of the floating-point format `text[at..at + len]` names as a mnemonic's suffix: h and bf16 a half, s and w a
+# single, d a double and q a quad. 0 for a suffix naming no format
+fun format_bits(text: str, at: usize, len: usize) u16 {
+    val v: View = view(?text[at], len);
+    if (view_eq_str(v, "h") || view_eq_str(v, "bf16")) { ret 16; }
+    if (view_eq_str(v, "s") || view_eq_str(v, "w"))    { ret 32; }
+    if (view_eq_str(v, "d"))                           { ret 64; }
+    if (view_eq_str(v, "q"))                           { ret 128; }
+    ret 0;
+}
+
+# the bits of the format a floating-point write of `mnemonic` leaves in its destination: the letter after `fl` of a
+# load, as flw, c.fldsp and flh, else its first suffix, as fli.s, the destination's format, as fadd.s, fcvt.s.d and fmv.w.x. 0
+# for a mnemonic stating none, as vfmv.f.s, whose width is the element width state sets
+fun result_bits(mnemonic: str) u16 {
+    var at:  usize = 0;
+    val len: usize = str_len(mnemonic);
+    if (len > 2 && mnemonic[0] == 'c' && mnemonic[1] == '.') { at = 2; }
+    val load: bool = len >= at + 3 && mnemonic[at] == 'f' && mnemonic[at + 1] == 'l';
+    if (load && (len == at + 3 || (len == at + 5 && mnemonic[at + 3] == 's' && mnemonic[at + 4] == 'p'))) { ret format_bits(mnemonic, at + 2, 1); }
+    var dot: usize = at;
+    for (dot < len && mnemonic[dot] != '.') { dot = dot + 1; }
+    if (dot == len) { ret 0; }
+    var end: usize = dot + 1;
+    for (end < len && mnemonic[end] != '.') { end = end + 1; }
+    ret format_bits(mnemonic, dot + 1, end - dot - 1);
+}
+
+# what operand `op` of row `r` leaves where it writes. no risc-v encoding family decides the rest of a bank, as x86 vex
+# does, so every write extends as its register's row states. a write of an f register holds the result of its format
+# in its low bits and nan-boxes it, setting every bit above (src/unpriv/d-st-ext.adoc, "NaN Boxing of Narrower
+# Values": a narrower transfer, compute or sign-injection result, n < FLEN, is held in the low n bits with the upper
+# bits all ones), so each f, d, q, zfh and zfhmin row writing an f register states its format's width and ONES above
+fun write_of(f: *emit.File, r: *mapping.Row, op: *mapping.Operand) emit.Value {
+    val register_use: bool = op.use == overlay.REGISTER || op.use == overlay.SREG || op.use == mapping.IMPLICIT;
+    if (!register_use || (op.role & operand.WRITE) == 0 || op.class::u32 >= riscv_register.FILE.class_count) { ret name("operand.AS_ROW"); }
+    if (riscv_register.FILE.classes[op.class].kind != register.FLOAT)                                        { ret name("operand.AS_ROW"); }
+    val bits: u16 = result_bits(r.mnemonic);
+    if (bits == 0) { ret name("operand.AS_ROW"); }
+    val w: *emit.Record = record(f, "operand.Write");
+    member(f, w, "extend", emit.Value.variant{emit.bare(f, "opt[register.Extend].none")});
+    member(f, w, "result", number(bits::i64));
+    member(f, w, "above", name("register.ONES"));
+    ret rec_value(w);
 }
 
 # row `i` of the catalog written into the tables
@@ -603,7 +646,7 @@ fun row(t: *Tables, i: u32) err[diag.Refusal] {
         member(f, o, "role", role(op.role));
         member(f, o, "width", number(0));
         member(f, o, "quantity", name("operand.ONE"));
-        member(f, o, "write", write_of(f));
+        member(f, o, "write", write_of(f, r, op));
         vector.push[emit.Value](?ops, rec_value(o));
         k = k + 1;
     }
@@ -640,6 +683,7 @@ fun row(t: *Tables, i: u32) err[diag.Refusal] {
     member(f, rr, "constraints", constraints_of(t, r));
     if (r.hint) { member(f, rr, "flags", name("row.HINT")); }
     or          { member(f, rr, "flags", number(0)); }
+    member(f, rr, "index", number(i::i64));
     emit.item(f, t.table, rec_value(rr));
     ret err[diag.Refusal].ok{};
 }
@@ -748,6 +792,7 @@ fun rows(t: *Tables, c: *set.Context) err[diag.Refusal] {
     emit.uses(f, "riscv_register: masc.isa.riscv.register");
     emit.uses(f, "std.types.bool.false");
     emit.uses(f, "std.types.bool.true");
+    emit.uses(f, "std.types.option.opt");
     val classes: *emit.Array = emit.array(f, "u16");
     var k:       u32         = 0;
     for (k < riscv_register.FILE.class_count) {
@@ -793,6 +838,7 @@ fun rows(t: *Tables, c: *set.Context) err[diag.Refusal] {
     member(f, codec, "dispatch", emit.Value.address{"gen_dispatch.DISPATCH"});
     # the narrowest element width is sew_min's, which the walks test a mask against
     member(f, codec, "element", emit.Value.name{"riscv_register.SEW_MIN + 1"});
+    member(f, codec, "forms", emit.Value.name{"riscv_field.FORMS"});
     emit.declare(f, "CODEC", "dispatch.Codec", rec_value(codec));
     ret err[diag.Refusal].ok{};
 }
@@ -923,7 +969,7 @@ fun csrs(t: *Tables, c: *set.Context, s: *read.Source) err[diag.Refusal] {
         i = i + 1;
     }
     val rv32: *emit.Array = emit.array(f, "requirement.Id");
-    emit.item(f, rv32, name("riscv_extension.XLEN_32"));
+    emit.item(f, rv32, name("riscv_extension.id.XLEN_32"));
     val only: *emit.Array = emit.array(f, "requirement.Alternative");
     emit.item(f, only, alternative(f, span(f, "requirement.Ids", "RV32_ID", 0, 1)));
     emit.declare(f, "RV32_ID", nil, emit.Value.array{rv32});
