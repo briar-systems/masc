@@ -15,7 +15,7 @@ bootstrap chain, and keep the result out of the tree.
 ```bash
 git init mach-dev
 git -C mach-dev remote add origin https://github.com/briar-systems/mach.git
-git -C mach-dev fetch --depth 1 origin 6b2b0788eb5066461c958e97e72889f5cf2e97cd
+git -C mach-dev fetch --depth 1 origin 3971bd51733236b21f54e3e9f0344120d5333222
 git -C mach-dev checkout FETCH_HEAD
 cd mach-dev
 RUNNER_OS=Linux RUNNER_TEMP="$PWD/../mach-boot" GITHUB_ENV=/dev/null bash .github/scripts/bootstrap.sh
