@@ -1,0 +1,505 @@
+# the extension catalog generator of a set whose catalog masc writes by hand as line records
+#
+# it reads `extensions.txt` of the source's tree, whose records state the rows, the state axes, the levels, the
+# aliases, the conflicts and the combinations, and emits the set's gen_extension: a handle for every row and every
+# state value by gen's one rule (emit.ident), the rows with their implications and revisions, the levels with their
+# kinds, members and state, the name index of every row's and level's own name and every alias, and the conflicts and
+# combinations. the set's extension module builds its catalog from these and forwards the handles as `id`
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_join;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use gen.diag;
+use gen.emit;
+use gen.lines;
+use gen.set;
+use gen.source;
+
+pub val FILE: str = "extensions.txt";
+
+pub val NO_FILE:     str = "source holds no extensions.txt";
+pub val BAD_RECORD:  str = "record is not a row, axis, level, alias, conflict or combination";
+pub val BAD_FIELDS:  str = "record has the wrong number of fields";
+pub val BAD_KIND:    str = "level kind is not arch, profile, cpu or psabi";
+pub val UNKNOWN:     str = "atom names no row, level or state value stated before it";
+pub val NAMED_TWICE: str = "name given to two rows, levels or aliases";
+pub val IDENT_TWICE: str = "two rows or state values mangle to one identifier";
+pub val LATE_AXIS:   str = "axis stated after a level, conflict or combination that might name its values";
+pub val LATE_ROW:    str = "row stated after an axis, whose values number on from the rows";
+pub val NOT_ROW:     str = "atom is not a row where only a row is taken";
+
+# a row of the catalog: its name, its revision and what it implies, as atoms
+rec Row {
+    name:     str;
+    revision: str;
+    implies:  vector.Vector[u32];
+}
+
+# a level: its name, its kind's constant, the rows it selects and the state values it sets
+rec Level {
+    name:    str;
+    kind:    str;
+    members: vector.Vector[u32];
+    state:   vector.Vector[u32];
+}
+
+# a key of the name index and the rows and levels it names, the latter counted on from the rows
+rec Alias {
+    key:  str;
+    rows: vector.Vector[u32];
+}
+
+rec Conflict {
+    a: u32;
+    b: u32;
+}
+
+rec Combination {
+    by:      u32;
+    when:    vector.Vector[u32];
+    implies: vector.Vector[u32];
+}
+
+# what the records state, and the atom every name resolves to
+# ---
+# values: the state values as `axis=value`, numbered on from the rows in order
+# atoms:  each row, level and state value by name: a row's id, a level's index past every atom, a state value's atom
+rec Catalog {
+    alloc:        *A.Allocator;
+    rows:         vector.Vector[Row];
+    values:       vector.Vector[str];
+    levels:       vector.Vector[Level];
+    aliases:      vector.Vector[Alias];
+    conflicts:    vector.Vector[Conflict];
+    combinations: vector.Vector[Combination];
+    atoms:        map.Map[str, u32];
+    closed:       bool;
+}
+
+# the bias a level's atom carries in `atoms`, past every row and state value a catalog may have
+val LEVEL_BIAS: u32 = 0x8000_0000;
+
+fun memory(l: *lines.Line) err[diag.Refusal] {
+    ret err[diag.Refusal].err{lines.refuse(l, diag.MEMORY, nil)};
+}
+
+fun owned(a: *A.Allocator, v: View) str {
+    val got: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# `name` given atom `atom`, refused when a name before it has it
+fun name_atom(c: *Catalog, l: *lines.Line, name: str, atom: u32) err[diag.Refusal] {
+    var key:   str       = name;
+    val known: opt[*u32] = map.get[str, u32](?c.atoms, ?key);
+    if (sel known.some) { ret err[diag.Refusal].err{lines.refuse(l, NAMED_TWICE, name)}; }
+    val put: res[bool, A.Error] = map.insert[str, u32](?c.atoms, name, atom);
+    if (sel put.err) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the atom `v` names, a level's past LEVEL_BIAS
+fun atom(c: *Catalog, v: View) opt[u32] {
+    var key:   str       = owned(c.alloc, v);
+    val known: opt[*u32] = map.get[str, u32](?c.atoms, ?key);
+    if (sel known.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{@known.some};
+}
+
+# the atoms of tokens `from` on of `t`, or of the comma list `list` when it is not nil
+fun atoms(c: *Catalog, l: *lines.Line, t: *vector.Vector[View], from: usize, out: *vector.Vector[u32], levels: bool) err[diag.Refusal] {
+    var i: usize = from;
+    for (i < t.len) {
+        val got: opt[u32] = atom(c, t.data[i]);
+        if (sel got.none)                             { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN, owned(c.alloc, t.data[i]))}; }
+        if (!levels && got.some >= LEVEL_BIAS)        { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN, owned(c.alloc, t.data[i]))}; }
+        if (!pushed(vector.push[u32](out, got.some))) { ret memory(l); }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the atoms of the comma list `v`
+fun listed(c: *Catalog, l: *lines.Line, v: View, out: *vector.Vector[u32]) err[diag.Refusal] {
+    var at: usize = 0;
+    for (at <= v.len) {
+        var end: usize = at;
+        for (end < v.len && v.data[end] != ',') {
+            end = end + 1;
+        }
+        val one: View     = View{data: ?v.data[at], len: end - at};
+        val got: opt[u32] = atom(c, one);
+        if (sel got.none)                             { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN, owned(c.alloc, one))}; }
+        if (got.some >= LEVEL_BIAS)                   { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN, owned(c.alloc, one))}; }
+        if (!pushed(vector.push[u32](out, got.some))) { ret memory(l); }
+        at = end + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the constant of level kind `v`, nil when it names none
+fun kind(v: View) str {
+    if (view_eq_str(v, "arch"))    { ret "extension.ARCH"; }
+    if (view_eq_str(v, "profile")) { ret "extension.PROFILE"; }
+    if (view_eq_str(v, "cpu"))     { ret "extension.CPU"; }
+    if (view_eq_str(v, "psabi"))   { ret "extension.PSABI"; }
+    ret nil;
+}
+
+fun row_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len < 3)                                        { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    if (c.values.len > 0 || c.levels.len > 0 || c.closed) { ret err[diag.Refusal].err{lines.refuse(l, LATE_ROW, nil)}; }
+    var r: Row = Row{name: owned(c.alloc, t.data[1]), revision: "", implies: vector.init[u32](c.alloc)};
+    if (!view_eq_str(t.data[2], "-")) { r.revision = owned(c.alloc, t.data[2]); }
+    val named: err[diag.Refusal] = name_atom(c, l, r.name, c.rows.len::u32);
+    if (sel named.err)                         { ret named; }
+    if (!pushed(vector.push[Row](?c.rows, r))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun axis_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len < 4)                    { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    if (c.levels.len > 0 || c.closed) { ret err[diag.Refusal].err{lines.refuse(l, LATE_AXIS, nil)}; }
+    var i: usize = 2;
+    for (i < t.len) {
+        val axis: str                = owned(c.alloc, t.data[1]);
+        val one:  str                = owned(c.alloc, t.data[i]);
+        val both: res[str, StrError] = str_join(c.alloc, axis, "=", one);
+        if (sel both.err) { ret memory(l); }
+        val named: err[diag.Refusal] = name_atom(c, l, both.ok, (c.rows.len + c.values.len)::u32);
+        if (sel named.err)                                 { ret named; }
+        if (!pushed(vector.push[str](?c.values, both.ok))) { ret memory(l); }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun level_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len < 3) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    val k: str = kind(t.data[2]);
+    if (k == nil) { ret err[diag.Refusal].err{lines.refuse(l, BAD_KIND, nil)}; }
+    var v:    Level              = Level{name: owned(c.alloc, t.data[1]), kind: k, members: vector.init[u32](c.alloc), state: vector.init[u32](c.alloc)};
+    var all:  vector.Vector[u32] = vector.init[u32](c.alloc);
+    val read: err[diag.Refusal]  = atoms(c, l, t, 3, ?all, false);
+    if (sel read.err) { ret read; }
+    var i: usize = 0;
+    for (i < all.len) {
+        var into: *vector.Vector[u32] = ?v.members;
+        if (all.data[i] >= c.rows.len::u32)               { into = ?v.state; }
+        if (!pushed(vector.push[u32](into, all.data[i]))) { ret memory(l); }
+        i = i + 1;
+    }
+    c.closed = true;
+    val named: err[diag.Refusal] = name_atom(c, l, v.name, LEVEL_BIAS + c.levels.len::u32);
+    if (sel named.err)                             { ret named; }
+    if (!pushed(vector.push[Level](?c.levels, v))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun alias_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len < 3) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var x:    Alias             = Alias{key: owned(c.alloc, t.data[1]), rows: vector.init[u32](c.alloc)};
+    val read: err[diag.Refusal] = atoms(c, l, t, 2, ?x.rows, true);
+    if (sel read.err) { ret read; }
+    var key:   str       = x.key;
+    val known: opt[*u32] = map.get[str, u32](?c.atoms, ?key);
+    if (sel known.some)                             { ret err[diag.Refusal].err{lines.refuse(l, NAMED_TWICE, x.key)}; }
+    if (!pushed(vector.push[Alias](?c.aliases, x))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun conflict_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 3) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var pair: vector.Vector[u32] = vector.init[u32](c.alloc);
+    val read: err[diag.Refusal]  = atoms(c, l, t, 1, ?pair, false);
+    if (sel read.err) { ret read; }
+    c.closed = true;
+    if (!pushed(vector.push[Conflict](?c.conflicts, Conflict{a: pair.data[0], b: pair.data[1]}))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun combination_line(c: *Catalog, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 4) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    val by: opt[u32] = atom(c, t.data[1]);
+    if (sel by.none)                { ret err[diag.Refusal].err{lines.refuse(l, NOT_ROW, owned(c.alloc, t.data[1]))}; }
+    if (by.some >= c.rows.len::u32) { ret err[diag.Refusal].err{lines.refuse(l, NOT_ROW, owned(c.alloc, t.data[1]))}; }
+    var x:    Combination       = Combination{by: by.some, when: vector.init[u32](c.alloc), implies: vector.init[u32](c.alloc)};
+    val when: err[diag.Refusal] = listed(c, l, t.data[2], ?x.when);
+    if (sel when.err) { ret when; }
+    val then: err[diag.Refusal] = listed(c, l, t.data[3], ?x.implies);
+    if (sel then.err) { ret then; }
+    c.closed = true;
+    if (!pushed(vector.push[Combination](?c.combinations, x))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the records of `f`, the rows first so a row's implication may name a row after it, read in a second pass
+fun read(c: *Catalog, f: *source.File) err[diag.Refusal] {
+    val got: res[vector.Vector[lines.Line], diag.Refusal] = lines.read(c.alloc, f, '#');
+    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+    var ls:   vector.Vector[lines.Line]          = got.ok;
+    var toks: vector.Vector[vector.Vector[View]] = vector.init[vector.Vector[View]](c.alloc);
+    var i:    usize                              = 0;
+    for (i < ls.len) {
+        val tk: res[vector.Vector[View], diag.Refusal] = lines.tokens(c.alloc, ?ls.data[i]);
+        if (sel tk.err)                                              { ret err[diag.Refusal].err{tk.err}; }
+        if (!pushed(vector.push[vector.Vector[View]](?toks, tk.ok))) { ret memory(?ls.data[i]); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ls.len) {
+        val l:    *lines.Line          = ?ls.data[i];
+        val t:    *vector.Vector[View] = ?toks.data[i];
+        var done: err[diag.Refusal]    = err[diag.Refusal].ok{};
+        if (view_eq_str(t.data[0], "row"))         { done = row_line(c, l, t); }
+        or (view_eq_str(t.data[0], "axis"))        { done = axis_line(c, l, t); }
+        or (view_eq_str(t.data[0], "level"))       { done = level_line(c, l, t); }
+        or (view_eq_str(t.data[0], "alias"))       { done = alias_line(c, l, t); }
+        or (view_eq_str(t.data[0], "conflict"))    { done = conflict_line(c, l, t); }
+        or (view_eq_str(t.data[0], "combination")) { done = combination_line(c, l, t); }
+        or                                         { ret err[diag.Refusal].err{lines.refuse(l, BAD_RECORD, nil)}; }
+        if (sel done.err)                          { ret done; }
+        i = i + 1;
+    }
+    # every row is named by now, so its implications resolve
+    var r: usize = 0;
+    i = 0;
+    for (i < ls.len) {
+        val t: *vector.Vector[View] = ?toks.data[i];
+        if (view_eq_str(t.data[0], "row")) {
+            val read: err[diag.Refusal] = atoms(c, ?ls.data[i], t, 3, ?c.rows.data[r].implies, false);
+            if (sel read.err) { ret read; }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+# the handle of atom `a`: a row's or a state value's identifier, or a level's row of the name index as a number
+fun handle(c: *Catalog, idents: *vector.Vector[str], a: u32) emit.Value {
+    if (a >= LEVEL_BIAS) { ret number((c.rows.len::u32 + a - LEVEL_BIAS)::i64); }
+    ret name(idents.data[a]);
+}
+
+# the run of atoms `ids` in pool `p` declared as `array`, NO_IDS when empty
+fun run(f: *emit.File, c: *Catalog, p: *emit.Pool, array: str, idents: *vector.Vector[str], ids: *vector.Vector[u32]) emit.Value {
+    if (ids.len == 0) { ret name("requirement.NO_IDS"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](f.alloc);
+    var i:     usize                     = 0;
+    for (i < ids.len) {
+        vector.push[emit.Value](?items, handle(c, idents, ids.data[i]));
+        i = i + 1;
+    }
+    val at: u32          = emit.pooled(f, p, items.data, items.len::u32);
+    val r:  *emit.Record = emit.record(f, "requirement.Ids");
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(ids.len::i64));
+    ret emit.Value.record{r};
+}
+
+# a name index entry keyed `key` over `rows`
+fun entry(f: *emit.File, c: *Catalog, p: *emit.Pool, idents: *vector.Vector[str], key: str, rows: *vector.Vector[u32], canonical: bool) emit.Value {
+    val e: *emit.Record = emit.record(f, "extension.NameEntry");
+    emit.member(f, e, "key", emit.Value.text{key});
+    emit.member(f, e, "rows", run(f, c, p, "NAMED", idents, rows));
+    if (canonical) { emit.member(f, e, "canonical", name("true")); }
+    or             { emit.member(f, e, "canonical", name("false")); }
+    ret emit.Value.record{e};
+}
+
+fun table(c: *set.Context, cat: *Catalog) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "extension");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    if (cat.aliases.len > 0) { emit.uses(f, "std.types.bool.false"); }
+    emit.uses(f, "std.types.bool.true");
+    emit.uses(f, "masc.core.extension");
+    emit.uses(f, "masc.core.requirement");
+    val count:  u32                = cat.rows.len::u32;
+    var idents: vector.Vector[str] = vector.init[str](c.alloc);
+    var seen:   map.Map[str, u32]  = map.init[str, u32](c.alloc);
+    var i:      u32                = 0;
+    for (i < count + cat.values.len::u32) {
+        var text: str = nil;
+        if (i < count) { text = cat.rows.data[i].name; }
+        or             { text = cat.values.data[i - count]; }
+        val id:    str       = emit.ident(f, text);
+        var key:   str       = id;
+        val known: opt[*u32] = map.get[str, u32](?seen, ?key);
+        if (sel known.some) { ret err[diag.Refusal].err{diag.refusal(f.path, 0, IDENT_TWICE, text)}; }
+        map.insert[str, u32](?seen, id, i);
+        vector.push[str](?idents, id);
+        if (i < count) { emit.declare(f, id, "requirement.Id", number(i::i64)); }
+        i = i + 1;
+    }
+    emit.declare(f, "COUNT", "u32", number(count::i64));
+    # the state values number on from the rows, axis by axis, as the set's axes do
+    i = count;
+    for (i < count + cat.values.len::u32) {
+        emit.declare(f, idents.data[i], "requirement.Id", number(i::i64));
+        i = i + 1;
+    }
+
+    var implied: emit.Pool   = emit.pool(f, "requirement.Id");
+    val rows:    *emit.Array = emit.array(f, "extension.Extension");
+    i = 0;
+    for (i < count) {
+        val x: *Row         = ?cat.rows.data[i];
+        val r: *emit.Record = emit.record(f, "extension.Extension");
+        emit.member(f, r, "name", emit.Value.text{x.name});
+        emit.member(f, r, "implies", run(f, cat, ?implied, "IMPLIED", ?idents, ?x.implies));
+        emit.member(f, r, "revision", emit.Value.text{x.revision});
+        emit.item(f, rows, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare(f, "ROWS", nil, emit.Value.array{rows});
+    emit.declare_array(f, "IMPLIED", implied.array);
+
+    var members: emit.Pool   = emit.pool(f, "requirement.Id");
+    val levels:  *emit.Array = emit.array(f, "extension.Level");
+    i = 0;
+    for (i < cat.levels.len::u32) {
+        val x: *Level       = ?cat.levels.data[i];
+        val r: *emit.Record = emit.record(f, "extension.Level");
+        emit.member(f, r, "name", emit.Value.text{x.name});
+        emit.member(f, r, "kind", name(x.kind));
+        emit.member(f, r, "members", run(f, cat, ?members, "LEVEL_MEMBERS", ?idents, ?x.members));
+        emit.member(f, r, "state", run(f, cat, ?members, "LEVEL_MEMBERS", ?idents, ?x.state));
+        emit.item(f, levels, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare(f, "LEVELS", nil, emit.Value.array{levels});
+    emit.declare(f, "LEVEL_COUNT", "u32", number(cat.levels.len::i64));
+    emit.declare_array(f, "LEVEL_MEMBERS", members.array);
+
+    var named: emit.Pool          = emit.pool(f, "requirement.Id");
+    val names: *emit.Array        = emit.keyed(f, "extension.NameEntry");
+    var one:   vector.Vector[u32] = vector.init[u32](c.alloc);
+    vector.push[u32](?one, 0);
+    i = 0;
+    for (i < count + cat.levels.len::u32) {
+        var key: str = nil;
+        if (i < count) {
+            key         = cat.rows.data[i].name;
+            one.data[0] = i;
+        }
+        or {
+            key         = cat.levels.data[i - count].name;
+            one.data[0] = LEVEL_BIAS + i - count;
+        }
+        emit.entry(f, names, key, entry(f, cat, ?named, ?idents, key, ?one, true));
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < cat.aliases.len) {
+        val x: *Alias = ?cat.aliases.data[k];
+        emit.entry(f, names, x.key, entry(f, cat, ?named, ?idents, x.key, ?x.rows, false));
+        k = k + 1;
+    }
+    emit.seal(f, names);
+    emit.declare(f, "NAMES", nil, emit.Value.array{names});
+    emit.declare(f, "NAME_COUNT", "u32", number(emit.length(names)::i64));
+    emit.declare_array(f, "NAMED", named.array);
+
+    val conflicts: *emit.Array = emit.array(f, "extension.Conflict");
+    k = 0;
+    for (k < cat.conflicts.len) {
+        val r: *emit.Record = emit.record(f, "extension.Conflict");
+        emit.member(f, r, "a", handle(cat, ?idents, cat.conflicts.data[k].a));
+        emit.member(f, r, "b", handle(cat, ?idents, cat.conflicts.data[k].b));
+        emit.item(f, conflicts, emit.Value.record{r});
+        k = k + 1;
+    }
+    emit.declare(f, "CONFLICTS", "*extension.Conflict", emit.declare_array(f, "CONFLICT_ROWS", conflicts));
+    emit.declare(f, "CONFLICT_COUNT", "u32", number(cat.conflicts.len::i64));
+
+    var combined:     emit.Pool   = emit.pool(f, "requirement.Id");
+    val combinations: *emit.Array = emit.array(f, "extension.Combination");
+    k = 0;
+    for (k < cat.combinations.len) {
+        val x: *Combination = ?cat.combinations.data[k];
+        val r: *emit.Record = emit.record(f, "extension.Combination");
+        emit.member(f, r, "by", handle(cat, ?idents, x.by));
+        emit.member(f, r, "when", run(f, cat, ?combined, "COMBINED", ?idents, ?x.when));
+        emit.member(f, r, "implies", run(f, cat, ?combined, "COMBINED", ?idents, ?x.implies));
+        emit.item(f, combinations, emit.Value.record{r});
+        k = k + 1;
+    }
+    emit.declare(f, "COMBINATIONS", "*extension.Combination", emit.declare_array(f, "COMBINATION_ROWS", combinations));
+    emit.declare(f, "COMBINATION_COUNT", "u32", number(cat.combinations.len::i64));
+    emit.declare_array(f, "COMBINED", combined.array);
+    ret err[diag.Refusal].ok{};
+}
+
+# the name of every row and state value `tree`'s extensions.txt states, as a requirement of another table spells it
+pub fun atom_names(a: *A.Allocator, tree: *source.Tree, out: *vector.Vector[str]) err[diag.Refusal] {
+    val file: opt[*source.File] = source.find(tree, FILE);
+    if (sel file.none) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_FILE, nil)}; }
+    var cat:  Catalog           = fresh(a);
+    val done: err[diag.Refusal] = read(?cat, file.some);
+    if (sel done.err) { ret done; }
+    var i: usize = 0;
+    for (i < cat.rows.len) {
+        vector.push[str](out, cat.rows.data[i].name);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < cat.values.len) {
+        vector.push[str](out, cat.values.data[i]);
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun fresh(a: *A.Allocator) Catalog {
+    ret Catalog{
+        alloc:        a,
+        rows:         vector.init[Row](a),
+        values:       vector.init[str](a),
+        levels:       vector.init[Level](a),
+        aliases:      vector.init[Alias](a),
+        conflicts:    vector.init[Conflict](a),
+        combinations: vector.init[Combination](a),
+        atoms:        map.init[str, u32](a),
+        closed:       false,
+    };
+}
+
+# the catalog of the set the running generator emits, from its source's extensions.txt
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    val file: opt[*source.File] = source.find(c.tree, FILE);
+    if (sel file.none) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_FILE, nil)}; }
+    var cat:  Catalog           = fresh(c.alloc);
+    val done: err[diag.Refusal] = read(?cat, file.some);
+    if (sel done.err) { ret done; }
+    ret table(c, ?cat);
+}

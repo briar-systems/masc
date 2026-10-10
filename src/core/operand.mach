@@ -15,6 +15,7 @@ use std.types.string.str;
 
 use masc.core.index;
 use masc.core.register;
+use masc.core.requirement;
 
 # the most operands a row has
 pub val MAX_OPERANDS: u32 = 16;
@@ -88,10 +89,22 @@ pub def Format: u8;
 pub val INTEGER: Format = 0;
 pub val FLOAT:   Format = 1;
 
+# how an immediate's encoded bits read as a number
+# ---
+# UNSIGNED: from 0 to 2^n - 1, the zero value
+# SIGNED:   two's complement, from -2^(n-1) to 2^(n-1) - 1
+# EITHER:   either reading, from -2^(n-1) to 2^n - 1, as x86's imm8 takes -1 and 0xff alike. it decodes unsigned, as its
+#           bits read
+pub def Sign: u8;
+
+pub val UNSIGNED: Sign = 0;
+pub val SIGNED:   Sign = 1;
+pub val EITHER:   Sign = 2;
+
 # a number encoded as `bits` bits of `value - bias`
 # ---
 # bits:     the bits of the encoded number, its zero low `scale` bits included
-# signed:   whether the encoded number is two's complement
+# sign:     how the encoded number reads
 # scale:    the low bits that must be zero, which no field encodes
 # bias:     subtracted before encoding and added back after decoding
 # fixup:    the fixup kind a symbolic value takes by default, NO_FIXUP when the operand admits no symbol
@@ -100,7 +113,7 @@ pub val FLOAT:   Format = 1;
 #           added back and the sign extended. the empty list excludes nothing
 pub rec Immediate {
     bits:     u8;
-    signed:   bool;
+    sign:     Sign;
     scale:    u8;
     bias:     i64;
     fixup:    FixupKind;
@@ -120,11 +133,14 @@ pub val NUMBER: Content = 1;
 
 # bytes a set's kind writes and reads whole, never through slices
 # ---
-# max:     the most bytes it admits
-# content: what the bytes hold
+# max:      the most bytes it admits
+# content:  what the bytes hold
+# width_of: the operand whose value resolves the literal's width in the stream's context, by its index plus one, as a
+#           spir-v OpConstant's literal takes the width of its result type. 0 for a width the literal states itself
 pub rec Literal {
-    max:     u32;
-    content: Content;
+    max:      u32;
+    content:  Content;
+    width_of: u8;
 }
 
 # a width an element width is scaled from, with the power of two that scales it
@@ -164,10 +180,14 @@ pub tag Element: u8 {
 #         its element width is fixed or the state's
 # packed: the state's elements one bit each, 2^(m - log2 s) and never past one register, as a
 #         risc-v mask
+# group:  this many elements of the value's width as one group, whatever the multiplier, covering as many registers
+#         as the state's register length gives it, one where the state states none: a scalar is a group of 1, as a
+#         risc-v reduction's ceil(EEW/VLEN), and a vector crypto round's element group of 4, its ceil(EGW/VLEN)
 pub tag Span: u8 {
     fixed: u8;
     scaled;
     packed;
+    group: u8;
 }
 
 # the registers an operand part admits: a member of any listed class whose
@@ -183,6 +203,9 @@ pub tag Span: u8 {
 #           constraint.Grouping states its length. a memory part's register is always 1
 # element:  the width of each element the value holds
 # span:     how many registers a group covers under a state, which constraint.grouping reads
+# unviewed: whether it admits every register of its classes and range whatever the view, as risc-v's `.insn` reads
+#           any x, f or v register as llvm-mc's AnyReg does, whether or not the selection holds the extension that
+#           makes the register exist. false for every operand of a row of the catalog
 pub rec Register {
     classes:  Classes;
     first:    u32;
@@ -191,15 +214,17 @@ pub rec Register {
     fields:   u8;
     element:  Element;
     span:     Span;
+    unviewed: bool;
 }
 
 # the addressing forms a memory operand admits beyond base plus displacement, as bits
 pub def Forms: u8;
 
-pub val ABSOLUTE: Forms = 0x1;
-pub val PCREL:    Forms = 0x2;
-pub val PRE:      Forms = 0x4;
-pub val POST:     Forms = 0x8;
+pub val ABSOLUTE:      Forms = 0x1;
+pub val PCREL:         Forms = 0x2;
+pub val PRE:           Forms = 0x4;
+pub val POST:          Forms = 0x8;
+pub val POST_REGISTER: Forms = 0x10;
 
 # where a distance from the program counter is measured from, as a relative target or a RELATIVE_PC address
 # ---
@@ -215,35 +240,43 @@ pub val END:      Anchor = 2;
 
 # how a memory value forms its address
 # ---
-# OFFSET:      base plus scaled index plus displacement, any of them absent
-# RELATIVE_PC: the displacement from the program counter the set defines
-# PREINDEX:    as OFFSET, writing the address back to the base first
-# POSTINDEX:   the base alone, writing base plus displacement back after
+# OFFSET:             base plus scaled index plus displacement, any of them absent
+# RELATIVE_PC:        the displacement from the program counter the set defines
+# PREINDEX:           as OFFSET, writing the address back to the base first
+# POSTINDEX:          the base alone, writing base plus displacement back after
+# POSTINDEX_REGISTER: the base alone, writing base plus the index back after, as aarch64's `ld1 {v0.16b}, [x0], x1`
 pub def Mode: u8;
 
-pub val OFFSET:      Mode = 0;
-pub val RELATIVE_PC: Mode = 1;
-pub val PREINDEX:    Mode = 2;
-pub val POSTINDEX:   Mode = 3;
+pub val OFFSET:             Mode = 0;
+pub val RELATIVE_PC:        Mode = 1;
+pub val PREINDEX:           Mode = 2;
+pub val POSTINDEX:          Mode = 3;
+pub val POSTINDEX_REGISTER: Mode = 4;
 
 # a memory operand
 # ---
-# base:    the registers a base may be
-# index:   the registers an index may be, no classes when no index is admitted
-# segment: the registers a segment override may be, no classes when none is admitted
-# scales:  the index scales admitted, bit n for a scale of 1 << n
-# disp:    the displacement
-# forms:   the forms admitted beyond base plus displacement
-# anchor:  where a RELATIVE_PC displacement is measured from, as x86's rip is the instruction's end and an aarch64
-#          literal load's pc its start. UNSTATED when the operand does not admit PCREL
+# base:       the registers a base may be
+# index:      the registers an index may be, no classes when no index is admitted
+# segment:    the registers a segment override may be, no classes when none is admitted
+# scales:     the index scales admitted, bit n for a scale of 1 << n
+# disp:       the displacement
+# forms:      the forms admitted beyond base plus displacement
+# anchor:     where a RELATIVE_PC displacement is measured from, as x86's rip is the instruction's end and an aarch64
+#             literal load's pc its start. UNSTATED when the operand does not admit PCREL
+# extends:    how an index may be extended before it is scaled, as aarch64's uxtw, sxtw, lsl and sxtx, the empty
+#             enumeration for an index taken as it is
+# broadcasts: the broadcasts admitted, bit n for one element repeated 2^n times, as x86 evex's `{1to8}` at bit 3. 0 for
+#             none
 pub rec Memory {
-    base:    Register;
-    index:   Register;
-    segment: Register;
-    scales:  u8;
-    disp:    Immediate;
-    forms:   Forms;
-    anchor:  Anchor;
+    base:       Register;
+    index:      Register;
+    segment:    Register;
+    scales:     u8;
+    disp:       Immediate;
+    forms:      Forms;
+    anchor:     Anchor;
+    extends:    Enumeration;
+    broadcasts: u8;
 }
 
 # a target as an offset from the instruction's start or end
@@ -253,10 +286,28 @@ pub rec Relative {
 }
 
 # one named value of an enumeration
+# ---
+# name:     its spelling
+# value:    its value, or its bit in a mask enumeration
+# requires: what the context must hold for it to be admitted, as a spir-v capability an enumerant needs, none for every
+#           context
+# params:   the operands that follow it when it is chosen, as a spir-v decoration's literals. in a mask enumeration each
+#           set bit's params follow in bit order. the empty group for none
 pub rec Enumerant {
-    name:  str;
-    value: u32;
+    name:     str;
+    value:    u32;
+    requires: requirement.Requirement;
+    params:   Group;
 }
+
+# operands as one tuple, a quantity applying to the whole tuple, as spir-v's PairIdRefIdRef or an OpSwitch's
+# literal and label
+pub rec Group {
+    at:  *Operand;
+    len: u32;
+}
+
+pub val NO_GROUP: Group = Group{at: nil, len: 0};
 
 # the values an enumerant or condition operand admits, the one table the printer and the parser read
 # ---
@@ -300,6 +351,8 @@ pub rec Typed {
 # marker: a symbol no bits hold, which only marks the instruction for the linker, as risc-v's
 #         `%tprel_add(sym)` on an add or `%tlsdesc_call(sym)` on a jalr. it admits only a symbol
 #         given exactly this fixup kind, which is recorded at the instruction's start
+# group:  a tuple of operands taken as one value, its members' values in order, which the set's kinds place as they do a
+#         literal, and the syntax spells joined by its variadic text
 pub tag Shape: u8 {
     register:  Register;
     immediate: Immediate;
@@ -311,6 +364,42 @@ pub tag Shape: u8 {
     id:        Typed;
     literal:   Literal;
     marker:    FixupKind;
+    group:     Group;
+}
+
+# what one write of a register leaves, in the rest of the register's bank and in the register itself. the zero value,
+# AS_ROW, writes the whole register as its row states, which is the deliberate default: only an encoding that decides
+# the extension, or a write narrower than its register, states another
+# ---
+# extend: what it leaves in the rest of the bank, whatever the register's row states, where the instruction's encoding
+#         decides it, as a vex write of xmm0 zeroing the rest of ymm0 that a legacy sse write keeps. none for what the
+#         row states
+# result: the low bits of the register the result is written in, 0 for the whole register, as a single-precision
+#         result in a risc-v f register of a selection with d
+# above:  what the register holds above the result, as risc-v nan-boxes a narrower float by setting every bit above it
+#         (src/unpriv/d-st-ext.adoc, "NaN Boxing of Narrower Values"). UNSTATED where the result is the whole register
+pub rec Write {
+    extend: opt[register.Extend];
+    result: u16;
+    above:  register.Extend;
+}
+
+pub val AS_ROW: Write = Write{extend: opt[register.Extend].none{}, result: 0, above: register.UNSTATED};
+
+# a write's result narrower than its register, the one query a reader tracking values asks
+# ---
+# bits:  the low bits the result is written in
+# above: what every bit of the register above them holds
+pub rec Narrowed {
+    bits:  u64;
+    above: register.Extend;
+}
+
+# what `w` leaves in a register `width` bits wide: the result's bits and what lies above them, none where the result
+# is the whole register
+pub fun narrowed(w: *Write, width: u64) opt[Narrowed] {
+    if (w.result == 0 || w.result::u64 >= width) { ret opt[Narrowed].none{}; }
+    ret opt[Narrowed].some{Narrowed{bits: w.result::u64, above: w.above}};
 }
 
 # one operand of a row
@@ -319,15 +408,14 @@ pub tag Shape: u8 {
 # role:     how the instruction uses it
 # width:    the bits of data it names, such as a memory access or a register's view
 # quantity: how many values it takes
-# write:    what its write of a register leaves in the rest of the register's bank, register.Write.row for what the
-#           register's row states. only an operand that writes a register states another, where its encoding
-#           decides it, as an x86 vex destination zeroing the rest of its vector register
+# write:    what its write of a register leaves in the rest of the register's bank and above its result, AS_ROW for a
+#           whole register written as its row states. only an operand that writes a register states another
 pub rec Operand {
     shape:    Shape;
     role:     Role;
     width:    u16;
     quantity: Quantity;
-    write:    register.Write;
+    write:    Write;
 }
 
 # a symbol a value refers to
@@ -343,21 +431,25 @@ pub rec Symbol {
 
 # a memory value
 # ---
-# base:    the base register, register.NONE for none
-# index:   the index register, register.NONE for none
-# scale:   the index scale as a power of two
-# disp:    the displacement, zero when symbol names a symbol
-# segment: the segment override, register.NONE for none
-# mode:    how the address forms
-# symbol:  the symbol the displacement refers to, id NO_SYMBOL for none
+# base:      the base register, register.NONE for none
+# index:     the index register, register.NONE for none
+# scale:     the index scale as a power of two
+# disp:      the displacement, zero when symbol names a symbol
+# segment:   the segment override, register.NONE for none
+# mode:      how the address forms
+# symbol:    the symbol the displacement refers to, id NO_SYMBOL for none
+# extend:    the value of the member of its operand's extends the index is extended by, 0 for an operand of none
+# broadcast: the element repeated 2^n times, as `{1to8}` is 3, 0 for none
 pub rec Address {
-    base:    register.Id;
-    index:   register.Id;
-    scale:   u8;
-    disp:    i64;
-    segment: register.Id;
-    mode:    Mode;
-    symbol:  Symbol;
+    base:      register.Id;
+    index:     register.Id;
+    scale:     u8;
+    disp:      i64;
+    segment:   register.Id;
+    mode:      Mode;
+    symbol:    Symbol;
+    extend:    u32;
+    broadcast: u8;
 }
 
 # bytes as a pointer and a count. a decoded literal borrows the stream it was read from
@@ -366,13 +458,13 @@ pub rec Bytes {
     len: u32;
 }
 
-# values as a pointer and a count, for register lists and variadic operands
+# values as a pointer and a count, for register lists, variadic operands and a group's members
 pub rec Values {
     at:  *Value;
     len: u32;
 }
 
-# the value an instruction holds for one operand
+# the value an instruction holds for one operand, a group's its members' values in order
 pub tag Value: u8 {
     none;
     register:  register.Id;
@@ -385,6 +477,7 @@ pub tag Value: u8 {
     list:      Values;
     id:        u32;
     literal:   Bytes;
+    group:     Values;
 }
 
 # the position of `class` in `classes`, -1 when it is not there
@@ -500,12 +593,16 @@ pub fun equal(a: *Value, b: *Value) bool {
         if (!sel b.memory) { ret false; }
         val x: Address = a.memory;
         val y: Address = b.memory;
-        ret x.base == y.base && x.index == y.index && x.scale == y.scale && x.disp == y.disp && x.segment == y.segment && x.mode == y.mode && same_symbol(x.symbol, y.symbol);
+        ret x.base == y.base && x.index == y.index && x.scale == y.scale && x.disp == y.disp && x.segment == y.segment && x.mode == y.mode && same_symbol(x.symbol, y.symbol) && x.extend == y.extend && x.broadcast == y.broadcast;
     }
-    if (sel a.list) {
-        if (!sel b.list) { ret false; }
-        val x: Values = a.list;
-        val y: Values = b.list;
+    if (sel a.list || sel a.group) {
+        if (sel a.list != sel b.list || sel a.group != sel b.group) { ret false; }
+        var x: Values = Values{at: nil, len: 0};
+        var y: Values = Values{at: nil, len: 0};
+        if (sel a.list)     { x = a.list; }
+        if (sel a.group)    { x = a.group; }
+        if (sel b.list)     { y = b.list; }
+        if (sel b.group)    { y = b.group; }
         if (x.len != y.len) { ret false; }
         var i: u32 = 0;
         for (i < x.len) {

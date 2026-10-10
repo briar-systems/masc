@@ -1,0 +1,306 @@
+# the reader of llvm's names for the aarch64 extensions, AArch64Features.td
+#
+# the file is TableGen. each `def` of class Extension or ExtensionWithMArch
+# is one llvm feature: its target feature name, which -mattr takes, the
+# FEAT_* names it covers, and the features it implies. a `let` before it
+# sets UserVisibleName, the name -march and .arch take, and
+# UserVisibleAlias, a second one. ExtensionWithMArch defaults the
+# user-visible name to the target feature name. each `def` of class
+# Architecture64 is an architecture version, `v9.2a` naming v9Ap2 for the
+# a profile. only these defs, at the top level, are read, and every other
+# record, class and body is passed over.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use gen.diag;
+use gen.source;
+
+pub val UNTERMINATED: str = "string or comment does not end";
+pub val BAD_DEF:      str = "extension def is not `def NAME : CLASS<...>` with string names";
+pub val BLOCK_LET:    str = "a `let ... in {` block is not read";
+
+val IDENT:  u8 = 0;
+val NUMBER: u8 = 1;
+val STRING: u8 = 2;
+val PUNCT:  u8 = 3;
+
+rec Token {
+    kind: u8;
+    text: View;
+    line: u32;
+}
+
+# one extension def
+# ---
+# name:    the def's name, as implied lists name it
+# feature: the target feature name
+# visible: the user-visible name, "" for none
+# alias:   the user-visible alias, "" for none
+# arm:     the FEAT_* names it covers
+# implies: the defs it implies
+pub rec Extension {
+    name:    str;
+    feature: str;
+    visible: str;
+    alias:   str;
+    arm:     vector.Vector[str];
+    implies: vector.Vector[str];
+}
+
+# one a-profile architecture version, `name` naming vMajorApMinor
+pub rec Architecture {
+    name:  str;
+    major: u32;
+    minor: u32;
+}
+
+pub rec Names {
+    extensions:    vector.Vector[Extension];
+    architectures: vector.Vector[Architecture];
+}
+
+fun word(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+fun refuse[T](f: *source.File, line: u32, message: str, subject: str) res[T, diag.Refusal] {
+    ret res[T, diag.Refusal].err{diag.refusal(f.path, line, message, subject)};
+}
+
+fun tokens(a: *A.Allocator, f: *source.File) res[vector.Vector[Token], diag.Refusal] {
+    var out:  vector.Vector[Token] = vector.init[Token](a);
+    var i:    usize                = 0;
+    var line: u32                  = 1;
+    val d:    *u8                  = f.data;
+    for (i < f.len) {
+        val c: u8 = d[i];
+        if (c == '\n') {
+            line = line + 1;
+            i    = i + 1;
+        }
+        or (c == ' ' || c == '\t' || c == '\r') { i = i + 1; }
+        or (c == '/' && i + 1 < f.len && d[i + 1] == '/') {
+            for (i < f.len && d[i] != '\n') { i = i + 1; }
+        }
+        or (c == '/' && i + 1 < f.len && d[i + 1] == '*') {
+            i = i + 2;
+            for (i + 1 < f.len && !(d[i] == '*' && d[i + 1] == '/')) {
+                if (d[i] == '\n') { line = line + 1; }
+                i = i + 1;
+            }
+            if (i + 1 >= f.len) { ret refuse[vector.Vector[Token]](f, line, UNTERMINATED, nil); }
+            i = i + 2;
+        }
+        or (c == '"') {
+            val start: usize = i + 1;
+            i = start;
+            for (i < f.len && d[i] != '"' && d[i] != '\n') {
+                if (d[i] == '\\') { i = i + 1; }
+                i = i + 1;
+            }
+            if (i >= f.len || d[i] != '"') { ret refuse[vector.Vector[Token]](f, line, UNTERMINATED, nil); }
+            vector.push[Token](?out, Token{kind: STRING, text: View{data: ?d[start], len: i - start}, line: line});
+            i = i + 1;
+        }
+        or (word(c)) {
+            val start: usize = i;
+            for (i < f.len && word(d[i])) { i = i + 1; }
+            var k: u8 = IDENT;
+            if (c >= '0' && c <= '9') { k = NUMBER; }
+            vector.push[Token](?out, Token{kind: k, text: View{data: ?d[start], len: i - start}, line: line});
+        }
+        or {
+            vector.push[Token](?out, Token{kind: PUNCT, text: View{data: ?d[i], len: 1}, line: line});
+            i = i + 1;
+        }
+    }
+    ret res[vector.Vector[Token], diag.Refusal].ok{out};
+}
+
+fun punct(t: *Token, c: u8) bool {
+    ret t.kind == PUNCT && t.text.data[0] == c;
+}
+
+fun ident(t: *Token, s: str) bool {
+    ret t.kind == IDENT && view_eq_str(t.text, s);
+}
+
+fun owned(a: *A.Allocator, v: View) opt[str] {
+    val got: res[str, StrError] = str_copy_slice(a, v.data::str, 0, v.len);
+    if (sel got.err) { ret opt[str].none{}; }
+    ret opt[str].some{got.ok};
+}
+
+# a value of a let or an argument: tokens from `at` up to a comma, `>` or `in` at its own depth
+fun value_end(t: *vector.Vector[Token], at: usize) usize {
+    var depth: i64   = 0;
+    var i:     usize = at;
+    for (i < t.len) {
+        val k: *Token = ?t.data[i];
+        if (depth == 0 && (punct(k, ',') || punct(k, '>') || punct(k, ';') || ident(k, "in"))) { ret i; }
+        if (punct(k, '<') || punct(k, '[') || punct(k, '(') || punct(k, '{'))                  { depth = depth + 1; }
+        if (punct(k, '>') || punct(k, ']') || punct(k, ')') || punct(k, '}'))                  { depth = depth - 1; }
+        i = i + 1;
+    }
+    ret i;
+}
+
+fun number(v: View) u32 {
+    var n: u32   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        n = n * 10 + (v.data[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the FEAT names of a comma-separated list
+fun split(a: *A.Allocator, v: View, out: *vector.Vector[str]) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        for (i < v.len && (v.data[i] == ' ' || v.data[i] == ',')) { i = i + 1; }
+        val start: usize = i;
+        for (i < v.len && v.data[i] != ' ' && v.data[i] != ',') { i = i + 1; }
+        if (i > start) {
+            val name: opt[str] = owned(a, View{data: ?v.data[start], len: i - start});
+            if (sel name.none) { ret false; }
+            vector.push[str](out, name.some);
+        }
+    }
+    ret true;
+}
+
+# the names AArch64Features.td gives
+pub fun read(a: *A.Allocator, f: *source.File) res[Names, diag.Refusal] {
+    val lexed: res[vector.Vector[Token], diag.Refusal] = tokens(a, f);
+    if (sel lexed.err) { ret res[Names, diag.Refusal].err{lexed.err}; }
+    var t:       vector.Vector[Token] = lexed.ok;
+    var out:     Names                = Names{extensions: vector.init[Extension](a), architectures: vector.init[Architecture](a)};
+    var visible: View                 = View{data: nil, len: 0};
+    var alias:   View                 = View{data: nil, len: 0};
+    var named:   bool                 = false;
+    var aliased: bool                 = false;
+    var depth:   i64                  = 0;
+    var i:       usize                = 0;
+    for (i < t.len) {
+        val k: *Token = ?t.data[i];
+        if (punct(k, '{')) {
+            depth = depth + 1;
+            i     = i + 1;
+            cnt;
+        }
+        if (punct(k, '}')) {
+            depth = depth - 1;
+            i     = i + 1;
+            cnt;
+        }
+        if (depth == 0 && ident(k, "let")) {
+            var j: usize = i + 1;
+            for (j + 2 < t.len && t.data[j].kind == IDENT && punct(?t.data[j + 1], '=')) {
+                val key: *Token = ?t.data[j];
+                val end: usize  = value_end(?t, j + 2);
+                if (end == j + 3 && t.data[j + 2].kind == STRING) {
+                    if (ident(key, "UserVisibleName")) {
+                        visible = t.data[j + 2].text;
+                        named   = true;
+                    }
+                    if (ident(key, "UserVisibleAlias")) {
+                        alias   = t.data[j + 2].text;
+                        aliased = true;
+                    }
+                }
+                j = end;
+                if (j < t.len && punct(?t.data[j], ',')) { j = j + 1; }
+            }
+            if (j < t.len && ident(?t.data[j], "in")) {
+                if (j + 1 < t.len && punct(?t.data[j + 1], '{')) { ret refuse[Names](f, t.data[j].line, BLOCK_LET, nil); }
+                i = j + 1;
+                cnt;
+            }
+            named   = false;
+            aliased = false;
+            i       = j;
+            cnt;
+        }
+        if (depth == 0 && ident(k, "def") && i + 4 < t.len && t.data[i + 1].kind == IDENT && punct(?t.data[i + 2], ':') && t.data[i + 3].kind == IDENT && punct(?t.data[i + 4], '<')) {
+            val cls:     *Token = ?t.data[i + 3];
+            val marched: bool   = ident(cls, "ExtensionWithMArch");
+            val ext:     bool   = marched || ident(cls, "Extension");
+            val arch:    bool   = ident(cls, "Architecture64");
+            var args:    [6]usize;
+            var ends:    [6]usize;
+            var n:       usize  = 0;
+            var j:       usize  = i + 5;
+            for (j < t.len && n < 6) {
+                args[n] = j;
+                ends[n] = value_end(?t, j);
+                j       = ends[n];
+                n       = n + 1;
+                if (j < t.len && punct(?t.data[j], ',')) { j = j + 1; }
+                or                                       { brk; }
+            }
+            if (ext) {
+                if (n < 4 || ends[0] != args[0] + 1 || ends[2] != args[2] + 1 || t.data[args[0]].kind != STRING || t.data[args[2]].kind != STRING) { ret refuse[Names](f, k.line, BAD_DEF, nil); }
+                var e:     Extension = Extension{name: "", feature: "", visible: "", alias: "", arm: vector.init[str](a), implies: vector.init[str](a)};
+                val dname: opt[str]  = owned(a, t.data[i + 1].text);
+                if (sel dname.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                val feature: opt[str] = owned(a, t.data[args[0]].text);
+                if (sel feature.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                e.name    = dname.some;
+                e.feature = feature.some;
+                if (marched) { e.visible = feature.some; }
+                if (named) {
+                    val v: opt[str] = owned(a, visible);
+                    if (sel v.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                    e.visible = v.some;
+                }
+                if (aliased) {
+                    val v: opt[str] = owned(a, alias);
+                    if (sel v.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                    e.alias = v.some;
+                }
+                if (!split(a, t.data[args[2]].text, ?e.arm)) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                if (n >= 5 && punct(?t.data[args[4]], '[')) {
+                    var m: usize = args[4] + 1;
+                    for (m < ends[4]) {
+                        if (t.data[m].kind == IDENT) {
+                            val d: opt[str] = owned(a, t.data[m].text);
+                            if (sel d.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                            vector.push[str](?e.implies, d.some);
+                        }
+                        m = m + 1;
+                    }
+                }
+                vector.push[Extension](?out.extensions, e);
+            }
+            if (arch) {
+                if (n < 4 || t.data[args[0]].kind != NUMBER || t.data[args[1]].kind != NUMBER || t.data[args[2]].kind != STRING || t.data[args[3]].kind != STRING) { ret refuse[Names](f, k.line, BAD_DEF, nil); }
+                if (view_eq_str(t.data[args[2]].text, "a")) {
+                    val name: opt[str] = owned(a, t.data[args[3]].text);
+                    if (sel name.none) { ret refuse[Names](f, k.line, diag.MEMORY, nil); }
+                    vector.push[Architecture](?out.architectures, Architecture{name: name.some, major: number(t.data[args[0]].text), minor: number(t.data[args[1]].text)});
+                }
+            }
+            named   = false;
+            aliased = false;
+            i       = j;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret res[Names, diag.Refusal].ok{out};
+}
