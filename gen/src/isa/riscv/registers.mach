@@ -1,0 +1,959 @@
+# the riscv register file, read from the registers topic and written as gen_register
+#
+# the topic gen/data/riscv/registers.txt states the quantities the file scales
+# by and their bounds, the slots they bind, the classes, the registers, their
+# aliases and their debug numbers, each line citing where it is read from. the
+# generator builds the file in memory as the core record masc holds, maps rows
+# against it, and writes it with its handles as gen_register, which masc's
+# register module forwards. a run `a0..a7` names the registers or aliases whose
+# names count on from the first's number, and a run of registers numbers and
+# banks them on from the first.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+
+use masc.core.extension;
+use masc.core.index;
+use masc.core.quantity;
+use masc.core.register;
+use masc.core.requirement;
+use masc.core.state;
+
+use gen.diag;
+use gen.emit;
+use gen.isa.riscv.handles;
+use gen.lines;
+use gen.overlay;
+use gen.set;
+
+pub val TOPIC: str = "registers";
+
+pub val BAD_FACT:       str = "registers line is not quantity, bound, binding, class, register, alias, column or number";
+pub val BAD_SCALED:     str = "scaled amount is not fixed:per:scale";
+pub val BAD_RUN:        str = "run is not two names of one prefix counting up";
+pub val UNKNOWN:        str = "registers line names a quantity, class, register or column the topic does not state before it";
+pub val UNKNOWN_ATOM:   str = "requirement names no extension or state value of the catalog";
+pub val NAMED_TWICE:    str = "register or alias name given twice";
+pub val UNORDERED:      str = "registers are not in ascending order of class and number";
+pub val NUMBERED_TWICE: str = "register numbered twice in one column";
+pub val MISSING:        str = "registers line lacks a word its kind needs";
+pub val UNEVEN:         str = "alias run and register run differ in length";
+
+# a register's number in one column, as the topic states it
+rec Numbering {
+    column: u32;
+    row:    u32;
+    number: u32;
+}
+
+# the topic's records as they are read, before the file is laid out
+rec Reading {
+    alloc:      *A.Allocator;
+    catalog:    *extension.Catalog;
+    axes:       *state.Axes;
+    quantities: vector.Vector[quantity.Quantity];
+    bounds:     vector.Vector[vector.Vector[quantity.Bound]];
+    bindings:   vector.Vector[quantity.Binding];
+    classes:    vector.Vector[register.Class];
+    registers:  vector.Vector[register.Register];
+    aliases:    vector.Vector[register.Alias];
+    formats:    vector.Vector[register.Format];
+    columns:    vector.Vector[str];
+    numbering:  vector.Vector[Numbering];
+}
+
+# the file and what its requirements are over
+# ---
+# file:    the register file, as masc's register module states it
+# catalog: the catalog its requirements name
+# axes:    the state axes of the catalog
+pub rec Registers {
+    file:    register.File;
+    catalog: *extension.Catalog;
+    axes:    *state.Axes;
+}
+
+fun memory(f: *overlay.Fact) diag.Refusal {
+    ret overlay.refuse(f, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun number_of(f: *overlay.Fact, text: str) res[u32, diag.Refusal] {
+    val n: res[i64, diag.Refusal] = overlay.number(f, text);
+    if (sel n.err)                      { ret res[u32, diag.Refusal].err{n.err}; }
+    if (n.ok < 0 || n.ok > 0xFFFF_FFFF) { ret res[u32, diag.Refusal].err{overlay.refuse(f, overlay.BAD_NUMBER, text)}; }
+    ret res[u32, diag.Refusal].ok{n.ok::u32};
+}
+
+# the named value `name` of `ws` as a number, `otherwise` when no word names it and it is not `needed`
+fun named_number(f: *overlay.Fact, ws: *vector.Vector[str], name: str, otherwise: u32, needed: bool) res[u32, diag.Refusal] {
+    val v: opt[str] = overlay.value(ws, name);
+    if (sel v.none) {
+        if (needed) { ret res[u32, diag.Refusal].err{overlay.refuse(f, MISSING, name)}; }
+        ret res[u32, diag.Refusal].ok{otherwise};
+    }
+    ret number_of(f, v.some);
+}
+
+# the scaled amount `text` spells as fixed:per:scale
+fun scaled(f: *overlay.Fact, text: str) res[quantity.Scaled, diag.Refusal] {
+    var parts: [3]u32;
+    var at:    usize = 0;
+    var k:     u32   = 0;
+    for (k < 3) {
+        var n:   u32  = 0;
+        var any: bool = false;
+        for (text[at] >= '0' && text[at] <= '9') {
+            n   = n * 10 + (text[at] - '0')::u32;
+            any = true;
+            at  = at + 1;
+        }
+        if (!any) { ret res[quantity.Scaled, diag.Refusal].err{overlay.refuse(f, BAD_SCALED, text)}; }
+        parts[k] = n;
+        if (k < 2) {
+            if (text[at] != ':') { ret res[quantity.Scaled, diag.Refusal].err{overlay.refuse(f, BAD_SCALED, text)}; }
+            at = at + 1;
+        }
+        k = k + 1;
+    }
+    if (text[at] != 0 || parts[2] > 255) { ret res[quantity.Scaled, diag.Refusal].err{overlay.refuse(f, BAD_SCALED, text)}; }
+    ret res[quantity.Scaled, diag.Refusal].ok{quantity.Scaled{fixed: parts[0], per: parts[1], scale: parts[2]::u8}};
+}
+
+fun named_scaled(f: *overlay.Fact, ws: *vector.Vector[str], name: str, otherwise: quantity.Scaled) res[quantity.Scaled, diag.Refusal] {
+    val v: opt[str] = overlay.value(ws, name);
+    if (sel v.none) { ret res[quantity.Scaled, diag.Refusal].ok{otherwise}; }
+    ret scaled(f, v.some);
+}
+
+# where the decimal digits that end `name` start, its length when none do
+fun digits_at(name: str) usize {
+    var at: usize = str_len(name);
+    for (at > 0 && name[at - 1] >= '0' && name[at - 1] <= '9') {
+        at = at - 1;
+    }
+    ret at;
+}
+
+fun decimal(text: str, at: usize) u32 {
+    var n: u32   = 0;
+    var i: usize = at;
+    for (text[i] != 0) {
+        n = n * 10 + (text[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the names `text` spells, one name or the run `first..last`, into `out`
+fun run(a: *A.Allocator, f: *overlay.Fact, text: str, out: *vector.Vector[str]) err[diag.Refusal] {
+    val len: usize = str_len(text);
+    var dot: usize = 0;
+    for (dot + 1 < len && !(text[dot] == '.' && text[dot + 1] == '.')) {
+        dot = dot + 1;
+    }
+    if (dot + 1 >= len) {
+        if (!pushed(vector.push[str](out, text))) { ret err[diag.Refusal].err{memory(f)}; }
+        ret err[diag.Refusal].ok{};
+    }
+    val head: res[*u8, A.Error] = A.allocate[u8](a, dot + 1);
+    if (sel head.err) { ret err[diag.Refusal].err{memory(f)}; }
+    var i: usize = 0;
+    for (i < dot) {
+        head.ok[i] = text[i];
+        i          = i + 1;
+    }
+    head.ok[dot] = 0;
+    val first: str   = head.ok;
+    val last:  str   = ?text[dot + 2];
+    val fa:    usize = digits_at(first);
+    val la:    usize = digits_at(last);
+    var same:  bool  = fa == la && fa < str_len(first) && la < str_len(last);
+    i = 0;
+    for (same && i < fa) {
+        if (first[i] != last[i]) { same = false; }
+        i = i + 1;
+    }
+    if (!same) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_RUN, text)}; }
+    val lo: u32 = decimal(first, fa);
+    val hi: u32 = decimal(last, la);
+    if (hi <= lo) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_RUN, text)}; }
+    var n: u32 = lo;
+    for (n <= hi) {
+        var digits: [16]u8;
+        val dl:     usize = format.put_u64(?digits[0], n::u64);
+        digits[dl] = 0;
+        val got: res[*u8, A.Error] = A.allocate[u8](a, fa + dl + 1);
+        if (sel got.err) { ret err[diag.Refusal].err{memory(f)}; }
+        var k: usize = 0;
+        for (k < fa) {
+            got.ok[k] = first[k];
+            k         = k + 1;
+        }
+        k = 0;
+        for (k < dl) {
+            got.ok[fa + k] = digits[k];
+            k              = k + 1;
+        }
+        got.ok[fa + dl] = 0;
+        if (!pushed(vector.push[str](out, got.ok))) { ret err[diag.Refusal].err{memory(f)}; }
+        n = n + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the requirement `text` spells: alternatives split by `|`, atoms by spaces, an atom after `!` one it must not hold
+fun requires(r: *Reading, f: *overlay.Fact, text: str) res[requirement.Requirement, diag.Refusal] {
+    var alts: vector.Vector[requirement.Alternative] = vector.init[requirement.Alternative](r.alloc);
+    val len:  usize                                  = str_len(text);
+    var at:   usize                                  = 0;
+    for (at <= len) {
+        var end: usize = at;
+        for (end < len && text[end] != '|') {
+            end = end + 1;
+        }
+        var all:  vector.Vector[requirement.Id] = vector.init[requirement.Id](r.alloc);
+        var none: vector.Vector[requirement.Id] = vector.init[requirement.Id](r.alloc);
+        var i:    usize                         = at;
+        for (i < end) {
+            if (text[i] == ' ') {
+                i = i + 1;
+                cnt;
+            }
+            var out: *vector.Vector[requirement.Id] = ?all;
+            if (text[i] == '!') {
+                out = ?none;
+                i   = i + 1;
+            }
+            var stop: usize = i;
+            for (stop < end && text[stop] != ' ') {
+                stop = stop + 1;
+            }
+            val id: opt[requirement.Id] = state.lookup(r.catalog, r.axes, text, i, stop - i);
+            if (sel id.none)                                        { ret res[requirement.Requirement, diag.Refusal].err{overlay.refuse(f, UNKNOWN_ATOM, text)}; }
+            if (!pushed(vector.push[requirement.Id](out, id.some))) { ret res[requirement.Requirement, diag.Refusal].err{memory(f)}; }
+            i = stop;
+        }
+        var alt: requirement.Alternative = requirement.Alternative{all: requirement.NO_IDS, none: requirement.NO_IDS};
+        if (all.len > 0)                                               { alt.all = requirement.Ids{at: all.data, len: all.len::u32}; }
+        if (none.len > 0)                                              { alt.none = requirement.Ids{at: none.data, len: none.len::u32}; }
+        if (!pushed(vector.push[requirement.Alternative](?alts, alt))) { ret res[requirement.Requirement, diag.Refusal].err{memory(f)}; }
+        at = end + 1;
+    }
+    ret res[requirement.Requirement, diag.Refusal].ok{requirement.Requirement{at: alts.data, len: alts.len::u32}};
+}
+
+fun named_requires(r: *Reading, f: *overlay.Fact, ws: *vector.Vector[str], name: str) res[requirement.Requirement, diag.Refusal] {
+    val v: opt[str] = overlay.value(ws, name);
+    if (sel v.none) { ret res[requirement.Requirement, diag.Refusal].ok{requirement.NO_ALTERNATIVES}; }
+    ret requires(r, f, v.some);
+}
+
+fun quantity_named(r: *Reading, name: str) opt[u32] {
+    var i: usize = 0;
+    for (i < r.quantities.len) {
+        if (str_equals(r.quantities.data[i].name, name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun class_named(r: *Reading, name: str) opt[u32] {
+    var i: usize = 0;
+    for (i < r.classes.len) {
+        if (str_equals(r.classes.data[i].name, name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun register_named(r: *Reading, name: str) opt[u32] {
+    var i: usize = 0;
+    for (i < r.registers.len) {
+        if (str_equals(r.registers.data[i].name, name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun column_named(r: *Reading, name: str) opt[u32] {
+    var i: usize = 0;
+    for (i < r.columns.len) {
+        if (str_equals(r.columns.data[i], name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun quantity_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val unit:  res[u32, diag.Refusal] = named_number(f, ws, "unit", 0, true);
+    val least: res[u32, diag.Refusal] = named_number(f, ws, "least", 0, true);
+    val most:  res[u32, diag.Refusal] = named_number(f, ws, "most", 0, true);
+    if (sel unit.err)  { ret err[diag.Refusal].err{unit.err}; }
+    if (sel least.err) { ret err[diag.Refusal].err{least.err}; }
+    if (sel most.err)  { ret err[diag.Refusal].err{most.err}; }
+    val q: quantity.Quantity = quantity.Quantity{name: key.data[1], unit: unit.ok, domain: quantity.Domain.powers{quantity.Range{least: least.ok, most: most.ok}}, bounds: quantity.NO_BOUNDS, register: quantity.NO_ROW};
+    if (!pushed(vector.push[quantity.Quantity](?r.quantities, q)))                                            { ret err[diag.Refusal].err{memory(f)}; }
+    if (!pushed(vector.push[vector.Vector[quantity.Bound]](?r.bounds, vector.init[quantity.Bound](r.alloc)))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun bound_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val q: opt[u32] = quantity_named(r, key.data[1]);
+    if (sel q.none) { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, key.data[1])}; }
+    val when: opt[str] = overlay.value(ws, "when");
+    if (sel when.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "when")}; }
+    val req: res[requirement.Requirement, diag.Refusal] = requires(r, f, when.some);
+    if (sel req.err) { ret err[diag.Refusal].err{req.err}; }
+    val least: res[u32, diag.Refusal] = named_number(f, ws, "least", 0, true);
+    val most:  res[u32, diag.Refusal] = named_number(f, ws, "most", 0, true);
+    if (sel least.err)                                                                                                              { ret err[diag.Refusal].err{least.err}; }
+    if (sel most.err)                                                                                                               { ret err[diag.Refusal].err{most.err}; }
+    if (!pushed(vector.push[quantity.Bound](?r.bounds.data[q.some], quantity.Bound{when: req.ok, least: least.ok, most: most.ok}))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun binding_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val slot: res[u32, diag.Refusal] = number_of(f, key.data[1]);
+    if (sel slot.err) { ret err[diag.Refusal].err{slot.err}; }
+    val name: opt[str] = overlay.value(ws, "quantity");
+    if (sel name.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "quantity")}; }
+    val q: opt[u32] = quantity_named(r, name.some);
+    if (sel q.none) { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, name.some)}; }
+    val when: res[requirement.Requirement, diag.Refusal] = named_requires(r, f, ws, "when");
+    if (sel when.err)                                                                                                                  { ret err[diag.Refusal].err{when.err}; }
+    if (!pushed(vector.push[quantity.Binding](?r.bindings, quantity.Binding{slot: slot.ok::u8, when: when.ok, quantity: q.some::u8}))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+val KIND_NAMES: [7]str = [7]str{"general", "float", "vector", "predicate", "flags", "tile", "system"};
+
+fun class_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val kind: opt[str] = overlay.value(ws, "kind");
+    if (sel kind.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "kind")}; }
+    var k: u32 = 0;
+    for (k < 7 && !str_equals(KIND_NAMES[k], kind.some)) {
+        k = k + 1;
+    }
+    if (k == 7) { ret err[diag.Refusal].err{overlay.refuse(f, overlay.UNKNOWN_WORD, kind.some)}; }
+    val none:  quantity.Scaled                    = quantity.Scaled{fixed: 0, per: 0, scale: 0};
+    val width: res[quantity.Scaled, diag.Refusal] = named_scaled(f, ws, "width", none);
+    val count: res[quantity.Scaled, diag.Refusal] = named_scaled(f, ws, "count", none);
+    if (sel width.err)                                                                                                                                 { ret err[diag.Refusal].err{width.err}; }
+    if (sel count.err)                                                                                                                                 { ret err[diag.Refusal].err{count.err}; }
+    if (!pushed(vector.push[register.Class](?r.classes, register.Class{name: key.data[1], kind: k::register.Kind, width: width.ok, count: count.ok}))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the flags `text` names, split by commas
+fun flags_of(f: *overlay.Fact, text: str) res[register.Flags, diag.Refusal] {
+    var flags: register.Flags = 0;
+    var at:    usize          = 0;
+    val len:   usize          = str_len(text);
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && text[end] != ',') {
+            end = end + 1;
+        }
+        var word: [16]u8;
+        var k:    usize = 0;
+        for (k < end - at && k < 15) {
+            word[k] = text[at + k];
+            k       = k + 1;
+        }
+        word[k] = 0;
+        val w: str = ?word[0];
+        if (str_equals(w, "zero"))      { flags = flags | register.ZERO; }
+        or (str_equals(w, "link"))      { flags = flags | register.LINK; }
+        or (str_equals(w, "stack"))     { flags = flags | register.STACK; }
+        or (str_equals(w, "accrued"))   { flags = flags | register.ACCRUED; }
+        or (str_equals(w, "length"))    { flags = flags | register.LENGTH; }
+        or (str_equals(w, "pc"))        { flags = flags | register.PC; }
+        or (str_equals(w, "unspelled")) { flags = flags | register.UNSPELLED; }
+        or                              { ret res[register.Flags, diag.Refusal].err{overlay.refuse(f, overlay.UNKNOWN_WORD, text)}; }
+        at = end + 1;
+    }
+    ret res[register.Flags, diag.Refusal].ok{flags};
+}
+
+fun register_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    var names:  vector.Vector[str] = vector.init[str](r.alloc);
+    val listed: err[diag.Refusal]  = run(r.alloc, f, key.data[1], ?names);
+    if (sel listed.err) { ret listed; }
+    val cname: opt[str] = overlay.value(ws, "class");
+    if (sel cname.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "class")}; }
+    val class: opt[u32] = class_named(r, cname.some);
+    if (sel class.none) { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, cname.some)}; }
+    val number: res[u32, diag.Refusal] = named_number(f, ws, "number", 0, true);
+    val bank:   res[u32, diag.Refusal] = named_number(f, ws, "bank", 0, true);
+    if (sel number.err) { ret err[diag.Refusal].err{number.err}; }
+    if (sel bank.err)   { ret err[diag.Refusal].err{bank.err}; }
+    val zero:   quantity.Scaled                    = quantity.Scaled{fixed: 0, per: 0, scale: 0};
+    val one:    quantity.Scaled                    = quantity.Scaled{fixed: 1, per: 0, scale: 0};
+    val offset: res[quantity.Scaled, diag.Refusal] = named_scaled(f, ws, "offset", zero);
+    val stride: res[quantity.Scaled, diag.Refusal] = named_scaled(f, ws, "stride", zero);
+    val count:  res[quantity.Scaled, diag.Refusal] = named_scaled(f, ws, "count", one);
+    if (sel offset.err) { ret err[diag.Refusal].err{offset.err}; }
+    if (sel stride.err) { ret err[diag.Refusal].err{stride.err}; }
+    if (sel count.err)  { ret err[diag.Refusal].err{count.err}; }
+    var flags: register.Flags = 0;
+    val named: opt[str]       = overlay.value(ws, "flags");
+    if (sel named.some) {
+        val got: res[register.Flags, diag.Refusal] = flags_of(f, named.some);
+        if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+        flags = got.ok;
+    }
+    val req: res[requirement.Requirement, diag.Refusal] = named_requires(r, f, ws, "requires");
+    if (sel req.err) { ret err[diag.Refusal].err{req.err}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        val row: register.Register = register.Register{name: names.data[i], class: class.some::u16, number: (number.ok + i::u32)::u16, bank: (bank.ok + i::u32)::u16, offset: offset.ok, stride: stride.ok, count: count.ok, places: register.ONE_PLACE, flags: flags, requires: req.ok, extend: register.KEEP, reach: register.Reach.bank{}};
+        if (!pushed(vector.push[register.Register](?r.registers, row))) { ret err[diag.Refusal].err{memory(f)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun alias_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    var names: vector.Vector[str] = vector.init[str](r.alloc);
+    var of:    vector.Vector[str] = vector.init[str](r.alloc);
+    val a:     err[diag.Refusal]  = run(r.alloc, f, key.data[1], ?names);
+    if (sel a.err) { ret a; }
+    val b: err[diag.Refusal] = run(r.alloc, f, f.fact, ?of);
+    if (sel b.err)           { ret b; }
+    if (names.len != of.len) { ret err[diag.Refusal].err{overlay.refuse(f, UNEVEN, f.key)}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        val row: opt[u32] = register_named(r, of.data[i]);
+        if (sel row.none)                                                                                              { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, of.data[i])}; }
+        if (!pushed(vector.push[register.Alias](?r.aliases, register.Alias{name: names.data[i], register: row.some}))) { ret err[diag.Refusal].err{memory(f)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun column_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val format: opt[str] = overlay.value(ws, "format");
+    if (sel format.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "format")}; }
+    var fmt: register.Format = register.DWARF;
+    if (str_equals(format.some, "codeview"))                    { fmt = register.CODEVIEW; }
+    or (!str_equals(format.some, "dwarf"))                      { ret err[diag.Refusal].err{overlay.refuse(f, overlay.UNKNOWN_WORD, format.some)}; }
+    if (!pushed(vector.push[str](?r.columns, key.data[1])))     { ret err[diag.Refusal].err{memory(f)}; }
+    if (!pushed(vector.push[register.Format](?r.formats, fmt))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun number_line(r: *Reading, f: *overlay.Fact, key: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 3) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val column: opt[u32] = column_named(r, key.data[1]);
+    if (sel column.none) { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, key.data[1])}; }
+    var names:  vector.Vector[str] = vector.init[str](r.alloc);
+    val listed: err[diag.Refusal]  = run(r.alloc, f, key.data[2], ?names);
+    if (sel listed.err) { ret listed; }
+    val first: res[u32, diag.Refusal] = number_of(f, f.fact);
+    if (sel first.err) { ret err[diag.Refusal].err{first.err}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        val row: opt[u32] = register_named(r, names.data[i]);
+        if (sel row.none)                                                                                                            { ret err[diag.Refusal].err{overlay.refuse(f, UNKNOWN, names.data[i])}; }
+        if (!pushed(vector.push[Numbering](?r.numbering, Numbering{column: column.some, row: row.some, number: first.ok + i::u32}))) { ret err[diag.Refusal].err{memory(f)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun by_key(a: *index.Entry, b: *index.Entry) i64 {
+    ret str_compare(a.key, b.key);
+}
+
+fun by_number(a: *index.Number, b: *index.Number) i64 {
+    if (a.key < b.key) { ret -1; }
+    if (a.key > b.key) { ret 1; }
+    ret 0;
+}
+
+fun refused(message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(nil, 0, message, subject)};
+}
+
+# the file the reading lays out: bounds placed under their quantities, the names and debug numbers indexed
+fun lay_out(r: *Reading, out: *register.File) err[diag.Refusal] {
+    var q: usize = 0;
+    for (q < r.quantities.len) {
+        val b: *vector.Vector[quantity.Bound] = ?r.bounds.data[q];
+        if (b.len > 0) { r.quantities.data[q].bounds = quantity.Bounds{at: b.data, len: b.len::u32}; }
+        q = q + 1;
+    }
+    var slots: u32   = 0;
+    var i:     usize = 0;
+    for (i < r.bindings.len) {
+        if (r.bindings.data[i].slot::u32 + 1 > slots) { slots = r.bindings.data[i].slot::u32 + 1; }
+        i = i + 1;
+    }
+    i = 1;
+    for (i < r.registers.len) {
+        if (register.id_of(?r.registers.data[i]) <= register.id_of(?r.registers.data[i - 1])) { ret refused(UNORDERED, r.registers.data[i].name); }
+        i = i + 1;
+    }
+    val nc:      usize                      = r.classes.len;
+    val classes: res[*index.Entry, A.Error] = A.allocate[index.Entry](r.alloc, nc);
+    if (sel classes.err) { ret refused(diag.MEMORY, nil); }
+    i = 0;
+    for (i < nc) {
+        classes.ok[i] = index.Entry{key: r.classes.data[i].name, row: i::u32};
+        i             = i + 1;
+    }
+    sort.sort_by[index.Entry](classes.ok, nc, by_key);
+    val rows:  usize                      = r.registers.len;
+    val total: usize                      = rows + r.aliases.len;
+    val names: res[*index.Entry, A.Error] = A.allocate[index.Entry](r.alloc, total);
+    if (sel names.err) { ret refused(diag.MEMORY, nil); }
+    i = 0;
+    for (i < rows) {
+        names.ok[i] = index.Entry{key: r.registers.data[i].name, row: i::u32};
+        i           = i + 1;
+    }
+    i = 0;
+    for (i < r.aliases.len) {
+        names.ok[rows + i] = index.Entry{key: r.aliases.data[i].name, row: (rows + i)::u32};
+        i                  = i + 1;
+    }
+    sort.sort_by[index.Entry](names.ok, total, by_key);
+    i = 1;
+    for (i < total) {
+        if (str_equals(names.ok[i].key, names.ok[i - 1].key)) { ret refused(NAMED_TWICE, names.ok[i].key); }
+        i = i + 1;
+    }
+    val nk:      usize                          = r.columns.len;
+    val columns: res[*register.Column, A.Error] = A.allocate[register.Column](r.alloc, nk);
+    if (sel columns.err) { ret refused(diag.MEMORY, nil); }
+    var k: usize = 0;
+    for (k < nk) {
+        val numbers: res[*u32, A.Error] = A.allocate[u32](r.alloc, rows);
+        if (sel numbers.err) { ret refused(diag.MEMORY, nil); }
+        i = 0;
+        for (i < rows) {
+            numbers.ok[i] = register.UNNUMBERED;
+            i             = i + 1;
+        }
+        var numbered: vector.Vector[index.Number] = vector.init[index.Number](r.alloc);
+        i = 0;
+        for (i < r.numbering.len) {
+            val n: *Numbering = ?r.numbering.data[i];
+            if (n.column::usize == k) {
+                if (numbers.ok[n.row] != register.UNNUMBERED) { ret refused(NUMBERED_TWICE, r.registers.data[n.row].name); }
+                numbers.ok[n.row] = n.number;
+                if (!pushed(vector.push[index.Number](?numbered, index.Number{key: n.number::u64, row: n.row}))) { ret refused(diag.MEMORY, nil); }
+            }
+            i = i + 1;
+        }
+        sort.sort_by[index.Number](numbered.data, numbered.len, by_number);
+        columns.ok[k] = register.Column{format: r.formats.data[k], flavour: requirement.NO_ALTERNATIVES, numbers: numbers.ok, len: rows::u32, numbered: index.Numbers{at: numbered.data, len: numbered.len::u32}};
+        k             = k + 1;
+    }
+    @out = register.File{
+        quantities:     quantity.Quantities{at: r.quantities.data, len: r.quantities.len::u32},
+        bindings:       quantity.Bindings{at: r.bindings.data, len: r.bindings.len::u32},
+        slot_count:     slots,
+        classes:        r.classes.data,
+        class_count:    nc::u32,
+        class_names:    index.Index{at: classes.ok, len: nc::u32},
+        registers:      r.registers.data,
+        register_count: rows::u32,
+        aliases:        r.aliases.data,
+        alias_count:    r.aliases.len::u32,
+        names:          index.Index{at: names.ok, len: total::u32},
+        columns:        columns.ok,
+        column_count:   nk::u32,
+    };
+    ret err[diag.Refusal].ok{};
+}
+
+# the registers topic `t` read and laid out into `out`, its requirements over `catalog` and `axes`
+pub fun read(a: *A.Allocator, t: *overlay.Topic, catalog: *extension.Catalog, axes: *state.Axes, out: *Registers) err[diag.Refusal] {
+    var r: Reading = Reading{
+        alloc:      a,
+        catalog:    catalog,
+        axes:       axes,
+        quantities: vector.init[quantity.Quantity](a),
+        bounds:     vector.init[vector.Vector[quantity.Bound]](a),
+        bindings:   vector.init[quantity.Binding](a),
+        classes:    vector.init[register.Class](a),
+        registers:  vector.init[register.Register](a),
+        aliases:    vector.init[register.Alias](a),
+        formats:    vector.init[register.Format](a),
+        columns:    vector.init[str](a),
+        numbering:  vector.init[Numbering](a),
+    };
+    val checked: err[diag.Refusal] = overlay.check(t, nil, overlay.unstated);
+    if (sel checked.err) { ret checked; }
+    var i: usize = 0;
+    for (i < t.facts.len) {
+        val f:   *overlay.Fact                         = ?t.facts.data[i];
+        val key: res[vector.Vector[str], diag.Refusal] = overlay.words(a, f, f.key);
+        val ws:  res[vector.Vector[str], diag.Refusal] = overlay.words(a, f, f.fact);
+        if (sel key.err)     { ret err[diag.Refusal].err{key.err}; }
+        if (sel ws.err)      { ret err[diag.Refusal].err{ws.err}; }
+        if (key.ok.len == 0) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+        val kind: str               = key.ok.data[0];
+        var done: err[diag.Refusal] = err[diag.Refusal].ok{};
+        if (str_equals(kind, "quantity")) { done = quantity_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "bound"))    { done = bound_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "binding"))  { done = binding_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "class"))    { done = class_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "register")) { done = register_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "alias"))    { done = alias_line(?r, f, ?key.ok); }
+        or (str_equals(kind, "column"))   { done = column_line(?r, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "number"))   { done = number_line(?r, f, ?key.ok); }
+        or                                { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+        if (sel done.err)                 { ret done; }
+        i = i + 1;
+    }
+    out.catalog = catalog;
+    out.axes    = axes;
+    ret lay_out(?r, ?out.file);
+}
+
+# the name the tables give atom `id`: an extension's name, or a state value's axis and value joined by `_`, as
+# `xlen_64`, which the emitters write as the identifier of the catalog's constant for it
+pub fun atom_name(a: *A.Allocator, catalog: *extension.Catalog, axes: *state.Axes, id: requirement.Id) str {
+    if (id < catalog.count) { ret catalog.extensions[id].name; }
+    val at: opt[state.Placed] = state.place(catalog, axes, id);
+    if (sel at.none) { ret "?"; }
+    val axis:   *state.Axis        = ?axes.at[at.some.axis];
+    val joined: res[str, StrError] = str_join(a, axis.name, "_", axis.values.at[at.some.value].name);
+    if (sel joined.err) { ret "?"; }
+    ret joined.ok;
+}
+
+# what the tables write a register file with: its pools of ids and alternatives
+rec Writer {
+    f:    *emit.File;
+    regs: *Registers;
+    ids:  emit.Pool;
+    alts: emit.Pool;
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun span(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = emit.record(f, of);
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(count::i64));
+    ret emit.Value.record{r};
+}
+
+fun ids_value(w: *Writer, ids: requirement.Ids) emit.Value {
+    if (ids.len == 0) { ret name("requirement.NO_IDS"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](w.f.alloc);
+    var i:     u32                       = 0;
+    for (i < ids.len) {
+        val n: str = atom_name(w.f.alloc, w.regs.catalog, w.regs.axes, ids.at[i]);
+        vector.push[emit.Value](?items, name(emit.concat(w.f, "riscv_extension.id.", emit.ident(w.f, n))));
+        i = i + 1;
+    }
+    ret span(w.f, "requirement.Ids", "IDS", emit.pooled(w.f, ?w.ids, items.data, ids.len), ids.len);
+}
+
+fun requirement_value(w: *Writer, req: requirement.Requirement) emit.Value {
+    if (req.len == 0) { ret name("requirement.NO_ALTERNATIVES"); }
+    emit.uses(w.f, "riscv_extension: masc.isa.riscv.extension");
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](w.f.alloc);
+    var i:     u32                       = 0;
+    for (i < req.len) {
+        val r: *emit.Record = emit.record(w.f, "requirement.Alternative");
+        emit.member(w.f, r, "all", ids_value(w, req.at[i].all));
+        emit.member(w.f, r, "none", ids_value(w, req.at[i].none));
+        vector.push[emit.Value](?items, emit.Value.record{r});
+        i = i + 1;
+    }
+    ret span(w.f, "requirement.Requirement", "ALTERNATIVES", emit.pooled(w.f, ?w.alts, items.data, req.len), req.len);
+}
+
+fun scaled_value(f: *emit.File, s: quantity.Scaled) emit.Value {
+    val r: *emit.Record = emit.record(f, "quantity.Scaled");
+    emit.member(f, r, "fixed", number(s.fixed::i64));
+    emit.member(f, r, "per", number(s.per::i64));
+    emit.member(f, r, "scale", number(s.scale::i64));
+    ret emit.Value.record{r};
+}
+
+val KIND_PATHS: [7]str = [7]str{"register.GENERAL", "register.FLOAT", "register.VECTOR", "register.PREDICATE", "register.FLAGS", "register.TILE", "register.SYSTEM"};
+
+val FLAG_BITS:  [7]register.Flags = [7]register.Flags{register.STACK, register.ZERO, register.PC, register.ACCRUED, register.LENGTH, register.UNSPELLED, register.LINK};
+val FLAG_PATHS: [7]str            = [7]str{"register.STACK", "register.ZERO", "register.PC", "register.ACCRUED", "register.LENGTH", "register.UNSPELLED", "register.LINK"};
+
+fun flags_value(f: *emit.File, flags: register.Flags) emit.Value {
+    var text: str = nil;
+    var i:    u32 = 0;
+    for (i < 7) {
+        if ((flags & FLAG_BITS[i]) != 0) {
+            if (text == nil) { text = FLAG_PATHS[i]; }
+            or               { text = emit.concat(f, emit.concat(f, text, " | "), FLAG_PATHS[i]); }
+        }
+        i = i + 1;
+    }
+    if (text == nil) { ret number(0); }
+    ret name(text);
+}
+
+fun declare(f: *emit.File, taken: *map.Map[str, str], id: str, of: str, v: emit.Value) err[diag.Refusal] {
+    ret handles.declare_handle(f, taken, id, id, of, v);
+}
+
+# the register file written as gen_register: its handles, its class, quantity and csr names, and the file itself
+pub fun generate(c: *set.Context, regs: *Registers) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "register");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f:    *emit.File     = opened.ok;
+    val file: *register.File = ?regs.file;
+    var w:    Writer         = Writer{f: f, regs: regs, ids: emit.pool(f, "requirement.Id"), alts: emit.pool(f, "requirement.Alternative")};
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.quantity");
+    emit.uses(f, "masc.core.requirement");
+    var taken:   map.Map[str, str] = map.init[str, str](c.alloc);
+    val handled: err[diag.Refusal] = handles.generate(c.alloc, f, file, ?taken);
+    if (sel handled.err) { ret handled; }
+    val bounds: *emit.Array = emit.array(f, "quantity.Bound");
+    val qs:     *emit.Array = emit.array(f, "quantity.Quantity");
+    var i:      u32         = 0;
+    for (i < file.quantities.len) {
+        val q:   *quantity.Quantity = ?file.quantities.at[i];
+        val r:   *emit.Record       = emit.record(f, "quantity.Quantity");
+        val dom: *emit.Record       = emit.record(f, "quantity.Range");
+        emit.member(f, r, "name", emit.Value.text{q.name});
+        emit.member(f, r, "unit", number(q.unit::i64));
+        if (sel q.domain.powers) {
+            emit.member(f, dom, "least", number(q.domain.powers.least::i64));
+            emit.member(f, dom, "most", number(q.domain.powers.most::i64));
+        }
+        emit.member(f, r, "domain", emit.Value.variant{emit.variant(f, "quantity.Domain.powers", emit.Value.record{dom})});
+        if (q.bounds.len == 0) { emit.member(f, r, "bounds", name("quantity.NO_BOUNDS")); }
+        or {
+            val first: u32 = emit.length(bounds);
+            var k:     u32 = 0;
+            for (k < q.bounds.len) {
+                val b: *emit.Record = emit.record(f, "quantity.Bound");
+                emit.member(f, b, "when", requirement_value(?w, q.bounds.at[k].when));
+                emit.member(f, b, "least", number(q.bounds.at[k].least::i64));
+                emit.member(f, b, "most", number(q.bounds.at[k].most::i64));
+                emit.item(f, bounds, emit.Value.record{b});
+                k = k + 1;
+            }
+            emit.member(f, r, "bounds", span(f, "quantity.Bounds", "BOUNDS", first, q.bounds.len));
+        }
+        emit.member(f, r, "register", name("quantity.NO_ROW"));
+        emit.item(f, qs, emit.Value.record{r});
+        val named: err[diag.Refusal] = declare(f, ?taken, emit.ident(f, q.name), "u8", number(i::i64));
+        if (sel named.err) { ret named; }
+        i = i + 1;
+    }
+    emit.declare_array(f, "BOUNDS", bounds);
+    emit.declare_array(f, "QUANTITIES", qs);
+    val binds: *emit.Array = emit.array(f, "quantity.Binding");
+    i = 0;
+    for (i < file.bindings.len) {
+        val b: *quantity.Binding = ?file.bindings.at[i];
+        val r: *emit.Record      = emit.record(f, "quantity.Binding");
+        emit.member(f, r, "slot", number(b.slot::i64));
+        emit.member(f, r, "when", requirement_value(?w, b.when));
+        emit.member(f, r, "quantity", number(b.quantity::i64));
+        emit.item(f, binds, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "BINDINGS", binds);
+    val classes: *emit.Array = emit.array(f, "register.Class");
+    val general: *emit.Array = emit.array(f, "u16");
+    i = 0;
+    for (i < file.class_count) {
+        val cl: *register.Class = ?file.classes[i];
+        val r:  *emit.Record    = emit.record(f, "register.Class");
+        emit.member(f, r, "name", emit.Value.text{cl.name});
+        emit.member(f, r, "kind", name(KIND_PATHS[cl.kind]));
+        emit.member(f, r, "width", scaled_value(f, cl.width));
+        emit.member(f, r, "count", scaled_value(f, cl.count));
+        emit.item(f, classes, emit.Value.record{r});
+        val pointed: err[diag.Refusal] = declare(f, ?taken, emit.ident(f, cl.name), "*register.Class", emit.element(f, "CLASSES", i));
+        if (sel pointed.err)             { ret pointed; }
+        if (cl.kind == register.GENERAL) { emit.item(f, general, name(emit.concat(f, emit.ident(f, cl.name), "_CLASS"))); }
+        i = i + 1;
+    }
+    emit.declare_array(f, "CLASSES", classes);
+    emit.declare_array(f, "GENERAL", general);
+    val class_names: *emit.Array = emit.array(f, "index.Entry");
+    i = 0;
+    for (i < file.class_names.len) {
+        val r: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, r, "key", emit.Value.text{file.class_names.at[i].key});
+        emit.member(f, r, "row", number(file.class_names.at[i].row::i64));
+        emit.item(f, class_names, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "CLASS_NAMES", class_names);
+    val rows: *emit.Array = emit.array(f, "register.Register");
+    i = 0;
+    for (i < file.register_count) {
+        val x: *register.Register = ?file.registers[i];
+        val r: *emit.Record       = emit.record(f, "register.Register");
+        emit.member(f, r, "name", emit.Value.text{x.name});
+        emit.member(f, r, "class", number(x.class::i64));
+        if (file.classes[x.class].kind == register.SYSTEM) {
+            val n: str = emit.concat(f, emit.ident(f, x.name), "_NUMBER");
+            emit.member(f, r, "number", name(n));
+            val numbered: err[diag.Refusal] = declare(f, ?taken, n, "u16", emit.Value.hex{x.number::u64});
+            if (sel numbered.err) { ret numbered; }
+        }
+        or { emit.member(f, r, "number", number(x.number::i64)); }
+        emit.member(f, r, "bank", number(x.bank::i64));
+        emit.member(f, r, "offset", scaled_value(f, x.offset));
+        emit.member(f, r, "stride", scaled_value(f, x.stride));
+        emit.member(f, r, "count", scaled_value(f, x.count));
+        emit.member(f, r, "places", name("register.ONE_PLACE"));
+        emit.member(f, r, "flags", flags_value(f, x.flags));
+        emit.member(f, r, "requires", requirement_value(?w, x.requires));
+        emit.member(f, r, "extend", name("register.KEEP"));
+        emit.member(f, r, "reach", emit.Value.variant{emit.bare(f, "register.Reach.bank")});
+        emit.item(f, rows, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "REGISTERS", rows);
+    val aliases: *emit.Array = emit.array(f, "register.Alias");
+    i = 0;
+    for (i < file.alias_count) {
+        val r: *emit.Record = emit.record(f, "register.Alias");
+        emit.member(f, r, "name", emit.Value.text{file.aliases[i].name});
+        emit.member(f, r, "register", number(file.aliases[i].register::i64));
+        emit.item(f, aliases, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "ALIASES", aliases);
+    val names: *emit.Array = emit.array(f, "index.Entry");
+    i = 0;
+    for (i < file.names.len) {
+        val r: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, r, "key", emit.Value.text{file.names.at[i].key});
+        emit.member(f, r, "row", number(file.names.at[i].row::i64));
+        emit.item(f, names, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "NAMES", names);
+    val columns: *emit.Array = emit.array(f, "register.Column");
+    var k:       u32         = 0;
+    for (k < file.column_count) {
+        val col:    *register.Column = ?file.columns[k];
+        var prefix: str              = "DWARF";
+        if (col.format == register.CODEVIEW) { prefix = "CODEVIEW"; }
+        val numbers:  *emit.Array = emit.array(f, "u32");
+        val numbered: *emit.Array = emit.array(f, "index.Number");
+        i = 0;
+        for (i < col.len) {
+            emit.item(f, numbers, emit.Value.hex{col.numbers[i]::u64});
+            i = i + 1;
+        }
+        i = 0;
+        for (i < col.numbered.len) {
+            val r: *emit.Record = emit.record(f, "index.Number");
+            emit.member(f, r, "key", emit.Value.hex{col.numbered.at[i].key});
+            emit.member(f, r, "row", number(col.numbered.at[i].row::i64));
+            emit.item(f, numbered, emit.Value.record{r});
+            i = i + 1;
+        }
+        val numbers_name:  str          = emit.concat(f, prefix, "_NUMBERS");
+        val numbered_name: str          = emit.concat(f, prefix, "_NUMBERED");
+        val r:             *emit.Record = emit.record(f, "register.Column");
+        emit.member(f, r, "format", name(emit.concat(f, "register.", prefix)));
+        emit.member(f, r, "flavour", requirement_value(?w, col.flavour));
+        emit.member(f, r, "numbers", emit.declare_array(f, numbers_name, numbers));
+        emit.member(f, r, "len", number(col.len::i64));
+        emit.member(f, r, "numbered", span(f, "index.Numbers", numbered_name, 0, col.numbered.len));
+        emit.declare_array(f, numbered_name, numbered);
+        emit.item(f, columns, emit.Value.record{r});
+        k = k + 1;
+    }
+    emit.declare_array(f, "COLUMNS", columns);
+    val words: u32         = (file.register_count + 63) / 64;
+    val every: *emit.Array = emit.array(f, "u64");
+    var word:  u32         = 0;
+    for (word < words) {
+        var bits: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        val left: u32 = file.register_count - word * 64;
+        if (left < 64) { bits = (1::u64 << left::u64) - 1; }
+        emit.item(f, every, emit.Value.hex{bits});
+        word = word + 1;
+    }
+    val every_named: err[diag.Refusal] = declare(f, ?taken, "EVERY", nil, emit.Value.array{every});
+    if (sel every_named.err) { ret every_named; }
+    val r: *emit.Record = emit.record(f, "register.File");
+    emit.member(f, r, "quantities", span(f, "quantity.Quantities", "QUANTITIES", 0, file.quantities.len));
+    emit.member(f, r, "bindings", span(f, "quantity.Bindings", "BINDINGS", 0, file.bindings.len));
+    emit.member(f, r, "slot_count", number(file.slot_count::i64));
+    emit.member(f, r, "classes", emit.element(f, "CLASSES", 0));
+    emit.member(f, r, "class_count", number(file.class_count::i64));
+    emit.member(f, r, "class_names", span(f, "index.Index", "CLASS_NAMES", 0, file.class_names.len));
+    emit.member(f, r, "registers", emit.element(f, "REGISTERS", 0));
+    emit.member(f, r, "register_count", number(file.register_count::i64));
+    emit.member(f, r, "aliases", emit.element(f, "ALIASES", 0));
+    emit.member(f, r, "alias_count", number(file.alias_count::i64));
+    emit.member(f, r, "names", span(f, "index.Index", "NAMES", 0, file.names.len));
+    emit.member(f, r, "columns", emit.element(f, "COLUMNS", 0));
+    emit.member(f, r, "column_count", number(file.column_count::i64));
+    val filed: err[diag.Refusal] = declare(f, ?taken, "FILE", "register.File", emit.Value.record{r});
+    if (sel filed.err) { ret filed; }
+    emit.declare_array(f, "IDS", w.ids.array);
+    emit.declare_array(f, "ALTERNATIVES", w.alts.array);
+    ret err[diag.Refusal].ok{};
+}
+
+test run__a_run_counts_its_names_on_and_a_run_of_two_prefixes_is_refused {
+    var tt: testing.Testing;
+    testing.make(?tt);
+    val a:     *A.Allocator       = testing.allocator_of(?tt);
+    var f:     overlay.Fact       = overlay.Fact{key: "register x", fact: "f", cites: "c", overrides: nil, line: lines.Line{file: "t", number: 1, text: view("", 0)}};
+    var names: vector.Vector[str] = vector.init[str](a);
+    val got:   err[diag.Refusal]  = run(a, ?f, "a8..a11", ?names);
+    if (sel got.err)                                                                             { ret 1; }
+    if (names.len != 4 || !str_equals(names.data[0], "a8") || !str_equals(names.data[3], "a11")) { ret 2; }
+    val bad: err[diag.Refusal] = run(a, ?f, "a0..t3", ?names);
+    if (!(sel bad.err && bad.err.message == BAD_RUN)) { ret 3; }
+    val s: res[quantity.Scaled, diag.Refusal] = scaled(?f, "0:32:2");
+    if (sel s.err)                         { ret 4; }
+    if (s.ok.per != 32 || s.ok.scale != 2) { ret 6; }
+    val t: res[quantity.Scaled, diag.Refusal] = scaled(?f, "0:32");
+    if (!(sel t.err && t.err.message == BAD_SCALED)) { ret 5; }
+    ret 0;
+}

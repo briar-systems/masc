@@ -15,6 +15,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.StrError;
 use std.types.string.str;
+use std.types.string.str_compare;
 use std.types.string.str_copy_slice;
 use std.types.string.str_join;
 use std.types.view.View;
@@ -22,7 +23,12 @@ use std.types.view.view_eq_str;
 
 use A: std.allocator;
 use std.collections.map;
+use std.collections.sort;
 use std.collections.vector;
+
+use masc.core.extension;
+use masc.core.requirement;
+use masc.core.state;
 
 use gen.diag;
 use gen.emit;
@@ -492,6 +498,157 @@ fun fresh(a: *A.Allocator) Catalog {
         atoms:        map.init[str, u32](a),
         closed:       false,
     };
+}
+
+# a set's catalog and state axes built in memory from its extensions.txt, as the set's own tables hold them, for a
+# generator that resolves names and closes selections over the catalog it does not read back from masc
+# ---
+# catalog: the rows, levels, name index, conflicts and combinations, spelled as a plain list
+# axes:    the state axes and their values in the order the records state them
+pub rec Built {
+    catalog: extension.Catalog;
+    axes:    state.Axes;
+}
+
+# the ids of the atoms `ids`, a level's counted on from the rows as the name index counts it
+fun ids_of(a: *A.Allocator, cat: *Catalog, ids: *vector.Vector[u32]) res[requirement.Ids, A.Error] {
+    if (ids.len == 0) { ret res[requirement.Ids, A.Error].ok{requirement.NO_IDS}; }
+    val got: res[*requirement.Id, A.Error] = A.allocate[requirement.Id](a, ids.len);
+    if (sel got.err) { ret res[requirement.Ids, A.Error].err{got.err}; }
+    var i: usize = 0;
+    for (i < ids.len) {
+        var id: u32 = ids.data[i];
+        if (id >= LEVEL_BIAS) { id = cat.rows.len::u32 + id - LEVEL_BIAS; }
+        got.ok[i] = id;
+        i         = i + 1;
+    }
+    ret res[requirement.Ids, A.Error].ok{requirement.Ids{at: got.ok, len: ids.len::u32}};
+}
+
+fun by_name(a: *extension.NameEntry, b: *extension.NameEntry) i64 {
+    ret str_compare(a.key, b.key);
+}
+
+fun build_memory() err[diag.Refusal] {
+    ret err[diag.Refusal].err{diag.refusal(FILE, 0, diag.MEMORY, nil)};
+}
+
+# the catalog `tree`'s extensions.txt states, built in memory into `out`
+pub fun built(a: *A.Allocator, tree: *source.Tree, out: *Built) err[diag.Refusal] {
+    val file: opt[*source.File] = source.find(tree, FILE);
+    if (sel file.none) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_FILE, nil)}; }
+    var cat:  Catalog           = fresh(a);
+    val done: err[diag.Refusal] = read(?cat, file.some);
+    if (sel done.err) { ret done; }
+    val count: usize                              = cat.rows.len;
+    val rows:  res[*extension.Extension, A.Error] = A.allocate[extension.Extension](a, count);
+    if (sel rows.err) { ret build_memory(); }
+    var i: usize = 0;
+    for (i < count) {
+        val implied: res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?cat.rows.data[i].implies);
+        if (sel implied.err) { ret build_memory(); }
+        rows.ok[i] = extension.Extension{name: cat.rows.data[i].name, implies: implied.ok, revision: cat.rows.data[i].revision};
+        i          = i + 1;
+    }
+    val levels: res[*extension.Level, A.Error] = A.allocate[extension.Level](a, cat.levels.len + 1);
+    if (sel levels.err) { ret build_memory(); }
+    i = 0;
+    for (i < cat.levels.len) {
+        val x:       *Level                        = ?cat.levels.data[i];
+        val members: res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?x.members);
+        val stated:  res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?x.state);
+        if (sel members.err) { ret build_memory(); }
+        if (sel stated.err)  { ret build_memory(); }
+        var kind: extension.LevelKind = extension.ARCH;
+        if (str_compare(x.kind, "extension.PROFILE") == 0) { kind = extension.PROFILE; }
+        or (str_compare(x.kind, "extension.CPU") == 0)     { kind = extension.CPU; }
+        or (str_compare(x.kind, "extension.PSABI") == 0)   { kind = extension.PSABI; }
+        levels.ok[i] = extension.Level{name: x.name, kind: kind, members: members.ok, state: stated.ok};
+        i            = i + 1;
+    }
+    var names: vector.Vector[extension.NameEntry] = vector.init[extension.NameEntry](a);
+    var one:   vector.Vector[u32]                 = vector.init[u32](a);
+    if (!pushed(vector.push[u32](?one, 0))) { ret build_memory(); }
+    i = 0;
+    for (i < count + cat.levels.len) {
+        var key: str = nil;
+        if (i < count) {
+            key         = cat.rows.data[i].name;
+            one.data[0] = i::u32;
+        }
+        or {
+            key         = cat.levels.data[i - count].name;
+            one.data[0] = LEVEL_BIAS + (i - count)::u32;
+        }
+        val rowed: res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?one);
+        if (sel rowed.err)                                                                                                     { ret build_memory(); }
+        if (!pushed(vector.push[extension.NameEntry](?names, extension.NameEntry{key: key, rows: rowed.ok, canonical: true}))) { ret build_memory(); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < cat.aliases.len) {
+        val rowed: res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?cat.aliases.data[i].rows);
+        if (sel rowed.err)                                                                                                                          { ret build_memory(); }
+        if (!pushed(vector.push[extension.NameEntry](?names, extension.NameEntry{key: cat.aliases.data[i].key, rows: rowed.ok, canonical: false}))) { ret build_memory(); }
+        i = i + 1;
+    }
+    sort.sort_by[extension.NameEntry](names.data, names.len, by_name);
+    val conflicts: res[*extension.Conflict, A.Error] = A.allocate[extension.Conflict](a, cat.conflicts.len + 1);
+    if (sel conflicts.err) { ret build_memory(); }
+    i = 0;
+    for (i < cat.conflicts.len) {
+        conflicts.ok[i] = extension.Conflict{a: cat.conflicts.data[i].a, b: cat.conflicts.data[i].b};
+        i               = i + 1;
+    }
+    val combinations: res[*extension.Combination, A.Error] = A.allocate[extension.Combination](a, cat.combinations.len + 1);
+    if (sel combinations.err) { ret build_memory(); }
+    i = 0;
+    for (i < cat.combinations.len) {
+        val x:       *Combination                  = ?cat.combinations.data[i];
+        val when:    res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?x.when);
+        val implied: res[requirement.Ids, A.Error] = ids_of(a, ?cat, ?x.implies);
+        if (sel when.err)    { ret build_memory(); }
+        if (sel implied.err) { ret build_memory(); }
+        combinations.ok[i] = extension.Combination{by: x.by, when: when.ok, implies: implied.ok};
+        i                  = i + 1;
+    }
+    out.catalog = extension.Catalog{
+        extensions:        rows.ok,
+        count:             count::u32,
+        levels:            levels.ok,
+        level_count:       cat.levels.len::u32,
+        names:             extension.Names{at: names.data, len: names.len::u32},
+        conflicts:         conflicts.ok,
+        conflict_count:    cat.conflicts.len::u32,
+        combinations:      combinations.ok,
+        combination_count: cat.combinations.len::u32,
+        syntax:            ?extension.LIST,
+    };
+    # the axes in the order their values are stated, each value the text after its axis's `=`
+    val axes: res[*state.Axis, A.Error] = A.allocate[state.Axis](a, cat.values.len + 1);
+    if (sel axes.err) { ret build_memory(); }
+    val values: res[*state.Value, A.Error] = A.allocate[state.Value](a, cat.values.len + 1);
+    if (sel values.err) { ret build_memory(); }
+    var n: u32 = 0;
+    i = 0;
+    for (i < cat.values.len) {
+        val text: str   = cat.values.data[i];
+        var eq:   usize = 0;
+        for (text[eq] != '=') {
+            eq = eq + 1;
+        }
+        val axis: res[str, StrError] = str_copy_slice(a, text, 0, eq);
+        if (sel axis.err) { ret build_memory(); }
+        values.ok[i] = state.Value{name: ?text[eq + 1], flag: nil, doc: nil};
+        if (n == 0 || str_compare(axes.ok[n - 1].name, axis.ok) != 0) {
+            axes.ok[n] = state.Axis{name: axis.ok, values: state.Values{at: ?values.ok[i], len: 0}, initial: 0, switchable: false};
+            n          = n + 1;
+        }
+        axes.ok[n - 1].values.len = axes.ok[n - 1].values.len + 1;
+        i                         = i + 1;
+    }
+    out.axes = state.Axes{at: axes.ok, len: n};
+    ret err[diag.Refusal].ok{};
 }
 
 # the catalog of the set the running generator emits, from its source's extensions.txt
