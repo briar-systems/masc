@@ -8,9 +8,9 @@ constructive, and professional.
 
 masc is built with the Mach compiler built from the commit pinned as `MACH_REF`
 in `.github/workflows/ci.yml`, as CI does, because masc's manifest and its std
-dependency use keys the released compiler cannot read. Build it with the
-released seed (`MACH_VERSION` in the same file) on `PATH`, and keep the result
-out of the tree.
+dependency use keys the released compiler cannot read. Build it with that
+commit's own bootstrap, which fetches the seed release and walks mach's
+bootstrap chain, and keep the result out of the tree.
 
 ```bash
 git init mach-dev
@@ -18,8 +18,9 @@ git -C mach-dev remote add origin https://github.com/briar-systems/mach.git
 git -C mach-dev fetch --depth 1 origin 6b2b0788eb5066461c958e97e72889f5cf2e97cd
 git -C mach-dev checkout FETCH_HEAD
 cd mach-dev
+RUNNER_OS=Linux RUNNER_TEMP="$PWD/../mach-boot" GITHUB_ENV=/dev/null bash .github/scripts/bootstrap.sh
 mkdir -p ../mach-bin
-bash .github/scripts/seed-build.sh "$(command -v mach)" ../mach-bin/mach
+cp b ../mach-bin/mach
 cd ..
 
 git clone https://github.com/briar-systems/masc.git
