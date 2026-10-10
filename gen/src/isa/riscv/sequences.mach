@@ -1,0 +1,524 @@
+# the riscv pseudo instructions of several instructions, read from the
+# sequences topic and written as gen_sequence
+#
+# each line of gen/data/riscv/sequences.txt is an operand, a step or a
+# sequence, as its header states. the generator resolves each step's row by
+# its key in the catalog and each register by the register file's name, and
+# writes the operands, parts, steps and sequences masc's syntax module
+# forwards, with the index of each sequence name.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.register;
+
+use gen.diag;
+use gen.emit;
+use gen.isa.riscv.facts;
+use gen.isa.riscv.mapping;
+use gen.isa.riscv.spell;
+use topic: gen.overlay;
+use gen.set;
+
+pub val TOPIC: str = "sequences";
+
+pub val BAD_LINE:     str = "sequences line is no operand, step or sequence";
+pub val NO_ROW:       str = "sequence step names no row of the catalog";
+pub val NO_REGISTER:  str = "sequence step names no register of the register file";
+pub val NO_CLASS:     str = "sequence operand names no register class of the register file";
+pub val NO_OPERAND:   str = "sequence names an operand the topic does not state";
+pub val NO_STEPS:     str = "sequence names steps the topic does not state";
+pub val PARTS:        str = "sequence step's parts are not its row's operands";
+pub val OUT_OF_RANGE: str = "sequence step names an operand past its sequence's";
+pub val NUMBERED:     str = "sequences or steps of a name are not numbered on from 1 together";
+
+# an operand of a sequence: an immediate its fixup takes, or a register of a class
+pub rec Operand {
+    name:     str;
+    register: bool;
+    bits:     u32;
+    signed:   bool;
+    fixup:    str;
+    class:    str;
+    write:    bool;
+    fact:     *topic.Fact;
+}
+
+# one instruction of a run of steps, its row by key and its parts as written
+pub rec Step {
+    steps:  str;
+    number: u32;
+    row:    str;
+    parts:  vector.Vector[str];
+    fact:   *topic.Fact;
+}
+
+# one sequence: its template, its operands by name, its steps by name, and the mode and requirement it holds under
+pub rec Sequence {
+    name:     str;
+    number:   u32;
+    template: str;
+    operands: vector.Vector[str];
+    steps:    str;
+    when:     str;
+    requires: str;
+    fact:     *topic.Fact;
+}
+
+pub rec Sequences {
+    operands:  vector.Vector[Operand];
+    steps:     vector.Vector[Step];
+    sequences: vector.Vector[Sequence];
+}
+
+fun refuse(f: *topic.Fact, message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{topic.refuse(f, message, subject)};
+}
+
+fun memory(f: *topic.Fact) err[diag.Refusal] {
+    ret refuse(f, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the number `w` of fact `f`, refused below 1
+fun ordinal(f: *topic.Fact, w: str) res[u32, diag.Refusal] {
+    val n: res[i64, diag.Refusal] = topic.number(f, w);
+    if (sel n.err) { ret res[u32, diag.Refusal].err{n.err}; }
+    if (n.ok < 1)  { ret res[u32, diag.Refusal].err{topic.refuse(f, NUMBERED, w)}; }
+    ret res[u32, diag.Refusal].ok{n.ok::u32};
+}
+
+fun operand_line(o: *Sequences, f: *topic.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 2 || ws.len < 2) { ret refuse(f, BAD_LINE, f.key); }
+    var op:   Operand = Operand{name: key.data[1], register: false, bits: 0, signed: false, fixup: nil, class: nil, write: false, fact: f};
+    val last: str     = ws.data[ws.len - 1];
+    if (str_equals(last, "write")) { op.write = true; }
+    or (!str_equals(last, "read")) { ret refuse(f, topic.UNKNOWN_WORD, last); }
+    if (str_equals(ws.data[0], "register")) {
+        val class: opt[str] = topic.value(ws, "class");
+        if (sel class.none) { ret refuse(f, BAD_LINE, f.fact); }
+        op.register = true;
+        op.class    = class.some;
+    }
+    or (str_equals(ws.data[0], "immediate")) {
+        val bits:  opt[str] = topic.value(ws, "bits");
+        val fixup: opt[str] = topic.value(ws, "fixup");
+        if (sel bits.none)  { ret refuse(f, BAD_LINE, f.fact); }
+        if (sel fixup.none) { ret refuse(f, BAD_LINE, f.fact); }
+        val n: res[u32, diag.Refusal] = ordinal(f, bits.some);
+        if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+        op.bits  = n.ok;
+        op.fixup = fixup.some;
+        var i: usize = 1;
+        for (i + 1 < ws.len) {
+            if (str_equals(ws.data[i], "signed")) { op.signed = true; }
+            i = i + 1;
+        }
+    }
+    or                                                  { ret refuse(f, topic.UNKNOWN_WORD, ws.data[0]); }
+    if (!pushed(vector.push[Operand](?o.operands, op))) { ret memory(f); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun step_line(a: *A.Allocator, o: *Sequences, f: *topic.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 3 || ws.len < 1) { ret refuse(f, BAD_LINE, f.key); }
+    val n: res[u32, diag.Refusal] = ordinal(f, key.data[2]);
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    var s: Step  = Step{steps: key.data[1], number: n.ok, row: ws.data[0], parts: vector.init[str](a), fact: f};
+    var i: usize = 1;
+    for (i < ws.len) {
+        if (!pushed(vector.push[str](?s.parts, ws.data[i]))) { ret memory(f); }
+        i = i + 1;
+    }
+    val k:     usize = o.steps.len;
+    val first: bool  = k == 0 || !str_equals(o.steps.data[k - 1].steps, s.steps);
+    if (first && s.number != 1)                               { ret refuse(f, NUMBERED, f.key); }
+    if (!first && s.number != o.steps.data[k - 1].number + 1) { ret refuse(f, NUMBERED, f.key); }
+    if (first && steps_named(o, s.steps) < o.steps.len)       { ret refuse(f, NUMBERED, f.key); }
+    if (!pushed(vector.push[Step](?o.steps, s)))              { ret memory(f); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun sequence_line(a: *A.Allocator, o: *Sequences, f: *topic.Fact, key: *vector.Vector[str], ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (key.len != 3) { ret refuse(f, BAD_LINE, f.key); }
+    val n: res[u32, diag.Refusal] = ordinal(f, key.data[2]);
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    val template: opt[str] = topic.value(ws, "template");
+    val operands: opt[str] = topic.value(ws, "operands");
+    val steps:    opt[str] = topic.value(ws, "steps");
+    if (sel template.none) { ret refuse(f, BAD_LINE, f.fact); }
+    if (sel operands.none) { ret refuse(f, BAD_LINE, f.fact); }
+    if (sel steps.none)    { ret refuse(f, BAD_LINE, f.fact); }
+    var s:        Sequence = Sequence{name: key.data[1], number: n.ok, template: template.some, operands: vector.init[str](a), steps: steps.some, when: nil, requires: nil, fact: f};
+    val when:     opt[str] = topic.value(ws, "when");
+    val requires: opt[str] = topic.value(ws, "requires");
+    if (sel when.some)     { s.when = when.some; }
+    if (sel requires.some) { s.requires = requires.some; }
+    val names: res[vector.Vector[str], diag.Refusal] = topic.words(a, f, operands.some);
+    if (sel names.err) { ret err[diag.Refusal].err{names.err}; }
+    s.operands = names.ok;
+    val k:     usize = o.sequences.len;
+    val first: bool  = k == 0 || !str_equals(o.sequences.data[k - 1].name, s.name);
+    if (first && s.number != 1)                                   { ret refuse(f, NUMBERED, f.key); }
+    if (!first && s.number != o.sequences.data[k - 1].number + 1) { ret refuse(f, NUMBERED, f.key); }
+    var i: usize = 0;
+    for (first && i < k) {
+        if (str_equals(o.sequences.data[i].name, s.name)) { ret refuse(f, NUMBERED, f.key); }
+        i = i + 1;
+    }
+    if (!pushed(vector.push[Sequence](?o.sequences, s))) { ret memory(f); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the sequences topic `t` read into `out`, as facts of masc's own
+pub fun read(a: *A.Allocator, t: *topic.Topic, out: *Sequences) err[diag.Refusal] {
+    out.operands  = vector.init[Operand](a);
+    out.steps     = vector.init[Step](a);
+    out.sequences = vector.init[Sequence](a);
+    val checked: err[diag.Refusal] = topic.check(t, nil, topic.unstated);
+    if (sel checked.err) { ret checked; }
+    var i: usize = 0;
+    for (i < t.facts.len) {
+        val f:   *topic.Fact                           = ?t.facts.data[i];
+        val key: res[vector.Vector[str], diag.Refusal] = topic.words(a, f, f.key);
+        val ws:  res[vector.Vector[str], diag.Refusal] = topic.words(a, f, f.fact);
+        if (sel key.err)    { ret err[diag.Refusal].err{key.err}; }
+        if (sel ws.err)     { ret err[diag.Refusal].err{ws.err}; }
+        if (key.ok.len < 2) { ret refuse(f, BAD_LINE, f.key); }
+        var done: err[diag.Refusal] = err[diag.Refusal].ok{};
+        val kind: str               = key.ok.data[0];
+        if (str_equals(kind, "operand"))  { done = operand_line(out, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "step"))     { done = step_line(a, out, f, ?key.ok, ?ws.ok); }
+        or (str_equals(kind, "sequence")) { done = sequence_line(a, out, f, ?key.ok, ?ws.ok); }
+        or                                { done = refuse(f, BAD_LINE, f.key); }
+        if (sel done.err)                 { ret done; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the first step of run `name`, the count of steps when there is none
+fun steps_named(o: *Sequences, name: str) usize {
+    var i: usize = 0;
+    for (i < o.steps.len && !str_equals(o.steps.data[i].steps, name)) {
+        i = i + 1;
+    }
+    ret i;
+}
+
+fun operand_named(o: *Sequences, name: str) *Operand {
+    var i: usize = 0;
+    for (i < o.operands.len) {
+        if (str_equals(o.operands.data[i].name, name)) { ret ?o.operands.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun row_keyed(catalog: *mapping.Catalog, key: str) *mapping.Row {
+    var i: usize = 0;
+    for (i < catalog.rows.len) {
+        if (str_equals(catalog.rows.data[i].key, key)) { ret catalog.rows.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun run(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = emit.record(f, of);
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(count::i64));
+    ret emit.Value.record{r};
+}
+
+# masc's riscv fixup or mode constant `name`
+fun constant(f: *emit.File, module: str, name: str) str {
+    ret emit.concat(f, module, emit.ident(f, name));
+}
+
+# the digits of `w` from `at` to `end` as a number, none when they are not all digits
+fun digits(w: str, at: usize, end: usize) opt[u32] {
+    if (end <= at) { ret opt[u32].none{}; }
+    var n: u32   = 0;
+    var i: usize = at;
+    for (i < end) {
+        if (w[i] < '0' || w[i] > '9') { ret opt[u32].none{}; }
+        n = n * 10 + (w[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret opt[u32].some{n};
+}
+
+# part `w` of step `s` as its literal, its operand references below `count`
+fun part(a: *A.Allocator, f: *emit.File, file: *register.File, s: *Step, w: str, count: *u32) res[emit.Value, diag.Refusal] {
+    val len: usize = str_len(w);
+    if (len >= 3 && w[0] == '<' && w[len - 1] == '>') {
+        val n: opt[u32] = digits(w, 1, len - 1);
+        if (sel n.none)          { ret res[emit.Value, diag.Refusal].err{topic.refuse(s.fact, BAD_LINE, w)}; }
+        if (n.some + 1 > @count) { @count = n.some + 1; }
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "core_syntax.Part.operand", number(n.some::i64))}};
+    }
+    if (len >= 4 && w[0] == '%' && w[len - 1] == ')') {
+        var open: usize = 1;
+        for (open < len && w[open] != '(') {
+            open = open + 1;
+        }
+        if (open == len) { ret res[emit.Value, diag.Refusal].err{topic.refuse(s.fact, BAD_LINE, w)}; }
+        val name: res[str, StrError] = str_copy_slice(a, w, 1, open - 1);
+        if (sel name.err) { ret res[emit.Value, diag.Refusal].err{topic.refuse(s.fact, diag.MEMORY, nil)}; }
+        val fixup: str = constant(f, "riscv_fixup.", name.ok);
+        if (len - open - 2 == 4 && w[open + 1] == 'h' && w[open + 2] == 'e' && w[open + 3] == 'r' && w[open + 4] == 'e') {
+            ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "core_syntax.Part.here", emit.Value.name{fixup})}};
+        }
+        val n: opt[u32] = digits(w, open + 1, len - 1);
+        if (sel n.none)          { ret res[emit.Value, diag.Refusal].err{topic.refuse(s.fact, BAD_LINE, w)}; }
+        if (n.some + 1 > @count) { @count = n.some + 1; }
+        val r: *emit.Record = emit.record(f, "core_syntax.Relocation");
+        emit.member(f, r, "operand", number(n.some::i64));
+        emit.member(f, r, "fixup", emit.Value.name{fixup});
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "core_syntax.Part.symbol", emit.Value.record{r})}};
+    }
+    if (w[0] >= '0' && w[0] <= '9') {
+        val n: res[i64, diag.Refusal] = topic.number(s.fact, w);
+        if (sel n.err) { ret res[emit.Value, diag.Refusal].err{n.err}; }
+        val v: emit.Value = emit.Value.variant{emit.variant(f, "operand.Value.immediate", number(n.ok))};
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "core_syntax.Part.value", v)}};
+    }
+    val at: opt[u32] = mapping.register_row(file, w);
+    if (sel at.none) { ret res[emit.Value, diag.Refusal].err{topic.refuse(s.fact, NO_REGISTER, w)}; }
+    val id: str = emit.concat(f, "gen_register.", emit.ident(f, file.registers[at.some].name));
+    ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "core_syntax.Part.register", emit.Value.name{id})}};
+}
+
+fun operand_value(f: *emit.File, file: *register.File, op: *Operand) res[emit.Value, diag.Refusal] {
+    val r: *emit.Record = emit.record(f, "operand.Operand");
+    if (op.register) {
+        var class: u32 = 0;
+        for (class < file.class_count && !str_equals(file.classes[class].name, op.class)) {
+            class = class + 1;
+        }
+        if (class == file.class_count) { ret res[emit.Value, diag.Refusal].err{topic.refuse(op.fact, NO_CLASS, op.class)}; }
+        val g: *emit.Record = emit.record(f, "operand.Register");
+        emit.member(f, g, "classes", run(f, "operand.Classes", "gen_row.CLASSES", class, 1));
+        emit.member(f, g, "first", number(0));
+        emit.member(f, g, "count", number(0));
+        emit.member(f, g, "excluded", emit.Value.name{"operand.NO_NUMBERS"});
+        emit.member(f, g, "fields", number(1));
+        emit.member(f, g, "element", emit.Value.variant{emit.bare(f, "operand.Element.none")});
+        emit.member(f, g, "span", emit.Value.variant{emit.variant(f, "operand.Span.fixed", number(0))});
+        emit.member(f, r, "shape", emit.Value.variant{emit.variant(f, "operand.Shape.register", emit.Value.record{g})});
+    }
+    or {
+        val i: *emit.Record = emit.record(f, "operand.Immediate");
+        emit.member(f, i, "bits", number(op.bits::i64));
+        if (op.signed) { emit.member(f, i, "sign", emit.Value.name{"operand.SIGNED"}); }
+        or             { emit.member(f, i, "sign", emit.Value.name{"operand.UNSIGNED"}); }
+        emit.member(f, i, "scale", number(0));
+        emit.member(f, i, "bias", number(0));
+        emit.member(f, i, "fixup", emit.Value.name{constant(f, "riscv_fixup.", op.fixup)});
+        emit.member(f, i, "format", emit.Value.name{"operand.INTEGER"});
+        emit.member(f, i, "excluded", emit.Value.name{"operand.NO_INTEGERS"});
+        emit.member(f, r, "shape", emit.Value.variant{emit.variant(f, "operand.Shape.immediate", emit.Value.record{i})});
+    }
+    if (op.write) { emit.member(f, r, "role", emit.Value.name{"operand.WRITE"}); }
+    or            { emit.member(f, r, "role", emit.Value.name{"operand.READ"}); }
+    emit.member(f, r, "width", number(0));
+    emit.member(f, r, "quantity", emit.Value.name{"operand.ONE"});
+    ret res[emit.Value, diag.Refusal].ok{emit.Value.record{r}};
+}
+
+# the tables written into `f`
+rec Pools {
+    operands: emit.Pool;
+    parts:    emit.Pool;
+    steps:    emit.Pool;
+    settings: emit.Pool;
+    ids:      emit.Pool;
+    alts:     emit.Pool;
+}
+
+# the run of steps `s` of sequence `q` in the pools, refused when a step's parts are not its row's operands or name an
+# operand past the sequence's
+fun steps_of(a: *A.Allocator, f: *emit.File, p: *Pools, o: *Sequences, catalog: *mapping.Catalog, file: *register.File, q: *Sequence, at: *u32, count: *u32) err[diag.Refusal] {
+    var i: usize = steps_named(o, q.steps);
+    if (i == o.steps.len) { ret refuse(q.fact, NO_STEPS, q.steps); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](a);
+    for (i < o.steps.len && str_equals(o.steps.data[i].steps, q.steps)) {
+        val s:   *Step        = ?o.steps.data[i];
+        val row: *mapping.Row = row_keyed(catalog, s.row);
+        if (row == nil)                      { ret refuse(s.fact, NO_ROW, s.row); }
+        if (row.operands.len != s.parts.len) { ret refuse(s.fact, PARTS, s.row); }
+        var parts: vector.Vector[emit.Value] = vector.init[emit.Value](a);
+        var used:  u32                       = 0;
+        var k:     usize                     = 0;
+        for (k < s.parts.len) {
+            val v: res[emit.Value, diag.Refusal] = part(a, f, file, s, s.parts.data[k], ?used);
+            if (sel v.err)                                      { ret err[diag.Refusal].err{v.err}; }
+            if (!pushed(vector.push[emit.Value](?parts, v.ok))) { ret memory(s.fact); }
+            k = k + 1;
+        }
+        if (used > q.operands.len::u32) { ret refuse(s.fact, OUT_OF_RANGE, q.template); }
+        val first: u32          = emit.pooled(f, ?p.parts, parts.data, parts.len::u32);
+        val r:     *emit.Record = emit.record(f, "core_syntax.Step");
+        emit.member(f, r, "row", emit.Value.name{emit.concat(f, "gen_row.", emit.ident(f, row.key))});
+        emit.member(f, r, "parts", run(f, "core_syntax.Parts", "PARTS", first, parts.len::u32));
+        if (!pushed(vector.push[emit.Value](?items, emit.Value.record{r}))) { ret memory(s.fact); }
+        i = i + 1;
+    }
+    @at    = emit.pooled(f, ?p.steps, items.data, items.len::u32);
+    @count = items.len::u32;
+    ret err[diag.Refusal].ok{};
+}
+
+# the mode setting `when` of `q` as its literal, `mode=value` over masc's riscv modes
+fun when_of(a: *A.Allocator, f: *emit.File, p: *Pools, q: *Sequence) res[emit.Value, diag.Refusal] {
+    if (q.when == nil) { ret res[emit.Value, diag.Refusal].ok{emit.Value.name{"mode.NO_SETTINGS"}}; }
+    val len: usize = str_len(q.when);
+    var eq:  usize = 0;
+    for (eq < len && q.when[eq] != '=') {
+        eq = eq + 1;
+    }
+    if (eq == 0 || eq + 1 >= len) { ret res[emit.Value, diag.Refusal].err{topic.refuse(q.fact, BAD_LINE, q.when)}; }
+    val mode: res[str, StrError] = str_copy_slice(a, q.when, 0, eq);
+    if (sel mode.err) { ret res[emit.Value, diag.Refusal].err{topic.refuse(q.fact, diag.MEMORY, nil)}; }
+    val s: *emit.Record = emit.record(f, "mode.Setting");
+    emit.member(f, s, "mode", emit.Value.address{constant(f, "riscv_mode.", mode.ok)});
+    emit.member(f, s, "value", emit.Value.address{constant(f, "riscv_mode.", ?q.when[eq + 1])});
+    var one: [1]emit.Value = [1]emit.Value{emit.Value.record{s}};
+    val at:  u32           = emit.pooled(f, ?p.settings, ?one[0], 1);
+    ret res[emit.Value, diag.Refusal].ok{run(f, "mode.Settings", "SETTINGS", at, 1)};
+}
+
+# the mnemonic of template `t`, its first word
+fun mnemonic(a: *A.Allocator, t: str) str {
+    val len: usize = str_len(t);
+    var end: usize = 0;
+    for (end < len && t[end] != ' ') {
+        end = end + 1;
+    }
+    val got: res[str, StrError] = str_copy_slice(a, t, 0, end);
+    if (sel got.err) { ret t; }
+    ret got.ok;
+}
+
+# the sequences written as gen_sequence: their operands, parts, steps, settings and requirements, the sequences in the
+# printer's preference, their indices in mnemonic order, and the index of each name's first, with the count of a name
+# of several
+pub fun generate(c: *set.Context, x: *facts.Facts, catalog: *mapping.Catalog, o: *Sequences) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "sequence");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f:    *emit.File     = opened.ok;
+    val a:    *A.Allocator   = c.alloc;
+    val file: *register.File = ?x.registers.file;
+    emit.uses(f, "masc.core.mode");
+    emit.uses(f, "masc.core.operand");
+    emit.uses(f, "masc.core.requirement");
+    emit.uses(f, "masc.core.row");
+    emit.uses(f, "core_syntax: masc.core.syntax");
+    emit.uses(f, "riscv_extension: masc.isa.riscv.extension");
+    emit.uses(f, "riscv_fixup: masc.isa.riscv.fixup");
+    emit.uses(f, "riscv_mode: masc.isa.riscv.mode");
+    emit.uses(f, "masc.isa.riscv.gen_register");
+    emit.uses(f, "masc.isa.riscv.gen_row");
+    var p: Pools = Pools{
+        operands: emit.pool(f, "operand.Operand"),
+        parts:    emit.pool(f, "core_syntax.Part"),
+        steps:    emit.pool(f, "core_syntax.Step"),
+        settings: emit.pool(f, "mode.Setting"),
+        ids:      emit.pool(f, "requirement.Id"),
+        alts:     emit.pool(f, "requirement.Alternative"),
+    };
+    val table: *emit.Array = emit.array(f, "core_syntax.Sequence");
+    var i:     usize       = 0;
+    for (i < o.sequences.len) {
+        val q:   *Sequence                 = ?o.sequences.data[i];
+        var ops: vector.Vector[emit.Value] = vector.init[emit.Value](a);
+        var k:   usize                     = 0;
+        for (k < q.operands.len) {
+            val op: *Operand = operand_named(o, q.operands.data[k]);
+            if (op == nil) { ret refuse(q.fact, NO_OPERAND, q.operands.data[k]); }
+            val v: res[emit.Value, diag.Refusal] = operand_value(f, file, op);
+            if (sel v.err)                                    { ret err[diag.Refusal].err{v.err}; }
+            if (!pushed(vector.push[emit.Value](?ops, v.ok))) { ret memory(q.fact); }
+            k = k + 1;
+        }
+        val first: u32               = emit.pooled(f, ?p.operands, ops.data, ops.len::u32);
+        var at:    u32               = 0;
+        var count: u32               = 0;
+        val laid:  err[diag.Refusal] = steps_of(a, f, ?p, o, catalog, file, q, ?at, ?count);
+        if (sel laid.err) { ret laid; }
+        val when: res[emit.Value, diag.Refusal] = when_of(a, f, ?p, q);
+        if (sel when.err) { ret err[diag.Refusal].err{when.err}; }
+        var requires: emit.Value = emit.Value.name{"requirement.NO_ALTERNATIVES"};
+        if (q.requires != nil) {
+            val req: res[*mapping.Requirement, diag.Refusal] = mapping.requirement_of(a, x, q.requires);
+            if (sel req.err) { ret err[diag.Refusal].err{topic.refuse(q.fact, req.err.message, q.requires)}; }
+            requires = spell.requirement(a, f, x, ?p.ids, ?p.alts, req.ok);
+        }
+        val r: *emit.Record = emit.record(f, "core_syntax.Sequence");
+        emit.member(f, r, "template", emit.Value.text{q.template});
+        emit.member(f, r, "operands", run(f, "row.Operands", "OPERANDS", first, ops.len::u32));
+        emit.member(f, r, "steps", run(f, "core_syntax.Steps", "STEPS", at, count));
+        emit.member(f, r, "when", when.ok);
+        emit.member(f, r, "requires", requires);
+        emit.item(f, table, emit.Value.record{r});
+        if (q.number == 1) {
+            emit.declare(f, emit.ident(f, q.name), "u32", number(i::i64));
+            var n: usize = i + 1;
+            for (n < o.sequences.len && str_equals(o.sequences.data[n].name, q.name)) {
+                n = n + 1;
+            }
+            if (n - i > 1) { emit.declare(f, emit.ident(f, emit.concat(f, q.name, "_count")), "u32", number((n - i)::i64)); }
+        }
+        i = i + 1;
+    }
+    var order: vector.Vector[u32] = vector.init[u32](a);
+    i = 0;
+    for (i < o.sequences.len) {
+        if (!pushed(vector.push[u32](?order, i::u32))) { ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, nil)}; }
+        var k: usize = i;
+        for (k > 0 && str_compare(mnemonic(a, o.sequences.data[order.data[k - 1]].template), mnemonic(a, o.sequences.data[order.data[k]].template)) > 0) {
+            val t: u32 = order.data[k];
+            order.data[k]     = order.data[k - 1];
+            order.data[k - 1] = t;
+            k                 = k - 1;
+        }
+        i = i + 1;
+    }
+    val named: *emit.Array = emit.array(f, "u32");
+    i = 0;
+    for (i < order.len) {
+        emit.item(f, named, number(order.data[i]::i64));
+        i = i + 1;
+    }
+    emit.declare(f, "OPERANDS", nil, emit.Value.array{p.operands.array});
+    emit.declare(f, "PARTS", nil, emit.Value.array{p.parts.array});
+    emit.declare(f, "STEPS", nil, emit.Value.array{p.steps.array});
+    emit.declare(f, "SETTINGS", nil, emit.Value.array{p.settings.array});
+    emit.declare(f, "REQUIRE_IDS", nil, emit.Value.array{p.ids.array});
+    emit.declare(f, "REQUIRE_ALTERNATIVES", nil, emit.Value.array{p.alts.array});
+    emit.declare_array(f, "SEQUENCES", table);
+    emit.declare_array(f, "SEQUENCES_NAMED", named);
+    ret err[diag.Refusal].ok{};
+}
