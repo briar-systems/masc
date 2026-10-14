@@ -17,6 +17,13 @@
 # against a section symbol, or against a symbol with no name, names a label
 # the disassembler states at its place, spelled by the syntax's anonymous stem.
 #
+# a mapping symbol, as elf's `$x` and `$d` where the dialect's assembler
+# writes the set's (`dialect.Dialect.mapping`), is a fact of its section and
+# place and never a label: the assembler writes them again where the code and
+# data it reads back start. a range a data mark starts prints as data, and one
+# a code mark starts is decoded, in any section, so llvm-mc's `$d` over data
+# in `.text` reads back as that data.
+#
 # a statement is read back under a scope: the object's selection, or a
 # combination of the dialect's narrowings of it, as risc-v's `.option norvc`
 # keeps a full-length instruction the object's selection would compress. the
@@ -130,6 +137,7 @@ pub val NO_WIDTH:   str = "the set's source dialect has no data directive of thi
 pub val FILL:       str = "realigned padding that is not the set's code fill";
 pub val ZEROS:      str = "relocation in a section of zero fill";
 pub val PAST:       str = "label or relocation past its section's end";
+pub val MAPPED:     str = "relocation against a mapping symbol, which marks a place and is no label the text can name";
 
 # how an instruction is spelled, as objdump's `-M no-aliases` chooses
 # ---
@@ -202,6 +210,15 @@ rec Site {
     reloc:   u32;
 }
 
+# a mapping symbol at its place
+# ---
+# code: whether it marks where code starts, else where data does
+rec Mapped {
+    section: u32;
+    offset:  u64;
+    code:    bool;
+}
+
 # a relocation kind and a set-local fixup kind bound to it
 rec Bound {
     kind:  *mink.reloc.Kind;
@@ -265,10 +282,13 @@ val REALIGN:   Attempt = 1;
 # count:   how many symbols the object has, the handles past it naming anchors
 # byte:    the one-byte data directive
 # li, ri:   the next label and the next relocation to print
-# apart: the unique numbers given so far, the last of them the latest
-# full:  whether the output failed to grow
-# forms: whether instructions are spelled by their rows' own forms
-# named: the handles the statement being verified names, which its parse resolves
+# apart:   the unique numbers given so far, the last of them the latest
+# full:    whether the output failed to grow
+# forms:   whether instructions are spelled by their rows' own forms
+# named:   the handles the statement being verified names, which its parse resolves
+# mapping: the mapping symbols the text's assembler writes, none when the dialect's writes none
+# marks:   the object's mapping symbols, in place order
+# mi:      the next mapping symbol to read
 rec Disasm {
     a:       *A.Allocator;
     s:       *set.Set;
@@ -282,6 +302,9 @@ rec Disasm {
     labels:  vector.Vector[Label];
     sites:   vector.Vector[Site];
     anchors: vector.Vector[Label];
+    marks:   vector.Vector[Mapped];
+    mapping: source.Mapping;
+    mi:      usize;
     bound:   vector.Vector[Bound];
     fills:   *vector.Vector[*fill.Pattern];
     scopes:  vector.Vector[Scope];
@@ -397,6 +420,36 @@ fun by_place(x: *Label, y: *Label) i64 {
     if (x.handle < y.handle) { ret -1; }
     if (x.handle > y.handle) { ret 1; }
     ret 0;
+}
+
+fun by_mark(x: *Mapped, y: *Mapped) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.offset < y.offset) { ret -1; }
+    if (x.offset > y.offset) { ret 1; }
+    ret 0;
+}
+
+# whether `name` starts with `stem`, and with `exact` is it
+fun stems(name: View, stem: str, exact: bool) bool {
+    val n: usize = str_len(stem);
+    if (n == 0 || name.len < n || (exact && name.len != n)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (name.data[i] != stem[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether symbol `sym` is a mapping symbol the text's assembler writes: a placed local of no type named by the code stem,
+# followed by anything when the code mark names the view, or by the data stem
+fun mapping_symbol(d: *Disasm, sym: *mink.object.Symbol) bool {
+    if (sym.binding != ?mink.symbol.LOCAL || sym.kind != ?mink.symbol.NOTYPE || !sel sym.def.placed) { ret false; }
+    val name: View = name_of(d, sym.name);
+    ret stems(name, d.mapping.code, !d.mapping.per_view) || stems(name, d.mapping.data, true);
 }
 
 fun by_site(x: *Site, y: *Site) i64 {
@@ -532,6 +585,7 @@ fun aim(d: *Disasm, r: *mink.object.Reloc, site: *Site) res[opt[Aimed], Refusal]
     if (!sel r.target.symbol) { ret res[opt[Aimed], Refusal].ok{opt[Aimed].none{}}; }
     val index: u32                 = r.target.symbol.index;
     val sym:   *mink.object.Symbol = symbol_of(d, index);
+    if (mapping_symbol(d, sym)) { ret res[opt[Aimed], Refusal].err{Refusal{message: MAPPED, section: site.section, offset: site.offset}}; }
     if (sel sym.def.placed) {
         val p: mink.object.Place = sym.def.placed;
         if (is_kind(sym.kind, mink.symbol.SECTION)) {
@@ -1499,13 +1553,31 @@ fun aligned(d: *Disasm, sec: *mink.object.Section) {
     }
 }
 
-# section `i` written: its header, then its labels, statements and data in offset order
+# whether section `i` holds code at `at`: as the mapping symbol at or before it marks it, the mapping symbols at `at`
+# read, else `code` as it stands
+fun marked_at(d: *Disasm, i: u32, at: u64, code: bool) bool {
+    var now: bool = code;
+    for (d.mi < d.marks.len && d.marks.data[d.mi].section == i && d.marks.data[d.mi].offset <= at) {
+        now  = d.marks.data[d.mi].code;
+        d.mi = d.mi + 1;
+    }
+    ret now;
+}
+
+# the offset of the next mapping symbol of `section` before `none`, `none` when it has no more
+fun next_mark(d: *Disasm, section: u32, none: u64) u64 {
+    if (d.mi < d.marks.len && d.marks.data[d.mi].section == section && d.marks.data[d.mi].offset < none) { ret d.marks.data[d.mi].offset; }
+    ret none;
+}
+
+# section `i` written: its header, then its labels, statements and data in offset order. it holds code where its
+# mapping symbols mark code, and in a section with none where its flags say it executes
 fun section(d: *Disasm, i: u32) err[Refusal] {
     val opened: err[Refusal] = header(d, i);
     if (sel opened.err) { ret opened; }
     val sec:  *mink.object.Section = section_of(d, i);
     val size: u64                  = size_of(d, i);
-    val code: bool                 = (sec.flags & mink.section.EXEC) != 0;
+    var code: bool                 = (sec.flags & mink.section.EXEC) != 0;
     var data: *u8                  = nil;
     var len:  usize                = 0;
     if (sel sec.contents.held) {
@@ -1516,7 +1588,8 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
     var at: u64 = 0;
     for (at < size) {
         labels_at(d, i, at);
-        val limit: u64 = next_label(d, i, size);
+        code = marked_at(d, i, at, code);
+        val limit: u64 = next_mark(d, i, next_label(d, i, size));
         if (sel sec.contents.zero) {
             if (next_site(d, i, limit) < limit) { ret refusal(ZEROS, i, next_site(d, i, limit)); }
             put(d, "\t.zero ");
@@ -1553,8 +1626,10 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
         at = at + run.ok;
     }
     labels_at(d, i, size);
+    code = marked_at(d, i, size, code);
     leave(d);
     if (d.li < d.labels.len && d.labels.data[d.li].section == i) { ret refusal(PAST, i, d.labels.data[d.li].offset); }
+    if (d.mi < d.marks.len && d.marks.data[d.mi].section == i)   { ret refusal(PAST, i, d.marks.data[d.mi].offset); }
     if (d.ri < d.sites.len && d.sites.data[d.ri].section == i)   { ret refusal(PAST, i, d.sites.data[d.ri].offset); }
     ret err[Refusal].ok{};
 }
@@ -1577,8 +1652,8 @@ fun declare(d: *Disasm, i: u32) err[Refusal] {
         put_char(d, '\n');
         ret err[Refusal].ok{};
     }
-    if (is_kind(sym.kind, mink.symbol.SECTION)) { ret err[Refusal].ok{}; }
-    if (sel sym.version.some)                   { ret whole(VERSIONED); }
+    if (is_kind(sym.kind, mink.symbol.SECTION) || mapping_symbol(d, sym)) { ret err[Refusal].ok{}; }
+    if (sel sym.version.some)                                             { ret whole(VERSIONED); }
     if (name.len == 0) {
         # an anchor stands for a placed local, and a size is a fact it cannot carry
         if (sym.binding != ?mink.symbol.LOCAL || sym.kind != ?mink.symbol.NOTYPE) { ret whole(NAMELESS); }
@@ -1680,6 +1755,7 @@ fun index(d: *Disasm) err[Refusal] {
     }
     sort.sort_by[Site](d.sites.data, d.sites.len, by_site);
     i = 0;
+    # the mapping symbols are read before the labels, so a section's marks are in place order when it is written
     for (i < d.count) {
         val sym:    *mink.object.Symbol = symbol_of(d, i);
         var p:      mink.object.Place   = mink.object.Place{section: mink.table.Id[mink.object.Section]{index: 0}, offset: 0};
@@ -1690,7 +1766,11 @@ fun index(d: *Disasm) err[Refusal] {
         }
         if (placed && !is_kind(sym.kind, mink.symbol.SECTION) && !is_kind(sym.kind, mink.symbol.FILE)) {
             if (p.section.index >= sections) { ret whole(PAST); }
-            if (name_of(d, sym.name).len == 0) {
+            if (mapping_symbol(d, sym)) {
+                val code: bool = stems(name_of(d, sym.name), d.mapping.code, !d.mapping.per_view);
+                if (!held(vector.push[Mapped](?d.marks, Mapped{section: p.section.index, offset: p.offset, code: code}))) { ret whole(MEMORY); }
+            }
+            or (name_of(d, sym.name).len == 0) {
                 if (!held(vector.push[Label](?d.anchors, Label{section: p.section.index, offset: p.offset, handle: 0}))) { ret whole(MEMORY); }
             }
             or {
@@ -1727,6 +1807,7 @@ fun index(d: *Disasm) err[Refusal] {
         k = k + 1;
     }
     sort.sort_by[Label](d.labels.data, d.labels.len, by_place);
+    sort.sort_by[Mapped](d.marks.data, d.marks.len, by_mark);
     ret err[Refusal].ok{};
 }
 
@@ -1734,6 +1815,7 @@ fun released(d: *Disasm) {
     vector.dnit[Label](?d.labels);
     vector.dnit[Site](?d.sites);
     vector.dnit[Label](?d.anchors);
+    vector.dnit[Mapped](?d.marks);
     vector.dnit[Bound](?d.bound);
     var i: usize = 0;
     for (i < d.scopes.len) {
@@ -1820,6 +1902,12 @@ pub fun close(f: *File) err[mink.fail.Fail] {
     ret unloaded;
 }
 
+# the mapping symbols the assembler writes in `dialect` for `s`, none when it writes none
+fun mapping_of(s: *set.Set, dialect_: *dialect.Dialect) source.Mapping {
+    if (dialect_.mapping) { ret s.source.mapping; }
+    ret source.NO_MAPPING;
+}
+
 # the object `o` appended to `out` as assembly text of the set `s` as `options` asks, decoded under the object's context
 # `object`, which the caller makes with `set.open` for the object's architecture
 # ---
@@ -1851,6 +1939,9 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
         labels:  vector.init[Label](a),
         sites:   vector.init[Site](a),
         anchors: vector.init[Label](a),
+        marks:   vector.init[Mapped](a),
+        mapping: mapping_of(s, options.dialect),
+        mi:      0,
         bound:   vector.init[Bound](a),
         fills:   nil,
         scopes:  vector.init[Scope](a),
@@ -1971,13 +2062,22 @@ test disassemble__a_symbol_prints_as_a_label_at_its_offset {
     ret 0;
 }
 
+# a dialect whose assembler writes no mapping symbols, as llvm's on coff, over elf
+#[testing]
+val T_UNMAPPED: dialect.Dialect = dialect.Dialect{format: ?mink.format.ELF, arch: nil, private: ".L", unique: opt[str].some{"unique"}, mapping: false};
+
 test disassemble__undecodable_bytes_print_as_data {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
-    # a zero parcel is reserved as illegal, and without c the selection decodes no 16-bit instruction
-    if (!t_disassemble(?t, "\tnop\n\t.byte 0, 0, 0xff, 0x7f\n\tnop\n"))           { ret 2; }
-    if (!t_holds(?t, "\n\tnop\n\t.byte 0x00, 0x00\n\t.byte 0xff, 0x7f\n\tnop\n")) { ret 3; }
-    if (!t_done(?t))                                                              { ret 4; }
+    # the data a data mark starts prints as data whole, and code resumes at the code mark after it
+    if (!t_disassemble(?t, "\tnop\n\t.byte 0, 0, 0xff, 0x7f\n\tnop\n"))   { ret 2; }
+    if (!t_holds(?t, "\n\tnop\n\t.byte 0x00, 0x00, 0xff, 0x7f\n\tnop\n")) { ret 3; }
+    # unmarked, a zero parcel is reserved as illegal, and without c the selection decodes no 16-bit instruction, so the
+    # bytes print as data a parcel at a time, the marks as the labels they are to a dialect that writes none
+    t.dialect = ?T_UNMAPPED;
+    if (!t_disassemble(?t, "\tnop\n\t.byte 0, 0, 0xff, 0x7f\n\tnop\n")) { ret 4; }
+    if (!t_holds(?t, "$d:\n\t.byte 0x00, 0x00\n\t.byte 0xff, 0x7f\n"))  { ret 5; }
+    if (!t_done(?t))                                                    { ret 6; }
     ret 0;
 }
 
@@ -2081,8 +2181,8 @@ test disassemble__a_data_section_prints_as_data_directives {
     ret 0;
 }
 
-# every symbol of `o` that is placed in a section, or every one that is undefined, left without a name, as mink writes
-# a pcrel_lo partner
+# every symbol of `o` that is placed in a section but its mapping symbols, or every one that is undefined, left without
+# a name, as mink writes a pcrel_lo partner
 #[testing]
 fun t_unname(o: *mink.object.Object, placed: bool) bool {
     val none: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.object.name_str(o, "");
@@ -2090,8 +2190,8 @@ fun t_unname(o: *mink.object.Object, placed: bool) bool {
     var i: usize = 0;
     for (i < o.symbols.count::usize) {
         val sym: *mink.object.Symbol = ?o.symbols.items[i];
-        if (placed && sym.binding == ?mink.symbol.LOCAL && sym.kind == ?mink.symbol.NOTYPE && sel sym.def.placed) { sym.name = none.ok; }
-        if (!placed && sel sym.def.undefined)                                                                     { sym.name = none.ok; }
+        if (placed && sym.binding == ?mink.symbol.LOCAL && sym.kind == ?mink.symbol.NOTYPE && sel sym.def.placed && !t_mapping(o, sym)) { sym.name = none.ok; }
+        if (!placed && sel sym.def.undefined)                                                                                           { sym.name = none.ok; }
         i = i + 1;
     }
     ret true;
@@ -2108,11 +2208,66 @@ fun t_reaches(o: *mink.object.Object, r: *mink.object.Reloc, section: *u32, offs
     ret true;
 }
 
-# whether `x` and `y` hold the same section bytes and the same relocations, each against the place it reaches, as
-# reassembly names a symbol the original left without one
+# whether symbol `sym` of `o` is named as a mapping symbol of risc-v, `$x` or `$d`
+#[testing]
+fun t_mapping(o: *mink.object.Object, sym: *mink.object.Symbol) bool {
+    val name: View = name_of_symbol(o, sym);
+    ret name.len >= 2 && name.data[0] == '$' && (name.data[1] == 'x' || name.data[1] == 'd');
+}
+
+#[testing]
+fun name_of_symbol(o: *mink.object.Object, sym: *mink.object.Symbol) View {
+    ret mink.object.name_of(o, sym.name);
+}
+
+# how many mapping symbols of `x` `y` holds one of by name and place
+#[testing]
+fun t_marks_held(x: *mink.object.Object, y: *mink.object.Object) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < x.symbols.count::usize) {
+        val a: *mink.object.Symbol = ?x.symbols.items[i];
+        i = i + 1;
+        if (!t_mapping(x, a)) { cnt; }
+        var k: usize = 0;
+        for (k < y.symbols.count::usize) {
+            val b: *mink.object.Symbol = ?y.symbols.items[k];
+            k = k + 1;
+            if (!same_view(name_of_symbol(x, a), name_of_symbol(y, b))) { cnt; }
+            if (sel a.def.placed) {
+                if (sel b.def.placed) {
+                    val p: mink.object.Place = a.def.placed;
+                    val q: mink.object.Place = b.def.placed;
+                    if (p.section.index == q.section.index && p.offset == q.offset) {
+                        n = n + 1;
+                        brk;
+                    }
+                }
+            }
+        }
+    }
+    ret n;
+}
+
+# how many mapping symbols `o` holds
+#[testing]
+fun t_mark_count(o: *mink.object.Object) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < o.symbols.count::usize) {
+        if (t_mapping(o, ?o.symbols.items[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# whether `x` and `y` hold the same section bytes, the same mapping symbols and the same relocations, each against the
+# place it reaches, as reassembly names a symbol the original left without one
 #[testing]
 fun t_same_object(x: *mink.object.Object, y: *mink.object.Object) bool {
     if (x.sections.count != y.sections.count || x.relocs.count != y.relocs.count) { ret false; }
+    val marks: usize = t_mark_count(x);
+    if (marks != t_mark_count(y) || t_marks_held(x, y) != marks) { ret false; }
     var i: usize = 0;
     for (i < x.sections.count::usize) {
         val a: mink.store.Bytes = mink.object.bytes(x, ?x.sections.items[i].contents);
