@@ -1,0 +1,335 @@
+# the operands topic: what each operand rule of the instruction model is as an operand
+#
+# the model states an operand symbol's text and the fields it is encoded in, never what the text means, so the topic
+# gen/data/aarch64/operands.txt states it, one line for each rule the model's instructions use as an operand, keyed by
+# the rule's id. the model dedups its rules on their full meaning, so one id is one meaning wherever it appears:
+#
+#   register <rule> | class=<classes> role=<role> [first=<n>]
+#     a register named by the bits of its fields, a member of the first class, or the last where the text is the
+#     choice of the class's one name and the numbered text, as `(XZR|X{UInteger})` names xzr by 31. `first` is the
+#     number the encoded zero names, as w12 for MOVA's `Rs plus 12`
+#   immediate <rule> | <unsigned|signed> [scale=<n>] [bias=<n>]
+#     a number held by the bits of its fields the row leaves free, `scale` low zero bits no field holds and `bias`
+#     added to the encoded bits
+#   choice <rule> | <rows|enumerant> <member>=<bits> ...
+#     a choice of texts, each member by the text it spells and the bits of the choice's fields it encodes, from the
+#     high bit, `x` for a bit it leaves to another operand and `:` separating fields for reading. a choice of `rows`
+#     makes one row of each member, as an element size that decides other operands' widths does, and an
+#     `enumerant` is one operand of its members' values
+#   element <specifier> | bits=<n> [lanes=<n>]
+#     the width of each element a register written with `.<specifier>` holds, and how many it holds
+#
+# a role is read, write, read-write or none. the model states nothing any line states, so no line overrides it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use masc.core.operand;
+
+use gen.diag;
+use topic: gen.overlay;
+use gen.source;
+
+pub val TOPIC: str = "operands";
+
+pub val BAD_KIND:    str = "operands line is no register, immediate, choice or element";
+pub val BAD_ROLE:    str = "role is not read, write, read-write or none";
+pub val BAD_SIGN:    str = "immediate is neither unsigned nor signed";
+pub val BAD_CHOICE:  str = "choice is neither rows nor enumerant";
+pub val BAD_MEMBER:  str = "choice member is not `<text>=<bits>`";
+pub val BAD_PATTERN: str = "member bits are not 0, 1 and x";
+pub val TWICE:       str = "operand rule or specifier stated twice";
+
+# how an operand rule is used
+pub def Use: u8;
+
+pub val REGISTER:  Use = 0;
+pub val IMMEDIATE: Use = 1;
+pub val CHOICE:    Use = 2;
+
+# one member of a choice
+# ---
+# text: the text it spells, as the model writes it
+# bits: the bits of the choice's fields it encodes, from the high bit, `x` for a bit it leaves
+pub rec Member {
+    text: str;
+    bits: str;
+}
+
+# what one operand rule is
+# ---
+# rule:    the rule's id
+# use:     how it is used
+# fact:    its line, for refusals
+# classes: a register's classes by name, the numbered class first
+# role:    a register's role
+# first:   the number a register's encoded zero names
+# sign:    an immediate's sign
+# scale:   an immediate's low zero bits
+# bias:    added to an immediate's encoded bits
+# rows:    whether a choice makes one row of each member
+# members: a choice's members, in the line's order
+pub rec Fact {
+    rule:    str;
+    use:     Use;
+    fact:    *topic.Fact;
+    classes: vector.Vector[str];
+    role:    operand.Role;
+    first:   u32;
+    sign:    operand.Sign;
+    scale:   u8;
+    bias:    i64;
+    rows:    bool;
+    members: vector.Vector[Member];
+}
+
+# an element specifier
+pub rec Element {
+    name:  str;
+    bits:  u16;
+    lanes: u8;
+}
+
+# the topic as read
+# ---
+# facts:      every operand rule's fact, in file order
+# rules:      each fact's index by its rule
+# elements:   every specifier
+# specifiers: each specifier's index by its name
+pub rec Operands {
+    facts:      vector.Vector[Fact];
+    rules:      map.Map[str, u32];
+    elements:   vector.Vector[Element];
+    specifiers: map.Map[str, u32];
+}
+
+fun fits(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun inserted(r: res[bool, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun found(o: opt[*u32]) bool {
+    ret sel o.some;
+}
+
+fun reject(l: *topic.Line, message: str, subject: str) err[diag.Refusal] {
+    ret topic.reject(l, message, subject);
+}
+
+fun memory(l: *topic.Line) err[diag.Refusal] {
+    ret reject(l, diag.MEMORY, nil);
+}
+
+fun role(l: *topic.Line, out: *operand.Role) err[diag.Refusal] {
+    var w:      str               = nil;
+    val needed: err[diag.Refusal] = topic.needed(l, "role", ?w);
+    if (sel needed.err)              { ret needed; }
+    if (str_equals(w, "read"))       { @out = operand.READ; }
+    or (str_equals(w, "write"))      { @out = operand.WRITE; }
+    or (str_equals(w, "read-write")) { @out = operand.READ_WRITE; }
+    or (str_equals(w, "none"))       { @out = operand.NONE; }
+    or                               { ret reject(l, BAD_ROLE, w); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the classes of `text`, split on commas
+fun classes(a: *A.Allocator, l: *topic.Line, text: str, out: *vector.Vector[str]) err[diag.Refusal] {
+    val len:  usize = str_len(text);
+    var from: usize = 0;
+    var i:    usize = 0;
+    for (i <= len) {
+        if (i == len || text[i] == ',') {
+            val got: res[str, StrError] = str_copy_slice(a, text, from, i - from);
+            if (sel got.err)                          { ret memory(l); }
+            if (!fits(vector.push[str](out, got.ok))) { ret memory(l); }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# a member `<text>=<bits>`, its `:` separators taken out of its bits
+fun member(a: *A.Allocator, l: *topic.Line, w: str, out: *vector.Vector[Member]) err[diag.Refusal] {
+    val len: usize = str_len(w);
+    var eq:  usize = len;
+    var i:   usize = 0;
+    for (i < len) {
+        if (w[i] == '=') { eq = i; }
+        i = i + 1;
+    }
+    if (eq == len || eq + 1 == len) { ret reject(l, BAD_MEMBER, w); }
+    val text: res[str, StrError] = str_copy_slice(a, w, 0, eq);
+    val got:  res[*u8, A.Error]  = A.allocate[u8](a, len - eq);
+    if (sel text.err) { ret memory(l); }
+    if (sel got.err)  { ret memory(l); }
+    var n: usize = 0;
+    i = eq + 1;
+    for (i < len) {
+        val c: u8 = w[i];
+        if (c == '0' || c == '1' || c == 'x') {
+            got.ok[n] = c;
+            n         = n + 1;
+        }
+        or (c != ':') { ret reject(l, BAD_PATTERN, w); }
+        i = i + 1;
+    }
+    got.ok[n] = 0;
+    if (!fits(vector.push[Member](out, Member{text: text.ok, bits: got.ok}))) { ret memory(l); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun number(l: *topic.Line, w: str, out: *i64) err[diag.Refusal] {
+    val got: res[i64, diag.Refusal] = topic.number(l.fact, w);
+    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+    @out = got.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+fun fact_of(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    @out = Fact{rule: l.key.data[1], use: REGISTER, fact: l.fact, classes: vector.init[str](a), role: operand.READ, first: 0, sign: operand.UNSIGNED, scale: 0, bias: 0, rows: false, members: vector.init[Member](a)};
+    if (topic.is(l, "register", 2)) {
+        val names: [3]str            = [3]str{"class", "role", "first"};
+        val known: err[diag.Refusal] = topic.known(l, ?names[0], 3);
+        if (sel known.err) { ret known; }
+        var c:      str               = nil;
+        val needed: err[diag.Refusal] = topic.needed(l, "class", ?c);
+        if (sel needed.err) { ret needed; }
+        val split: err[diag.Refusal] = classes(a, l, c, ?out.classes);
+        if (sel split.err) { ret split; }
+        val roled: err[diag.Refusal] = role(l, ?out.role);
+        if (sel roled.err) { ret roled; }
+        var first: i64               = 0;
+        val f:     str               = topic.optional(l, "first", "0");
+        val read:  err[diag.Refusal] = number(l, f, ?first);
+        if (sel read.err) { ret read; }
+        out.first = first::u32;
+        ret err[diag.Refusal].ok{};
+    }
+    if (topic.is(l, "immediate", 2)) {
+        out.use  = IMMEDIATE;
+        out.role = operand.READ;
+        if (l.ws.len == 0) { ret reject(l, BAD_SIGN, nil); }
+        val sign: str = l.ws.data[0];
+        if (str_equals(sign, "unsigned")) { out.sign = operand.UNSIGNED; }
+        or (str_equals(sign, "signed"))   { out.sign = operand.SIGNED; }
+        or                                { ret reject(l, BAD_SIGN, sign); }
+        var i: usize = 1;
+        for (i < l.ws.len) {
+            val w: str = l.ws.data[i];
+            var v: i64 = 0;
+            if (str_len(w) > 6 && w[0] == 's' && w[1] == 'c' && w[2] == 'a' && w[3] == 'l' && w[4] == 'e' && w[5] == '=') {
+                val got: err[diag.Refusal] = number(l, ?w[6], ?v);
+                if (sel got.err) { ret got; }
+                out.scale = v::u8;
+            }
+            or (str_len(w) > 5 && w[0] == 'b' && w[1] == 'i' && w[2] == 'a' && w[3] == 's' && w[4] == '=') {
+                val got: err[diag.Refusal] = number(l, ?w[5], ?v);
+                if (sel got.err) { ret got; }
+                out.bias = v;
+            }
+            or { ret reject(l, topic.UNKNOWN_WORD, w); }
+            i = i + 1;
+        }
+        ret err[diag.Refusal].ok{};
+    }
+    if (topic.is(l, "choice", 2)) {
+        out.use  = CHOICE;
+        out.role = operand.READ;
+        if (l.ws.len < 2) { ret reject(l, BAD_CHOICE, nil); }
+        val how: str = l.ws.data[0];
+        if (str_equals(how, "rows"))       { out.rows = true; }
+        or (!str_equals(how, "enumerant")) { ret reject(l, BAD_CHOICE, how); }
+        var i: usize = 1;
+        for (i < l.ws.len) {
+            val got: err[diag.Refusal] = member(a, l, l.ws.data[i], ?out.members);
+            if (sel got.err) { ret got; }
+            i = i + 1;
+        }
+        ret err[diag.Refusal].ok{};
+    }
+    ret reject(l, BAD_KIND, l.key.data[0]);
+}
+
+fun element_of(l: *topic.Line, out: *Element) err[diag.Refusal] {
+    val names: [2]str            = [2]str{"bits", "lanes"};
+    val known: err[diag.Refusal] = topic.known(l, ?names[0], 2);
+    if (sel known.err) { ret known; }
+    var b:      str               = nil;
+    val needed: err[diag.Refusal] = topic.needed(l, "bits", ?b);
+    if (sel needed.err) { ret needed; }
+    var bits:  i64               = 0;
+    var lanes: i64               = 0;
+    val got:   err[diag.Refusal] = number(l, b, ?bits);
+    if (sel got.err) { ret got; }
+    val counted: err[diag.Refusal] = number(l, topic.optional(l, "lanes", "0"), ?lanes);
+    if (sel counted.err) { ret counted; }
+    @out = Element{name: l.key.data[1], bits: bits::u16, lanes: lanes::u8};
+    ret err[diag.Refusal].ok{};
+}
+
+# the operands topic of the data tree `tree`
+pub fun read(a: *A.Allocator, tree: *source.Tree) res[Operands, diag.Refusal] {
+    val got: res[topic.Topic, diag.Refusal] = topic.read(a, tree, TOPIC);
+    if (sel got.err) { ret res[Operands, diag.Refusal].err{got.err}; }
+    var t:       topic.Topic       = got.ok;
+    val checked: err[diag.Refusal] = topic.check(?t, nil, topic.unstated);
+    if (sel checked.err) { ret res[Operands, diag.Refusal].err{checked.err}; }
+    var out: Operands = Operands{facts: vector.init[Fact](a), rules: map.init[str, u32](a), elements: vector.init[Element](a), specifiers: map.init[str, u32](a)};
+    var i:   usize    = 0;
+    for (i < t.facts.len) {
+        var l:    topic.Line        = topic.Line{fact: nil, key: vector.init[str](a), ws: vector.init[str](a)};
+        val read: err[diag.Refusal] = topic.line(a, ?t.facts.data[i], ?l);
+        if (sel read.err)   { ret res[Operands, diag.Refusal].err{read.err}; }
+        if (l.key.len != 2) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, BAD_KIND, nil)}; }
+        if (topic.is(?l, "element", 2)) {
+            var e:  Element           = Element{name: nil, bits: 0, lanes: 0};
+            val ok: err[diag.Refusal] = element_of(?l, ?e);
+            if (sel ok.err)                                                                      { ret res[Operands, diag.Refusal].err{ok.err}; }
+            if (found(map.get[str, u32](?out.specifiers, ?e.name)))                              { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, TWICE, e.name)}; }
+            if (!inserted(map.insert[str, u32](?out.specifiers, e.name, out.elements.len::u32))) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+            if (!fits(vector.push[Element](?out.elements, e)))                                   { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+        }
+        or {
+            var f:  Fact;
+            val ok: err[diag.Refusal] = fact_of(a, ?l, ?f);
+            if (sel ok.err)                                                              { ret res[Operands, diag.Refusal].err{ok.err}; }
+            if (found(map.get[str, u32](?out.rules, ?f.rule)))                           { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, TWICE, f.rule)}; }
+            if (!inserted(map.insert[str, u32](?out.rules, f.rule, out.facts.len::u32))) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+            if (!fits(vector.push[Fact](?out.facts, f)))                                 { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+        }
+        i = i + 1;
+    }
+    ret res[Operands, diag.Refusal].ok{out};
+}
+
+# the fact of rule `id`, none when the topic states none
+pub fun of(o: *Operands, id: str) opt[*Fact] {
+    val at: opt[*u32] = map.get[str, u32](?o.rules, ?id);
+    if (sel at.none) { ret opt[*Fact].none{}; }
+    ret opt[*Fact].some{?o.facts.data[@at.some]};
+}
+
+# the specifier `name`, none when the topic states none
+pub fun element(o: *Operands, name: str) opt[*Element] {
+    val at: opt[*u32] = map.get[str, u32](?o.specifiers, ?name);
+    if (sel at.none) { ret opt[*Element].none{}; }
+    ret opt[*Element].some{?o.elements.data[@at.some]};
+}
