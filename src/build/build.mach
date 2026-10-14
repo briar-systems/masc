@@ -117,6 +117,7 @@ use core_source: masc.core.source;
 use core_state:  masc.core.state;
 use masc.core.syntax;
 use masc.core.trait;
+use masc.format.dialect;
 
 #[testing]
 use riscv_catalog:   masc.isa.riscv.catalog;
@@ -684,6 +685,8 @@ rec Entry {
 # cts:       the ranges marked as built to run in constant time, the last open while `ct_end` is awaited
 # frames:    the frames of the functions stated, the last open while `cfi_end` is awaited
 # rules:     the rules of every frame, each at the statement it precedes
+# mapping:   the mapping symbols written, the set's source dialect's where the format's assembler writes them
+#            (`dialect.Dialect.mapping`), else none
 # modes:     the assembler modes the next statement is read under, each at its initial value until changed
 # states:    every value the modes have held, a new one recorded each time a mode changes, which fragments name by index
 # state:     the index of `modes` among `states`
@@ -734,6 +737,7 @@ pub rec Builder {
     cts:       vector.Vector[Ct];
     frames:    vector.Vector[Framed];
     rules:     vector.Vector[Ruled];
+    mapping:   core_source.Mapping;
     modes:     mode.State;
     states:    vector.Vector[mode.State];
     state:     u32;
@@ -956,6 +960,7 @@ pub fun make(a: *A.Allocator, formats: *mink.registry.Registry, s: *set.Set, obj
         cts:      vector.init[Ct](a),
         frames:   vector.init[Framed](a),
         rules:    vector.init[Ruled](a),
+        mapping:  mapping_of(s, arch, format),
         modes:    mode.initial(?s.assembly),
         states:   vector.init[mode.State](a),
         state:    0,
@@ -1004,6 +1009,14 @@ pub fun make(a: *A.Allocator, formats: *mink.registry.Registry, s: *set.Set, obj
         ret res[Builder, Refusal].err{memory()};
     }
     ret res[Builder, Refusal].ok{b};
+}
+
+# the mapping symbols an object of `arch` in `format` over `s` holds: the set's source dialect's where the format's
+# assembler writes them, else none
+fun mapping_of(s: *set.Set, arch: *mink.arch.Arch, format: *mink.format.Format) core_source.Mapping {
+    val d: opt[*dialect.Dialect] = dialect.of(format, arch);
+    if (sel d.some && d.some.mapping) { ret s.source.mapping; }
+    ret core_source.NO_MAPPING;
 }
 
 # how the object's format names sections
@@ -3405,6 +3418,96 @@ fun build_object(b: *Builder, o: *mink.object.Object) err[mink.fail.Fail] {
     ret err[mink.fail.Fail].ok{};
 }
 
+# what a section holds where a mapping symbol was last written
+# ---
+# UNMARKED: nothing marked yet
+# CODE:     code, under the code mark last written
+# DATA:     data
+def Marked: u8;
+
+val UNMARKED: Marked = 0;
+val CODE:     Marked = 1;
+val DATA:     Marked = 2;
+
+# a mapping symbol named `name` at `offset` of section `s`, a local symbol of no type
+fun mark_place(b: *Builder, o: *mink.object.Object, s: usize, offset: u64, name: *u8, len: usize) err[Refusal] {
+    val named: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.object.name(o, name, len);
+    if (sel named.err) { ret err[Refusal].err{failed(named.err)}; }
+    val made: res[mink.table.Id[mink.object.Symbol], mink.fail.Fail] = mink.object.add_symbol(o, mink.object.Symbol{
+        name:       named.ok,
+        binding:    ?mink.symbol.LOCAL,
+        visibility: ?mink.symbol.DEFAULT,
+        kind:       ?mink.symbol.NOTYPE,
+        def:        mink.object.Definition.placed{mink.object.Place{section: mink.table.Id[mink.object.Section]{index: s::u32}, offset: offset}},
+    });
+    if (sel made.err) { ret err[Refusal].err{failed(made.err)}; }
+    ret err[Refusal].ok{};
+}
+
+# the code mark of view `v` into `out`: the mapping's code stem, followed by the view's versioned selection when the
+# mapping names the view
+fun code_mark(b: *Builder, v: *core_state.Context, out: *vector.Vector[u8]) bool {
+    out.len = 0;
+    val stem: err[A.Error] = extension.append(out, b.mapping.code);
+    if (sel stem.err)        { ret false; }
+    if (!b.mapping.per_view) { ret true; }
+    val spelled: err[A.Error] = extension.spell_versioned(v.selection, out);
+    ret sel spelled.ok;
+}
+
+# the mapping symbols of every section: a code mark where code starts, at a section's start, after data, or under a
+# view whose code mark is another, and a data mark where data starts, as llvm-mc 23.1.1 writes `$x` and `$d`
+# (RISCVELFStreamer.cpp and AArch64ELFStreamer.cpp emitMappingSymbol). an alignment starts neither, so its padding
+# reads as what came before it, and a section holding only labels holds no mark
+fun map_sections(b: *Builder, o: *mink.object.Object) err[Refusal] {
+    if (str_len(b.mapping.code) == 0) { ret err[Refusal].ok{}; }
+    var name: vector.Vector[u8] = vector.init[u8](b.a);
+    var last: vector.Vector[u8] = vector.init[u8](b.a);
+    var done: err[Refusal]      = err[Refusal].ok{};
+    var s:    usize             = 0;
+    for (s < b.areas.len && sel done.ok) {
+        val area: *Area               = ?b.areas.data[s];
+        var at:   Marked              = UNMARKED;
+        var seen: *core_state.Context = nil;
+        var j:    usize               = 0;
+        for (j < area.fragments.len && sel done.ok) {
+            val f: *Fragment = ?area.fragments.data[j];
+            j = j + 1;
+            if (sel f.body.align) { cnt; }
+            if (!sel f.body.code) {
+                if (at != DATA) { done = mark_place(b, o, s, f.offset, b.mapping.data, str_len(b.mapping.data)); }
+                at = DATA;
+                cnt;
+            }
+            # a view's mark is spelled once each time the view changes, and written when it is another than the last
+            if (at == CODE && f.view == seen) { cnt; }
+            seen = f.view;
+            if (!code_mark(b, f.view, ?name)) {
+                done = err[Refusal].err{memory()};
+                cnt;
+            }
+            if (at == CODE && mink.store.same_bytes(mink.store.Bytes{data: name.data, len: name.len}, mink.store.Bytes{data: last.data, len: last.len})) { cnt; }
+            done     = mark_place(b, o, s, f.offset, name.data, name.len);
+            at       = CODE;
+            last.len = 0;
+            if (!held(vector.reserve[u8](?last, name.len))) {
+                done = err[Refusal].err{memory()};
+                cnt;
+            }
+            var k: usize = 0;
+            for (k < name.len) {
+                last.data[k] = name.data[k];
+                k            = k + 1;
+            }
+            last.len = name.len;
+        }
+        s = s + 1;
+    }
+    vector.dnit[u8](?name);
+    vector.dnit[u8](?last);
+    ret done;
+}
+
 # whether the object's context or any context a fragment was written under admits `required`, as the gnu assembler
 # sets EF_RISCV_RVC when `.option arch, +c` turns c on in an object built without it
 fun written_under(b: *Builder, required: requirement.Requirement) bool {
@@ -3679,6 +3782,11 @@ fun produce(b: *Builder) res[mink.object.Object, Refusal] {
     if (sel built.err) {
         mink.object.release(?o);
         ret res[mink.object.Object, Refusal].err{failed(built.err)};
+    }
+    val mapped: err[Refusal] = map_sections(b, ?o);
+    if (sel mapped.err) {
+        mink.object.release(?o);
+        ret res[mink.object.Object, Refusal].err{mapped.err};
     }
     val marked: err[Refusal] = record_cts(b, ?o);
     if (sel marked.err) {
@@ -4579,8 +4687,8 @@ test build__an_unresolvable_fixup_is_refused {
     if (call.kind != ?mink.riscv_kinds.CALL_PLT_PAIR || mark.kind != ?mink.riscv_kinds.RELAX || mark.offset != 0) { ret 10; }
     val callee: *mink.object.Symbol = t_named_by(?o, call);
     if (callee == nil || !sel callee.def.undefined) { ret 11; }
-    # the marker names nothing, and no symbol stands in for it
-    if (!sel mark.target.none || o.symbols.count != 1) { ret 12; }
+    # the marker names nothing, and no symbol stands in for it: the callee and the code's mapping symbol are all
+    if (!sel mark.target.none || o.symbols.count != 2) { ret 12; }
     if (!t_done(?t, ?o))                               { ret 13; }
     ret 0;
 }
@@ -4795,7 +4903,8 @@ test build__a_local_label_is_not_exported {
     val done: res[mink.object.Object, Refusal] = finish(?t.b);
     if (sel done.err) { ret 6; }
     var o: mink.object.Object = done.ok;
-    if (o.symbols.count != 1) { ret 7; }
+    # the exported label and the code's mapping symbol
+    if (o.symbols.count != 2) { ret 7; }
     val only: View = mink.object.name_of(?o, t_symbol(?o, mink.table.Id[mink.object.Symbol]{index: 0}).name);
     if (only.len != 1 || only.data[0] != 'f') { ret 8; }
     val loop_symbol: opt[mink.table.Id[mink.object.Symbol]] = symbol_of(?t.b, loop);
