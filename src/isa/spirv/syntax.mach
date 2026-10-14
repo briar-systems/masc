@@ -1,0 +1,215 @@
+# the spir-v assembly syntax, spirv-as's
+#
+# every row's template and the index by mnemonic are generated from the core grammar (gen_syntax): an instruction is
+# its opname and its operands in order, the result it defines bound before it as `%r = OpTypeInt 32 0`, an optional
+# operand written only when present, a mask's members joined by `|`, an enumerant's params after it, an operation of
+# OpSpecConstantOp after its result type and an extended instruction after its set. what is written here is how its
+# values are spelled: an id `%` and its number or a name, a string between double quotes, which a backslash escapes
+# within, and an integer in decimal or after 0x. mnemonics and names read with their case.
+#
+# a source names an id by its number or by a name, which the stream gives the id past the highest it has seen. the
+# printer writes every id by its number, as spirv-dis --raw-id does, so its text reads back to the same ids.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use core_syntax: masc.core.syntax;
+use masc.syntax.expr;
+use masc.syntax.read;
+use masc.syntax.write;
+
+use spirv_kind:   masc.isa.spirv.kind;
+use spirv_stream: masc.isa.spirv.stream;
+
+use masc.isa.spirv.gen_syntax;
+
+pub val NO_ID:      str = "expected an id, `%` and a number or a name";
+pub val UNNAMED:    str = "an id is named only within a module's stream";
+pub val NO_BINDING: str = "expected `=` after the result id";
+pub val UNCLOSED:   str = "string not closed";
+pub val NO_STRING:  str = "expected a string between double quotes";
+pub val TYPED:      str = "a literal typed by another operand is not spelled";
+
+# whether `c` continues an id's name or number
+fun name_byte(c: u8) bool {
+    ret read.word(c);
+}
+
+# the id at the reader's position, `%` and a number or a name, the reader advanced past it
+fun id_read(r: *core_syntax.Reader) res[u32, diagnostic.Diagnostic] {
+    val at: usize = r.at;
+    if (read.peek(r) != '%') { ret res[u32, diagnostic.Diagnostic].err{read.refuse(r, NO_ID, at, read.token(r, at))}; }
+    var end: usize = at + 1;
+    for (end < r.end && name_byte(r.text[end])) { end = end + 1; }
+    val len: usize = end - at - 1;
+    if (len == 0) { ret res[u32, diagnostic.Diagnostic].err{read.refuse(r, NO_ID, at, 1)}; }
+    var numbered: bool  = true;
+    var n:        u64   = 0;
+    var i:        usize = at + 1;
+    for (i < end) {
+        val c: u8 = r.text[i];
+        if (c < '0' || c > '9') { numbered = false; }
+        or (n <= 0xFFFF_FFFF)   { n = n * 10 + (c - '0')::u64; }
+        i = i + 1;
+    }
+    if (numbered && n > 0xFFFF_FFFF) { ret res[u32, diagnostic.Diagnostic].err{read.refuse(r, field.OUT_OF_RANGE, at, end - at)}; }
+    var got: res[u32, str] = res[u32, str].err{UNNAMED};
+    if (r.ctx != nil && r.ctx.stream != nil) {
+        if (numbered) { got = spirv_stream.numbered(r.ctx.stream, n::u32); }
+        or            { got = spirv_stream.named(r.ctx.stream, View{data: ?r.text[at + 1], len: len}); }
+    }
+    or (numbered) {
+        got = res[u32, str].ok{n::u32};
+        if (n == 0) { got = res[u32, str].err{spirv_stream.NO_ID}; }
+    }
+    if (sel got.err) { ret res[u32, diagnostic.Diagnostic].err{read.refuse(r, got.err, at, end - at)}; }
+    r.at = end;
+    ret res[u32, diagnostic.Diagnostic].ok{got.ok};
+}
+
+fun id_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.id) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+    val got: res[u32, diagnostic.Diagnostic] = id_read(r);
+    if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+    @out = operand.Value.id{got.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun id_write(w: *core_syntax.Writer, id: u32) err[field.Refusal] {
+    val percent: err[field.Refusal] = write.text(w, "%");
+    if (sel percent.err) { ret percent; }
+    ret write.decimal(w, id::i64);
+}
+
+fun id_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel value.id) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    ret id_write(w, value.id);
+}
+
+val ID: core_syntax.Hook = core_syntax.Hook{parse: id_parse, print: id_print};
+
+# a string between double quotes, a backslash taking the byte after it as it is, its bytes borrowed from the text
+# when it holds no backslash
+fun string_parse(r: *core_syntax.Reader, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val at: usize = r.at;
+    if (read.peek(r) != '"') { ret err[diagnostic.Diagnostic].err{read.refuse(r, NO_STRING, at, read.token(r, at))}; }
+    var end:     usize = at + 1;
+    var len:     u32   = 0;
+    var escaped: bool  = false;
+    for (end < r.end && r.text[end] != '"') {
+        if (r.text[end] == '\\') {
+            escaped = true;
+            end     = end + 1;
+        }
+        if (end < r.end) {
+            if (r.text[end] == 0) { ret err[diagnostic.Diagnostic].err{read.refuse(r, field.NUL_IN_STRING, end, 1)}; }
+            end = end + 1;
+            len = len + 1;
+        }
+    }
+    if (end >= r.end) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNCLOSED, at, end - at)}; }
+    if (!escaped) {
+        @out = operand.Value.literal{operand.Bytes{at: ?r.text[at + 1], len: len}};
+        r.at = end + 1;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val room: res[*u8, diagnostic.Diagnostic] = read.reserve(r, len);
+    if (sel room.err) { ret err[diagnostic.Diagnostic].err{room.err}; }
+    var i: usize = at + 1;
+    var k: u32   = 0;
+    for (i < end) {
+        if (r.text[i] == '\\') { i = i + 1; }
+        room.ok[k] = r.text[i];
+        k          = k + 1;
+        i          = i + 1;
+    }
+    @out = operand.Value.literal{operand.Bytes{at: room.ok, len: len}};
+    r.at = end + 1;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun string_print(w: *core_syntax.Writer, bytes: operand.Bytes) err[field.Refusal] {
+    val open: err[field.Refusal] = write.text(w, "\"");
+    if (sel open.err) { ret open; }
+    var i: u32 = 0;
+    for (i < bytes.len) {
+        val c: u8 = bytes.at[i];
+        if (c == '"' || c == '\\') {
+            val escape: err[field.Refusal] = write.text(w, "\\");
+            if (sel escape.err) { ret escape; }
+        }
+        val one: err[field.Refusal] = write.bytes(w, ?bytes.at[i], 1);
+        if (sel one.err) { ret one; }
+        i = i + 1;
+    }
+    ret write.text(w, "\"");
+}
+
+fun literal_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.literal)                      { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+    if (desc.shape.literal.content == operand.STRING) { ret string_parse(r, out); }
+    ret err[diagnostic.Diagnostic].err{read.refuse(r, TYPED, r.at, read.token(r, r.at))};
+}
+
+fun literal_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel desc.shape.literal || !sel value.literal)                          { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (sel desc.shape.literal && desc.shape.literal.content != operand.STRING) { ret write.refuse(w, TYPED, field.NO_OPERAND); }
+    if (sel value.literal)                                                      { ret string_print(w, value.literal); }
+    ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND);
+}
+
+val LITERAL: core_syntax.Hook = core_syntax.Hook{parse: literal_parse, print: literal_print};
+
+# the result id a statement binds, `%r =` before its opname, none when it starts with its opname
+fun statement(r: *core_syntax.Reader) err[diagnostic.Diagnostic] {
+    if (read.peek(r) != '%') { ret err[diagnostic.Diagnostic].ok{}; }
+    val got: res[u32, diagnostic.Diagnostic] = id_read(r);
+    if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+    read.skip(r);
+    if (read.peek(r) != '=') { ret err[diagnostic.Diagnostic].err{read.refuse(r, NO_BINDING, r.at, read.token(r, r.at))}; }
+    r.at = r.at + 1;
+    read.skip(r);
+    r.bound = operand.Value.id{got.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `%r = ` of the result id `ins` defines, nothing for an instruction that defines none
+fun lead(w: *core_syntax.Writer, ins: *inst.Inst) err[field.Refusal] {
+    val d: u8 = ins.row.effect.values.defines;
+    if (d == 0) { ret err[field.Refusal].ok{}; }
+    val v: *operand.Value = ?ins.values[d - 1];
+    if (!sel v.id) { ret write.refuse(w, write.NO_SPELLING, d - 1); }
+    val id: err[field.Refusal] = id_write(w, v.id);
+    if (sel id.err) { ret id; }
+    ret write.text(w, " = ");
+}
+
+# spirv-as's syntax
+pub val SYNTAX: core_syntax.Syntax = core_syntax.Syntax{
+    name:       "spirv",
+    forms:      core_syntax.Forms{at: ?gen_syntax.FORM_TEXT[0], len: gen_syntax.FORM_COUNT},
+    aliases:    core_syntax.Aliases{at: nil, len: 0},
+    index:      core_syntax.Index{at: ?gen_syntax.ENTRIES[0], len: gen_syntax.ENTRY_COUNT, candidates: ?gen_syntax.CANDIDATES[0], count: gen_syntax.CANDIDATE_COUNT},
+    specifiers: core_syntax.Specifiers{at: nil, len: 0},
+    sequences:  core_syntax.NO_SEQUENCES,
+    hooks:      core_syntax.Hooks{immediate: ?expr.IMMEDIATE, memory: nil, list: nil, id: ?ID, literal: ?LITERAL, register: nil},
+    register:   "",
+    aliased:    false,
+    join:       "|",
+    variadic:   " ",
+    fold:       false,
+    anonymous:  ".Ltmp",
+    own:        nil,
+    statement:  statement,
+    lead:       lead,
+};

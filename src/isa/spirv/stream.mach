@@ -1,0 +1,268 @@
+# the state a spir-v module's stream keeps across its instructions
+#
+# spir-v types a literal by the result type its id was defined with, and an extended instruction by the set its set
+# operand's import names, so a reader of one instruction asks what the instructions before it defined. the state
+# keeps every id's type, the width and class of every integer and float type OpTypeInt and OpTypeFloat define, the
+# import code of every set OpExtInstImport imports, and the text names of ids a module's source spells by name.
+# `observe` adds what each instruction defines, refusing an id defined twice, and a module's reader asks `width`, `space`
+# and the scalar of an id.
+#
+# a source spells an id `%n` by its number or `%name` by a name. a name takes one past the highest id the stream has
+# seen, at its first sight, and a later number naming that id is refused, so a source's numbers keep their ids and
+# its names take ids none of them has.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.map;
+
+use masc.core.field;
+use masc.core.index;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.stream;
+
+use masc.isa.spirv.gen_operand;
+use masc.isa.spirv.gen_row;
+use spirv_kind: masc.isa.spirv.kind;
+
+pub val DEFINED_TWICE: str = "id defined twice";
+pub val NAMED_ID:      str = "id a name already took";
+pub val NO_ID:         str = "id 0 names nothing";
+
+# what a scalar type's literals are
+# ---
+# INTEGER: an unsigned integer
+# SIGNED:  a signed integer, its literals sign-extended to whole words
+# FLOAT:   an ieee 754 binary float
+pub def Class: u8;
+
+pub val INTEGER: Class = 0;
+pub val SIGNED:  Class = 1;
+pub val FLOAT:   Class = 2;
+
+# a scalar type
+# ---
+# bits:  its width in bits
+# class: what its literals are
+pub rec Scalar {
+    bits:  u32;
+    class: Class;
+}
+
+# the stream's state
+# ---
+# alloc:   what it lives in
+# defined: every defined id's type id, 0 for an id defined with no type
+# scalars: every integer and float type, by its id
+# imports: the import code of every set an id imports, by the id
+# names:   the id of every name the source spelled, each name owned
+# named:   the ids names took
+# top:     the highest id the stream has seen
+pub rec State {
+    alloc:   *A.Allocator;
+    defined: map.Map[u32, u32];
+    scalars: map.Map[u32, Scalar];
+    imports: map.Map[u32, u32];
+    names:   map.Map[str, u32];
+    named:   map.Map[u32, bool];
+    top:     u32;
+}
+
+fun state_of(p: ptr) *State {
+    ret p::*State;
+}
+
+fun make(a: *A.Allocator) res[ptr, A.Error] {
+    val got: res[*State, A.Error] = A.allocate[State](a, 1);
+    if (sel got.err) { ret res[ptr, A.Error].err{got.err}; }
+    @got.ok = State{alloc: a, defined: map.init[u32, u32](a), scalars: map.init[u32, Scalar](a), imports: map.init[u32, u32](a), names: map.init[str, u32](a), named: map.init[u32, bool](a), top: 0};
+    ret res[ptr, A.Error].ok{got.ok::ptr};
+}
+
+# every name's owned text given back
+fun forget_names(s: *State) {
+    var it:  map.Iter = map.iter[str, u32](?s.names);
+    var one: map.Entry[str, u32];
+    for (map.next[str, u32](?s.names, ?it, ?one)) {
+        val text:  str          = @one.key;
+        val freed: err[A.Error] = A.deallocate[u8](s.alloc, text, str_len(text) + 1);
+    }
+    map.clear[str, u32](?s.names);
+}
+
+fun release(a: *A.Allocator, p: ptr) {
+    val s: *State = state_of(p);
+    forget_names(s);
+    map.dnit[u32, u32](?s.defined);
+    map.dnit[u32, Scalar](?s.scalars);
+    map.dnit[u32, u32](?s.imports);
+    map.dnit[str, u32](?s.names);
+    map.dnit[u32, bool](?s.named);
+    val freed: err[A.Error] = A.deallocate[State](a, s, 1);
+}
+
+fun begin(p: ptr) {
+    val s: *State = state_of(p);
+    forget_names(s);
+    map.clear[u32, u32](?s.defined);
+    map.clear[u32, Scalar](?s.scalars);
+    map.clear[u32, u32](?s.imports);
+    map.clear[u32, bool](?s.named);
+    s.top = 0;
+}
+
+fun memory() err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(field.MEMORY, field.NO_OPERAND, 0)};
+}
+
+# the id value `v` holds, 0 for a value that is no id
+fun id_of(v: *operand.Value) u32 {
+    if (sel v.id) { ret v.id; }
+    ret 0;
+}
+
+# the immediate value `v` holds, 0 for a value that is no immediate
+fun number_of(v: *operand.Value) i64 {
+    if (sel v.immediate) { ret v.immediate; }
+    ret 0;
+}
+
+# the import code of the set named by literal `v`, 0 for a set masc has no rows of
+fun import_code(v: *operand.Value) u32 {
+    if (!sel v.literal) { ret 0; }
+    val bytes: operand.Bytes = v.literal;
+    val name:  View          = View{data: bytes.at, len: bytes.len::usize};
+    val found: opt[u32]      = index.find_view(?IMPORTS_INDEX, name, false);
+    if (sel found.none) { ret 0; }
+    ret found.some;
+}
+
+# the extended sets masc has rows of, by the name OpExtInstImport imports each by, each entry's row its import code
+val IMPORTS_INDEX: index.Index = index.Index{at: ?gen_operand.IMPORTS[0], len: gen_operand.IMPORT_COUNT};
+
+fun seen(s: *State, id: u32) {
+    if (id > s.top) { s.top = id; }
+}
+
+# what `ins` defines added to the state: its result's type, a scalar type's width and class and an import's set
+fun observe(p: ptr, ins: *inst.Inst) err[field.Refusal] {
+    val s: *State = state_of(p);
+    val v: u8     = ins.row.effect.values.defines;
+    if (v == 0 || v::u32 > ins.count) { ret err[field.Refusal].ok{}; }
+    val id: u32 = id_of(?ins.values[v - 1]);
+    if (id == 0) { ret err[field.Refusal].err{field.refusal(NO_ID, v - 1, 0)}; }
+    var key:   u32       = id;
+    val prior: opt[*u32] = map.get[u32, u32](?s.defined, ?key);
+    if (sel prior.some) { ret err[field.Refusal].err{field.refusal(DEFINED_TWICE, v - 1, 0)}; }
+    var type: u32 = 0;
+    val t:    u8  = ins.row.effect.values.type;
+    if (t != 0 && t::u32 <= ins.count) { type = id_of(?ins.values[t - 1]); }
+    val put: res[bool, A.Error] = map.insert[u32, u32](?s.defined, id, type);
+    if (sel put.err) { ret memory(); }
+    seen(s, id);
+    if (ins.row == gen_row.OPTYPEINT && ins.count >= 3) {
+        var class: Class = INTEGER;
+        if (number_of(?ins.values[2]) != 0) { class = SIGNED; }
+        val typed: res[bool, A.Error] = map.insert[u32, Scalar](?s.scalars, id, Scalar{bits: number_of(?ins.values[1])::u32, class: class});
+        if (sel typed.err) { ret memory(); }
+    }
+    or (ins.row == gen_row.OPTYPEFLOAT && ins.count >= 2) {
+        val typed: res[bool, A.Error] = map.insert[u32, Scalar](?s.scalars, id, Scalar{bits: number_of(?ins.values[1])::u32, class: FLOAT});
+        if (sel typed.err) { ret memory(); }
+    }
+    or (ins.row == gen_row.OPEXTINSTIMPORT && ins.count >= 2) {
+        val code: u32 = import_code(?ins.values[1]);
+        if (code != 0) {
+            val imported: res[bool, A.Error] = map.insert[u32, u32](?s.imports, id, code);
+            if (sel imported.err) { ret memory(); }
+        }
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# the scalar type `id` is, or the scalar type of the value `id` names, none for neither
+pub fun scalar(p: ptr, id: u32) opt[Scalar] {
+    val s:   *State       = state_of(p);
+    var key: u32          = id;
+    val own: opt[*Scalar] = map.get[u32, Scalar](?s.scalars, ?key);
+    if (sel own.some) { ret opt[Scalar].some{@own.some}; }
+    val typed: opt[*u32] = map.get[u32, u32](?s.defined, ?key);
+    if (sel typed.none) { ret opt[Scalar].none{}; }
+    var of:      u32          = @typed.some;
+    val scalar_: opt[*Scalar] = map.get[u32, Scalar](?s.scalars, ?of);
+    if (sel scalar_.none) { ret opt[Scalar].none{}; }
+    ret opt[Scalar].some{@scalar_.some};
+}
+
+# the bytes of whole words a literal of the scalar type `id` is, or of the type of the value it names, none for an id
+# of no scalar type or one wider than a literal holds
+pub fun width(p: ptr, id: u32) opt[u8] {
+    val got: opt[Scalar] = scalar(p, id);
+    if (sel got.none) { ret opt[u8].none{}; }
+    val bits: u32 = got.some.bits;
+    if (bits == 0 || bits > 2048) { ret opt[u8].none{}; }
+    val words: u32 = (bits + 31) / 32;
+    if (words * 4 > 255) { ret opt[u8].none{}; }
+    ret opt[u8].some{(words * 4)::u8};
+}
+
+# the import code of the set id `index` imports, in the imports space, or the type of id `index` in the id space
+pub fun space(p: ptr, at: u16, index: u32) opt[u32] {
+    val s:   *State    = state_of(p);
+    var key: u32       = index;
+    var got: opt[*u32] = opt[*u32].none{};
+    if (at == spirv_kind.IMPORTS) { got = map.get[u32, u32](?s.imports, ?key); }
+    or (at == spirv_kind.IDS)     { got = map.get[u32, u32](?s.defined, ?key); }
+    if (sel got.none)             { ret opt[u32].none{}; }
+    ret opt[u32].some{@got.some};
+}
+
+# the id the source's `%` and number `n` spells, refused where a name took it or it is 0
+pub fun numbered(p: ptr, n: u32) res[u32, str] {
+    val s: *State = state_of(p);
+    if (n == 0) { ret res[u32, str].err{NO_ID}; }
+    var key:   u32        = n;
+    val taken: opt[*bool] = map.get[u32, bool](?s.named, ?key);
+    if (sel taken.some) { ret res[u32, str].err{NAMED_ID}; }
+    seen(s, n);
+    ret res[u32, str].ok{n};
+}
+
+# the id the source's `%` and `name` spells, one past the highest id the stream has seen at its first sight
+pub fun named(p: ptr, name: View) res[u32, str] {
+    val s:    *State            = state_of(p);
+    val text: res[*u8, A.Error] = A.allocate[u8](s.alloc, name.len + 1);
+    if (sel text.err) { ret res[u32, str].err{field.MEMORY}; }
+    var i: usize = 0;
+    for (i < name.len) {
+        text.ok[i] = name.data[i];
+        i          = i + 1;
+    }
+    text.ok[name.len] = 0;
+    var key:   str       = text.ok;
+    val known: opt[*u32] = map.get[str, u32](?s.names, ?key);
+    if (sel known.some) {
+        val freed: err[A.Error] = A.deallocate[u8](s.alloc, text.ok, name.len + 1);
+        ret res[u32, str].ok{@known.some};
+    }
+    if (s.top == 0xFFFF_FFFF) { ret res[u32, str].err{field.OUT_OF_RANGE}; }
+    val id:   u32                = s.top + 1;
+    val put:  res[bool, A.Error] = map.insert[str, u32](?s.names, text.ok, id);
+    val took: res[bool, A.Error] = map.insert[u32, bool](?s.named, id, true);
+    if (sel put.err || sel took.err) { ret res[u32, str].err{field.MEMORY}; }
+    s.top = id;
+    ret res[u32, str].ok{id};
+}
+
+# how a spir-v module's stream keeps its state. spir-v has no operand stack, so it names no stack types
+pub val HOOKS: stream.Hooks = stream.Hooks{types: stream.Names{at: nil, len: 0}, make: make, release: release, begin: begin, observe: observe, width: width, space: space};
