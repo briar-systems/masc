@@ -1,0 +1,845 @@
+# an XED instruction's decode pattern evaluated under each configuration of the prefixes that size an operation
+#
+# a configuration is the code width and the prefixes XED's patterns test to tell operand sizes and rex2 forms apart:
+# 66, rex.w and a rex2 prefix, the last two only in 64-bit code. under each, the pattern is read as XED's decoder reads
+# it (pysrc/generator.py, the decode spine): OSZ_NONTERM and ASZ_NONTERM give the effective operand and address sizes,
+# and each piece in turn either fixes a byte of the opcode, captures ModRM's fields, tests a field or calls a
+# nonterminal. a test of the configuration's own fields admits the configuration or not, and a call of a nonterminal
+# that sets the operand size (DF64, FORCE64, IMMUNE66_LOOP64), or consumes an immediate, a branch displacement or an
+# absolute address (SIMM8, UIMMv, BRDISPz, MEMDISPv and their kin), is evaluated by its rules: the first whose tests
+# hold, or its `otherwise`, its captures and bindings read. MODRM() is the addressing form the ModRM kind encodes, so
+# its rules are not walked, and the nonterminals of INERT test prefixes that make no row of their own. the result is a
+# `Form`: the opcode, ModRM's facts, the operands with their registers, widths and the bits each consumes, and the
+# registers and stack accesses no operand names.
+#
+# a register operand's nonterminal is resolved through its OUTREG chains (gen.isa.x86.xed.nonterminal.resolve), every
+# end whose tests on the code width and the effective sizes hold yielding a register, and the fields its tests read
+# place it: ModRM.rm, ModRM.reg, the opcode's low bits, or nowhere, a register the state alone fixes, as OrAX's eax.
+# every register is named by the row of masc's x86 register file of its name.
+#
+# whatever the evaluation does not know is refused naming it, a field a test reads that it does not track, a binding
+# it does not read, a piece of a kind it has no reading of, so a new XED revision cannot be read past it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_to_lower;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use masc.core.operand;
+
+use gen.diag;
+use gen.isa.x86.xed;
+use gen.lines;
+
+pub val UNTRACKED:   str = "pattern tests a field the x86 row generator does not track";
+pub val UNREAD:      str = "nonterminal binds a field the x86 row generator does not read";
+pub val UNKNOWN:     str = "pattern piece is of no kind the x86 row generator reads";
+pub val NO_NAMED:    str = "XED register names no register of masc's x86 register file";
+pub val PLACES:      str = "register nonterminal reads more than one of ModRM.rm, ModRM.reg and the opcode's low bits";
+pub val OPERAND:     str = "XED operand is of no kind the x86 row generator reads";
+pub val UNTAKEN:     str = "operand consumes no immediate, displacement or address its pattern takes";
+pub val NO_YIELD:    str = "register nonterminal yields no register under the configuration";
+pub val TWO_CLASSES: str = "register nonterminal yields registers of classes no x86 operand holds together";
+pub val ESCAPE:      str = "opcode bytes are no escape the legacy maps have";
+pub val NO_WIDTH:    str = "operand states no width code, or one with no width at the effective operand size";
+
+# the nonterminals whose rules test prefixes that make no row of their own: the branch hints and notrack, which 2e and
+# 3e are on a branch, and the segment a memory operand takes, which its segment part states
+pub val INERT_COUNT: u32 = 4;
+
+pub val INERT: [INERT_COUNT]str = [INERT_COUNT]str{"BRANCH_HINT", "CET_NO_TRACK", "REMOVE_SEGMENT", "OVERRIDE_SEG0"};
+
+# the addressing nonterminal the ModRM kind encodes
+pub val MODRM: str = "MODRM";
+
+# the spine's nonterminals that set the effective operand and address sizes before an instruction's pattern is read
+pub val OSZ: str = "OSZ_NONTERM";
+pub val ASZ: str = "ASZ_NONTERM";
+
+# a configuration of the prefixes that size an operation
+# ---
+# mode: the code width as XED's MODE holds it: 0 for 16, 1 for 32 and 2 for 64 bits
+# osz:  1 when 66 is there
+# rexw: rex.w or rex2.w, 64-bit code alone
+# rex2: 1 when a rex2 prefix is there, 64-bit code alone
+pub rec Config {
+    mode: u8;
+    osz:  u8;
+    rexw: u8;
+    rex2: u8;
+}
+
+# the code width in bits of XED mode `mode`
+pub fun width_of(mode: u8) u8 {
+    if (mode == 2) { ret 64; }
+    if (mode == 1) { ret 32; }
+    ret 16;
+}
+
+# every configuration of mode `mode`, in a fixed order: osz, then rexw and rex2 in 64-bit code
+pub fun configs(a: *A.Allocator, mode: u8) vector.Vector[Config] {
+    var out: vector.Vector[Config] = vector.init[Config](a);
+    var top: u8                    = 1;
+    if (mode == 2) { top = 2; }
+    var osz: u8 = 0;
+    for (osz < 2) {
+        var w: u8 = 0;
+        for (w < top) {
+            var r: u8 = 0;
+            for (r < top) {
+                vector.push[Config](?out, Config{mode: mode, osz: osz, rexw: w, rex2: r});
+                r = r + 1;
+            }
+            w = w + 1;
+        }
+        osz = osz + 1;
+    }
+    ret out;
+}
+
+# the fields the evaluation tracks: the configuration's and what the spine and the sizing nonterminals derive
+rec State {
+    mode: u8;
+    osz:  u8;
+    rexw: u8;
+    rex2: u8;
+    asz:  u8;
+    eosz: u8;
+    easz: u8;
+    df64: u8;
+}
+
+# the tracked field named `name` of `s`, nil for a field the evaluation does not track
+fun tracked(s: *State, name: str) *u8 {
+    if (str_equals(name, "MODE")) { ret ?s.mode; }
+    if (str_equals(name, "OSZ"))  { ret ?s.osz; }
+    if (str_equals(name, "REXW")) { ret ?s.rexw; }
+    if (str_equals(name, "REX2")) { ret ?s.rex2; }
+    if (str_equals(name, "ASZ"))  { ret ?s.asz; }
+    if (str_equals(name, "EOSZ")) { ret ?s.eosz; }
+    if (str_equals(name, "EASZ")) { ret ?s.easz; }
+    if (str_equals(name, "DF64")) { ret ?s.df64; }
+    ret nil;
+}
+
+# what consumes bits of the stream past ModRM
+# ---
+# IMMEDIATE: an immediate, UIMM0
+# BRANCH:    a branch displacement, DISP under a BRDISP_WIDTH binding
+# ADDRESS:   an absolute address, DISP under a DISP_WIDTH binding
+pub def Use: u8;
+
+pub val IMMEDIATE: Use = 0;
+pub val BRANCH:    Use = 1;
+pub val ADDRESS:   Use = 2;
+
+# bits of the stream a nonterminal consumes
+# ---
+# use:    what they are
+# bits:   how many
+# signed: whether XED reads them sign-extended (IMM0SIGNED)
+# scaled: whether their width is the effective operand size's, a rule of the nonterminal testing EOSZ
+pub rec Taken {
+    use:    Use;
+    bits:   u8;
+    signed: bool;
+    scaled: bool;
+}
+
+# where a register operand is encoded
+# ---
+# RM:    ModRM.rm, with rex.b and rex2.b4
+# REG:   ModRM.reg, with rex.r and rex2.r4
+# LOW:   the opcode byte's low three bits, with rex.b and rex2.b4
+# FIXED: nowhere: the state alone fixes it, as al of an implicit operand or OrAX's eax
+pub def Place: u8;
+
+pub val RM:    Place = 0;
+pub val REG:   Place = 1;
+pub val LOW:   Place = 2;
+pub val FIXED: Place = 3;
+
+# a row of masc's x86 register file as the generator names it
+# ---
+# name:   the row's name
+# class:  its class's name
+# order:  its class's place among the classes, the row index of the class's first row
+# number: its number in its class
+# row:    its index in the file's rows
+pub rec Named {
+    name:   str;
+    class:  str;
+    order:  u32;
+    number: u32;
+    row:    u32;
+}
+
+# what an operand is
+pub def What: u8;
+
+pub val REGISTER: What = 0;
+pub val MEMORY:   What = 1;
+pub val AGEN:     What = 2;
+pub val MOFFS:    What = 3;
+pub val IMM:      What = 4;
+pub val RELATIVE: What = 5;
+
+# one operand of a form, in XED's order
+# ---
+# what:    what it is
+# role:    how the instruction uses it
+# width:   the bits it names: a register's width, a memory access's, 0 for an immediate or a target
+# place:   where a register is encoded
+# classes: the classes its registers are of, in the file's order, one or two (gpr8 and gpr8h)
+# numbers: bit n for each register number its nonterminal yields
+# fixed:   the row of the register a FIXED operand is
+# taken:   the bits an immediate, a target or an address consumes
+pub rec Operand {
+    what:    What;
+    role:    operand.Role;
+    width:   u16;
+    place:   Place;
+    classes: [2]*Named;
+    count:   u8;
+    numbers: u64;
+    fixed:   *Named;
+    taken:   Taken;
+}
+
+# a register no operand names that the instruction reads or writes
+# ---
+# register: the row, nil for the stack: STACKPUSH and STACKPOP
+# role:     how the instruction uses it
+# width:    for the stack, the bits it pushes or pops
+# push:     for the stack, whether it pushes
+pub rec Implied {
+    register: *Named;
+    role:     operand.Role;
+    width:    u16;
+    push:     bool;
+}
+
+# a pattern evaluated under one configuration
+# ---
+# config:   the configuration
+# admitted: whether the pattern holds under it
+# eosz:     the effective operand size: 1 for 16, 2 for 32 and 3 for 64 bits
+# map:      the opcode map: 0 for one byte, 1 for 0f, 2 for 0f 38, 3 for 0f 3a
+# opcode:   the opcode byte, its low three bits clear when they hold a register
+# low:      whether the opcode's low three bits hold a register
+# modrm:    whether a ModRM byte follows
+# direct:   whether ModRM.mod is 3
+# digit:    the opcode extension in ModRM.reg, NO_DIGIT for none
+# memory:   whether the pattern calls MODRM(), the addressing form of a memory operand
+# no_rex2:  whether it tests NOREX2, refusing a rex2 prefix
+# locked:   whether it needs f0
+# operands: its operands
+# implied:  the registers no operand names
+pub rec Form {
+    config:   Config;
+    admitted: bool;
+    eosz:     u8;
+    map:      u8;
+    opcode:   u8;
+    low:      bool;
+    modrm:    bool;
+    direct:   bool;
+    digit:    u8;
+    memory:   bool;
+    no_rex2:  bool;
+    locked:   bool;
+    operands: vector.Vector[Operand];
+    implied:  vector.Vector[Implied];
+}
+
+pub val NO_DIGIT: u8 = 0xFF;
+
+# what the evaluation reads: the model, the register file by name and the resolved register nonterminals
+pub rec Reader {
+    alloc:    *A.Allocator;
+    xed:      *xed.Xed;
+    named:    map.Map[str, *Named];
+    resolved: map.Map[str, vector.Vector[xed.nonterminal.Outcome]];
+}
+
+# a reader over `x` and the register file's rows `rows`
+pub fun reader(a: *A.Allocator, x: *xed.Xed, rows: *vector.Vector[Named]) Reader {
+    var r: Reader = Reader{alloc: a, xed: x, named: map.init[str, *Named](a), resolved: map.init[str, vector.Vector[xed.nonterminal.Outcome]](a)};
+    var i: usize  = 0;
+    for (i < rows.len) {
+        map.insert[str, *Named](?r.named, rows.data[i].name, ?rows.data[i]);
+        i = i + 1;
+    }
+    ret r;
+}
+
+fun memory(subject: str) diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, subject);
+}
+
+fun refuse(l: *lines.Line, message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{lines.refuse(l, message, subject)};
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the row of masc's register file XED's register `xed_name` is, by its name in lower case
+pub fun named(r: *Reader, xed_name: str) opt[*Named] {
+    val low: res[str, StrError] = str_to_lower(r.alloc, xed_name);
+    if (sel low.err) { ret opt[*Named].none{}; }
+    val got: opt[**Named] = map.get[str, *Named](?r.named, ?low.ok);
+    if (sel got.none) { ret opt[*Named].none{}; }
+    ret opt[*Named].some{@got.some};
+}
+
+# whether test `p` holds of `s`, its field tracked
+fun holds(p: *xed.pattern.Piece, v: u8) bool {
+    if (p.equal) { ret v::u64 == p.value; }
+    ret v::u64 != p.value;
+}
+
+# whether every test of `pieces` on a field `s` tracks holds, a test of another field read as any value when `loose`,
+# else refused through `out`
+fun tests_hold(pieces: *vector.Vector[xed.pattern.Piece], s: *State, loose: bool, l: *lines.Line, out: *err[diag.Refusal]) bool {
+    var i: usize = 0;
+    for (i < pieces.len) {
+        val p: *xed.pattern.Piece = ?pieces.data[i];
+        if (p.kind == xed.pattern.TEST) {
+            val f: *u8 = tracked(s, p.name);
+            if (f == nil) {
+                if (!loose) {
+                    @out = refuse(l, UNTRACKED, p.name);
+                    ret false;
+                }
+            }
+            or (!holds(p, @f)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a rule of `nt` tests the effective operand size
+fun scaled(nt: *xed.nonterminal.Nonterminal) bool {
+    var i: usize = 0;
+    for (i < nt.rules.len) {
+        val ps: *vector.Vector[xed.pattern.Piece] = ?nt.rules.data[i].pattern.pieces;
+        var k:  usize                             = 0;
+        for (k < ps.len) {
+            if (ps.data[k].kind == xed.pattern.TEST && str_equals(ps.data[k].name, "EOSZ")) { ret true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# what an evaluation of a nonterminal leaves besides the state
+rec Effects {
+    taken: vector.Vector[Taken];
+}
+
+# the nonterminal `name` evaluated under `s`: its first rule whose tests hold, else its `otherwise`, its captures taken
+# and its bindings applied, a nested call evaluated in place
+# ---
+# ret: whether a rule holds, or the refusal of what it cannot read
+fun evaluate(r: *Reader, name: str, s: *State, fx: *Effects, l: *lines.Line) res[bool, diag.Refusal] {
+    val found: opt[*xed.nonterminal.Nonterminal] = xed.nonterminal.find(?r.xed.nonterminals, name);
+    if (sel found.none) { ret res[bool, diag.Refusal].err{lines.refuse(l, xed.NO_NONTERMINAL, name)}; }
+    val nt:     *xed.nonterminal.Nonterminal = found.some;
+    var chosen: *xed.nonterminal.Rule        = nil;
+    var other:  *xed.nonterminal.Rule        = nil;
+    var i:      usize                        = 0;
+    for (i < nt.rules.len && chosen == nil) {
+        val rule:      *xed.nonterminal.Rule             = ?nt.rules.data[i];
+        val ps:        *vector.Vector[xed.pattern.Piece] = ?rule.pattern.pieces;
+        var otherwise: bool                              = false;
+        var k:         usize                             = 0;
+        for (k < ps.len) {
+            if (ps.data[k].kind == xed.pattern.OTHERWISE) { otherwise = true; }
+            k = k + 1;
+        }
+        if (otherwise) { other = rule; }
+        or {
+            var refused: err[diag.Refusal] = err[diag.Refusal].ok{};
+            val held:    bool              = tests_hold(ps, s, false, ?rule.line, ?refused);
+            if (sel refused.err) { ret res[bool, diag.Refusal].err{refused.err}; }
+            if (held)            { chosen = rule; }
+        }
+        i = i + 1;
+    }
+    if (chosen == nil) { chosen = other; }
+    if (chosen == nil) { ret res[bool, diag.Refusal].ok{false}; }
+    var taking: bool                              = false;
+    var take:   Taken;
+    val ps:     *vector.Vector[xed.pattern.Piece] = ?chosen.pattern.pieces;
+    var k:      usize                             = 0;
+    for (k < ps.len) {
+        val p: *xed.pattern.Piece = ?ps.data[k];
+        if (p.kind == xed.pattern.CAPTURE) {
+            if (str_equals(p.name, "UIMM0")) { take = Taken{use: IMMEDIATE, bits: p.len, signed: false, scaled: scaled(nt)}; }
+            or (str_equals(p.name, "DISP"))  { take = Taken{use: BRANCH, bits: p.len, signed: true, scaled: scaled(nt)}; }
+            or                               { ret res[bool, diag.Refusal].err{lines.refuse(?chosen.line, UNKNOWN, p.name)}; }
+            taking = true;
+        }
+        or (p.kind == xed.pattern.CALL) {
+            val inner: res[bool, diag.Refusal] = evaluate(r, p.name, s, fx, ?chosen.line);
+            if (sel inner.err) { ret inner; }
+            if (!inner.ok)     { ret inner; }
+        }
+        or (p.kind == xed.pattern.BITS) { ret res[bool, diag.Refusal].err{lines.refuse(?chosen.line, UNKNOWN, nt.name)}; }
+        k = k + 1;
+    }
+    var b: usize = 0;
+    for (b < chosen.bindings.len) {
+        val op: *xed.operand.Operand = ?chosen.bindings.data[b];
+        if (op.form != xed.operand.CONSTANT || !op.numeric) { ret res[bool, diag.Refusal].err{lines.refuse(?chosen.line, UNREAD, op.name)}; }
+        val f: *u8 = tracked(s, op.name);
+        if (f != nil)                            { @f = op.number::u8; }
+        or (str_equals(op.name, "IMM0SIGNED"))   { take.signed = op.number != 0; }
+        or (str_equals(op.name, "DISP_WIDTH"))   { take.use = ADDRESS; }
+        or (str_equals(op.name, "BRDISP_WIDTH")) { take.use = BRANCH; }
+        or (str_equals(op.name, "IMM_WIDTH"))    { take.use = IMMEDIATE; }
+        or                                       { ret res[bool, diag.Refusal].err{lines.refuse(?chosen.line, UNREAD, op.name)}; }
+        b = b + 1;
+    }
+    if (taking) {
+        if (!pushed(vector.push[Taken](?fx.taken, take))) { ret res[bool, diag.Refusal].err{memory(name)}; }
+    }
+    ret res[bool, diag.Refusal].ok{true};
+}
+
+fun inert(name: str) bool {
+    var i: u32 = 0;
+    for (i < INERT_COUNT) {
+        if (str_equals(INERT[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the resolved ends of register nonterminal `name`, resolved once
+fun outcomes(r: *Reader, name: str) res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal] {
+    val have: opt[*vector.Vector[xed.nonterminal.Outcome]] = map.get[str, vector.Vector[xed.nonterminal.Outcome]](?r.resolved, ?name);
+    if (sel have.some) { ret res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal].ok{have.some}; }
+    val got: res[vector.Vector[xed.nonterminal.Outcome], diag.Refusal] = xed.nonterminal.resolve(r.alloc, ?r.xed.nonterminals, name);
+    if (sel got.err) { ret res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal].err{got.err}; }
+    val put: res[bool, A.Error] = map.insert[str, vector.Vector[xed.nonterminal.Outcome]](?r.resolved, name, got.ok);
+    if (sel put.err) { ret res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal].err{memory(name)}; }
+    val again: opt[*vector.Vector[xed.nonterminal.Outcome]] = map.get[str, vector.Vector[xed.nonterminal.Outcome]](?r.resolved, ?name);
+    if (sel again.none) { ret res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal].err{memory(name)}; }
+    ret res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal].ok{again.some};
+}
+
+# the place the fields an outcome tests encode a register at, FIXED when it tests none
+fun place_of(pieces: *vector.Vector[xed.pattern.Piece], out: *Place, seen: *bool, l: *lines.Line) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < pieces.len) {
+        val p: *xed.pattern.Piece = ?pieces.data[i];
+        if (p.kind == xed.pattern.TEST) {
+            var at: Place = FIXED;
+            # rex.b and rex.r extend the field they sit beside, so only the field names the place
+            if (str_equals(p.name, "RM"))  { at = RM; }
+            or (str_equals(p.name, "REG")) { at = REG; }
+            or (str_equals(p.name, "SRM")) { at = LOW; }
+            if (at != FIXED) {
+                if (@seen && @out != FIXED && @out != at) { ret refuse(l, PLACES, p.name); }
+                @out  = at;
+                @seen = true;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# operand `op` holding the registers nonterminal `name` yields under `s`, a register no field encodes when it reads none
+fun register_nt(r: *Reader, name: str, s: *State, op: *Operand, l: *lines.Line) err[diag.Refusal] {
+    val got: res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal] = outcomes(r, name);
+    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+    val ends:   *vector.Vector[xed.nonterminal.Outcome] = got.ok;
+    var place:  Place                                   = FIXED;
+    var seen:   bool                                    = false;
+    var yields: u32                                     = 0;
+    var last:   *Named                                  = nil;
+    var i:      usize                                   = 0;
+    for (i < ends.len) {
+        val o:       *xed.nonterminal.Outcome = ?ends.data[i];
+        var refused: err[diag.Refusal]        = err[diag.Refusal].ok{};
+        val held:    bool                     = tests_hold(?o.conditions, s, true, ?o.rule.line, ?refused);
+        if (held && o.register != nil && !str_equals(o.register, "ERROR") && !str_equals(o.register, "INVALID")) {
+            val placed: err[diag.Refusal] = place_of(?o.conditions, ?place, ?seen, ?o.rule.line);
+            if (sel placed.err) { ret placed; }
+            val n: opt[*Named] = named_or_enclosing(r, o.register);
+            if (sel n.none) { ret refuse(?o.rule.line, NO_NAMED, o.register); }
+            val added: err[diag.Refusal] = add_register(op, n.some, l);
+            if (sel added.err) { ret added; }
+            yields = yields + 1;
+            last   = n.some;
+        }
+        i = i + 1;
+    }
+    if (yields == 0) { ret refuse(l, NO_YIELD, name); }
+    op.place = place;
+    if (place == FIXED) {
+        if (yields != 1) { ret refuse(l, NO_YIELD, name); }
+        op.fixed = last;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# register row `n` added to operand `op`'s classes and numbers
+fun add_register(op: *Operand, n: *Named, l: *lines.Line) err[diag.Refusal] {
+    var k:  u8  = 0;
+    var at: i32 = -1;
+    for (k < op.count) {
+        if (str_equals(op.classes[k].class, n.class)) { at = k::i32; }
+        k = k + 1;
+    }
+    if (at < 0) {
+        if (op.count == 2) { ret refuse(l, TWO_CLASSES, n.class); }
+        op.classes[op.count] = n;
+        op.count             = op.count + 1;
+        # the classes in the file's order
+        if (op.count == 2 && op.classes[1].order < op.classes[0].order) {
+            val first: *Named = op.classes[0];
+            op.classes[0] = op.classes[1];
+            op.classes[1] = first;
+        }
+    }
+    if (n.number < 64) { op.numbers = op.numbers | (1::u64 << n.number::u64); }
+    ret err[diag.Refusal].ok{};
+}
+
+# register operand `from` of the same form under another configuration joined into `into`: the registers either
+# yields, as a rex2 prefix reaches r16 to r31 and loses ah to bh, which one row holds and the kind encodes
+pub fun join(into: *Operand, from: *Operand, l: *lines.Line) err[diag.Refusal] {
+    var k: u8 = 0;
+    for (k < from.count) {
+        val added: err[diag.Refusal] = add_register(into, from.classes[k], l);
+        if (sel added.err) { ret added; }
+        k = k + 1;
+    }
+    into.numbers = into.numbers | from.numbers;
+    ret err[diag.Refusal].ok{};
+}
+
+# the role of XED action `action`: a conditional write keeps the old value where it does not write, so it reads it too
+fun role_of(action: str) operand.Role {
+    if (str_equals(action, "r") || str_equals(action, "cr")) { ret operand.READ; }
+    if (str_equals(action, "w"))                             { ret operand.WRITE; }
+    ret operand.READ_WRITE;
+}
+
+# the bits operand `op` of `ins` names at effective operand size `eosz`, from its width code or the one its nonterminal,
+# register or constant takes
+fun width_bits(r: *Reader, ins: *xed.instruction.Instruction, op: *xed.operand.Operand, eosz: u8) res[u16, diag.Refusal] {
+    val code: opt[str] = xed.operand.width(r.alloc, ?r.xed.tables, op);
+    if (sel code.none) { ret res[u16, diag.Refusal].err{lines.refuse(?ins.line, NO_WIDTH, op.name)}; }
+    val w: opt[*xed.table.Width] = xed.table.width(r.alloc, ?r.xed.tables, code.some);
+    if (sel w.none) { ret res[u16, diag.Refusal].err{lines.refuse(?ins.line, NO_WIDTH, code.some)}; }
+    var k: u8 = eosz;
+    if (k > 3) { k = 3; }
+    val bits: u32 = w.some.bits[k];
+    if (bits == 0 || bits > 0xFFFF) { ret res[u16, diag.Refusal].err{lines.refuse(?ins.line, NO_WIDTH, code.some)}; }
+    ret res[u16, diag.Refusal].ok{bits::u16};
+}
+
+# the width of the registers nonterminal `name` yields under `s`, for an operand with no width code, which XED takes
+# from the register it decodes (datafiles/xed-regs.txt, its width columns), refused unless they all agree
+fun yielded_width(r: *Reader, name: str, s: *State, l: *lines.Line) res[u16, diag.Refusal] {
+    val got: res[*vector.Vector[xed.nonterminal.Outcome], diag.Refusal] = outcomes(r, name);
+    if (sel got.err) { ret res[u16, diag.Refusal].err{got.err}; }
+    var bits: u32   = 0;
+    var i:    usize = 0;
+    for (i < got.ok.len) {
+        val o:       *xed.nonterminal.Outcome = ?got.ok.data[i];
+        var refused: err[diag.Refusal]        = err[diag.Refusal].ok{};
+        val held:    bool                     = tests_hold(?o.conditions, s, true, ?o.rule.line, ?refused);
+        if (held && o.register != nil && !str_equals(o.register, "ERROR") && !str_equals(o.register, "INVALID")) {
+            val reg: opt[*xed.table.Register] = xed.table.register(r.alloc, ?r.xed.tables, o.register);
+            if (sel reg.none) { ret res[u16, diag.Refusal].err{lines.refuse(l, NO_WIDTH, o.register)}; }
+            var w: u32 = reg.some.width;
+            if (s.mode == 2)                        { w = reg.some.width64; }
+            if (w == 0 || (bits != 0 && w != bits)) { ret res[u16, diag.Refusal].err{lines.refuse(l, NO_WIDTH, name)}; }
+            bits = w;
+        }
+        i = i + 1;
+    }
+    if (bits == 0 || bits > 0xFFFF) { ret res[u16, diag.Refusal].err{lines.refuse(l, NO_WIDTH, name)}; }
+    ret res[u16, diag.Refusal].ok{bits::u16};
+}
+
+# the first bits of `fx` of use `use` not yet consumed, marked consumed
+fun take(fx: *Effects, used: *u8, use: Use) opt[Taken] {
+    var i: usize = 0;
+    for (i < fx.taken.len) {
+        if (fx.taken.data[i].use == use && ((@used >> i::u8) & 1) == 0) {
+            @used = @used | (1::u8 << i::u8);
+            ret opt[Taken].some{fx.taken.data[i]};
+        }
+        i = i + 1;
+    }
+    ret opt[Taken].none{};
+}
+
+# the row of the register XED names `xed_name`, or of the widest register enclosing it, as rip encloses eip
+fun named_or_enclosing(r: *Reader, xed_name: str) opt[*Named] {
+    val own: opt[*Named] = named(r, xed_name);
+    if (sel own.some) { ret own; }
+    val reg: opt[*xed.table.Register] = xed.table.register(r.alloc, ?r.xed.tables, xed_name);
+    if (sel reg.some) {
+        if (reg.some.enclosing != nil) { ret named(r, reg.some.enclosing); }
+    }
+    ret opt[*Named].none{};
+}
+
+# a register or the stack no operand names, from operand `op` of `ins` under `s`, into `f`
+fun implied(r: *Reader, ins: *xed.instruction.Instruction, op: *xed.operand.Operand, s: *State, f: *Form) err[diag.Refusal] {
+    # the segment, base and index of a memory operand are its own parts
+    if (str_equals(op.name, "SEG0") || str_equals(op.name, "SEG1") || str_equals(op.name, "BASE0") || str_equals(op.name, "BASE1") || str_equals(op.name, "INDEX")) { ret err[diag.Refusal].ok{}; }
+    val role: operand.Role = role_of(op.action);
+    if (op.form == xed.operand.REGISTER) {
+        if (str_equals(op.value, "STACKPUSH") || str_equals(op.value, "STACKPOP")) {
+            val w: res[u16, diag.Refusal] = width_bits(r, ins, op, s.eosz);
+            if (sel w.err)                                                                                                                           { ret err[diag.Refusal].err{w.err}; }
+            if (!pushed(vector.push[Implied](?f.implied, Implied{register: nil, role: role, width: w.ok, push: str_equals(op.value, "STACKPUSH")}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+            ret err[diag.Refusal].ok{};
+        }
+        val n: opt[*Named] = named_or_enclosing(r, op.value);
+        if (sel n.none)                                                                                              { ret refuse(?ins.line, NO_NAMED, op.value); }
+        if (!pushed(vector.push[Implied](?f.implied, Implied{register: n.some, role: role, width: 0, push: false}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+        ret err[diag.Refusal].ok{};
+    }
+    if (op.form == xed.operand.NONTERMINAL) {
+        var o:   Operand;
+        val got: err[diag.Refusal] = register_nt(r, op.value, s, ?o, ?ins.line);
+        if (sel got.err)      { ret got; }
+        if (o.place != FIXED) { ret refuse(?ins.line, OPERAND, op.name); }
+        val n:   opt[*Named] = named_or_enclosing(r, o.fixed.name);
+        var row: *Named      = o.fixed;
+        if (sel n.some)                                                                                           { row = n.some; }
+        if (!pushed(vector.push[Implied](?f.implied, Implied{register: row, role: role, width: 0, push: false}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+        ret err[diag.Refusal].ok{};
+    }
+    ret refuse(?ins.line, OPERAND, op.name);
+}
+
+# the operands of `ins` under `s` into `f`, the bits its nonterminals took in `fx`
+fun operands_of(r: *Reader, ins: *xed.instruction.Instruction, s: *State, fx: *Effects, f: *Form) err[diag.Refusal] {
+    var used: u8    = 0;
+    var i:    usize = 0;
+    for (i < ins.operands.len) {
+        val op: *xed.operand.Operand = ?ins.operands.data[i];
+        if (str_equals(op.visibility, "SUPP") || str_equals(op.visibility, "ECOND")) {
+            val done: err[diag.Refusal] = implied(r, ins, op, s, f);
+            if (sel done.err) { ret done; }
+            i = i + 1;
+            cnt;
+        }
+        var o: Operand;
+        o.role  = role_of(op.action);
+        o.place = FIXED;
+        if (op.form == xed.operand.BARE && str_equals(op.name, "MEM0")) {
+            val w: res[u16, diag.Refusal] = width_bits(r, ins, op, s.eosz);
+            if (sel w.err) { ret err[diag.Refusal].err{w.err}; }
+            o.width = w.ok;
+            val address: opt[Taken] = take(fx, ?used, ADDRESS);
+            if (sel address.some) {
+                o.what  = MOFFS;
+                o.taken = address.some;
+            }
+            or (f.memory) { o.what = MEMORY; }
+            or            { ret refuse(?ins.line, UNTAKEN, op.name); }
+        }
+        or (op.form == xed.operand.BARE && str_equals(op.name, "AGEN")) {
+            if (!f.memory) { ret refuse(?ins.line, UNTAKEN, op.name); }
+            o.what = AGEN;
+        }
+        or (op.form == xed.operand.BARE && str_equals(op.name, "IMM0")) {
+            val got: opt[Taken] = take(fx, ?used, IMMEDIATE);
+            if (sel got.none) { ret refuse(?ins.line, UNTAKEN, op.name); }
+            o.what  = IMM;
+            o.taken = got.some;
+        }
+        or (op.form == xed.operand.BARE && str_equals(op.name, "RELBR")) {
+            val got: opt[Taken] = take(fx, ?used, BRANCH);
+            if (sel got.none) { ret refuse(?ins.line, UNTAKEN, op.name); }
+            o.what  = RELATIVE;
+            o.taken = got.some;
+        }
+        or (op.form == xed.operand.NONTERMINAL) {
+            o.what = REGISTER;
+            val got: err[diag.Refusal] = register_nt(r, op.value, s, ?o, ?ins.line);
+            if (sel got.err) { ret got; }
+            val code: opt[str]               = xed.operand.width(r.alloc, ?r.xed.tables, op);
+            var w:    res[u16, diag.Refusal] = yielded_width(r, op.value, s, ?ins.line);
+            if (sel code.some) { w = width_bits(r, ins, op, s.eosz); }
+            if (sel w.err)     { ret err[diag.Refusal].err{w.err}; }
+            o.width = w.ok;
+        }
+        or (op.form == xed.operand.REGISTER) {
+            o.what = REGISTER;
+            val n: opt[*Named] = named(r, op.value);
+            if (sel n.none) { ret refuse(?ins.line, NO_NAMED, op.value); }
+            val added: err[diag.Refusal] = add_register(?o, n.some, ?ins.line);
+            if (sel added.err) { ret added; }
+            o.fixed = n.some;
+            val w: res[u16, diag.Refusal] = width_bits(r, ins, op, s.eosz);
+            if (sel w.err) { ret err[diag.Refusal].err{w.err}; }
+            o.width = w.ok;
+        }
+        or                                                 { ret refuse(?ins.line, OPERAND, op.name); }
+        if (!pushed(vector.push[Operand](?f.operands, o))) { ret err[diag.Refusal].err{memory(op.name)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the map and opcode of the fixed bytes `bytes`, refused when they are no escape the legacy maps have
+fun opcode_of(ins: *xed.instruction.Instruction, bytes: *u8, count: u32, f: *Form) err[diag.Refusal] {
+    if (count == 1 && bytes[0] != 0x0F) {
+        f.map    = 0;
+        f.opcode = bytes[0];
+        ret err[diag.Refusal].ok{};
+    }
+    if (count == 2 && bytes[0] == 0x0F && bytes[1] != 0x38 && bytes[1] != 0x3A) {
+        f.map    = 1;
+        f.opcode = bytes[1];
+        ret err[diag.Refusal].ok{};
+    }
+    if (count == 3 && bytes[0] == 0x0F && bytes[1] == 0x38) {
+        f.map    = 2;
+        f.opcode = bytes[2];
+        ret err[diag.Refusal].ok{};
+    }
+    if (count == 3 && bytes[0] == 0x0F && bytes[1] == 0x3A) {
+        f.map    = 3;
+        f.opcode = bytes[2];
+        ret err[diag.Refusal].ok{};
+    }
+    ret refuse(?ins.line, ESCAPE, ins.iclass);
+}
+
+# instruction `ins` evaluated under configuration `c`
+# ---
+# ret: its form, admitted when its pattern holds under `c`, or the refusal of what the evaluation cannot read
+pub fun form(r: *Reader, ins: *xed.instruction.Instruction, c: Config) res[Form, diag.Refusal] {
+    var f:     Form                    = Form{config: c, admitted: false, eosz: 0, map: 0, opcode: 0, low: false, modrm: false, direct: false, digit: NO_DIGIT, memory: false, no_rex2: false, locked: false, operands: vector.init[Operand](r.alloc), implied: vector.init[Implied](r.alloc)};
+    var s:     State                   = State{mode: c.mode, osz: c.osz, rexw: c.rexw, rex2: c.rex2, asz: 0, eosz: 0, easz: 0, df64: 0};
+    var fx:    Effects                 = Effects{taken: vector.init[Taken](r.alloc)};
+    var spine: Effects                 = Effects{taken: vector.init[Taken](r.alloc)};
+    val sized: res[bool, diag.Refusal] = evaluate(r, OSZ, ?s, ?spine, ?ins.line);
+    if (sel sized.err) { ret res[Form, diag.Refusal].err{sized.err}; }
+    val addressed: res[bool, diag.Refusal] = evaluate(r, ASZ, ?s, ?spine, ?ins.line);
+    if (sel addressed.err)          { ret res[Form, diag.Refusal].err{addressed.err}; }
+    if (!sized.ok || !addressed.ok) { ret res[Form, diag.Refusal].ok{f}; }
+    var bytes: [4]u8;
+    var count: u32                               = 0;
+    var acc:   u64                               = 0;
+    var held:  u32                               = 0;
+    val ps:    *vector.Vector[xed.pattern.Piece] = ?ins.pattern.pieces;
+    var i:     usize                             = 0;
+    for (i < ps.len) {
+        val p: *xed.pattern.Piece = ?ps.data[i];
+        if (p.kind == xed.pattern.BITS || (p.kind == xed.pattern.CAPTURE && str_equals(p.name, "SRM"))) {
+            if (p.kind == xed.pattern.CAPTURE) {
+                if (p.fixed != 0) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNKNOWN, p.name)}; }
+                f.low = true;
+            }
+            acc  = (acc << p.len::u64) | (p.value & p.fixed);
+            held = held + p.len::u32;
+            for (held >= 8) {
+                if (count == 4) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, ESCAPE, ins.iclass)}; }
+                bytes[count] = (acc >> (held - 8)::u64)::u8;
+                count        = count + 1;
+                held         = held - 8;
+            }
+        }
+        or (p.kind == xed.pattern.CAPTURE) {
+            if (str_equals(p.name, "MOD")) {
+                f.modrm = true;
+                if (p.fixed != 0) { f.direct = p.value == 3; }
+            }
+            or (str_equals(p.name, "REG")) {
+                f.modrm = true;
+                if (p.fixed == 7) { f.digit = p.value::u8; }
+                or (p.fixed != 0) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNKNOWN, p.name)}; }
+            }
+            or (str_equals(p.name, "RM")) {
+                f.modrm = true;
+                if (p.fixed != 0) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNKNOWN, p.name)}; }
+            }
+            or { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNKNOWN, p.name)}; }
+        }
+        or (p.kind == xed.pattern.TEST) {
+            val t: *u8 = tracked(?s, p.name);
+            if (str_equals(p.name, "MOD")) {
+                if (p.value != 3) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNTRACKED, p.name)}; }
+                f.direct = p.equal;
+            }
+            or (str_equals(p.name, "NOREX2")) { f.no_rex2 = p.equal == (p.value != 0); }
+            or (str_equals(p.name, "LOCK"))   { f.locked = p.equal == (p.value != 0); }
+            or (t != nil) {
+                if (!holds(p, @t)) { ret res[Form, diag.Refusal].ok{f}; }
+            }
+            or { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNTRACKED, p.name)}; }
+        }
+        or (p.kind == xed.pattern.CALL) {
+            if (str_equals(p.name, MODRM)) { f.memory = true; }
+            or (!inert(p.name)) {
+                val got: res[bool, diag.Refusal] = evaluate(r, p.name, ?s, ?fx, ?ins.line);
+                if (sel got.err) { ret res[Form, diag.Refusal].err{got.err}; }
+                if (!got.ok)     { ret res[Form, diag.Refusal].ok{f}; }
+            }
+        }
+        or { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, UNKNOWN, ins.iclass)}; }
+        i = i + 1;
+    }
+    if (held != 0) { ret res[Form, diag.Refusal].err{lines.refuse(?ins.line, ESCAPE, ins.iclass)}; }
+    val coded: err[diag.Refusal] = opcode_of(ins, ?bytes[0], count, ?f);
+    if (sel coded.err) { ret res[Form, diag.Refusal].err{coded.err}; }
+    f.eosz = s.eosz;
+    val ops: err[diag.Refusal] = operands_of(r, ins, ?s, ?fx, ?f);
+    if (sel ops.err) { ret res[Form, diag.Refusal].err{ops.err}; }
+    f.admitted = true;
+    ret res[Form, diag.Refusal].ok{f};
+}
+
+pub val NO_ADDRESS: str = "ASZ_NONTERM gives the code width no address size, or no general register of it";
+
+# the general register class of the address size code of mode `mode` takes with an address-size override (`asz` 1) or
+# without, as XED's ASZ_NONTERM gives it: the class of the first general register XED states of that width
+pub fun address_class(r: *Reader, mode: u8, asz: u8) res[*Named, diag.Refusal] {
+    var s:   State                   = State{mode: mode, osz: 0, rexw: 0, rex2: 0, asz: asz, eosz: 0, easz: 0, df64: 0};
+    var fx:  Effects                 = Effects{taken: vector.init[Taken](r.alloc)};
+    var l:   lines.Line;
+    val got: res[bool, diag.Refusal] = evaluate(r, ASZ, ?s, ?fx, ?l);
+    if (sel got.err)                         { ret res[*Named, diag.Refusal].err{got.err}; }
+    if (!got.ok || s.easz < 1 || s.easz > 3) { ret res[*Named, diag.Refusal].err{diag.refusal(nil, 0, NO_ADDRESS, ASZ)}; }
+    val bits: u32                                = 8::u32 << s.easz::u32;
+    val regs: *vector.Vector[xed.table.Register] = ?r.xed.tables.registers;
+    var i:    usize                              = 0;
+    for (i < regs.len) {
+        val x: *xed.table.Register = ?regs.data[i];
+        if (str_equals(x.class, "gpr") && x.width == bits && x.ordinal == 0 && !x.high) {
+            val n: opt[*Named] = named(r, x.name);
+            if (sel n.some) { ret res[*Named, diag.Refusal].ok{n.some}; }
+        }
+        i = i + 1;
+    }
+    ret res[*Named, diag.Refusal].err{diag.refusal(nil, 0, NO_ADDRESS, ASZ)};
+}
