@@ -1,0 +1,313 @@
+# the state a typed stream keeps across its instructions, and the spelling of its stack types
+#
+# a machine set's instructions are read one at a time: what one means never
+# turns on another. a typed stream's do. spir-v types a literal by the result
+# type its id was defined with, so `OpConstant %int 5` writes the width
+# `OpTypeInt` gave %int, and wasm numbers functions, globals, locals and
+# memories in index spaces the module's earlier fields fill, and counts a
+# branch's target by the structured blocks open around it. the set states how
+# its stream keeps that as hooks, and a reader takes the stream's state from
+# the context it reads under (`state.Context.stream`), so every reader of one
+# stream sees what the instructions before it defined. a machine set states
+# no hooks and its contexts no stream.
+#
+# a stack type is spelled by the set's type names, a type variable as `$` and
+# its number, an operand's type as the template hole `<n>`, and the
+# polymorphic stack as `...`, so a signature reads back from the text it
+# prints.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.core.effect;
+use masc.core.field;
+use masc.core.inst;
+
+# a type of the set's own type language and its spelling, as wasm's i32 of code 0x7f
+# ---
+# code: the code `effect.TypeRef.fixed` holds
+# name: its spelling
+pub rec Name {
+    code: u32;
+    name: str;
+}
+
+# names as a pointer to static rows and a count
+pub rec Names {
+    at:  *Name;
+    len: u32;
+}
+
+# how a set keeps the state of a typed stream. the state is the hooks' own, made by `make` and given to every other
+# hook, and a reader reaches it through its context
+# ---
+# types:   the spellings of the set's stack types
+# make:    a new state, of a stream that has not begun
+# release: everything a state holds given back
+# begin:   the state started on a new stream, as a spir-v module or a wasm function body, whose index spaces and labels
+#          it keeps from then on
+# observe: what instruction `ins` defines added to the state, after it is read or written: a spir-v id's type, a wasm
+#          index space's entry or a structured block opened or closed. refused when the instruction breaks what the
+#          stream holds, as a block closed that is not open
+# width:   the width in bytes of a literal typed by id `id`, none for an id the stream has given no width
+# space:   the entry `index` names in index space `space`, as its type's code, none for an index past the space's end
+pub rec Hooks {
+    types:   Names;
+    make:    fun(*A.Allocator) res[ptr, A.Error];
+    release: fun(*A.Allocator, ptr);
+    begin:   fun(ptr);
+    observe: fun(ptr, *inst.Inst) err[field.Refusal];
+    width:   fun(ptr, u32) opt[u8];
+    space:   fun(ptr, u16, u32) opt[u32];
+}
+
+# the spelling of the polymorphic stack
+pub val POLYMORPHIC: str = "...";
+
+# a type read from text, and how many bytes of it it covers
+pub rec Read {
+    ref: effect.TypeRef;
+    len: usize;
+}
+
+# the name of code `code`, none for a code no name spells
+fun name_of(names: *Names, code: u32) opt[str] {
+    var i: u32 = 0;
+    for (i < names.len) {
+        if (names.at[i].code == code) { ret opt[str].some{names.at[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+fun put(out: *vector.Vector[u8], s: str) err[A.Error] {
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[u8](out, s[i]);
+        if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+fun put_number(out: *vector.Vector[u8], n: u8) err[A.Error] {
+    var digits: [4]u8;
+    var count:  usize = 0;
+    var m:      u8    = n;
+    for {
+        digits[count] = '0' + m % 10;
+        count         = count + 1;
+        m             = m / 10;
+        if (m == 0) { brk; }
+    }
+    for (count > 0) {
+        count = count - 1;
+        val pushed: res[usize, A.Error] = vector.push[u8](out, digits[count]);
+        if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    }
+    ret err[A.Error].ok{};
+}
+
+# `ref` spelled onto `out` by `names`
+# ---
+# ret: false for a fixed type no name spells, `out` as it was
+pub fun spell(names: *Names, ref: effect.TypeRef, out: *vector.Vector[u8]) res[bool, A.Error] {
+    if (sel ref.fixed) {
+        val named: opt[str] = name_of(names, ref.fixed);
+        if (sel named.none) { ret res[bool, A.Error].ok{false}; }
+        val put_: err[A.Error] = put(out, named.some);
+        if (sel put_.err) { ret res[bool, A.Error].err{put_.err}; }
+        ret res[bool, A.Error].ok{true};
+    }
+    var lead:   str = POLYMORPHIC;
+    var number: u8  = 0;
+    var close:  str = "";
+    if (sel ref.variable) {
+        lead   = "$";
+        number = ref.variable;
+    }
+    or (sel ref.operand) {
+        lead   = "<";
+        number = ref.operand;
+        close  = ">";
+    }
+    val led: err[A.Error] = put(out, lead);
+    if (sel led.err) { ret res[bool, A.Error].err{led.err}; }
+    if (!sel ref.polymorphic) {
+        val n: err[A.Error] = put_number(out, number);
+        if (sel n.err) { ret res[bool, A.Error].err{n.err}; }
+        val c: err[A.Error] = put(out, close);
+        if (sel c.err) { ret res[bool, A.Error].err{c.err}; }
+    }
+    ret res[bool, A.Error].ok{true};
+}
+
+# `types` spelled onto `out`, a space between two, as `spell` spells each
+fun spell_all(names: *Names, types: effect.Types, out: *vector.Vector[u8]) res[bool, A.Error] {
+    var i: u32 = 0;
+    for (i < types.len) {
+        if (i > 0) {
+            val gap: err[A.Error] = put(out, " ");
+            if (sel gap.err) { ret res[bool, A.Error].err{gap.err}; }
+        }
+        val one: res[bool, A.Error] = spell(names, types.at[i], out);
+        if (sel one.err) { ret one; }
+        if (!one.ok)     { ret one; }
+        i = i + 1;
+    }
+    ret res[bool, A.Error].ok{true};
+}
+
+# `sig` spelled onto `out` as `[pops] -> [pushes]`, each list as `spell_all` spells it
+# ---
+# ret: false for a fixed type no name spells, what was written so far left on `out`
+pub fun spell_signature(names: *Names, sig: *effect.Signature, out: *vector.Vector[u8]) res[bool, A.Error] {
+    val open: err[A.Error] = put(out, "[");
+    if (sel open.err) { ret res[bool, A.Error].err{open.err}; }
+    val pops: res[bool, A.Error] = spell_all(names, sig.pops, out);
+    if (sel pops.err) { ret pops; }
+    if (!pops.ok)     { ret pops; }
+    val arrow: err[A.Error] = put(out, "] -> [");
+    if (sel arrow.err) { ret res[bool, A.Error].err{arrow.err}; }
+    val pushes: res[bool, A.Error] = spell_all(names, sig.pushes, out);
+    if (sel pushes.err) { ret pushes; }
+    if (!pushes.ok)     { ret pushes; }
+    val close: err[A.Error] = put(out, "]");
+    if (sel close.err) { ret res[bool, A.Error].err{close.err}; }
+    ret res[bool, A.Error].ok{true};
+}
+
+fun digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+# a number read from text, and how many bytes of it it covers
+rec Number {
+    n:   u8;
+    len: usize;
+}
+
+# the number of the digits at `text` from `at`, none when there are none or it passes 255
+fun number_at(text: View, at: usize) opt[Number] {
+    var n: u32   = 0;
+    var i: usize = at;
+    for (i < text.len && digit(text.data[i])) {
+        n = n * 10 + (text.data[i] - '0')::u32;
+        if (n > 255) { ret opt[Number].none{}; }
+        i = i + 1;
+    }
+    if (i == at) { ret opt[Number].none{}; }
+    ret opt[Number].some{Number{n: n::u8, len: i - at}};
+}
+
+# whether `text` holds `s` at `at`
+fun spelled_at(text: View, at: usize, s: str) bool {
+    val n: usize = str_len(s);
+    if (at + n > text.len) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (text.data[at + i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the type `text` spells from `at`, as `spell` writes it, the longest name the set's names hold where several start
+# there. none when no spelling starts there
+pub fun read(names: *Names, text: View, at: usize) opt[Read] {
+    if (at >= text.len) { ret opt[Read].none{}; }
+    val c: u8 = text.data[at];
+    if (c == '$') {
+        val n: opt[Number] = number_at(text, at + 1);
+        if (sel n.none) { ret opt[Read].none{}; }
+        ret opt[Read].some{Read{ref: effect.TypeRef.variable{n.some.n}, len: n.some.len + 1}};
+    }
+    if (c == '<') {
+        val n: opt[Number] = number_at(text, at + 1);
+        if (sel n.none) { ret opt[Read].none{}; }
+        val end: usize = at + 1 + n.some.len;
+        if (end >= text.len || text.data[end] != '>') { ret opt[Read].none{}; }
+        ret opt[Read].some{Read{ref: effect.TypeRef.operand{n.some.n}, len: n.some.len + 2}};
+    }
+    if (spelled_at(text, at, POLYMORPHIC)) { ret opt[Read].some{Read{ref: effect.TypeRef.polymorphic{}, len: str_len(POLYMORPHIC)}}; }
+    var best: opt[Read] = opt[Read].none{};
+    var i:    u32       = 0;
+    for (i < names.len) {
+        val name: str   = names.at[i].name;
+        val n:    usize = str_len(name);
+        val past: bool  = at + n >= text.len || text.data[at + n] == ' ' || text.data[at + n] == ']';
+        if (spelled_at(text, at, name) && past) {
+            var longer: bool = true;
+            if (sel best.some) { longer = best.some.len < n; }
+            if (longer)        { best = opt[Read].some{Read{ref: effect.TypeRef.fixed{names.at[i].code}, len: n}}; }
+        }
+        i = i + 1;
+    }
+    ret best;
+}
+
+#[testing]
+val T_NAMES: [3]Name = [3]Name{Name{code: 0x7f, name: "i32"}, Name{code: 0x7e, name: "i64"}, Name{code: 0x7b, name: "v128"}};
+
+#[testing]
+val T_POPS: [3]effect.TypeRef = [3]effect.TypeRef{effect.TypeRef.variable{0}, effect.TypeRef.operand{1}, effect.TypeRef.fixed{0x7f}};
+
+#[testing]
+val T_PUSHES: [2]effect.TypeRef = [2]effect.TypeRef{effect.TypeRef.fixed{0x7b}, effect.TypeRef.polymorphic{}};
+
+#[testing]
+fun t_same(a: effect.TypeRef, b: effect.TypeRef) bool {
+    if (sel a.fixed)    { ret sel b.fixed && b.fixed == a.fixed; }
+    if (sel a.variable) { ret sel b.variable && b.variable == a.variable; }
+    if (sel a.operand)  { ret sel b.operand && b.operand == a.operand; }
+    ret sel b.polymorphic;
+}
+
+# a signature of every kind of type prints and each of its types reads back from the text, and a code no name spells
+# is refused
+test spell_signature__every_kind_of_type_reads_back_from_its_spelling {
+    var t: testing.Testing;
+    testing.make(?t);
+    val names: Names              = Names{at: ?T_NAMES[0], len: 3};
+    val sig:   effect.Signature   = effect.Signature{pops: effect.Types{at: ?T_POPS[0], len: 3}, pushes: effect.Types{at: ?T_PUSHES[0], len: 2}};
+    var out:   vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t));
+    val wrote: res[bool, A.Error] = spell_signature(?names, ?sig, ?out);
+    if (sel wrote.err) { ret 1; }
+    if (!wrote.ok)     { ret 1; }
+    val text: View  = View{data: out.data, len: out.len};
+    var at:   usize = 1;
+    var i:    u32   = 0;
+    for (i < 5) {
+        val got: opt[Read] = read(?names, text, at);
+        if (sel got.none) { ret 2; }
+        var want: effect.TypeRef = effect.TypeRef.polymorphic{};
+        if (i < 3)                       { want = T_POPS[i]; }
+        or                               { want = T_PUSHES[i - 3]; }
+        if (!t_same(got.some.ref, want)) { ret 3; }
+        at = at + got.some.len;
+        if (i == 2) { at = at + str_len("] -> ["); }
+        or          { at = at + 1; }
+        i = i + 1;
+    }
+    if (at != text.len) { ret 4; }
+    var none:    vector.Vector[u8]  = vector.init[u8](testing.allocator_of(?t));
+    val unnamed: res[bool, A.Error] = spell(?names, effect.TypeRef.fixed{0x70}, ?none);
+    if (sel unnamed.err)             { ret 5; }
+    if (unnamed.ok || none.len != 0) { ret 5; }
+    vector.dnit[u8](?out);
+    vector.dnit[u8](?none);
+    ret 0;
+}
