@@ -1,0 +1,1355 @@
+# the spir-v generator
+#
+# it reads the core grammar and the extended instruction sets of SPIRV-Headers, with masc's facts beside them under
+# gen/data/spirv, and emits the spir-v catalog beside masc's spirv modules: the capabilities, extensions and core
+# versions as the rows of the extension catalog (gen_extension), every value and bit enumeration with its members'
+# params and requirements (gen_operand), the rows with their operands, fields, requirements and effects and the
+# handles of each (gen_row), the decode dispatch (gen_dispatch) and the spirv-as template of every row (gen_syntax).
+#
+# a row is one instruction, its fields the lead word, one field per operand and a fixed word where the encoding holds
+# one: an OpSpecConstantOp row per operation it takes and an OpExtInst row per instruction of each extended set, each
+# by its operation or its set and number, so decode dispatches on them and the text spells them. what makes a row,
+# member or capability available is its core version, from and to, or any extension that brings it, and then any of
+# its capabilities. a capability's own capabilities are those it implies. an instruction or member the grammar
+# states under no version and no extension is available through its capabilities alone, whose own availability is
+# what OpCapability needs. an instruction's further opnames are not spelled: a syntax alias takes no bound result,
+# which every such instruction defines. every row is untimed and its constant-time class the dependent one, since
+# spir-v states no timing.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use masc.core.field;
+use masc.core.operand;
+
+use gen.catalog;
+use gen.diag;
+use gen.dispatch;
+use gen.emit;
+use spirv_facts:   gen.isa.spirv.facts;
+use spirv_grammar: gen.isa.spirv.grammar;
+use gen.set;
+use gen.source;
+
+pub val NO_GRAMMAR:  str = "source holds no spirv.core.grammar.json";
+pub val NO_DATA:     str = "spir-v generator reads one data tree beside its source";
+pub val NO_KIND:     str = "operand names a kind the grammar does not state";
+pub val NO_ATOM:     str = "availability names a capability, extension or version the catalog does not hold";
+pub val NO_RESULT:   str = "operation of OpSpecConstantOp defines no typed result";
+pub val PARAMS:      str = "enumerant takes a list as a param, which masc's operand model does not hold, and no omission names it";
+pub val TOO_MANY:    str = "row has more operands than a row holds";
+pub val KEYS_MANGLE: str = "two row keys mangle to one identifier";
+pub val NO_CONTROL:  str = "control transfer names an instruction no row is";
+
+# the core grammar's file in the source's tree
+pub val GRAMMAR: str = "spirv.core.grammar.json";
+
+# the most bytes a string literal holds, its nul and padding past them: a word count of 65535 less the lead word
+val MAX_STRING: i64 = 262135;
+
+# the most bytes a context-dependent literal holds, the whole words of the widest type the stream's width states
+val MAX_NUMBER: i64 = 256;
+
+# how a row's opcode word is followed: by its operands, by an operation word or by an extended set and its number
+val CORE:    u8 = 0;
+val SPEC:    u8 = 1;
+val EXTINST: u8 = 2;
+
+# one alternative of a requirement, as catalog atoms
+rec Alt {
+    all:  vector.Vector[u32];
+    none: vector.Vector[u32];
+}
+
+# one operand of a row
+# ---
+# kind:     its operand kind
+# quantity: how many values it takes
+# role:     how the instruction uses it
+# width_of: the operand whose type gives its literal, or its pair's literal member, its width, by its index plus one
+pub rec Op {
+    kind:     *spirv_grammar.Kind;
+    quantity: operand.Quantity;
+    role:     operand.Role;
+    width_of: u8;
+}
+
+# one row
+# ---
+# key:      its key
+# mnemonic: its base instruction's opname
+# word:     the operation or extended instruction its text spells after operand `after`, nil for none
+# after:    the operand the word follows
+# form:     CORE, SPEC or EXTINST
+# opcode:   its opcode
+# fixed:    the operation's opcode, or the extended instruction's number
+# set:      its extended set's import code, 0 for none
+# ops:      its operands
+# alts:     its requirement
+# defines:  the operand defining its result, by its index plus one
+# type:     the operand naming its result's type, by its index plus one
+# control:  its control transfer, none for one that falls through
+rec Row {
+    key:      str;
+    mnemonic: str;
+    word:     str;
+    after:    u8;
+    form:     u8;
+    opcode:   u32;
+    fixed:    u32;
+    set:      u32;
+    ops:      vector.Vector[Op];
+    alts:     vector.Vector[Alt];
+    defines:  u8;
+    type:     u8;
+    control:  opt[spirv_facts.Control];
+}
+
+# the generator's state
+# ---
+# alloc:    allocator for everything
+# grammar:  the core grammar
+# facts:    the facts beside it
+# cat:      the catalog being built
+# idents:   each catalog row's handle, by its id
+# operands: gen_operand, its pools and the member count of each enumeration by kind name
+# rows:     the rows, and gen_row's pools
+pub rec Gen {
+    alloc:    *A.Allocator;
+    grammar:  *spirv_grammar.Grammar;
+    facts:    *spirv_facts.Facts;
+    cat:      catalog.Catalog;
+    idents:   vector.Vector[str];
+    operands: *emit.File;
+    ids:      emit.Pool;
+    alts:     emit.Pool;
+    params:   emit.Pool;
+    groups:   emit.Pool;
+    counts:   map.Map[str, u32];
+    rows:     vector.Vector[Row];
+    file:     *emit.File;
+    ops:      emit.Pool;
+    fields:   emit.Pool;
+    effects:  emit.Pool;
+}
+
+fun memory() diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun rec_value(r: *emit.Record) emit.Value {
+    ret emit.Value.record{r};
+}
+
+fun boolean(b: bool) emit.Value {
+    if (b) { ret name("true"); }
+    ret name("false");
+}
+
+# `left` and `right` joined, nil when the storage is refused
+fun join(g: *Gen, left: str, right: str) str {
+    val got: res[str, StrError] = str_join(g.alloc, left, right);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+fun join3(g: *Gen, a: str, b: str, c: str) str {
+    val got: res[str, StrError] = str_join(g.alloc, a, b, c);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# a span `of` over `count` items from item `at` of `array`
+fun span(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = emit.record(f, of);
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(count::i64));
+    ret rec_value(r);
+}
+
+# the name of version `minor` of spir-v 1
+fun version_name(g: *Gen, minor: i64) str {
+    var digits: [4]u8;
+    var n:      i64   = minor;
+    var len:    usize = 0;
+    var rev:    [4]u8;
+    for {
+        rev[len] = '0' + (n % 10)::u8;
+        len      = len + 1;
+        n        = n / 10;
+        if (n == 0 || len == 3) { brk; }
+    }
+    var k: usize = 0;
+    for (k < len) {
+        digits[k] = rev[len - 1 - k];
+        k         = k + 1;
+    }
+    digits[len] = 0;
+    val copied: res[str, StrError] = str_copy_slice(g.alloc, ?digits[0], 0, len);
+    if (sel copied.err) { ret nil; }
+    ret join(g, "spv1.", copied.ok);
+}
+
+# the minor number of version text `v`, as `1.3` is 3, -1 for text that is no version of spir-v 1
+fun minor_of(v: str) i64 {
+    if (v[0] != '1' || v[1] != '.' || v[2] == 0) { ret -1; }
+    var n: i64   = 0;
+    var i: usize = 2;
+    for (v[i] != 0) {
+        if (v[i] < '0' || v[i] > '9') { ret -1; }
+        n = n * 10 + (v[i] - '0')::i64;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the catalog atom named `n`
+fun atom(g: *Gen, n: str) res[u32, diag.Refusal] {
+    val got: opt[u32] = catalog.row_named(?g.cat, n);
+    if (sel got.none) { ret res[u32, diag.Refusal].err{diag.refusal(nil, 0, NO_ATOM, n)}; }
+    ret res[u32, diag.Refusal].ok{got.some};
+}
+
+# the atom of version text `v`
+fun version_atom(g: *Gen, v: str) res[u32, diag.Refusal] {
+    val minor: i64 = minor_of(v);
+    if (minor < 0) { ret res[u32, diag.Refusal].err{diag.refusal(nil, 0, NO_ATOM, v)}; }
+    ret atom(g, version_name(g, minor));
+}
+
+fun alt(g: *Gen) Alt {
+    ret Alt{all: vector.init[u32](g.alloc), none: vector.init[u32](g.alloc)};
+}
+
+# the alternatives that make `gate` available: its version, ended by the version after its last, or any extension that
+# brings it, and one that holds nothing when it states neither
+fun availability(g: *Gen, gate: *spirv_grammar.Gate, out: *vector.Vector[Alt]) err[diag.Refusal] {
+    if (gate.version != nil) {
+        var a: Alt                    = alt(g);
+        val v: res[u32, diag.Refusal] = version_atom(g, gate.version);
+        if (sel v.err) { ret err[diag.Refusal].err{v.err}; }
+        vector.push[u32](?a.all, v.ok);
+        if (gate.last != nil) {
+            val after: i64 = minor_of(gate.last) + 1;
+            if (after <= g.grammar.minor) {
+                val next: res[u32, diag.Refusal] = atom(g, version_name(g, after));
+                if (sel next.err) { ret err[diag.Refusal].err{next.err}; }
+                vector.push[u32](?a.none, next.ok);
+            }
+        }
+        if (!pushed(vector.push[Alt](out, a))) { ret err[diag.Refusal].err{memory()}; }
+    }
+    var i: usize = 0;
+    for (i < gate.extensions.len) {
+        var a: Alt                    = alt(g);
+        val e: res[u32, diag.Refusal] = atom(g, gate.extensions.data[i]);
+        if (sel e.err) { ret err[diag.Refusal].err{e.err}; }
+        vector.push[u32](?a.all, e.ok);
+        if (!pushed(vector.push[Alt](out, a))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    if (out.len == 0 && !pushed(vector.push[Alt](out, alt(g)))) { ret err[diag.Refusal].err{memory()}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the alternatives of any one of `caps`, and one that holds nothing when there are none
+fun enabling(g: *Gen, caps: *vector.Vector[str], out: *vector.Vector[Alt]) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < caps.len) {
+        var a: Alt                    = alt(g);
+        val c: res[u32, diag.Refusal] = atom(g, caps.data[i]);
+        if (sel c.err) { ret err[diag.Refusal].err{c.err}; }
+        vector.push[u32](?a.all, c.ok);
+        if (!pushed(vector.push[Alt](out, a))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    if (out.len == 0 && !pushed(vector.push[Alt](out, alt(g)))) { ret err[diag.Refusal].err{memory()}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun append_ids(into: *vector.Vector[u32], from: *vector.Vector[u32]) {
+    var i: usize = 0;
+    for (i < from.len) {
+        var held: bool  = false;
+        var k:    usize = 0;
+        for (k < into.len) {
+            if (into.data[k] == from.data[i]) { held = true; }
+            k = k + 1;
+        }
+        if (!held) { vector.push[u32](into, from.data[i]); }
+        i = i + 1;
+    }
+}
+
+# every alternative of `a` met together with every one of `b`
+fun product(g: *Gen, a: *vector.Vector[Alt], b: *vector.Vector[Alt]) vector.Vector[Alt] {
+    var out: vector.Vector[Alt] = vector.init[Alt](g.alloc);
+    var i:   usize              = 0;
+    for (i < a.len) {
+        var j: usize = 0;
+        for (j < b.len) {
+            var x: Alt = alt(g);
+            append_ids(?x.all, ?a.data[i].all);
+            append_ids(?x.all, ?b.data[j].all);
+            append_ids(?x.none, ?a.data[i].none);
+            append_ids(?x.none, ?b.data[j].none);
+            vector.push[Alt](?out, x);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# the requirement of `gate`, its availability and then its capabilities unless `implied` names them as implications
+fun required(g: *Gen, gate: *spirv_grammar.Gate, implied: bool) res[vector.Vector[Alt], diag.Refusal] {
+    var avail: vector.Vector[Alt] = vector.init[Alt](g.alloc);
+    val got:   err[diag.Refusal]  = availability(g, gate, ?avail);
+    if (sel got.err) { ret res[vector.Vector[Alt], diag.Refusal].err{got.err}; }
+    if (implied)     { ret res[vector.Vector[Alt], diag.Refusal].ok{avail}; }
+    var caps: vector.Vector[Alt] = vector.init[Alt](g.alloc);
+    val held: err[diag.Refusal]  = enabling(g, ?gate.capabilities, ?caps);
+    if (sel held.err) { ret res[vector.Vector[Alt], diag.Refusal].err{held.err}; }
+    ret res[vector.Vector[Alt], diag.Refusal].ok{product(g, ?avail, ?caps)};
+}
+
+# a run of catalog atoms in gen_operand's id pool
+fun ids_value(g: *Gen, ids: *vector.Vector[u32]) emit.Value {
+    val f: *emit.File = g.operands;
+    if (ids.len == 0) { ret name("requirement.NO_IDS"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    var i:     usize                     = 0;
+    for (i < ids.len) {
+        vector.push[emit.Value](?items, name(join(g, "spirv_extension.id.", g.idents.data[ids.data[i]])));
+        i = i + 1;
+    }
+    val at: u32 = emit.pooled(f, ?g.ids, items.data, items.len::u32);
+    ret span(f, "requirement.Ids", "REQUIRE_IDS", at, ids.len::u32);
+}
+
+# requirement `alts` as a literal of file `f`, its alternatives pooled in gen_operand, reached by `prefix`
+fun requirement_value(g: *Gen, f: *emit.File, prefix: str, alts: *vector.Vector[Alt]) emit.Value {
+    var i: usize = 0;
+    for (i < alts.len) {
+        if (alts.data[i].all.len == 0 && alts.data[i].none.len == 0) { ret name("requirement.NO_ALTERNATIVES"); }
+        i = i + 1;
+    }
+    if (alts.len == 0) { ret name("requirement.NO_ALTERNATIVES"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    i = 0;
+    for (i < alts.len) {
+        val r: *emit.Record = emit.record(g.operands, "requirement.Alternative");
+        emit.member(g.operands, r, "all", ids_value(g, ?alts.data[i].all));
+        emit.member(g.operands, r, "none", ids_value(g, ?alts.data[i].none));
+        vector.push[emit.Value](?items, rec_value(r));
+        i = i + 1;
+    }
+    val at: u32 = emit.pooled(g.operands, ?g.alts, items.data, items.len::u32);
+    ret span(f, "requirement.Requirement", join(g, prefix, "REQUIRE_ALTERNATIVES"), at, alts.len::u32);
+}
+
+# the catalog: the core versions, each implying the one before, the capabilities with their implications and further
+# names, and every extension any availability names, by name
+fun build_catalog(g: *Gen) err[diag.Refusal] {
+    g.cat = catalog.fresh(g.alloc);
+    var m: i64 = 0;
+    for (m <= g.grammar.minor) {
+        val row: res[u32, diag.Refusal] = catalog.add_row(?g.cat, version_name(g, m), "");
+        if (sel row.err) { ret err[diag.Refusal].err{row.err}; }
+        if (m > 0) {
+            val implied: err[diag.Refusal] = catalog.add_implied(?g.cat, row.ok, row.ok - 1);
+            if (sel implied.err) { ret implied; }
+        }
+        m = m + 1;
+    }
+    val caps: opt[*spirv_grammar.Kind] = spirv_grammar.kind(g.grammar, "Capability");
+    if (sel caps.none) { ret err[diag.Refusal].err{diag.refusal(GRAMMAR, 0, NO_KIND, "Capability")}; }
+    var i: usize = 0;
+    for (i < caps.some.enumerants.len) {
+        val row: res[u32, diag.Refusal] = catalog.add_row(?g.cat, caps.some.enumerants.data[i].name, "");
+        if (sel row.err) { ret err[diag.Refusal].err{row.err}; }
+        i = i + 1;
+    }
+    # every extension any availability names, in name order
+    var seen:  map.Map[str, bool] = map.init[str, bool](g.alloc);
+    var names: vector.Vector[str] = vector.init[str](g.alloc);
+    i = 0;
+    for (i < g.grammar.instructions.len) {
+        note_extensions(?seen, ?names, ?g.grammar.instructions.data[i].gate);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < g.grammar.kinds.len) {
+        val k: *spirv_grammar.Kind = ?g.grammar.kinds.data[i];
+        var j: usize               = 0;
+        for (j < k.enumerants.len) {
+            note_extensions(?seen, ?names, ?k.enumerants.data[j].gate);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < g.facts.imports.len) {
+        val r: str = g.facts.imports.data[i].requires;
+        if (r != nil) { note(?seen, ?names, r); }
+        i = i + 1;
+    }
+    sort.sort_by[str](names.data, names.len, by_text);
+    i = 0;
+    for (i < names.len) {
+        val row: res[u32, diag.Refusal] = catalog.add_row(?g.cat, names.data[i], "");
+        if (sel row.err) { ret err[diag.Refusal].err{row.err}; }
+        i = i + 1;
+    }
+    # a capability implies the capabilities it depends on, and its further names name it
+    i = 0;
+    for (i < caps.some.enumerants.len) {
+        val e:  *spirv_grammar.Enumerant = ?caps.some.enumerants.data[i];
+        val at: res[u32, diag.Refusal]   = atom(g, e.name);
+        if (sel at.err) { ret err[diag.Refusal].err{at.err}; }
+        var j: usize = 0;
+        for (j < e.gate.capabilities.len) {
+            val dep: res[u32, diag.Refusal] = atom(g, e.gate.capabilities.data[j]);
+            if (sel dep.err) { ret err[diag.Refusal].err{dep.err}; }
+            val implied: err[diag.Refusal] = catalog.add_implied(?g.cat, at.ok, dep.ok);
+            if (sel implied.err) { ret implied; }
+            j = j + 1;
+        }
+        j = 0;
+        for (j < e.aliases.len) {
+            val named: err[diag.Refusal] = catalog.add_alias(?g.cat, e.aliases.data[j], at.ok);
+            if (sel named.err) { ret named; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    g.idents = vector.init[str](g.alloc);
+    i        = 0;
+    for (i < g.cat.rows.len) {
+        vector.push[str](?g.idents, emit.ident(g.operands, g.cat.rows.data[i].name));
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun by_text(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+fun note(seen: *map.Map[str, bool], names: *vector.Vector[str], n: str) {
+    var key:   str        = n;
+    val known: opt[*bool] = map.get[str, bool](seen, ?key);
+    if (sel known.some) { ret; }
+    map.insert[str, bool](seen, n, true);
+    vector.push[str](names, n);
+}
+
+fun note_extensions(seen: *map.Map[str, bool], names: *vector.Vector[str], gate: *spirv_grammar.Gate) {
+    var i: usize = 0;
+    for (i < gate.extensions.len) {
+        note(seen, names, gate.extensions.data[i]);
+        i = i + 1;
+    }
+}
+
+# the kind of `g` named `n`, refused when the grammar states none
+fun kind_of(g: *Gen, n: str) res[*spirv_grammar.Kind, diag.Refusal] {
+    val k: opt[*spirv_grammar.Kind] = spirv_grammar.kind(g.grammar, n);
+    if (sel k.none) { ret res[*spirv_grammar.Kind, diag.Refusal].err{diag.refusal(GRAMMAR, 0, NO_KIND, n)}; }
+    ret res[*spirv_grammar.Kind, diag.Refusal].ok{k.some};
+}
+
+fun enumerated(k: *spirv_grammar.Kind) bool {
+    ret str_equals(k.category, "ValueEnum") || str_equals(k.category, "BitEnum");
+}
+
+# enumeration `k` as a literal reaching gen_operand's tables by `prefix`
+fun enumeration_value(g: *Gen, f: *emit.File, prefix: str, k: *spirv_grammar.Kind) emit.Value {
+    val id:    str       = emit.ident(f, k.name);
+    var probe: str       = k.name;
+    val held:  opt[*u32] = map.get[str, u32](?g.counts, ?probe);
+    var count: u32       = 0;
+    if (sel held.some) { count = @held.some; }
+    val r: *emit.Record = emit.record(f, "operand.Enumeration");
+    if (count == 0) {
+        emit.member(f, r, "members", name("nil"));
+        emit.member(f, r, "count", number(0));
+        emit.member(f, r, "mask", boolean(str_equals(k.category, "BitEnum")));
+        emit.member(f, r, "names", name("index.NO_ENTRIES"));
+        ret rec_value(r);
+    }
+    emit.member(f, r, "members", emit.element(f, join3(g, prefix, id, "_MEMBERS"), 0));
+    emit.member(f, r, "count", number(count::i64));
+    emit.member(f, r, "mask", boolean(str_equals(k.category, "BitEnum")));
+    emit.member(f, r, "names", span(f, "index.Index", join3(g, prefix, id, "_NAMES"), 0, count));
+    ret rec_value(r);
+}
+
+fun immediate(f: *emit.File, format: str) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Immediate");
+    emit.member(f, r, "bits", number(32));
+    emit.member(f, r, "sign", name("operand.UNSIGNED"));
+    emit.member(f, r, "scale", number(0));
+    emit.member(f, r, "bias", number(0));
+    emit.member(f, r, "fixup", name("operand.NO_FIXUP"));
+    emit.member(f, r, "format", name(format));
+    emit.member(f, r, "excluded", name("operand.NO_INTEGERS"));
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.immediate", rec_value(r))};
+}
+
+fun literal(f: *emit.File, max: i64, content: str, width_of: u8) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Literal");
+    emit.member(f, r, "max", number(max));
+    emit.member(f, r, "content", name(content));
+    emit.member(f, r, "width_of", number(width_of::i64));
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.literal", rec_value(r))};
+}
+
+# the shape of an operand of kind `k` in file `f`, reaching gen_operand's tables by `prefix`, its literal, or its
+# pair's literal member, taking the width of operand `width_of` less one when it is not 0
+fun shape(g: *Gen, f: *emit.File, prefix: str, k: *spirv_grammar.Kind, width_of: u8) res[emit.Value, diag.Refusal] {
+    if (str_equals(k.category, "Id")) {
+        val r: *emit.Record = emit.record(f, "operand.Typed");
+        emit.member(f, r, "space", name("spirv_kind.IDS"));
+        emit.member(f, r, "bits", number(32));
+        emit.member(f, r, "fixup", name("operand.NO_FIXUP"));
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "operand.Shape.id", rec_value(r))}};
+    }
+    if (enumerated(k)) {
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "operand.Shape.enumerant", enumeration_value(g, f, prefix, k))}};
+    }
+    if (str_equals(k.category, "Composite")) {
+        var members: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+        var i:       usize                     = 0;
+        for (i < k.bases.len) {
+            val base: res[*spirv_grammar.Kind, diag.Refusal] = kind_of(g, k.bases.data[i]);
+            if (sel base.err) { ret res[emit.Value, diag.Refusal].err{base.err}; }
+            var w: u8 = 0;
+            if (str_equals(base.ok.category, "Literal")) { w = width_of; }
+            val s: res[emit.Value, diag.Refusal] = shape(g, g.operands, "", base.ok, w);
+            if (sel s.err) { ret s; }
+            vector.push[emit.Value](?members, operand_value(g.operands, s.ok, "operand.READ", "operand.ONE"));
+            i = i + 1;
+        }
+        val at: u32 = emit.pooled(g.operands, ?g.groups, members.data, members.len::u32);
+        ret res[emit.Value, diag.Refusal].ok{emit.Value.variant{emit.variant(f, "operand.Shape.group", span(f, "operand.Group", join(g, prefix, "GROUPS"), at, members.len::u32))}};
+    }
+    if (str_equals(k.name, "LiteralString"))                                  { ret res[emit.Value, diag.Refusal].ok{literal(f, MAX_STRING, "operand.STRING", 0)}; }
+    if (str_equals(k.name, "LiteralFloat"))                                   { ret res[emit.Value, diag.Refusal].ok{immediate(f, "operand.FLOAT")}; }
+    if (str_equals(k.name, "LiteralContextDependentNumber") || width_of != 0) { ret res[emit.Value, diag.Refusal].ok{literal(f, MAX_NUMBER, "operand.NUMBER", width_of)}; }
+    ret res[emit.Value, diag.Refusal].ok{immediate(f, "operand.INTEGER")};
+}
+
+fun operand_value(f: *emit.File, s: emit.Value, role: str, quantity: str) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Operand");
+    emit.member(f, r, "shape", s);
+    emit.member(f, r, "role", name(role));
+    emit.member(f, r, "width", number(0));
+    emit.member(f, r, "quantity", name(quantity));
+    emit.member(f, r, "write", name("operand.AS_ROW"));
+    ret rec_value(r);
+}
+
+fun quantity_name(q: operand.Quantity) str {
+    if (q == operand.OPTIONAL) { ret "operand.OPTIONAL"; }
+    if (q == operand.VARIADIC) { ret "operand.VARIADIC"; }
+    ret "operand.ONE";
+}
+
+fun role_name(r: operand.Role) str {
+    if (r == operand.WRITE) { ret "operand.WRITE"; }
+    ret "operand.READ";
+}
+
+# one member of an enumeration, under the name `n`
+fun member_value(g: *Gen, e: *spirv_grammar.Enumerant, n: str, capability: bool) res[emit.Value, diag.Refusal] {
+    val f:    *emit.File                            = g.operands;
+    val alts: res[vector.Vector[Alt], diag.Refusal] = required(g, ?e.gate, capability);
+    if (sel alts.err) { ret res[emit.Value, diag.Refusal].err{alts.err}; }
+    var reqs:   vector.Vector[Alt] = alts.ok;
+    var params: emit.Value         = name("operand.NO_GROUP");
+    if (e.params.len > 0) {
+        var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+        var i:     usize                     = 0;
+        for (i < e.params.len) {
+            val k: res[*spirv_grammar.Kind, diag.Refusal] = kind_of(g, e.params.data[i].kind);
+            if (sel k.err) { ret res[emit.Value, diag.Refusal].err{k.err}; }
+            val s: res[emit.Value, diag.Refusal] = shape(g, f, "", k.ok, 0);
+            if (sel s.err) { ret s; }
+            vector.push[emit.Value](?items, operand_value(f, s.ok, "operand.READ", "operand.ONE"));
+            i = i + 1;
+        }
+        val at: u32 = emit.pooled(f, ?g.params, items.data, items.len::u32);
+        params = span(f, "operand.Group", "PARAMS", at, items.len::u32);
+    }
+    val r: *emit.Record = emit.record(f, "operand.Enumerant");
+    emit.member(f, r, "name", emit.Value.text{n});
+    emit.member(f, r, "value", emit.Value.hex{e.value::u64});
+    emit.member(f, r, "requires", requirement_value(g, f, "", ?reqs));
+    emit.member(f, r, "params", params);
+    ret res[emit.Value, diag.Refusal].ok{rec_value(r)};
+}
+
+# whether member `e` of kind `k` takes a list as a param, which an omission must name
+fun listed_params(e: *spirv_grammar.Enumerant) bool {
+    var i: usize = 0;
+    for (i < e.params.len) {
+        if (e.params.data[i].quantity != operand.ONE) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the members and name index of every value and bit enumeration, an omitted member left out and a further name of a
+# member a member of its own after the members, of its value, params and requirement
+fun enumerations(g: *Gen) err[diag.Refusal] {
+    val f: *emit.File = g.operands;
+    var i: usize      = 0;
+    # the counts first, so a param's enumeration reads its own before its tables are written
+    for (i < g.grammar.kinds.len) {
+        val k: *spirv_grammar.Kind = ?g.grammar.kinds.data[i];
+        if (enumerated(k)) {
+            var n: u32   = 0;
+            var j: usize = 0;
+            for (j < k.enumerants.len) {
+                val e: *spirv_grammar.Enumerant = ?k.enumerants.data[j];
+                if (!omitted(g, k, e)) { n = n + 1 + e.aliases.len::u32; }
+                j = j + 1;
+            }
+            map.insert[str, u32](?g.counts, k.name, n);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < g.grammar.kinds.len) {
+        val k: *spirv_grammar.Kind = ?g.grammar.kinds.data[i];
+        if (enumerated(k)) {
+            val capability: bool        = str_equals(k.name, "Capability");
+            val members:    *emit.Array = emit.array(f, "operand.Enumerant");
+            val names:      *emit.Array = emit.keyed(f, "index.Entry");
+            var at:         u32         = 0;
+            var pass:       u32         = 0;
+            for (pass < 2) {
+                var j: usize = 0;
+                for (j < k.enumerants.len) {
+                    val e: *spirv_grammar.Enumerant = ?k.enumerants.data[j];
+                    if (!omitted(g, k, e)) {
+                        if (listed_params(e)) { ret err[diag.Refusal].err{diag.refusal(GRAMMAR, 0, PARAMS, e.name)}; }
+                        var a: usize = 0;
+                        var n: usize = 1;
+                        if (pass == 1) { n = e.aliases.len; }
+                        for (a < n) {
+                            var spelled: str = e.name;
+                            if (pass == 1) { spelled = e.aliases.data[a]; }
+                            val m: res[emit.Value, diag.Refusal] = member_value(g, e, spelled, capability);
+                            if (sel m.err) { ret err[diag.Refusal].err{m.err}; }
+                            emit.item(f, members, m.ok);
+                            val entry: *emit.Record = emit.record(f, "index.Entry");
+                            emit.member(f, entry, "key", emit.Value.text{spelled});
+                            emit.member(f, entry, "row", number(at::i64));
+                            emit.entry(f, names, spelled, rec_value(entry));
+                            at = at + 1;
+                            a  = a + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+                pass = pass + 1;
+            }
+            val id: str = emit.ident(f, k.name);
+            emit.seal(f, names);
+            emit.declare_array(f, join(g, id, "_MEMBERS"), members);
+            emit.declare_array(f, join(g, id, "_NAMES"), names);
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun omitted(g: *Gen, k: *spirv_grammar.Kind, e: *spirv_grammar.Enumerant) bool {
+    var key:  str        = spirv_facts.pair(g.alloc, k.name, e.name);
+    val held: opt[*bool] = map.get[str, bool](?g.facts.omitted, ?key);
+    ret sel held.some;
+}
+
+# operand `r` of instruction `ins` appended to `row`, its width taken from the literals topic
+fun add_op(g: *Gen, row: *Row, ins: *spirv_grammar.Instruction, at: usize) err[diag.Refusal] {
+    val ref: *spirv_grammar.Ref                     = ?ins.operands.data[at];
+    val k:   res[*spirv_grammar.Kind, diag.Refusal] = kind_of(g, ref.kind);
+    if (sel k.err) { ret err[diag.Refusal].err{k.err}; }
+    var op: Op = Op{kind: k.ok, quantity: ref.quantity, role: operand.READ, width_of: 0};
+    if (str_equals(ref.kind, "IdResult")) { op.role = operand.WRITE; }
+    var digits: [8]u8;
+    var n:      usize = at;
+    var len:    usize = 0;
+    var rev:    [8]u8;
+    for {
+        rev[len] = '0' + (n % 10)::u8;
+        len      = len + 1;
+        n        = n / 10;
+        if (n == 0) { brk; }
+    }
+    var d: usize = 0;
+    for (d < len) {
+        digits[d] = rev[len - 1 - d];
+        d         = d + 1;
+    }
+    digits[len] = 0;
+    var key:   str      = spirv_facts.pair(g.alloc, ins.name, ?digits[0]);
+    val width: opt[*u8] = map.get[str, u8](?g.facts.widths, ?key);
+    if (sel width.some)                                        { op.width_of = @width.some + 1; }
+    or (str_equals(ref.kind, "LiteralContextDependentNumber")) { ret err[diag.Refusal].err{diag.refusal(GRAMMAR, 0, spirv_facts.NOT_A_LITERAL, key)}; }
+    if (op.role == operand.WRITE)                              { row.defines = row.ops.len::u8 + 1; }
+    if (str_equals(ref.kind, "IdResultType"))                  { row.type = row.ops.len::u8 + 1; }
+    if (row.ops.len >= 16)                                     { ret err[diag.Refusal].err{diag.refusal(nil, 0, TOO_MANY, row.key)}; }
+    vector.push[Op](?row.ops, op);
+    ret err[diag.Refusal].ok{};
+}
+
+fun new_row(g: *Gen, key: str, ins: *spirv_grammar.Instruction) Row {
+    ret Row{key: key, mnemonic: ins.name, word: nil, after: 0, form: CORE, opcode: ins.opcode, fixed: 0, set: 0, ops: vector.init[Op](g.alloc), alts: vector.init[Alt](g.alloc), defines: 0, type: 0, control: opt[spirv_facts.Control].none{}};
+}
+
+# the opname without its `Op`, as OpSpecConstantOp's text names its operation
+fun bare(n: str) str {
+    if (n[0] == 'O' && n[1] == 'p') { ret ?n[2]; }
+    ret n;
+}
+
+# every row: an instruction's own, or one per operation of OpSpecConstantOp and per instruction of each extended set
+# of OpExtInst, and of OpExtInstWithForwardRefsKHR for a non-semantic set
+fun build_rows(g: *Gen) err[diag.Refusal] {
+    g.rows = vector.init[Row](g.alloc);
+    var i: usize = 0;
+    for (i < g.grammar.instructions.len) {
+        val ins: *spirv_grammar.Instruction = ?g.grammar.instructions.data[i];
+        if (str_equals(ins.name, "OpSpecConstantOp")) {
+            val done: err[diag.Refusal] = spec_rows(g, ins);
+            if (sel done.err) { ret done; }
+        }
+        or (str_equals(ins.name, "OpExtInst") || str_equals(ins.name, "OpExtInstWithForwardRefsKHR")) {
+            val done: err[diag.Refusal] = extinst_rows(g, ins);
+            if (sel done.err) { ret done; }
+        }
+        or {
+            var r: Row   = new_row(g, ins.name, ins);
+            var k: usize = 0;
+            for (k < ins.operands.len) {
+                val added: err[diag.Refusal] = add_op(g, ?r, ins, k);
+                if (sel added.err) { ret added; }
+                k = k + 1;
+            }
+            val reqs: res[vector.Vector[Alt], diag.Refusal] = required(g, ?ins.gate, false);
+            if (sel reqs.err) { ret err[diag.Refusal].err{reqs.err}; }
+            r.alts = reqs.ok;
+            var key: str                       = ins.name;
+            val ctl: opt[*spirv_facts.Control] = map.get[str, spirv_facts.Control](?g.facts.controls, ?key);
+            if (sel ctl.some) { r.control = opt[spirv_facts.Control].some{@ctl.some}; }
+            vector.push[Row](?g.rows, r);
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun spec_rows(g: *Gen, base: *spirv_grammar.Instruction) err[diag.Refusal] {
+    val own: res[vector.Vector[Alt], diag.Refusal] = required(g, ?base.gate, false);
+    if (sel own.err) { ret err[diag.Refusal].err{own.err}; }
+    var i: usize = 0;
+    for (i < g.facts.operations.len) {
+        val x:  *spirv_facts.Operation     = ?g.facts.operations.data[i];
+        val op: *spirv_grammar.Instruction = spirv_grammar.instruction(g.grammar, x.name);
+        if (op.operands.len < 2 || !str_equals(op.operands.data[0].kind, "IdResultType") || !str_equals(op.operands.data[1].kind, "IdResult")) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_RESULT, x.name)}; }
+        var r: Row = new_row(g, join3(g, base.name, ".", bare(x.name)), base);
+        r.form  = SPEC;
+        r.word  = bare(x.name);
+        r.after = 1;
+        r.fixed = op.opcode;
+        var k: usize = 0;
+        for (k < 2) {
+            val added: err[diag.Refusal] = add_op(g, ?r, base, k);
+            if (sel added.err) { ret added; }
+            k = k + 1;
+        }
+        k = 2;
+        for (k < op.operands.len) {
+            val added: err[diag.Refusal] = add_op(g, ?r, op, k);
+            if (sel added.err) { ret added; }
+            k = k + 1;
+        }
+        val theirs: res[vector.Vector[Alt], diag.Refusal] = required(g, ?op.gate, false);
+        if (sel theirs.err) { ret err[diag.Refusal].err{theirs.err}; }
+        var mine:  vector.Vector[Alt] = own.ok;
+        var other: vector.Vector[Alt] = theirs.ok;
+        var both:  vector.Vector[Alt] = product(g, ?mine, ?other);
+        if (x.when != nil) {
+            var when: vector.Vector[Alt]     = vector.init[Alt](g.alloc);
+            var a:    Alt                    = alt(g);
+            val cap:  res[u32, diag.Refusal] = atom(g, x.when);
+            if (sel cap.err) { ret err[diag.Refusal].err{cap.err}; }
+            vector.push[u32](?a.all, cap.ok);
+            vector.push[Alt](?when, a);
+            both = product(g, ?both, ?when);
+        }
+        r.alts = both;
+        vector.push[Row](?g.rows, r);
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun extinst_rows(g: *Gen, base: *spirv_grammar.Instruction) err[diag.Refusal] {
+    val own: res[vector.Vector[Alt], diag.Refusal] = required(g, ?base.gate, false);
+    if (sel own.err) { ret err[diag.Refusal].err{own.err}; }
+    val forward: bool  = !str_equals(base.name, "OpExtInst");
+    var i:       usize = 0;
+    for (i < g.facts.imports.len) {
+        val x:        *spirv_facts.Import = ?g.facts.imports.data[i];
+        val ns:       str                 = "NonSemantic.";
+        var semantic: bool                = false;
+        var c:        usize               = 0;
+        for (c < str_len(ns)) {
+            if (x.name[c] != ns[c]) { semantic = true; }
+            c = c + 1;
+        }
+        if (forward && semantic) {
+            i = i + 1;
+            cnt;
+        }
+        var set_alts: vector.Vector[Alt] = own.ok;
+        if (x.requires != nil) {
+            var need: vector.Vector[Alt]     = vector.init[Alt](g.alloc);
+            var a:    Alt                    = alt(g);
+            val ext:  res[u32, diag.Refusal] = atom(g, x.requires);
+            if (sel ext.err) { ret err[diag.Refusal].err{ext.err}; }
+            vector.push[u32](?a.all, ext.ok);
+            vector.push[Alt](?need, a);
+            set_alts = product(g, ?set_alts, ?need);
+        }
+        var j: usize = 0;
+        for (j < x.grammar.instructions.len) {
+            val ins: *spirv_grammar.Instruction = ?x.grammar.instructions.data[j];
+            var r:   Row                        = new_row(g, join3(g, join3(g, base.name, ".", x.name), ".", ins.name), base);
+            r.form  = EXTINST;
+            r.word  = ins.name;
+            r.after = 2;
+            r.fixed = ins.opcode;
+            r.set   = x.code;
+            var k: usize = 0;
+            for (k < 3) {
+                val added: err[diag.Refusal] = add_op(g, ?r, base, k);
+                if (sel added.err) { ret added; }
+                k = k + 1;
+            }
+            k = 0;
+            for (k < ins.operands.len) {
+                val added: err[diag.Refusal] = add_op(g, ?r, ins, k);
+                if (sel added.err) { ret added; }
+                k = k + 1;
+            }
+            var caps: vector.Vector[Alt] = vector.init[Alt](g.alloc);
+            val held: err[diag.Refusal]  = enabling(g, ?ins.gate.capabilities, ?caps);
+            if (sel held.err) { ret held; }
+            r.alts = product(g, ?set_alts, ?caps);
+            vector.push[Row](?g.rows, r);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# a field of kind `kind` over operand `op`
+fun field_value(f: *emit.File, kind: str, fixed: u64, mask: u64, op: str, param: u64) emit.Value {
+    val r: *emit.Record = emit.record(f, "field.Field");
+    emit.member(f, r, "kind", name(kind));
+    emit.member(f, r, "width", number(32));
+    emit.member(f, r, "fixed", emit.Value.hex{fixed});
+    emit.member(f, r, "mask", emit.Value.hex{mask});
+    emit.member(f, r, "slices", name("field.NO_SLICES"));
+    emit.member(f, r, "operand", name(op));
+    emit.member(f, r, "param", emit.Value.hex{param});
+    ret rec_value(r);
+}
+
+fun index_text(g: *Gen, k: usize) str {
+    var digits: [8]u8;
+    var rev:    [8]u8;
+    var n:      usize = k;
+    var len:    usize = 0;
+    for {
+        rev[len] = '0' + (n % 10)::u8;
+        len      = len + 1;
+        n        = n / 10;
+        if (n == 0) { brk; }
+    }
+    var d: usize = 0;
+    for (d < len) {
+        digits[d] = rev[len - 1 - d];
+        d         = d + 1;
+    }
+    val got: res[str, StrError] = str_copy_slice(g.alloc, ?digits[0], 0, len);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# the fields of row `r`: its lead, then a field per operand, the operation's or the extended instruction's word after
+# the operand its text spells it after, and the set operand of an extended instruction read through its import
+fun fields_of(g: *Gen, r: *Row) emit.Value {
+    val f:     *emit.File                = g.file;
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    vector.push[emit.Value](?items, field_value(f, "spirv_kind.LEAD", r.opcode::u64, 0xFFFF, "field.NO_OPERAND", 0));
+    var k: usize = 0;
+    for (k < r.ops.len) {
+        var kind:  str = "spirv_kind.OPERAND";
+        var param: u64 = 0;
+        if (r.form == EXTINST && k == 2) {
+            kind  = "spirv_kind.EXTSET";
+            param = r.set::u64;
+        }
+        vector.push[emit.Value](?items, field_value(f, kind, 0, 0, index_text(g, k), param));
+        if (r.form != CORE && k == r.after::usize) { vector.push[emit.Value](?items, field_value(f, "spirv_kind.WORD", r.fixed::u64, 0xFFFF_FFFF, "field.NO_OPERAND", 0)); }
+        k = k + 1;
+    }
+    val at: u32 = emit.pooled(f, ?g.fields, items.data, items.len::u32);
+    ret span(f, "field.Fields", "FIELDS", at, items.len::u32);
+}
+
+fun effect_of(g: *Gen, r: *Row) emit.Value {
+    val f:  *emit.File   = g.file;
+    val ru: *emit.Record = emit.record(f, "effect.Ruled");
+    emit.member(f, ru, "otherwise", name("effect.NO_TOUCHED"));
+    emit.member(f, ru, "rules", name("effect.NO_REGISTER_RULES"));
+    emit.member(f, ru, "may", name("effect.NO_TOUCHED"));
+    emit.member(f, ru, "must", name("effect.NO_TOUCHED"));
+    val fl: *emit.Record = emit.record(f, "effect.Flags");
+    emit.member(f, fl, "read", name("effect.NO_WORDS"));
+    emit.member(f, fl, "written", name("effect.NO_WORDS"));
+    emit.member(f, fl, "undefined", name("effect.NO_WORDS"));
+    emit.member(f, fl, "kept", name("effect.NO_WORDS"));
+    val c: *emit.Record = emit.record(f, "effect.Control");
+    if (sel r.control.some) {
+        val x: spirv_facts.Control = r.control.some;
+        emit.member(f, c, "transfer", name(x.transfer));
+        emit.member(f, c, "target", name(x.target));
+        emit.member(f, c, "conditional", boolean(x.conditional));
+        if (x.operand == field.NO_OPERAND) { emit.member(f, c, "operand", name("field.NO_OPERAND")); }
+        or                                 { emit.member(f, c, "operand", number(x.operand::i64)); }
+    }
+    or {
+        emit.member(f, c, "transfer", name("effect.NONE"));
+        emit.member(f, c, "target", name("effect.UNTARGETED"));
+        emit.member(f, c, "conditional", name("false"));
+        emit.member(f, c, "operand", name("field.NO_OPERAND"));
+    }
+    emit.member(f, c, "rules", name("effect.NO_RULES"));
+    val v: *emit.Record = emit.record(f, "effect.Values");
+    emit.member(f, v, "defines", number(r.defines::i64));
+    emit.member(f, v, "type", number(r.type::i64));
+    val e: *emit.Record = emit.record(f, "effect.Effect");
+    emit.member(f, e, "implicit", emit.Value.variant{emit.variant(f, "effect.Registers.ruled", rec_value(ru))});
+    emit.member(f, e, "flags", rec_value(fl));
+    emit.member(f, e, "memory", name("effect.NO_ACCESSES"));
+    emit.member(f, e, "control", rec_value(c));
+    emit.member(f, e, "stack", emit.Value.variant{emit.bare(f, "effect.Stack.none")});
+    emit.member(f, e, "latency", name("effect.UNTIMED"));
+    emit.member(f, e, "fixed", name("effect.NO_FIXEDS"));
+    emit.member(f, e, "writes", name("effect.NO_WRITES"));
+    emit.member(f, e, "signature", name("effect.NO_SIGNATURE"));
+    emit.member(f, e, "values", rec_value(v));
+    var one: [1]emit.Value = [1]emit.Value{rec_value(e)};
+    ret emit.element(f, "EFFECTS", emit.pooled(f, ?g.effects, ?one[0], 1));
+}
+
+fun row_value(g: *Gen, r: *Row, i: u32) res[emit.Value, diag.Refusal] {
+    val f:   *emit.File                = g.file;
+    var ops: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    var k:   usize                     = 0;
+    for (k < r.ops.len) {
+        val op: *Op                           = ?r.ops.data[k];
+        val s:  res[emit.Value, diag.Refusal] = shape(g, f, "gen_operand.", op.kind, op.width_of);
+        if (sel s.err) { ret s; }
+        vector.push[emit.Value](?ops, operand_value(f, s.ok, role_name(op.role), quantity_name(op.quantity)));
+        k = k + 1;
+    }
+    var operands: emit.Value = name("row.NO_OPERANDS");
+    if (ops.len > 0) { operands = span(f, "row.Operands", "OPERANDS", emit.pooled(f, ?g.ops, ops.data, ops.len::u32), ops.len::u32); }
+    val rr: *emit.Record = emit.record(f, "row.Row");
+    emit.member(f, rr, "key", emit.Value.text{r.key});
+    emit.member(f, rr, "mnemonic", emit.Value.text{r.mnemonic});
+    emit.member(f, rr, "operands", operands);
+    emit.member(f, rr, "encoding", fields_of(g, r));
+    emit.member(f, rr, "requires", requirement_value(g, f, "gen_operand.", ?r.alts));
+    emit.member(f, rr, "effect", effect_of(g, r));
+    emit.member(f, rr, "ct", emit.Value.address{"ct.DEPENDENT"});
+    emit.member(f, rr, "constraints", name("constraint.NO_CONSTRAINTS"));
+    emit.member(f, rr, "flags", number(0));
+    emit.member(f, rr, "index", number(i::i64));
+    ret res[emit.Value, diag.Refusal].ok{rec_value(rr)};
+}
+
+# the rows, their keys and handles
+fun rows(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "row");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    g.file    = f;
+    g.ops     = emit.pool(f, "operand.Operand");
+    g.fields  = emit.pool(f, "field.Field");
+    g.effects = emit.pool(f, "effect.Effect");
+    emit.uses(f, "std.types.bool.false");
+    emit.uses(f, "std.types.bool.true");
+    emit.uses(f, "masc.core.constraint");
+    emit.uses(f, "masc.core.ct");
+    emit.uses(f, "masc.core.effect");
+    emit.uses(f, "masc.core.field");
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.operand");
+    emit.uses(f, "masc.core.requirement");
+    emit.uses(f, "masc.core.row");
+    emit.uses(f, "masc.isa.spirv.gen_operand");
+    emit.uses(f, "spirv_kind: masc.isa.spirv.kind");
+    val table: *emit.Array       = emit.array(f, "row.Row");
+    val keys:  *emit.Array       = emit.keyed(f, "index.Entry");
+    var taken: map.Map[str, u32] = map.init[str, u32](g.alloc);
+    var i:     u32               = 0;
+    for (i < g.rows.len::u32) {
+        val r:   *Row                          = ?g.rows.data[i];
+        val got: res[emit.Value, diag.Refusal] = row_value(g, r, i);
+        if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+        emit.item(f, table, got.ok);
+        val entry: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, entry, "key", emit.Value.text{r.key});
+        emit.member(f, entry, "row", number(i::i64));
+        emit.entry(f, keys, r.key, rec_value(entry));
+        val id:    str       = emit.ident(f, r.key);
+        var probe: str       = id;
+        val prior: opt[*u32] = map.get[str, u32](?taken, ?probe);
+        if (sel prior.some) { ret err[diag.Refusal].err{diag.refusal(nil, 0, KEYS_MANGLE, join3(g, g.rows.data[@prior.some].key, " and ", r.key))}; }
+        map.insert[str, u32](?taken, id, i);
+        emit.declare(f, id, "*row.Row", emit.element(f, "ROWS", i));
+        i = i + 1;
+    }
+    emit.declare(f, "OPERANDS", nil, emit.Value.array{g.ops.array});
+    emit.declare(f, "FIELDS", nil, emit.Value.array{g.fields.array});
+    emit.declare(f, "EFFECTS", nil, emit.Value.array{g.effects.array});
+    emit.declare(f, "ROWS", nil, emit.Value.array{table});
+    emit.declare(f, "KEYS", nil, emit.Value.array{keys});
+    emit.declare(f, "COUNT", "u32", number(g.rows.len::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# the generator-side reading of each runtime key of masc's spirv key module, in its order: the opcode, the operation
+# of OpSpecConstantOp, the import code of an extended instruction's set and its number
+val KEYS: [4]dispatch.Key = [4]dispatch.Key{
+    dispatch.Key{name: "opcode", word: 0, lo: 0, len: 16},
+    dispatch.Key{name: "operation", word: 1, lo: 0, len: 32},
+    dispatch.Key{name: "set", word: 2, lo: 0, len: 32},
+    dispatch.Key{name: "instruction", word: 3, lo: 0, len: 32},
+};
+
+fun dispatched(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val n:     usize                           = g.rows.len;
+    val words: res[*u64, A.Error]              = A.allocate[u64](g.alloc, n * 8 + 1);
+    val cubes: res[*dispatch.Cube, A.Error]    = A.allocate[dispatch.Cube](g.alloc, n + 1);
+    val pats:  res[*dispatch.Pattern, A.Error] = A.allocate[dispatch.Pattern](g.alloc, n + 1);
+    if (sel words.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel cubes.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel pats.err)  { ret err[diag.Refusal].err{memory()}; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: *Row = ?g.rows.data[i];
+        val w: *u64 = ?words.ok[i * 8];
+        w[0] = r.opcode::u64;
+        w[1] = 0;
+        w[2] = 0;
+        w[3] = 0;
+        w[4] = 0xFFFF;
+        w[5] = 0;
+        w[6] = 0;
+        w[7] = 0;
+        if (r.form == SPEC) {
+            w[1] = r.fixed::u64;
+            w[5] = 0xFFFF_FFFF;
+        }
+        if (r.form == EXTINST) {
+            w[2] = r.set::u64;
+            w[3] = r.fixed::u64;
+            w[6] = 0xFFFF_FFFF;
+            w[7] = 0xFFFF_FFFF;
+        }
+        cubes.ok[i] = dispatch.Cube{value: w, mask: ?w[4]};
+        pats.ok[i]  = dispatch.Pattern{row: i::u32, name: r.key, cubes: ?cubes.ok[i], count: 1};
+        i           = i + 1;
+    }
+    var space: dispatch.Space                    = dispatch.Space{words: 4, keys: ?KEYS[0], key_count: 4};
+    val built: res[dispatch.Built, diag.Refusal] = dispatch.build(g.alloc, ?space, pats.ok, n::u32);
+    if (sel built.err) { ret err[diag.Refusal].err{built.err}; }
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "dispatch");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "spirv_key: masc.isa.spirv.key");
+    var b: dispatch.Built = built.ok;
+    dispatch.declare(f, "DISPATCH", "spirv_key.KEYS", 4, ?b);
+    ret err[diag.Refusal].ok{};
+}
+
+fun put(out: *vector.Vector[u8], s: str) {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        vector.push[u8](out, s[i]);
+        i = i + 1;
+    }
+}
+
+# the spirv-as template of row `r`: its opname and every operand but the result the statement binds, an optional one
+# in a group, and the operation or extended instruction after the operand it follows
+fun template(g: *Gen, r: *Row) str {
+    var out: vector.Vector[u8] = vector.init[u8](g.alloc);
+    put(?out, r.mnemonic);
+    var k: usize = 0;
+    for (k < r.ops.len) {
+        if (k + 1 != r.defines::usize) {
+            val hole: str = join3(g, "<", index_text(g, k), ">");
+            if (r.ops.data[k].quantity == operand.OPTIONAL) {
+                put(?out, "<[ ");
+                put(?out, hole);
+                put(?out, "]>");
+            }
+            or {
+                put(?out, " ");
+                put(?out, hole);
+            }
+        }
+        if (r.word != nil && k == r.after::usize) {
+            put(?out, " ");
+            put(?out, r.word);
+        }
+        k = k + 1;
+    }
+    vector.push[u8](?out, 0);
+    ret out.data;
+}
+
+# a mnemonic and the group of its rows
+rec Named {
+    name:  str;
+    group: u32;
+}
+
+fun by_name(a: *Named, b: *Named) i64 {
+    ret str_compare(a.name, b.name);
+}
+
+# the template of every row and the index of rows by mnemonic, each mnemonic's rows in row order
+fun syntaxes(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "syntax");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "std.types.string.str");
+    emit.uses(f, "masc.core.syntax");
+    val forms: *emit.Array = emit.array(f, "str");
+    # the mnemonics in byte order, each with its rows
+    var firsts: map.Map[str, u32]                 = map.init[str, u32](g.alloc);
+    var groups: vector.Vector[vector.Vector[u32]] = vector.init[vector.Vector[u32]](g.alloc);
+    var names:  vector.Vector[Named]              = vector.init[Named](g.alloc);
+    var i:      u32                               = 0;
+    for (i < g.rows.len::u32) {
+        val r: *Row = ?g.rows.data[i];
+        emit.item(f, forms, emit.Value.text{template(g, r)});
+        var key:   str       = r.mnemonic;
+        val known: opt[*u32] = map.get[str, u32](?firsts, ?key);
+        if (sel known.some) { vector.push[u32](?groups.data[@known.some], i); }
+        or {
+            map.insert[str, u32](?firsts, r.mnemonic, groups.len::u32);
+            var one: vector.Vector[u32] = vector.init[u32](g.alloc);
+            vector.push[u32](?one, i);
+            vector.push[vector.Vector[u32]](?groups, one);
+            vector.push[Named](?names, Named{name: r.mnemonic, group: groups.len::u32 - 1});
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Named](names.data, names.len, by_name);
+    val entries:    *emit.Array = emit.array(f, "syntax.Entry");
+    val candidates: *emit.Array = emit.array(f, "syntax.Candidate");
+    var at:         u32         = 0;
+    var k:          usize       = 0;
+    for (k < names.len) {
+        val rows_: *vector.Vector[u32] = ?groups.data[names.data[k].group];
+        val e:     *emit.Record        = emit.record(f, "syntax.Entry");
+        emit.member(f, e, "key", emit.Value.text{names.data[k].name});
+        emit.member(f, e, "first", number(at::i64));
+        emit.member(f, e, "len", number(rows_.len::i64));
+        emit.item(f, entries, rec_value(e));
+        var j: usize = 0;
+        for (j < rows_.len) {
+            val cd: *emit.Record = emit.record(f, "syntax.Candidate");
+            emit.member(f, cd, "row", number(rows_.data[j]::i64));
+            emit.member(f, cd, "alias", number(0));
+            emit.item(f, candidates, rec_value(cd));
+            j = j + 1;
+        }
+        at = at + rows_.len::u32;
+        k  = k + 1;
+    }
+    emit.declare(f, "FORM_TEXT", nil, emit.Value.array{forms});
+    emit.declare(f, "FORM_COUNT", "u32", number(g.rows.len::i64));
+    emit.declare(f, "ENTRIES", nil, emit.Value.array{entries});
+    emit.declare(f, "ENTRY_COUNT", "u32", number(names.len::i64));
+    emit.declare(f, "CANDIDATES", nil, emit.Value.array{candidates});
+    emit.declare(f, "CANDIDATE_COUNT", "u32", number(at::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# the extended sets by the name OpExtInstImport imports each by, each entry's row its import code
+fun imports_index(g: *Gen) {
+    val f:     *emit.File  = g.operands;
+    val names: *emit.Array = emit.keyed(f, "index.Entry");
+    var i:     usize       = 0;
+    for (i < g.facts.imports.len) {
+        val x: *spirv_facts.Import = ?g.facts.imports.data[i];
+        val r: *emit.Record        = emit.record(f, "index.Entry");
+        emit.member(f, r, "key", emit.Value.text{x.name});
+        emit.member(f, r, "row", number(x.code::i64));
+        emit.entry(f, names, x.name, rec_value(r));
+        i = i + 1;
+    }
+    emit.seal(f, names);
+    emit.declare(f, "IMPORTS", nil, emit.Value.array{names});
+    emit.declare(f, "IMPORT_COUNT", "u32", number(g.facts.imports.len::i64));
+}
+
+rec Atom {
+    value: u32;
+    id:    u32;
+}
+
+fun by_value(a: *Atom, b: *Atom) i64 {
+    if (a.value < b.value) { ret -1; }
+    if (a.value > b.value) { ret 1; }
+    ret 0;
+}
+
+# the catalog atom of every capability by its value, ascending, which OpCapability widens the selection by
+fun capability_atoms(g: *Gen) err[diag.Refusal] {
+    val f:    *emit.File               = g.operands;
+    val caps: opt[*spirv_grammar.Kind] = spirv_grammar.kind(g.grammar, "Capability");
+    if (sel caps.none) { ret err[diag.Refusal].err{diag.refusal(GRAMMAR, 0, NO_KIND, "Capability")}; }
+    var atoms: vector.Vector[Atom] = vector.init[Atom](g.alloc);
+    var i:     usize               = 0;
+    for (i < caps.some.enumerants.len) {
+        val e:  *spirv_grammar.Enumerant = ?caps.some.enumerants.data[i];
+        val at: res[u32, diag.Refusal]   = atom(g, e.name);
+        if (sel at.err) { ret err[diag.Refusal].err{at.err}; }
+        vector.push[Atom](?atoms, Atom{value: e.value, id: at.ok});
+        i = i + 1;
+    }
+    sort.sort_by[Atom](atoms.data, atoms.len, by_value);
+    val rows: *emit.Array = emit.array(f, "spirv_kind.Atom");
+    i = 0;
+    for (i < atoms.len) {
+        val r: *emit.Record = emit.record(f, "spirv_kind.Atom");
+        emit.member(f, r, "value", emit.Value.hex{atoms.data[i].value::u64});
+        emit.member(f, r, "id", name(join(g, "spirv_extension.id.", g.idents.data[atoms.data[i].id])));
+        emit.item(f, rows, rec_value(r));
+        i = i + 1;
+    }
+    emit.declare_array(f, "CAPABILITY_ATOMS", rows);
+    emit.declare(f, "CAPABILITY_ATOM_COUNT", "u32", number(atoms.len::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# every control transfer names an instruction that is a row of its own
+fun controls_rowed(g: *Gen) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < g.grammar.instructions.len) {
+        val ins: *spirv_grammar.Instruction = ?g.grammar.instructions.data[i];
+        var key: str                        = ins.name;
+        val ctl: opt[*spirv_facts.Control]  = map.get[str, spirv_facts.Control](?g.facts.controls, ?key);
+        if (sel ctl.some && (str_equals(ins.name, "OpSpecConstantOp") || str_equals(ins.name, "OpExtInst") || str_equals(ins.name, "OpExtInstWithForwardRefsKHR"))) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_CONTROL, ins.name)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    if (c.inputs.len != 1) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_DATA, nil)}; }
+    val file: opt[*source.File] = source.find(c.tree, GRAMMAR);
+    if (sel file.none) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_GRAMMAR, nil)}; }
+    var core: spirv_grammar.Grammar;
+    val read: err[diag.Refusal] = spirv_grammar.read(c.alloc, file.some, true, ?core);
+    if (sel read.err) { ret read; }
+    var x:     spirv_facts.Facts;
+    val known: err[diag.Refusal] = spirv_facts.read(c.alloc, c.inputs.data[0], c.tree, ?core, ?x);
+    if (sel known.err) { ret known; }
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "operand");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    var g: Gen;
+    g.alloc    = c.alloc;
+    g.grammar  = ?core;
+    g.facts    = ?x;
+    g.operands = opened.ok;
+    g.ids      = emit.pool(g.operands, "requirement.Id");
+    g.alts     = emit.pool(g.operands, "requirement.Alternative");
+    g.params   = emit.pool(g.operands, "operand.Operand");
+    g.groups   = emit.pool(g.operands, "operand.Operand");
+    g.counts   = map.init[str, u32](c.alloc);
+    emit.uses(g.operands, "std.types.bool.false");
+    emit.uses(g.operands, "std.types.bool.true");
+    emit.uses(g.operands, "masc.core.index");
+    emit.uses(g.operands, "masc.core.operand");
+    emit.uses(g.operands, "masc.core.requirement");
+    emit.uses(g.operands, "spirv_extension: masc.isa.spirv.extension");
+    emit.uses(g.operands, "spirv_kind: masc.isa.spirv.kind");
+    val cat: err[diag.Refusal] = build_catalog(?g);
+    if (sel cat.err) { ret cat; }
+    val ctl: err[diag.Refusal] = controls_rowed(?g);
+    if (sel ctl.err) { ret ctl; }
+    val en: err[diag.Refusal] = enumerations(?g);
+    if (sel en.err) { ret en; }
+    imports_index(?g);
+    val atoms: err[diag.Refusal] = capability_atoms(?g);
+    if (sel atoms.err) { ret atoms; }
+    val built: err[diag.Refusal] = build_rows(?g);
+    if (sel built.err) { ret built; }
+    val wrote: err[diag.Refusal] = rows(?g, c);
+    if (sel wrote.err) { ret wrote; }
+    emit.declare(g.operands, "REQUIRE_IDS", nil, emit.Value.array{g.ids.array});
+    emit.declare(g.operands, "REQUIRE_ALTERNATIVES", nil, emit.Value.array{g.alts.array});
+    emit.declare(g.operands, "PARAMS", nil, emit.Value.array{g.params.array});
+    emit.declare(g.operands, "GROUPS", nil, emit.Value.array{g.groups.array});
+    val spread: err[diag.Refusal] = dispatched(?g, c);
+    if (sel spread.err) { ret spread; }
+    val spelled: err[diag.Refusal] = syntaxes(?g, c);
+    if (sel spelled.err) { ret spelled; }
+    ret catalog.emit_built(c, ?g.cat);
+}
