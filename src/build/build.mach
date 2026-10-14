@@ -130,6 +130,8 @@ use riscv_set:       masc.isa.riscv.set;
 
 #[testing]
 use masc.isa.riscv.gen_register;
+#[testing]
+use riscv_mode: masc.isa.riscv.mode;
 
 pub val ARCH:           str = "the set does not serve this architecture";
 pub val SELECTION:      str = "the context is not of the set's extension catalog and state axes";
@@ -443,13 +445,16 @@ tag Body: u8 {
 
 # a fragment and where the current pass places it
 # ---
-# view: the context it was written under, which admits, encodes, relaxes and fills it
+# view:   the context it was written under, which admits, encodes, relaxes and fills it
+# syntax: the index of the set's syntax it was written in
+# modes:  the assembler modes it was written under, by their index among the builder's mode states
 rec Fragment {
     body:   Body;
     offset: u64;
     size:   u64;
     view:   *core_state.Context;
     syntax: u32;
+    modes:  u32;
 }
 
 # a section's state
@@ -561,6 +566,8 @@ rec Waiting {
 # view:     the context what is emitted next is written under
 # syntax:   the syntax what is emitted next is written in
 # modes:    the assembler modes
+# states:   the mode states recorded
+# state:    the index of the modes among them
 rec Snapshot {
     areas:    usize;
     labels:   usize;
@@ -576,6 +583,8 @@ rec Snapshot {
     view:     *core_state.Context;
     syntax:   u32;
     modes:    mode.State;
+    states:   usize;
+    state:    u32;
 }
 
 # something that writes more of the object once the layout of the rest is settled, from the final places of what facts
@@ -666,6 +675,8 @@ rec Entry {
 # frames:    the frames of the functions stated, the last open while `cfi_end` is awaited
 # rules:     the rules of every frame, each at the statement it precedes
 # modes:     the assembler modes the next statement is read under, each at its initial value until changed
+# states:    every value the modes have held, a new one recorded each time a mode changes, which fragments name by index
+# state:     the index of `modes` among `states`
 # passes:    how many passes the last layout took
 # finished:  whether the object was handed over
 pub rec Builder {
@@ -712,6 +723,8 @@ pub rec Builder {
     frames:    vector.Vector[Framed];
     rules:     vector.Vector[Ruled];
     modes:     mode.State;
+    states:    vector.Vector[mode.State];
+    state:     u32;
     passes:    u32;
     finished:  bool;
 }
@@ -926,6 +939,8 @@ pub fun make(a: *A.Allocator, formats: *mink.registry.Registry, s: *set.Set, obj
         frames:   vector.init[Framed](a),
         rules:    vector.init[Ruled](a),
         modes:    mode.initial(?s.assembly),
+        states:   vector.init[mode.State](a),
+        state:    0,
         finished: false,
     };
     # the bindings indexed by fixup kind, so a relocation's kind is one load
@@ -935,7 +950,8 @@ pub fun make(a: *A.Allocator, formats: *mink.registry.Registry, s: *set.Set, obj
         if (s.bindings.at[i].fixup::usize > top) { top = s.bindings.at[i].fixup::usize; }
         i = i + 1;
     }
-    var ok: bool = s.bindings.len == 0 || held(vector.reserve[*mink.reloc.Kind](?b.kinds, top + 1));
+    var ok: bool = held(vector.push[mode.State](?b.states, b.modes));
+    ok = ok && (s.bindings.len == 0 || held(vector.reserve[*mink.reloc.Kind](?b.kinds, top + 1)));
     if (ok && s.bindings.len > 0) {
         var k: usize = 0;
         for (k <= top) {
@@ -985,8 +1001,19 @@ pub fun modes_of(b: *Builder) *mode.State {
 # the mode of `to` at its value for the statements after, as the caller's flags start the source and a directive changes
 # it between statements
 pub fun set_mode(b: *Builder, to: mode.Setting) err[Refusal] {
-    if (!mode.change(?b.modes, to)) { ret refused(OTHER_MODE); }
+    var next: mode.State = b.modes;
+    if (!mode.change(?next, to))                         { ret refused(OTHER_MODE); }
+    if (mode.same(?next, ?b.modes))                      { ret err[Refusal].ok{}; }
+    if (!held(vector.push[mode.State](?b.states, next))) { ret err[Refusal].err{memory()}; }
+    b.modes = next;
+    b.state = (b.states.len - 1)::u32;
     ret err[Refusal].ok{};
+}
+
+# the assembler modes fragment `f` was written under, which every computation over it reads, as a marker that holds only
+# under some modes
+fun modes_at(b: *Builder, f: *Fragment) *mode.State {
+    ret ?b.states.data[f.modes::usize];
 }
 
 # the slot of a datum's basis and width among the builder's data kinds
@@ -1035,6 +1062,7 @@ pub fun release(b: *Builder) {
     vector.dnit[Ct](?b.cts);
     vector.dnit[Framed](?b.frames);
     vector.dnit[Ruled](?b.rules);
+    vector.dnit[mode.State](?b.states);
 }
 
 # the id of `s`'s bytes among the builder's names, a new name interned, and every name given its label and section slots
@@ -1548,8 +1576,8 @@ fun spanned(b: *Builder, v: *core_state.Context, ins: *inst.Inst, left: u32) res
         for (i < b.fixups.len && got.split == operand.NO_SYMBOL) {
             val sp: opt[*core_fixup.Span] = core_fixup.span_of(b.set.spans, b.fixups.data[i].kind);
             if (sel sp.some) {
-                if (sp.some.count > left) { got.split = b.fixups.data[i].symbol; }
-                got.marker = sp.some.marker;
+                if (sp.some.count > left)               { got.split = b.fixups.data[i].symbol; }
+                if (mode.holds(?b.modes, sp.some.when)) { got.marker = sp.some.marker; }
             }
             i = i + 1;
         }
@@ -1684,7 +1712,7 @@ fun put(b: *Builder, steps: *relax.Emitted, count: u32) err[Refusal] {
         };
         if (i == 0) { code.run = count; }
         keep_values(b, ?s.values[0], n);
-        vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: shaped.lens[i]::u64, view: b.view, syntax: b.syntax});
+        vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: shaped.lens[i]::u64, view: b.view, syntax: b.syntax, modes: b.state});
         i = i + 1;
     }
     ret err[Refusal].ok{};
@@ -1756,7 +1784,7 @@ pub fun format(b: *Builder, f: *core_source.Format, values: *operand.Value) err[
         run:      1,
     };
     keep_values(b, values, n);
-    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: done.ok.len::u64, view: b.view, syntax: b.syntax});
+    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: done.ok.len::u64, view: b.view, syntax: b.syntax, modes: b.state});
     ret err[Refusal].ok{};
 }
 
@@ -2260,7 +2288,7 @@ pub fun data(b: *Builder, p: *u8, n: usize) err[Refusal] {
         i                      = i + 1;
     }
     b.data.len = start + n;
-    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.data{Span{start: start, len: n}}, size: n::u64, view: b.view, syntax: b.syntax});
+    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.data{Span{start: start, len: n}}, size: n::u64, view: b.view, syntax: b.syntax, modes: b.state});
     ret err[Refusal].ok{};
 }
 
@@ -2269,8 +2297,8 @@ pub fun zero(b: *Builder, n: u64) err[Refusal] {
     val raised: opt[*Raised] = raising(b);
     if (sel raised.some) { ret pad_raised(raised.some, n, 0); }
     val area: res[*Area, Refusal] = here(b);
-    if (sel area.err)                                                                                                            { ret err[Refusal].err{area.err}; }
-    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.zero{n}, size: n, view: b.view, syntax: b.syntax}))) { ret err[Refusal].err{memory()}; }
+    if (sel area.err)                                                                                                                            { ret err[Refusal].err{area.err}; }
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.zero{n}, size: n, view: b.view, syntax: b.syntax, modes: b.state}))) { ret err[Refusal].err{memory()}; }
     ret err[Refusal].ok{};
 }
 
@@ -2284,10 +2312,10 @@ pub fun align(b: *Builder, al: Align) err[Refusal] {
         ret pad_raised(raised.some, gap(?al, raised.some.bytes.len::u64), fill);
     }
     val area: res[*Area, Refusal] = here(b);
-    if (sel area.err)                                                                                                              { ret err[Refusal].err{area.err}; }
-    if (al.boundary == 0 || (al.boundary & (al.boundary - 1)) != 0)                                                                { ret refused(BOUNDARY); }
-    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.align{al}, size: 0, view: b.view, syntax: b.syntax}))) { ret err[Refusal].err{memory()}; }
-    if (al.boundary > area.ok.align)                                                                                               { area.ok.align = al.boundary; }
+    if (sel area.err)                                                                                                                              { ret err[Refusal].err{area.err}; }
+    if (al.boundary == 0 || (al.boundary & (al.boundary - 1)) != 0)                                                                                { ret refused(BOUNDARY); }
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.align{al}, size: 0, view: b.view, syntax: b.syntax, modes: b.state}))) { ret err[Refusal].err{memory()}; }
+    if (al.boundary > area.ok.align)                                                                                                               { area.ok.align = al.boundary; }
     ret err[Refusal].ok{};
 }
 
@@ -2312,7 +2340,7 @@ pub fun datum(b: *Builder, r: Reference) err[Refusal] {
     if (r.basis > core_fixup.RELATIVE || r.width == 0 || r.width > core_fixup.MAX_WIDTH) { ret refused(NO_DATUM); }
     val fixup: operand.FixupKind = b.data_kind[datum_slot(r.basis, r.width)];
     if (fixup == operand.NO_FIXUP) { ret refused(NO_DATUM); }
-    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.datum{Datum{fixup: fixup, ref: r}}, size: r.width::u64, view: b.view, syntax: b.syntax}))) {
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.datum{Datum{fixup: fixup, ref: r}}, size: r.width::u64, view: b.view, syntax: b.syntax, modes: b.state}))) {
         ret err[Refusal].err{memory()};
     }
     ret err[Refusal].ok{};
@@ -2347,7 +2375,7 @@ pub fun difference(b: *Builder, d: Difference, width: u8) err[Refusal] {
     if (!area.ok.bits)                                             { ret refused(NO_BYTES); }
     if (!names_label(b, d.plus.id) || !names_label(b, d.minus.id)) { ret refused(NOT_A_LABEL); }
     if (width == 0 || width > core_fixup.MAX_WIDTH)                { ret refused(WIDTH); }
-    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.difference{Gap{of: d, width: width}}, size: width::u64, view: b.view, syntax: b.syntax}))) {
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.difference{Gap{of: d, width: width}}, size: width::u64, view: b.view, syntax: b.syntax, modes: b.state}))) {
         ret err[Refusal].err{memory()};
     }
     ret err[Refusal].ok{};
@@ -3393,6 +3421,8 @@ fun snapshot(b: *Builder) Snapshot {
         view:     b.view,
         syntax:   b.syntax,
         modes:    b.modes,
+        states:   b.states.len,
+        state:    b.state,
     };
 }
 
@@ -3432,6 +3462,8 @@ fun restore(b: *Builder, s: *Snapshot) {
     b.view       = s.view;
     b.syntax     = s.syntax;
     b.modes      = s.modes;
+    b.states.len = s.states;
+    b.state      = s.state;
 }
 
 # every writer run in order, each writing from the final places, refused at the first that fails
@@ -3657,11 +3689,13 @@ pub tag Stated: u8 {
 # stated: what it is
 # view:   the context it was written under, which admits, encodes, relaxes and fills it, its selection and state
 # syntax: the index of the set's syntax it was written in
+# modes:  the assembler modes it was written under, valid until the builder is next written or released
 # offset: where the last layout placed it
 pub rec Statement {
     stated: Stated;
     view:   *core_state.Context;
     syntax: u32;
+    modes:  *mode.State;
     offset: u64;
 }
 
@@ -3688,7 +3722,7 @@ pub fun statement(b: *Builder, s: Section, j: usize, values: *operand.Value) Sta
     or (sel f.body.align)      { stated = Stated.align{f.body.align}; }
     or (sel f.body.datum)      { stated = Stated.datum{f.body.datum.ref}; }
     or (sel f.body.difference) { stated = Stated.difference{Measure{of: f.body.difference.of, width: f.body.difference.width}}; }
-    ret Statement{stated: stated, view: f.view, syntax: f.syntax, offset: f.offset};
+    ret Statement{stated: stated, view: f.view, syntax: f.syntax, modes: modes_at(b, f), offset: f.offset};
 }
 
 # where a label is placed in the statement record
@@ -4663,6 +4697,42 @@ test build__switching_sections_keeps_each_sections_cursor {
     if (!t_same(t_bytes(?o, first.index), 4, want.data, 4))                             { ret 11; }
     vector.dnit[u8](?want);
     if (!t_done(?t, ?o)) { ret 12; }
+    ret 0;
+}
+
+# whether statement `j` of section `s` was written with the position mode at `v`
+#[testing]
+fun t_moded(t: *T, s: Section, j: usize, v: *mode.Value) bool {
+    var values: [row.MAX_OPERANDS]operand.Value;
+    val st:     Statement  = statement(?t.b, s, j, ?values[0]);
+    var want:   mode.State = mode.initial(?t.b.set.assembly);
+    if (!mode.change(?want, mode.Setting{mode: ?riscv_mode.POSITION, value: v})) { ret false; }
+    ret mode.same(st.modes, ?want);
+}
+
+# each statement records the modes it was written under, a new state only when a mode changes, and a writer's change
+# is taken back with the rest of what it wrote
+test build__a_statement_records_the_assembler_modes_it_was_written_under {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val text: Section      = t_text(?t, ".text");
+    var one:  u8           = 1;
+    val pic:  mode.Setting = mode.Setting{mode: ?riscv_mode.POSITION, value: ?riscv_mode.PIC};
+    if (!t_ok(data(?t.b, ?one, 1)) || !t_ok(set_mode(?t.b, pic)) || !t_ok(data(?t.b, ?one, 1))) { ret 2; }
+    # setting a mode to the value it holds records nothing new
+    if (!t_ok(set_mode(?t.b, pic)) || t.b.states.len != 2)                                         { ret 3; }
+    if (!t_ok(set_mode(?t.b, mode.Setting{mode: ?riscv_mode.POSITION, value: ?riscv_mode.NOPIC}))) { ret 4; }
+    if (!t_ok(data(?t.b, ?one, 1)))                                                                { ret 5; }
+    if (!t_moded(?t, text, 0, ?riscv_mode.NOPIC) || !t_moded(?t, text, 1, ?riscv_mode.PIC))        { ret 6; }
+    if (!t_moded(?t, text, 2, ?riscv_mode.NOPIC))                                                  { ret 7; }
+    var before: Snapshot = snapshot(?t.b);
+    if (!t_ok(set_mode(?t.b, pic))) { ret 8; }
+    restore(?t.b, ?before);
+    if (t.b.states.len != 3 || !mode.same(?t.b.modes, ?t.b.states.data[t.b.state::usize])) { ret 9; }
+    val done: res[mink.object.Object, Refusal] = finish(?t.b);
+    if (sel done.err) { ret 10; }
+    var o: mink.object.Object = done.ok;
+    if (!t_done(?t, ?o)) { ret 11; }
     ret 0;
 }
 
