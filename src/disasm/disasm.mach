@@ -73,6 +73,7 @@ use mink;
 use masc.asm.asm;
 use masc.asm.core;
 use masc.asm.model;
+use masc.build.build;
 use masc.codec.narrow;
 use masc.codec.walk;
 use cmp: masc.core.compress;
@@ -137,6 +138,7 @@ pub val NO_WIDTH:   str = "the set's source dialect has no data directive of thi
 pub val FILL:       str = "realigned padding that is not the set's code fill";
 pub val ZEROS:      str = "relocation in a section of zero fill";
 pub val PAST:       str = "label or relocation past its section's end";
+pub val FOLDED:     str = "relocation to a place of its own section that the assembler resolves, which the text cannot keep";
 pub val MAPPED:     str = "relocation against a mapping symbol, which marks a place and is no label the text can name";
 
 # how an instruction is spelled, as objdump's `-M no-aliases` chooses
@@ -718,6 +720,86 @@ fun note(d: *Disasm, h: u32) bool {
     ret true;
 }
 
+# the place relocation `r` names in section `section`, none when it names a place of another section or, unless
+# `preempted`, a symbol other objects may preempt
+fun own_place(d: *Disasm, r: *mink.object.Reloc, section: u32, preempted: bool) opt[u64] {
+    if (!sel r.target.symbol) { ret opt[u64].none{}; }
+    val sym: *mink.object.Symbol = symbol_of(d, r.target.symbol.index);
+    if (!sel sym.def.placed)                                                { ret opt[u64].none{}; }
+    if (!preempted && mink.symbol.binds(sym.binding, mink.symbol.EXTERNAL)) { ret opt[u64].none{}; }
+    val p: mink.object.Place = sym.def.placed;
+    if (p.section.index != section) { ret opt[u64].none{}; }
+    val to: i64 = p.offset:~i64 + r.addend;
+    if (to < 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{to:~u64};
+}
+
+# whether a marker the linker resizes an instruction by, a relocation naming nothing other than the set's realign
+# marker, lies at an offset from `lo` up to `hi` of section `section`
+fun resized(d: *Disasm, section: u32, lo: u64, hi: u64) bool {
+    var want: Site  = Site{section: section, offset: lo, reloc: 0};
+    var a:    usize = 0;
+    var b:    usize = d.sites.len;
+    for (a < b) {
+        val mid: usize = a + (b - a) / 2;
+        if (by_site(?d.sites.data[mid], ?want) < 0) { a = mid + 1; }
+        or                                          { b = mid; }
+    }
+    for (a < d.sites.len && d.sites.data[a].section == section && d.sites.data[a].offset < hi) {
+        val r: *mink.object.Reloc = reloc_of(d, ?d.sites.data[a]);
+        if (sel r.target.none && !binds(d, r.kind, d.s.realign)) { ret true; }
+        a = a + 1;
+    }
+    ret false;
+}
+
+# refused when the reassembly would resolve relocation `r` at `site`, which the object keeps: the builder folds its kind
+# held as value `v` of operand `desc`, nil for a datum, it names a place of its own section other objects cannot preempt,
+# and no instruction the linker may resize lies between that place and the statement at `at`, as the builder measures
+# it. a text that kept it would need the relocation stated by itself, which the dialect has no directive for
+fun unfolded(d: *Disasm, site: *Site, r: *mink.object.Reloc, desc: *operand.Operand, v: *operand.Value, at: u64) err[Refusal] {
+    if (!build.folds(desc, v, r.kind)) { ret err[Refusal].ok{}; }
+    val to: opt[u64] = own_place(d, r, site.section, false);
+    if (sel to.none) { ret err[Refusal].ok{}; }
+    var lo: u64 = at;
+    var hi: u64 = at + 1;
+    if (to.some < lo)                     { lo = to.some; }
+    if (to.some > hi)                     { hi = to.some; }
+    if (resized(d, site.section, lo, hi)) { ret err[Refusal].ok{}; }
+    ret refusal(FOLDED, site.section, site.offset);
+}
+
+# the section relocation `r` names a place of, none when it names no placed symbol
+fun section_named(d: *Disasm, r: *mink.object.Reloc) opt[u32] {
+    if (!sel r.target.symbol) { ret opt[u32].none{}; }
+    val sym: *mink.object.Symbol = symbol_of(d, r.target.symbol.index);
+    if (!sel sym.def.placed) { ret opt[u32].none{}; }
+    ret opt[u32].some{sym.def.placed.section.index};
+}
+
+# refused when the reassembly would resolve the difference relocations `add` and `sub` at `site`, which the object
+# keeps: both name places of one section, and no instruction the linker may resize lies between them, as the builder
+# folds `a - b`, but for a symbol other objects may preempt less the datum's own place
+fun pair_unfolded(d: *Disasm, site: *Site, add: *mink.object.Reloc, sub: *mink.object.Reloc) err[Refusal] {
+    val home: opt[u32] = section_named(d, add);
+    if (sel home.none) { ret err[Refusal].ok{}; }
+    val p: opt[u64] = own_place(d, add, home.some, true);
+    val q: opt[u64] = own_place(d, sub, home.some, true);
+    if (sel p.none) { ret err[Refusal].ok{}; }
+    if (sel q.none) { ret err[Refusal].ok{}; }
+    val here:  bool     = home.some == site.section && q.some == site.offset;
+    val fixed: opt[u64] = own_place(d, add, home.some, false);
+    if (here && sel fixed.none) { ret err[Refusal].ok{}; }
+    var lo: u64 = p.some;
+    var hi: u64 = q.some;
+    if (hi < lo) {
+        lo = q.some;
+        hi = p.some;
+    }
+    if (resized(d, home.some, lo, hi)) { ret err[Refusal].ok{}; }
+    ret refusal(FOLDED, site.section, site.offset);
+}
+
 # each relocation of the decoded step `st` among `first` to `end` given to the operand whose field it patches
 fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
     var i: usize = first;
@@ -739,7 +821,10 @@ fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
                 val f: operand.FixupKind = fixup_for(d, r.kind, operand.default_fixup(?st.ins.row.operands.at[k]));
                 if (f == operand.NO_FIXUP || holds_symbol(?st.values[k])) { ret res[bool, Refusal].ok{false}; }
                 if (!note(d, aimed.ok.some.handle))                       { ret res[bool, Refusal].ok{false}; }
-                st.values[k] = symbolic(st.values[k], operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: f});
+                var named: operand.Value = symbolic(st.values[k], operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: f});
+                val kept_: err[Refusal]  = unfolded(d, site, r, ?st.ins.row.operands.at[k], ?named, st.at);
+                if (sel kept_.err) { ret res[bool, Refusal].err{kept_.err}; }
+                st.values[k] = named;
                 given        = true;
             }
             k = k + 1;
@@ -1142,13 +1227,19 @@ fun datum(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u64) 
             val m: res[opt[Aimed], Refusal] = aim(d, sub, other);
             if (sel m.err)     { ret res[u64, Refusal].err{m.err}; }
             if (sel m.ok.none) { ret res[u64, Refusal].err{Refusal{message: UNPAIRED, section: section, offset: at}}; }
+            val kept_: err[Refusal] = pair_unfolded(d, site, r, sub);
+            if (sel kept_.err) { ret res[u64, Refusal].err{kept_.err}; }
             width = p.width;
             minus = m.ok;
             taken = 2;
         }
         i = i + 1;
     }
-    if (width == 0)              { ret res[u64, Refusal].err{Refusal{message: UNTAKEN, section: section, offset: at}}; }
+    if (width == 0) { ret res[u64, Refusal].err{Refusal{message: UNTAKEN, section: section, offset: at}}; }
+    if (sel minus.none) {
+        val kept_: err[Refusal] = unfolded(d, site, r, nil, nil, at);
+        if (sel kept_.err) { ret res[u64, Refusal].err{kept_.err}; }
+    }
     if (at + width::u64 > limit) { ret res[u64, Refusal].err{Refusal{message: UNTAKEN, section: section, offset: at}}; }
     var b: u64 = 0;
     for (b < width::u64) {
@@ -2440,6 +2531,41 @@ test disassemble__a_relocation_against_an_unnamed_undefined_symbol_is_refused {
     if (!sel done.err) { ret 4; }
     mink.object.release(?o);
     if (!t_done(?t)) { ret 5; }
+    ret 0;
+}
+
+# an object holding a branch relocation to a local place of its own section, as the gnu assembler keeps one under
+# -mrelax, which masc's reassembly would resolve, is refused naming the relocation, and a reference across a call the
+# linker may resize is kept (#182)
+test disassemble__a_relocation_the_reassembly_would_resolve_is_refused_naming_it {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val a:       *A.Allocator                           = testing.allocator_of(?t.t);
+    val text:    str                                    = "\tbeqz a0, x\n\tnop\n";
+    val options: model.Options                          = model.Options{arch: ?mink.arch_riscv.RISCV64, formats: ?t.formats, syntax: 0, abi: trait.t_abi(?mink.arch_riscv.RISCV64, "lp64d"), dialect: ?dialect.ELF, layers: model.NO_LAYERS};
+    var got:     res[mink.object.Object, model.Refusal] = asm.assemble(a, ?riscv_set.SET, ?t.ctx, options, text, str_len(text), diagnostic.START);
+    if (sel got.err) { ret 2; }
+    var o: mink.object.Object = got.ok;
+    if (o.relocs.count != 1) { ret 3; }
+    val name: res[mink.table.Id[mink.intern.Name], mink.fail.Fail] = mink.object.name_str(?o, "y");
+    if (sel name.err) { ret 4; }
+    val y: res[mink.table.Id[mink.object.Symbol], mink.fail.Fail] = mink.object.add_symbol(?o, mink.object.Symbol{
+        name:       name.ok,
+        binding:    ?mink.symbol.LOCAL,
+        visibility: ?mink.symbol.DEFAULT,
+        kind:       ?mink.symbol.NOTYPE,
+        def:        mink.object.Definition.placed{mink.object.Place{section: mink.table.Id[mink.object.Section]{index: 0}, offset: 8}},
+    });
+    if (sel y.err) { ret 5; }
+    o.relocs.items[0].target = mink.object.Target.symbol{y.ok};
+    val done: err[Refusal] = disassemble(a, ?riscv_set.SET, ?t.ctx, Options{syntax: 0, spelling: ALIASES, dialect: ?dialect.ELF, naming: t.naming}, ?o, ?t.out);
+    if (!sel done.err) { ret 6; }
+    # the branch to the undefined symbol grew past a jal, whose relocation it is
+    if (done.err.message != FOLDED || done.err.section != 0 || done.err.offset != o.relocs.items[0].offset) { ret 7; }
+    mink.object.release(?o);
+    # a branch across a call the linker may resize keeps its relocation, as masc's builder keeps it
+    if (!t_disassemble(?t, "\tbeqz a0, 1f\n\tcall f\n1:\n\tnop\n")) { ret 8; }
+    if (!t_done(?t))                                                { ret 9; }
     ret 0;
 }
 
