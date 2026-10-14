@@ -1,0 +1,1053 @@
+# the mapping of the instruction model onto aarch64 rows
+#
+# an instruction's assembly is read as its template: literal text, the tokens' texts, an optional `#`, and its operand
+# symbols, each one the operands topic states. a choice the topic makes `rows` of is spelled in place by each member,
+# one row per member, the member fixing the bits of the choice's fields it encodes and its own condition holding with
+# the instruction's, so a row's element widths are fixed, as `add z0.s, z1.s, z2.s` is the row add_z_zz_.s. every
+# other operand takes the bits of its fields its row leaves free, from its value's high bit, and every bit of the
+# encoding is the encoding's, a member's or one operand's.
+#
+# a row's requirement is its conditions as alternatives over the catalog's features, each field test of a condition
+# decided by the bits the row fixes. the streaming topic states under which value of streaming each alternative holds.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use json.lib.json;
+
+use masc.core.field;
+use masc.core.operand;
+
+use gen.diag;
+use gen.isa.aarch64;
+use gen.isa.aarch64.feature;
+use gen.isa.aarch64.instructions;
+use gen.isa.aarch64.operands;
+use gen.isa.aarch64.streaming;
+
+pub val UNSTATED:      str = "operand rule the operands topic does not state";
+pub val NO_ELEMENT:    str = "element specifier the operands topic does not state";
+pub val NO_CLASS:      str = "register class the register file does not hold";
+pub val NO_FIELD:      str = "operand is encoded in a field the encoding does not have";
+pub val UNHELD:        str = "encoding leaves bits no operand holds";
+pub val HELD_TWICE:    str = "bits held by two operands";
+pub val MEMBERS:       str = "choice members differ from the text the model gives it";
+pub val MEMBER_BITS:   str = "member bits differ in length from the choice's fields or fix a bit the encoding fixes";
+pub val OPEN_MEMBER:   str = "enumerant member leaves a bit open";
+pub val TEXT_RULE:     str = "assembly rule that is no operand is neither text nor an optional text";
+pub val WRITTEN_TWICE: str = "operand symbol written twice in a template";
+pub val CONDITION:     str = "condition the mapping does not read";
+pub val UNDECIDED:     str = "condition tests bits the row leaves to its operands";
+pub val NO_FEATURE:    str = "condition names a feature the catalog does not hold";
+pub val NEVER:         str = "row's conditions never hold";
+pub val NUMBERED:      str = "rule of a register spelled by its number is not text around one number";
+
+# the format of a register hole that spells the register by its number, as masc.core.syntax names it
+val NUMBER: str = "number";
+
+# what an operand is
+pub def Shape: u8;
+
+pub val REGISTER:  Shape = 0;
+pub val IMMEDIATE: Shape = 1;
+pub val ENUMERANT: Shape = 2;
+
+# one enumerant member: its text and its value
+pub rec Member {
+    name:  str;
+    value: u32;
+}
+
+# one operand of a row
+# ---
+# rule:      the rule it is, by its display
+# fact:      what the topic states of it
+# shape:     what it is
+# classes:   a register's classes, by their index in the register file
+# first:     a register's first number
+# count:     how many numbers it admits from first, 0 for every number of the class
+# element:   the width of the elements a register holds
+# role:      how the row uses it
+# immediate: an immediate's number
+# members:   an enumerant's members, in the topic's order
+# slices:    where its bits lie, its operand left for the row to number
+# format:    the format its hole hands the syntax, nil for none
+pub rec Operand {
+    rule:      *instructions.Rule;
+    fact:      *operands.Fact;
+    shape:     Shape;
+    classes:   vector.Vector[u16];
+    first:     u32;
+    count:     u32;
+    element:   operand.Element;
+    role:      operand.Role;
+    immediate: operand.Immediate;
+    members:   vector.Vector[Member];
+    slices:    vector.Vector[field.Slice];
+    format:    str;
+}
+
+# one way to meet a row's requirement, its atoms as the emitted constants name them
+pub rec Alternative {
+    all:  vector.Vector[str];
+    none: vector.Vector[str];
+}
+
+# a row
+# ---
+# key:         its key, the instruction's name and each member it is made of, as `add_z_zz_.s`
+# mnemonic:    its mnemonic
+# template:    its spelling
+# instruction: the instruction it is an encoding of
+# fixed:       its fixed bits
+# mask:        which bits are fixed
+# operands:    its operands in written order
+# requires:    its requirement's alternatives
+pub rec Row {
+    key:         str;
+    mnemonic:    str;
+    template:    str;
+    instruction: *instructions.Instruction;
+    fixed:       u64;
+    mask:        u64;
+    operands:    vector.Vector[Operand];
+    requires:    vector.Vector[Alternative];
+}
+
+# what the mapping reads
+# ---
+# model:     the instruction model
+# operands:  the operands topic
+# streaming: the streaming topic
+# features:  the feature model, whose rows the catalog holds
+# registers: the register families
+pub rec Sources {
+    model:     *instructions.Model;
+    operands:  *operands.Operands;
+    streaming: *streaming.Streaming;
+    features:  *feature.Model;
+    registers: *aarch64.Families;
+}
+
+# a piece of an instruction's text
+# ---
+# text:     literal text
+# operand:  an operand symbol, by its rule
+# optional: text that may be left out, as `#`
+pub tag Piece: u8 {
+    text:     str;
+    operand:  u32;
+    optional: str;
+}
+
+rec Mapper {
+    alloc:   *A.Allocator;
+    src:     *Sources;
+    ins:     *instructions.Instruction;
+    failed:  bool;
+    failure: diag.Refusal;
+}
+
+fun fail(m: *Mapper, message: str, subject: str) {
+    if (m.failed) { ret; }
+    m.failed = true;
+    var s: str = subject;
+    if (m.ins != nil) {
+        val both: res[str, StrError] = str_join(m.alloc, m.ins.name, ": ", subject);
+        if (sel both.ok) { s = both.ok; }
+    }
+    if (subject == nil && m.ins != nil) { s = m.ins.name; }
+    m.failure = diag.refusal(instructions.INSTRUCTIONS, 0, message, s);
+}
+
+fun pushed(m: *Mapper, got: res[usize, A.Error]) {
+    if (sel got.err) { fail(m, diag.MEMORY, nil); }
+}
+
+# `s` in lower case, owned
+fun lower(m: *Mapper, s: str) str {
+    val len: usize             = str_len(s);
+    val got: res[*u8, A.Error] = A.allocate[u8](m.alloc, len + 1);
+    if (sel got.err) {
+        fail(m, diag.MEMORY, nil);
+        ret "";
+    }
+    var i: usize = 0;
+    for (i < len) {
+        var c: u8 = s[i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        got.ok[i] = c;
+        i         = i + 1;
+    }
+    got.ok[len] = 0;
+    ret got.ok;
+}
+
+fun join(m: *Mapper, a: str, b: str) str {
+    val got: res[str, StrError] = str_join(m.alloc, a, b);
+    if (sel got.err) {
+        fail(m, diag.MEMORY, nil);
+        ret "";
+    }
+    ret got.ok;
+}
+
+# whether the instruction encodes an operand by the symbol `display`
+fun encoded(ins: *instructions.Instruction, display: str) *instructions.Encoded {
+    if (display == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < ins.encoded.len) {
+        if (str_equals(ins.encoded.data[i].display, display)) { ret ?ins.encoded.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the text of `symbols`, each rule spelled by its own text, a token by its default
+fun spelled(m: *Mapper, symbols: *vector.Vector[instructions.Symbol]) str {
+    var out: str   = "";
+    var i:   usize = 0;
+    for (i < symbols.len && !m.failed) {
+        val s: instructions.Symbol = symbols.data[i];
+        if (sel s.literal) { out = join(m, out, s.literal); }
+        if (sel s.rule) {
+            val r: *instructions.Rule = ?m.src.model.rules.data[s.rule];
+            if (r.kind == instructions.RULE)                    { out = join(m, out, spelled(m, ?r.symbols)); }
+            or (r.kind == instructions.TOKEN && r.token != nil) { out = join(m, out, r.token); }
+            or                                                  { fail(m, TEXT_RULE, r.id); }
+        }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# the text a token is written as: one space between words, a comma and a space between operands
+fun token_text(r: *instructions.Rule) str {
+    if (str_equals(r.id, "SPACE")) { ret " "; }
+    if (str_equals(r.id, "COMMA")) { ret ", "; }
+    ret r.token;
+}
+
+# `template` followed by the text of numbered register rule `r`, its literals in lower case and `hole` for its one
+# number, as `<ZAd>` is `ZA` and a number
+fun numbered(m: *Mapper, template: str, r: *instructions.Rule, hole: str) str {
+    var out:     str   = template;
+    var numbers: u32   = 0;
+    var i:       usize = 0;
+    for (i < r.symbols.len) {
+        val s: instructions.Symbol = r.symbols.data[i];
+        if (sel s.literal) { out = join(m, out, lower(m, s.literal)); }
+        if (sel s.rule) {
+            if (!str_equals(m.src.model.rules.data[s.rule].id, "UInteger")) { fail(m, NUMBERED, r.id); }
+            out     = join(m, out, hole);
+            numbers = numbers + 1;
+        }
+        i = i + 1;
+    }
+    if (numbers != 1) { fail(m, NUMBERED, r.id); }
+    ret out;
+}
+
+# `symbols` as pieces, a rule no operand is read for its text
+fun pieces(m: *Mapper, symbols: *vector.Vector[instructions.Symbol], out: *vector.Vector[Piece]) {
+    var i: usize = 0;
+    for (i < symbols.len && !m.failed) {
+        val s: instructions.Symbol = symbols.data[i];
+        if (sel s.literal) { pushed(m, vector.push[Piece](out, Piece.text{s.literal})); }
+        if (sel s.rule) {
+            val r: *instructions.Rule = ?m.src.model.rules.data[s.rule];
+            if (encoded(m.ins, r.display) != nil) { pushed(m, vector.push[Piece](out, Piece.operand{s.rule})); }
+            or (r.kind == instructions.TOKEN) {
+                val t: str = token_text(r);
+                if (t == nil) { fail(m, TEXT_RULE, r.id); }
+                or            { pushed(m, vector.push[Piece](out, Piece.text{t})); }
+            }
+            or (r.kind == instructions.RULE) { pieces(m, ?r.symbols, out); }
+            or {
+                # a choice no operand is read for is text that may be left out
+                if (r.choices.len != 2) { fail(m, TEXT_RULE, r.id); }
+                or {
+                    val a: *vector.Vector[instructions.Symbol] = ?r.choices.data[0];
+                    val b: *vector.Vector[instructions.Symbol] = ?r.choices.data[1];
+                    if (a.len > 0 && b.len == 0) { pushed(m, vector.push[Piece](out, Piece.optional{spelled(m, a)})); }
+                    or (a.len == 0 && b.len > 0) { pushed(m, vector.push[Piece](out, Piece.optional{spelled(m, b)})); }
+                    or                           { fail(m, TEXT_RULE, r.id); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the bit positions of the fields `fields` names, from the high bit of the first
+fun positions(m: *Mapper, fields: *vector.Vector[str], out: *vector.Vector[u8]) {
+    var i: usize = 0;
+    for (i < fields.len && !m.failed) {
+        var found: bool  = false;
+        var k:     usize = 0;
+        for (k < m.ins.bits.len) {
+            val b: *instructions.Bits = ?m.ins.bits.data[k];
+            if (b.name != nil && str_equals(b.name, fields.data[i])) {
+                found = true;
+                var p: u8 = b.width;
+                for (p > 0) {
+                    p = p - 1;
+                    pushed(m, vector.push[u8](out, b.start + p));
+                }
+            }
+            k = k + 1;
+        }
+        if (!found) { fail(m, NO_FIELD, fields.data[i]); }
+        i = i + 1;
+    }
+}
+
+# a choice member's text and the rule it is, for a choice of rules each one text
+rec Choice {
+    rule:    u32;
+    display: str;
+    fact:    *operands.Fact;
+    places:  vector.Vector[u8];
+}
+
+# the text of member `k` of choice rule `r`
+fun member_text(m: *Mapper, r: *instructions.Rule, k: usize) str {
+    ret spelled(m, ?r.choices.data[k]);
+}
+
+# the condition of member `k` of choice rule `r`: the condition of the rule the member is, nil for none
+fun member_condition(m: *Mapper, r: *instructions.Rule, k: usize) *json.Value {
+    val c: *vector.Vector[instructions.Symbol] = ?r.choices.data[k];
+    if (c.len != 1) { ret nil; }
+    val s: instructions.Symbol = c.data[0];
+    if (!sel s.rule) { ret nil; }
+    ret m.src.model.rules.data[s.rule].condition;
+}
+
+# the index of the topic's member of text `text` among the members of choice `r`
+fun choice_member(m: *Mapper, r: *instructions.Rule, f: *operands.Fact, k: usize) *operands.Member {
+    val text: str   = member_text(m, r, k);
+    var i:    usize = 0;
+    for (i < f.members.len) {
+        if (str_equals(f.members.data[i].text, text)) { ret ?f.members.data[i]; }
+        i = i + 1;
+    }
+    fail(m, MEMBERS, text);
+    ret nil;
+}
+
+# condition evaluation
+#
+# a condition is read as alternatives, each a conjunction of features held and features not held. a test of a
+# field's bits is decided by the bits the row fixes, and a condition that tests bits the row leaves open is refused
+
+rec Conjunction {
+    all:  vector.Vector[str];
+    none: vector.Vector[str];
+}
+
+rec Formula {
+    alternatives: vector.Vector[Conjunction];
+}
+
+fun formula(m: *Mapper) Formula {
+    ret Formula{alternatives: vector.init[Conjunction](m.alloc)};
+}
+
+fun conjunction(m: *Mapper) Conjunction {
+    ret Conjunction{all: vector.init[str](m.alloc), none: vector.init[str](m.alloc)};
+}
+
+fun truth(m: *Mapper, held: bool) Formula {
+    var f: Formula = formula(m);
+    if (held) { pushed(m, vector.push[Conjunction](?f.alternatives, conjunction(m))); }
+    ret f;
+}
+
+fun holds(names: *vector.Vector[str], name: str) bool {
+    var i: usize = 0;
+    for (i < names.len) {
+        if (str_equals(names.data[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun copy(m: *Mapper, c: *Conjunction) Conjunction {
+    var out: Conjunction = conjunction(m);
+    var i:   usize       = 0;
+    for (i < c.all.len) {
+        pushed(m, vector.push[str](?out.all, c.all.data[i]));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < c.none.len) {
+        pushed(m, vector.push[str](?out.none, c.none.data[i]));
+        i = i + 1;
+    }
+    ret out;
+}
+
+# `a` and `b` both, each pair of alternatives joined, a pair that holds and lacks one feature dropped
+fun both(m: *Mapper, a: *Formula, b: *Formula) Formula {
+    var out: Formula = formula(m);
+    var i:   usize   = 0;
+    for (i < a.alternatives.len) {
+        var k: usize = 0;
+        for (k < b.alternatives.len) {
+            var c:  Conjunction  = copy(m, ?a.alternatives.data[i]);
+            val y:  *Conjunction = ?b.alternatives.data[k];
+            var ok: bool         = true;
+            var j:  usize        = 0;
+            for (j < y.all.len) {
+                if (holds(?c.none, y.all.data[j])) { ok = false; }
+                if (!holds(?c.all, y.all.data[j])) { pushed(m, vector.push[str](?c.all, y.all.data[j])); }
+                j = j + 1;
+            }
+            j = 0;
+            for (j < y.none.len) {
+                if (holds(?c.all, y.none.data[j]))   { ok = false; }
+                if (!holds(?c.none, y.none.data[j])) { pushed(m, vector.push[str](?c.none, y.none.data[j])); }
+                j = j + 1;
+            }
+            if (ok) { pushed(m, vector.push[Conjunction](?out.alternatives, c)); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret out;
+}
+
+fun either(m: *Mapper, a: *Formula, b: *Formula) Formula {
+    var out: Formula = formula(m);
+    var i:   usize   = 0;
+    for (i < a.alternatives.len) {
+        pushed(m, vector.push[Conjunction](?out.alternatives, a.alternatives.data[i]));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.alternatives.len) {
+        pushed(m, vector.push[Conjunction](?out.alternatives, b.alternatives.data[i]));
+        i = i + 1;
+    }
+    ret out;
+}
+
+# not `a`: every alternative failing, so for each one a feature it holds lacked or one it lacks held
+fun negated(m: *Mapper, a: *Formula) Formula {
+    var out: Formula = truth(m, true);
+    var i:   usize   = 0;
+    for (i < a.alternatives.len) {
+        val c:   *Conjunction = ?a.alternatives.data[i];
+        var any: Formula      = formula(m);
+        var k:   usize        = 0;
+        for (k < c.all.len) {
+            var x: Conjunction = conjunction(m);
+            pushed(m, vector.push[str](?x.none, c.all.data[k]));
+            pushed(m, vector.push[Conjunction](?any.alternatives, x));
+            k = k + 1;
+        }
+        k = 0;
+        for (k < c.none.len) {
+            var x: Conjunction = conjunction(m);
+            pushed(m, vector.push[str](?x.all, c.none.data[k]));
+            pushed(m, vector.push[Conjunction](?any.alternatives, x));
+            k = k + 1;
+        }
+        out = both(m, ?out, ?any);
+        i   = i + 1;
+    }
+    ret out;
+}
+
+# the bits field `name` holds in the row, as a pattern of 0, 1 and x from its high bit
+fun field_bits(m: *Mapper, name: str, fixed: u64, mask: u64, out: *vector.Vector[u8]) bool {
+    var k: usize = 0;
+    for (k < m.ins.bits.len) {
+        val b: *instructions.Bits = ?m.ins.bits.data[k];
+        if (b.name != nil && str_equals(b.name, name)) {
+            var p: u8 = b.width;
+            for (p > 0) {
+                p = p - 1;
+                val at: u64 = (b.start + p)::u64;
+                var c:  u8  = 'x';
+                if (((mask >> at) & 1) != 0) { c = '0' + ((fixed >> at) & 1)::u8; }
+                pushed(m, vector.push[u8](out, c));
+            }
+            ret true;
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether the row's bits `bits` match the model's pattern `quoted`, `'01x'`: 1 when they do, 0 when they do not and
+# -1 when a bit the pattern tests is open
+fun matches(bits: *vector.Vector[u8], pattern: str) i32 {
+    val len: usize = str_len(pattern);
+    if (len != bits.len + 2) { ret -2; }
+    var open: bool  = false;
+    var i:    usize = 0;
+    for (i < bits.len) {
+        val want: u8 = pattern[i + 1];
+        val got:  u8 = bits.data[i];
+        if (want != 'x') {
+            if (got == 'x')  { open = true; }
+            or (got != want) { ret 0; }
+        }
+        i = i + 1;
+    }
+    if (open) { ret -1; }
+    ret 1;
+}
+
+# the decided truth of a field test `left op right` over the row's bits, -1 when undecided and -2 when malformed
+fun field_test(m: *Mapper, e: *json.Value, fixed: u64, mask: u64) i32 {
+    val left:  *json.Value = at(e, "left");
+    val right: *json.Value = at(e, "right");
+    if (!instructions.kind(left, "AST.Identifier")) { ret -2; }
+    val name: str               = string(m, left, "value");
+    var bits: vector.Vector[u8] = vector.init[u8](m.alloc);
+    if (!field_bits(m, name, fixed, mask, ?bits)) { ret -2; }
+    val op: str = string(m, e, "op");
+    if (instructions.kind(right, "Values.Value")) {
+        val got: i32 = matches(?bits, string(m, right, "value"));
+        if (got < 0)              { ret got; }
+        if (str_equals(op, "==")) { ret got; }
+        if (str_equals(op, "!=")) { ret 1 - got; }
+        ret -2;
+    }
+    if (instructions.kind(right, "AST.Set") && str_equals(op, "IN")) {
+        val values: *json.Value = at(right, "values");
+        if (values == nil || values.kind != json.ARRAY) { ret -2; }
+        var open: bool  = false;
+        var i:    usize = 0;
+        for (i < values.count) {
+            val got: i32 = matches(?bits, string(m, ?values.children[i], "value"));
+            if (got == 1)  { ret 1; }
+            if (got == -1) { open = true; }
+            if (got == -2) { ret -2; }
+            i = i + 1;
+        }
+        if (open) { ret -1; }
+        ret 0;
+    }
+    ret -2;
+}
+
+fun at(v: *json.Value, key: str) *json.Value {
+    if (v == nil || v.kind != json.OBJECT) { ret nil; }
+    val got: opt[*json.Value] = json.value_find(v, key);
+    if (sel got.none) { ret nil; }
+    ret got.some;
+}
+
+# the text of string member `key` of `v`, owned, empty when it is absent
+fun string(m: *Mapper, v: *json.Value, key: str) str {
+    val s: *json.Value = at(v, key);
+    if (s == nil || s.kind != json.STRING) { ret ""; }
+    val got: res[str, StrError] = str_copy_slice(m.alloc, s.str_val, 0, s.str_len);
+    if (sel got.err) {
+        fail(m, diag.MEMORY, nil);
+        ret "";
+    }
+    ret got.ok;
+}
+
+# condition `e` as alternatives over features, its field tests decided by the row's bits
+fun condition(m: *Mapper, e: *json.Value, fixed: u64, mask: u64) Formula {
+    if (e == nil) { ret truth(m, true); }
+    if (instructions.kind(e, "AST.Bool")) {
+        val v: *json.Value = at(e, "value");
+        ret truth(m, v != nil && v.kind == json.BOOL && json.value_bool(v));
+    }
+    if (instructions.kind(e, "AST.Function")) {
+        val args: *json.Value = at(e, "arguments");
+        if (!str_equals(string(m, e, "name"), "IsFeatureImplemented") || args == nil || args.kind != json.ARRAY || args.count != 1 || !instructions.kind(?args.children[0], "AST.Identifier")) {
+            fail(m, CONDITION, string(m, e, "name"));
+            ret truth(m, false);
+        }
+        var c: Conjunction = conjunction(m);
+        pushed(m, vector.push[str](?c.all, string(m, ?args.children[0], "value")));
+        var f: Formula = formula(m);
+        pushed(m, vector.push[Conjunction](?f.alternatives, c));
+        ret f;
+    }
+    if (instructions.kind(e, "AST.UnaryOp") && str_equals(string(m, e, "op"), "!")) {
+        var inner: Formula = condition(m, at(e, "expr"), fixed, mask);
+        ret negated(m, ?inner);
+    }
+    if (instructions.kind(e, "AST.BinaryOp")) {
+        val op: str = string(m, e, "op");
+        if (str_equals(op, "&&") || str_equals(op, "||")) {
+            var a: Formula = condition(m, at(e, "left"), fixed, mask);
+            var b: Formula = condition(m, at(e, "right"), fixed, mask);
+            if (str_equals(op, "&&")) { ret both(m, ?a, ?b); }
+            ret either(m, ?a, ?b);
+        }
+        val decided: i32 = field_test(m, e, fixed, mask);
+        if (decided == -1) {
+            fail(m, UNDECIDED, op);
+            ret truth(m, false);
+        }
+        if (decided >= 0) { ret truth(m, decided == 1); }
+    }
+    fail(m, CONDITION, string(m, e, "_type"));
+    ret truth(m, false);
+}
+
+# the emitted constant of feature `name`, refused when the catalog does not hold it
+fun atom(m: *Mapper, name: str) str {
+    val row: opt[u32] = feature.row(m.src.features, name);
+    if (sel row.none) {
+        fail(m, NO_FEATURE, name);
+        ret "";
+    }
+    if (str_equals(name, "FEAT_AdvSIMD")) { ret "gen_extension.SIMD"; }
+    if (!str_starts_with(name, "FEAT_")) {
+        fail(m, NO_FEATURE, name);
+        ret "";
+    }
+    var out: str               = "gen_extension.";
+    val len: usize             = str_len(name);
+    val got: res[*u8, A.Error] = A.allocate[u8](m.alloc, len);
+    if (sel got.err) {
+        fail(m, diag.MEMORY, nil);
+        ret "";
+    }
+    var i: usize = 5;
+    for (i < len) {
+        var c: u8 = name[i];
+        if (c >= 'a' && c <= 'z')                                { c = c - 32; }
+        or (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) { c = '_'; }
+        got.ok[i - 5] = c;
+        i             = i + 1;
+    }
+    got.ok[len - 5] = 0;
+    ret join(m, out, got.ok);
+}
+
+# the alternatives of row conditions `f` with the streaming value each holds under
+fun requirement(m: *Mapper, f: *Formula, out: *vector.Vector[Alternative]) {
+    val mode: streaming.Mode = streaming.mode(m.src.streaming, m.ins.group);
+    var i:    usize          = 0;
+    for (i < f.alternatives.len && !m.failed) {
+        val c: *Conjunction = ?f.alternatives.data[i];
+        var a: Alternative  = Alternative{all: vector.init[str](m.alloc), none: vector.init[str](m.alloc)};
+        var k: usize        = 0;
+        for (k < c.all.len) {
+            pushed(m, vector.push[str](?a.all, atom(m, c.all.data[k])));
+            k = k + 1;
+        }
+        k = 0;
+        for (k < c.none.len) {
+            pushed(m, vector.push[str](?a.none, atom(m, c.none.data[k])));
+            k = k + 1;
+        }
+        val state: str = streaming.state(m.src.streaming, mode, ?c.all);
+        if (state != nil) { pushed(m, vector.push[str](?a.all, state)); }
+        pushed(m, vector.push[Alternative](out, a));
+        i = i + 1;
+    }
+    if (!m.failed && out.len == 0) { fail(m, NEVER, nil); }
+}
+
+# the class of register file class name `name`
+fun class_index(m: *Mapper, name: str) u16 {
+    var i: usize = 0;
+    for (i < m.src.registers.classes.len) {
+        if (str_equals(m.src.registers.classes.data[i].name, name)) { ret i::u16; }
+        i = i + 1;
+    }
+    fail(m, NO_CLASS, name);
+    ret 0;
+}
+
+# operand `r`'s fact, refused when the topic states none
+fun fact(m: *Mapper, r: *instructions.Rule) *operands.Fact {
+    val got: opt[*operands.Fact] = operands.of(m.src.operands, r.id);
+    if (sel got.none) {
+        fail(m, UNSTATED, r.id);
+        ret nil;
+    }
+    ret got.some;
+}
+
+# the free bits of `places` under `mask`, from the high bit
+fun free(places: *vector.Vector[u8], mask: u64, out: *vector.Vector[u8], m: *Mapper) {
+    var i: usize = 0;
+    for (i < places.len) {
+        if (((mask >> places.data[i]::u64) & 1) == 0) { pushed(m, vector.push[u8](out, places.data[i])); }
+        i = i + 1;
+    }
+}
+
+# the slices of a value whose bits from `lo` up lie at `free`, its high bit first
+fun slices(m: *Mapper, free: *vector.Vector[u8], lo: u8, out: *vector.Vector[field.Slice]) {
+    val n: usize = free.len;
+    var i: usize = 0;
+    for (i < n) {
+        # a run of positions falling by one from i
+        var end: usize = i + 1;
+        for (end < n && free.data[end] + 1 == free.data[end - 1]) { end = end + 1; }
+        val low:   u8 = free.data[end - 1];
+        val vbit:  u8 = (n - end)::u8 + lo;
+        val count: u8 = (end - i)::u8;
+        pushed(m, vector.push[field.Slice](out, field.Slice{operand: 0, part: field.NUMBER, lo: vbit, len: count, at: low, invert: false}));
+        i = end;
+    }
+}
+
+# the element a register written as `.<spec>` holds
+fun element_of(m: *Mapper, spec: str) operand.Element {
+    val e: opt[*operands.Element] = operands.element(m.src.operands, spec);
+    if (sel e.none) {
+        fail(m, NO_ELEMENT, spec);
+        ret operand.Element.none{};
+    }
+    ret operand.Element.fixed{e.some.bits};
+}
+
+# the text written right after piece `k`, its rows members spelled, nil when an operand follows
+fun after(m: *Mapper, ps: *vector.Vector[Piece], k: usize, members: *vector.Vector[str], choices: *vector.Vector[Choice]) str {
+    if (k + 1 >= ps.len) { ret nil; }
+    val p: Piece = ps.data[k + 1];
+    if (sel p.text) { ret p.text; }
+    if (sel p.operand) {
+        var i: usize = 0;
+        for (i < choices.len) {
+            if (choices.data[i].rule == p.operand) { ret members.data[i]; }
+            i = i + 1;
+        }
+    }
+    ret nil;
+}
+
+# the specifier written after a register at piece `k`, as `s` of `z0.s`, nil when none is
+fun specifier(m: *Mapper, ps: *vector.Vector[Piece], k: usize, members: *vector.Vector[str], choices: *vector.Vector[Choice]) str {
+    val dot: str = after(m, ps, k, members, choices);
+    if (dot == nil || !str_equals(dot, ".")) { ret nil; }
+    ret after(m, ps, k + 1, members, choices);
+}
+
+# operand `r`, a piece of row `row` at `k`, built into `out`
+fun build(m: *Mapper, row: *Row, r: *instructions.Rule, places: *vector.Vector[u8], spec: str, out: *Operand) {
+    val f: *operands.Fact = fact(m, r);
+    if (f == nil) { ret; }
+    @out = Operand{
+        rule:      r,
+        fact:      f,
+        shape:     REGISTER,
+        classes:   vector.init[u16](m.alloc),
+        first:     0,
+        count:     0,
+        element:   operand.Element.none{},
+        role:      f.role,
+        immediate: operand.Immediate{bits: 0, sign: operand.UNSIGNED, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS},
+        members:   vector.init[Member](m.alloc),
+        slices:    vector.init[field.Slice](m.alloc),
+        format:    nil,
+    };
+    var bits: vector.Vector[u8] = vector.init[u8](m.alloc);
+    free(places, row.mask, ?bits, m);
+    if (f.use == operands.REGISTER) {
+        var i: usize = 0;
+        for (i < f.classes.len) {
+            pushed(m, vector.push[u16](?out.classes, class_index(m, f.classes.data[i])));
+            i = i + 1;
+        }
+        if (m.failed) { ret; }
+        out.first = f.first;
+        val c:     *aarch64.Class = ?m.src.registers.classes.data[out.classes.data[0]];
+        val reach: u64            = 1::u64 << bits.len::u64;
+        if (f.first > 0 || reach < c.count::u64) { out.count = reach::u32; }
+        if (spec != nil)                         { out.element = element_of(m, spec); }
+        if (c.tile)                              { out.format = NUMBER; }
+        slices(m, ?bits, 0, ?out.slices);
+        ret;
+    }
+    if (f.use == operands.IMMEDIATE) {
+        out.shape     = IMMEDIATE;
+        out.immediate = operand.Immediate{bits: bits.len::u8 + f.scale, sign: f.sign, scale: f.scale, bias: f.bias, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS};
+        slices(m, ?bits, f.scale, ?out.slices);
+        ret;
+    }
+    out.shape = ENUMERANT;
+    var i: usize = 0;
+    for (i < r.choices.len && !m.failed) {
+        val mem: *operands.Member = choice_member(m, r, f, i);
+        if (mem == nil) { ret; }
+        if (str_len(mem.bits) != places.len) {
+            fail(m, MEMBER_BITS, mem.text);
+            ret;
+        }
+        var value: u32   = 0;
+        var k:     usize = 0;
+        for (k < places.len) {
+            if (mem.bits[k] == 'x') {
+                fail(m, OPEN_MEMBER, mem.text);
+                ret;
+            }
+            value = (value << 1) | (mem.bits[k] - '0')::u32;
+            k     = k + 1;
+        }
+        pushed(m, vector.push[Member](?out.members, Member{name: lower(m, mem.text), value: value}));
+        i = i + 1;
+    }
+    if (bits.len != places.len) {
+        fail(m, MEMBER_BITS, r.id);
+        ret;
+    }
+    slices(m, ?bits, 0, ?out.slices);
+}
+
+# the row of the instruction made of members `chosen` of its rows choices
+fun row_of(m: *Mapper, ps: *vector.Vector[Piece], choices: *vector.Vector[Choice], chosen: *vector.Vector[usize], out: *vector.Vector[Row]) {
+    val ins:   *instructions.Instruction = m.ins;
+    var fixed: u64                       = 0;
+    var mask:  u64                       = 0;
+    var i:     usize                     = 0;
+    for (i < ins.bits.len) {
+        val b: *instructions.Bits = ?ins.bits.data[i];
+        var k: u8                 = 0;
+        for (k < b.width) {
+            val c:  u8  = b.pattern[(b.width - 1 - k)::usize];
+            val at: u64 = (b.start + k)::u64;
+            if (c != 'x') {
+                mask = mask | (1::u64 << at);
+                if (c == '1') { fixed = fixed | (1::u64 << at); }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var key:     str                        = ins.name;
+    var members: vector.Vector[str]         = vector.init[str](m.alloc);
+    var conds:   vector.Vector[*json.Value] = vector.init[*json.Value](m.alloc);
+    i = 0;
+    for (i < choices.len && !m.failed) {
+        val ch:  *Choice            = ?choices.data[i];
+        val r:   *instructions.Rule = ?m.src.model.rules.data[ch.rule];
+        val mem: *operands.Member   = choice_member(m, r, ch.fact, chosen.data[i]);
+        if (mem == nil) { ret; }
+        if (str_len(mem.bits) != ch.places.len) {
+            fail(m, MEMBER_BITS, mem.text);
+            ret;
+        }
+        var k: usize = 0;
+        for (k < ch.places.len) {
+            val at: u64 = ch.places.data[k]::u64;
+            if (mem.bits[k] != 'x') {
+                if (((mask >> at) & 1) != 0) {
+                    fail(m, MEMBER_BITS, mem.text);
+                    ret;
+                }
+                mask = mask | (1::u64 << at);
+                if (mem.bits[k] == '1') { fixed = fixed | (1::u64 << at); }
+            }
+            k = k + 1;
+        }
+        val text: str = lower(m, mem.text);
+        pushed(m, vector.push[str](?members, text));
+        key = join(m, join(m, key, "."), text);
+        val c: *json.Value = member_condition(m, r, chosen.data[i]);
+        if (c != nil) { pushed(m, vector.push[*json.Value](?conds, c)); }
+        i = i + 1;
+    }
+    var row: Row = Row{key: key, mnemonic: nil, template: "", instruction: ins, fixed: fixed, mask: mask, operands: vector.init[Operand](m.alloc), requires: vector.init[Alternative](m.alloc)};
+    # the template and the operands, in written order
+    var held:    u64                = mask;
+    var written: vector.Vector[u32] = vector.init[u32](m.alloc);
+    var open:    bool               = false;
+    i = 0;
+    for (i < ps.len && !m.failed) {
+        val p: Piece = ps.data[i];
+        if (sel p.text) { row.template = join(m, row.template, lower(m, p.text)); }
+        if (sel p.optional) {
+            row.template = join(m, join(m, join(m, row.template, "<["), lower(m, p.optional)), "]>");
+        }
+        if (sel p.operand) {
+            var member: str   = nil;
+            var k:      usize = 0;
+            for (k < choices.len) {
+                if (choices.data[k].rule == p.operand) { member = members.data[k]; }
+                k = k + 1;
+            }
+            if (member != nil) { row.template = join(m, row.template, member); }
+            or {
+                k = 0;
+                for (k < written.len) {
+                    if (written.data[k] == p.operand) { fail(m, WRITTEN_TWICE, m.src.model.rules.data[p.operand].id); }
+                    k = k + 1;
+                }
+                pushed(m, vector.push[u32](?written, p.operand));
+                val r:      *instructions.Rule    = ?m.src.model.rules.data[p.operand];
+                val e:      *instructions.Encoded = encoded(ins, r.display);
+                var places: vector.Vector[u8]     = vector.init[u8](m.alloc);
+                positions(m, ?e.fields, ?places);
+                var op: Operand;
+                build(m, ?row, r, ?places, specifier(m, ps, i, ?members, choices), ?op);
+                if (m.failed) { ret; }
+                val n: u8 = row.operands.len::u8;
+                k = 0;
+                for (k < op.slices.len) {
+                    val s:    *field.Slice = ?op.slices.data[k];
+                    val bits: u64          = field.ones(s.len) << s.at::u64;
+                    if ((held & bits) != 0) { fail(m, HELD_TWICE, r.id); }
+                    held      = held | bits;
+                    s.operand = n;
+                    k         = k + 1;
+                }
+                var hole: str = "<";
+                hole = join(m, hole, digits(m, n::u32));
+                if (op.format != nil) { hole = join(m, join(m, hole, ":"), op.format); }
+                hole = join(m, hole, ">");
+                if (op.format != nil && str_equals(op.format, NUMBER)) { row.template = numbered(m, row.template, r, hole); }
+                or                                                     { row.template = join(m, row.template, hole); }
+                pushed(m, vector.push[Operand](?row.operands, op));
+            }
+        }
+        i = i + 1;
+    }
+    if (m.failed)            { ret; }
+    if (held != 0xFFFF_FFFF) { fail(m, UNHELD, nil); }
+    # the mnemonic is the template's text before its first space
+    var end: usize = 0;
+    for (row.template[end] != 0 && row.template[end] != ' ') { end = end + 1; }
+    val mn: res[str, StrError] = str_copy_slice(m.alloc, row.template, 0, end);
+    if (sel mn.ok) { row.mnemonic = mn.ok; }
+    or             { fail(m, diag.MEMORY, nil); }
+    # the requirement: every condition of the instruction and of the members it is made of
+    var f: Formula = truth(m, true);
+    i = 0;
+    for (i < ins.conditions.len && !m.failed) {
+        var c: Formula = condition(m, ins.conditions.data[i], fixed, mask);
+        f = both(m, ?f, ?c);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < conds.len && !m.failed) {
+        var c: Formula = condition(m, conds.data[i], fixed, mask);
+        f = both(m, ?f, ?c);
+        i = i + 1;
+    }
+    requirement(m, ?f, ?row.requires);
+    if (!m.failed) { pushed(m, vector.push[Row](out, row)); }
+}
+
+fun digits(m: *Mapper, n: u32) str {
+    var buf: [12]u8;
+    var len: usize = 0;
+    var v:   u32   = n;
+    if (v == 0) {
+        buf[0] = '0';
+        len    = 1;
+    }
+    for (v > 0) {
+        buf[len] = '0' + (v % 10)::u8;
+        len      = len + 1;
+        v        = v / 10;
+    }
+    val got: res[*u8, A.Error] = A.allocate[u8](m.alloc, len + 1);
+    if (sel got.err) {
+        fail(m, diag.MEMORY, nil);
+        ret "";
+    }
+    var i: usize = 0;
+    for (i < len) {
+        got.ok[i] = buf[len - 1 - i];
+        i         = i + 1;
+    }
+    got.ok[len] = 0;
+    ret got.ok;
+}
+
+# the rows of instruction `ins`, one per combination of its rows choices' members
+fun rows_of(m: *Mapper, ins: *instructions.Instruction, out: *vector.Vector[Row]) {
+    m.ins = ins;
+    var ps: vector.Vector[Piece] = vector.init[Piece](m.alloc);
+    pieces(m, ?ins.symbols, ?ps);
+    var choices: vector.Vector[Choice] = vector.init[Choice](m.alloc);
+    var i:       usize                 = 0;
+    for (i < ps.len && !m.failed) {
+        val p: Piece = ps.data[i];
+        if (sel p.operand) {
+            val r: *instructions.Rule = ?m.src.model.rules.data[p.operand];
+            val f: *operands.Fact     = fact(m, r);
+            if (f != nil && f.use == operands.CHOICE && f.rows) {
+                var seen: bool  = false;
+                var k:    usize = 0;
+                for (k < choices.len) {
+                    if (choices.data[k].rule == p.operand) { seen = true; }
+                    k = k + 1;
+                }
+                if (!seen) {
+                    var c: Choice = Choice{rule: p.operand, display: r.display, fact: f, places: vector.init[u8](m.alloc)};
+                    positions(m, ?encoded(ins, r.display).fields, ?c.places);
+                    if (r.kind != instructions.CHOICE || r.choices.len != f.members.len) { fail(m, MEMBERS, r.id); }
+                    pushed(m, vector.push[Choice](?choices, c));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    var chosen: vector.Vector[usize] = vector.init[usize](m.alloc);
+    i = 0;
+    for (i < choices.len) {
+        pushed(m, vector.push[usize](?chosen, 0));
+        i = i + 1;
+    }
+    for (!m.failed) {
+        row_of(m, ?ps, ?choices, ?chosen, out);
+        # the next combination, the last choice counting fastest
+        var k:    usize = choices.len;
+        var done: bool  = true;
+        for (k > 0 && done) {
+            k = k - 1;
+            val r: *instructions.Rule = ?m.src.model.rules.data[choices.data[k].rule];
+            chosen.data[k] = chosen.data[k] + 1;
+            if (chosen.data[k] < r.choices.len) { done = false; }
+            or                                  { chosen.data[k] = 0; }
+        }
+        if (done) { brk; }
+    }
+}
+
+# the rows of the instructions `names`, in their order
+pub fun map_rows(a: *A.Allocator, src: *Sources, names: *str, count: usize, out: *vector.Vector[Row]) err[diag.Refusal] {
+    var m: Mapper = Mapper{alloc: a, src: src, ins: nil, failed: false, failure: diag.refusal(nil, 0, nil, nil)};
+    var i: usize  = 0;
+    for (i < count && !m.failed) {
+        var found: bool  = false;
+        var k:     usize = 0;
+        for (k < src.model.instructions.len && !found) {
+            if (str_equals(src.model.instructions.data[k].name, names[i])) {
+                found = true;
+                rows_of(?m, ?src.model.instructions.data[k], out);
+            }
+            k = k + 1;
+        }
+        if (!found) { fail(?m, UNSTATED, names[i]); }
+        i = i + 1;
+    }
+    if (m.failed) { ret err[diag.Refusal].err{m.failure}; }
+    ret err[diag.Refusal].ok{};
+}

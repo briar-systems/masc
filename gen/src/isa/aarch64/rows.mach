@@ -1,0 +1,590 @@
+# the aarch64 row generator
+#
+# it reads Arm's instruction model (Instructions.json of the vendored AARCHMRS) with the feature model beside it, maps
+# each instruction onto rows by the operands topic and the streaming and timing topics of gen/data/aarch64, and emits
+# the catalog beside masc's aarch64 modules: the rows with their operands, encodings, requirements, effects and
+# constant-time classes, and the codec over them (gen_row), the decode dispatch over the keys topic (gen_dispatch and
+# gen_key) and each row's spelling indexed by mnemonic (gen_syntax). shared lists, such as an operand list many rows
+# have, are emitted once and pointed into.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use masc.core.field;
+use masc.core.operand;
+
+use gen.diag;
+use gen.dispatch;
+use gen.emit;
+use gen.isa.aarch64;
+use gen.isa.aarch64.feature;
+use gen.isa.aarch64.instructions;
+use gen.isa.aarch64.mapping;
+use gen.isa.aarch64.operands;
+use gen.isa.aarch64.streaming;
+use gen.isa.aarch64.timing;
+use gen.keys;
+use gen.overlay;
+use gen.set;
+use gen.source;
+use gen.tar;
+
+pub val NO_ARCHIVE:  str = "source holds no single .tar.gz release";
+pub val NO_INPUTS:   str = "generator is not given the aarch64 overlay and register families";
+pub val KEYS_MANGLE: str = "two row keys mangle to one identifier";
+
+# the instructions of the GA2 slice, the first rows: sve's unpredicated add, sme's move of a z register into a za
+# tile slice, and the move of an immediate into PSTATE, as `msr dit, #1`
+val SLICE: [3]str = [3]str{"add_z_zz_", "mova_za_p_rz_w", "MSR_SI_pstate"};
+
+# the tables as they are written
+rec Tables {
+    alloc:   *A.Allocator;
+    rows:    *vector.Vector[mapping.Row];
+    timing:  *timing.Timing;
+    file:    *emit.File;
+    ids:     emit.Pool;
+    alts:    emit.Pool;
+    ops:     emit.Pool;
+    slices:  emit.Pool;
+    classes: emit.Pool;
+    members: emit.Pool;
+    names:   emit.Pool;
+    fields:  *emit.Array;
+    table:   *emit.Array;
+}
+
+fun inserted(r: res[bool, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun memory() diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, nil);
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun record(f: *emit.File, of: str) *emit.Record {
+    ret emit.record(f, of);
+}
+
+fun member(f: *emit.File, r: *emit.Record, n: str, v: emit.Value) {
+    emit.member(f, r, n, v);
+}
+
+fun rec_value(r: *emit.Record) emit.Value {
+    ret emit.Value.record{r};
+}
+
+fun role(r: operand.Role) emit.Value {
+    if (r == operand.READ)       { ret name("operand.READ"); }
+    if (r == operand.WRITE)      { ret name("operand.WRITE"); }
+    if (r == operand.READ_WRITE) { ret name("operand.READ_WRITE"); }
+    ret name("operand.NONE");
+}
+
+# a pointer and count record over run `at` of `count` items of the array declared `array`
+fun span(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = record(f, of);
+    member(f, r, "at", emit.element(f, array, at));
+    member(f, r, "len", number(count::i64));
+    ret rec_value(r);
+}
+
+fun span_or(f: *emit.File, of: str, empty: str, array: str, at: u32, count: u32) emit.Value {
+    if (count == 0) { ret name(empty); }
+    ret span(f, of, array, at, count);
+}
+
+fun element(f: *emit.File, e: operand.Element) emit.Value {
+    if (sel e.fixed) { ret emit.Value.variant{emit.variant(f, "operand.Element.fixed", number(e.fixed::i64))}; }
+    ret emit.Value.variant{emit.bare(f, "operand.Element.none")};
+}
+
+fun ids(t: *Tables, atoms: *vector.Vector[str]) emit.Value {
+    val f:     *emit.File                = t.file;
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var i:     usize                     = 0;
+    for (i < atoms.len) {
+        vector.push[emit.Value](?items, name(atoms.data[i]));
+        i = i + 1;
+    }
+    if (items.len == 0) { ret name("requirement.NO_IDS"); }
+    ret span(f, "requirement.Ids", "IDS", emit.pooled(f, ?t.ids, items.data, items.len::u32), items.len::u32);
+}
+
+# a requirement over alternatives `alts`, the shared constant when there are none
+fun requirement(t: *Tables, alts: *vector.Vector[mapping.Alternative]) emit.Value {
+    val f:     *emit.File                = t.file;
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var i:     usize                     = 0;
+    for (i < alts.len) {
+        val r: *emit.Record = record(f, "requirement.Alternative");
+        member(f, r, "all", ids(t, ?alts.data[i].all));
+        member(f, r, "none", ids(t, ?alts.data[i].none));
+        vector.push[emit.Value](?items, rec_value(r));
+        i = i + 1;
+    }
+    if (items.len == 0) { ret name("requirement.NO_ALTERNATIVES"); }
+    ret span(f, "requirement.Requirement", "ALTERNATIVES", emit.pooled(f, ?t.alts, items.data, items.len::u32), items.len::u32);
+}
+
+# the enumeration of an enumerant operand, its members and its name index pooled
+fun enumeration(t: *Tables, op: *mapping.Operand) emit.Value {
+    val f:       *emit.File                = t.file;
+    var members: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var order:   vector.Vector[u32]        = vector.init[u32](t.alloc);
+    var i:       usize                     = 0;
+    for (i < op.members.len) {
+        val r: *emit.Record = record(f, "operand.Enumerant");
+        member(f, r, "name", emit.Value.text{op.members.data[i].name});
+        member(f, r, "value", number(op.members.data[i].value::i64));
+        member(f, r, "requires", name("requirement.NO_ALTERNATIVES"));
+        member(f, r, "params", name("operand.NO_GROUP"));
+        vector.push[emit.Value](?members, rec_value(r));
+        vector.push[u32](?order, i::u32);
+        i = i + 1;
+    }
+    # the name index ascends by name
+    var a: usize = 0;
+    for (a < order.len) {
+        var b: usize = a + 1;
+        for (b < order.len) {
+            if (str_compare(op.members.data[order.data[b]].name, op.members.data[order.data[a]].name) < 0) {
+                val x: u32 = order.data[a];
+                order.data[a] = order.data[b];
+                order.data[b] = x;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    var names: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    i = 0;
+    for (i < order.len) {
+        val r: *emit.Record = record(f, "index.Entry");
+        member(f, r, "key", emit.Value.text{op.members.data[order.data[i]].name});
+        member(f, r, "row", number(order.data[i]::i64));
+        vector.push[emit.Value](?names, rec_value(r));
+        i = i + 1;
+    }
+    val n: u32          = op.members.len::u32;
+    val e: *emit.Record = record(f, "operand.Enumeration");
+    member(f, e, "members", emit.element(f, "ENUMERANTS", emit.pooled(f, ?t.members, members.data, n)));
+    member(f, e, "count", number(n::i64));
+    member(f, e, "mask", name("false"));
+    member(f, e, "names", span(f, "index.Index", "ENUMERANT_NAMES", emit.pooled(f, ?t.names, names.data, n), n));
+    ret rec_value(e);
+}
+
+fun immediate(f: *emit.File, imm: *operand.Immediate) emit.Value {
+    val r: *emit.Record = record(f, "operand.Immediate");
+    member(f, r, "bits", number(imm.bits::i64));
+    if (imm.sign == operand.SIGNED) { member(f, r, "sign", name("operand.SIGNED")); }
+    or                              { member(f, r, "sign", name("operand.UNSIGNED")); }
+    member(f, r, "scale", number(imm.scale::i64));
+    member(f, r, "bias", number(imm.bias));
+    member(f, r, "fixup", name("operand.NO_FIXUP"));
+    member(f, r, "format", name("operand.INTEGER"));
+    member(f, r, "excluded", name("operand.NO_INTEGERS"));
+    ret rec_value(r);
+}
+
+fun shape(t: *Tables, op: *mapping.Operand) emit.Value {
+    val f: *emit.File = t.file;
+    if (op.shape == mapping.IMMEDIATE) { ret emit.Value.variant{emit.variant(f, "operand.Shape.immediate", immediate(f, ?op.immediate))}; }
+    if (op.shape == mapping.ENUMERANT) { ret emit.Value.variant{emit.variant(f, "operand.Shape.enumerant", enumeration(t, op))}; }
+    var cs: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var i:  usize                     = 0;
+    for (i < op.classes.len) {
+        vector.push[emit.Value](?cs, number(op.classes.data[i]::i64));
+        i = i + 1;
+    }
+    val r: *emit.Record = record(f, "operand.Register");
+    member(f, r, "classes", span(f, "operand.Classes", "CLASS_LISTS", emit.pooled(f, ?t.classes, cs.data, cs.len::u32), cs.len::u32));
+    member(f, r, "first", number(op.first::i64));
+    member(f, r, "count", number(op.count::i64));
+    member(f, r, "excluded", name("operand.NO_NUMBERS"));
+    member(f, r, "fields", number(1));
+    member(f, r, "element", element(f, op.element));
+    member(f, r, "span", emit.Value.variant{emit.variant(f, "operand.Span.fixed", number(0))});
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.register", rec_value(r))};
+}
+
+fun slice(f: *emit.File, s: *field.Slice) emit.Value {
+    val r: *emit.Record = record(f, "field.Slice");
+    member(f, r, "operand", number(s.operand::i64));
+    member(f, r, "part", name("field.NUMBER"));
+    member(f, r, "lo", number(s.lo::i64));
+    member(f, r, "len", number(s.len::i64));
+    member(f, r, "at", number(s.at::i64));
+    member(f, r, "invert", name("false"));
+    ret rec_value(r);
+}
+
+# row `i` written into the tables
+fun row(t: *Tables, i: u32) {
+    val f:   *emit.File                = t.file;
+    val r:   *mapping.Row              = ?t.rows.data[i];
+    var ops: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var sl:  vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+    var k:   usize                     = 0;
+    for (k < r.operands.len) {
+        val op: *mapping.Operand = ?r.operands.data[k];
+        val o:  *emit.Record     = record(f, "operand.Operand");
+        member(f, o, "shape", shape(t, op));
+        member(f, o, "role", role(op.role));
+        member(f, o, "width", number(0));
+        member(f, o, "quantity", name("operand.ONE"));
+        member(f, o, "write", name("operand.AS_ROW"));
+        vector.push[emit.Value](?ops, rec_value(o));
+        var j: usize = 0;
+        for (j < op.slices.len) {
+            vector.push[emit.Value](?sl, slice(f, ?op.slices.data[j]));
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    var operands: emit.Value = name("row.NO_OPERANDS");
+    if (ops.len > 0) { operands = span(f, "row.Operands", "OPERANDS", emit.pooled(f, ?t.ops, ops.data, ops.len::u32), ops.len::u32); }
+    var slices: emit.Value = name("field.NO_SLICES");
+    if (sl.len > 0) { slices = span(f, "field.Slices", "SLICES", emit.pooled(f, ?t.slices, sl.data, sl.len::u32), sl.len::u32); }
+    val fl: *emit.Record = record(f, "field.Field");
+    member(f, fl, "kind", name("aarch64_field.UNIT_KIND"));
+    member(f, fl, "width", number(32));
+    member(f, fl, "fixed", emit.Value.hex{r.fixed});
+    member(f, fl, "mask", emit.Value.hex{r.mask});
+    member(f, fl, "slices", slices);
+    member(f, fl, "operand", name("field.NO_OPERAND"));
+    member(f, fl, "param", emit.Value.hex{0});
+    emit.item(f, t.fields, rec_value(fl));
+    var ct: str = "ct.DEPENDENT";
+    if (timing.dit(t.timing, r.instruction.operation)) { ct = "DIT_INDEPENDENT"; }
+    val rr: *emit.Record = record(f, "row.Row");
+    member(f, rr, "key", emit.Value.text{r.key});
+    member(f, rr, "mnemonic", emit.Value.text{r.mnemonic});
+    member(f, rr, "operands", operands);
+    member(f, rr, "encoding", span(f, "field.Fields", "FIELDS", i, 1));
+    member(f, rr, "requires", requirement(t, ?r.requires));
+    member(f, rr, "effect", emit.Value.address{"NO_EFFECT"});
+    member(f, rr, "ct", emit.Value.address{ct});
+    member(f, rr, "constraints", name("constraint.NO_CONSTRAINTS"));
+    member(f, rr, "flags", number(0));
+    member(f, rr, "index", number(i::i64));
+    emit.item(f, t.table, rec_value(rr));
+}
+
+# the effect of a row that touches nothing its operands do not name
+fun no_effect(f: *emit.File) emit.Value {
+    val implicit: *emit.Record = record(f, "effect.Ruled");
+    member(f, implicit, "otherwise", name("effect.NO_TOUCHED"));
+    member(f, implicit, "rules", name("effect.NO_REGISTER_RULES"));
+    member(f, implicit, "may", name("effect.NO_TOUCHED"));
+    member(f, implicit, "must", name("effect.NO_TOUCHED"));
+    val flags: *emit.Record = record(f, "effect.Flags");
+    member(f, flags, "read", name("effect.NO_WORDS"));
+    member(f, flags, "written", name("effect.NO_WORDS"));
+    member(f, flags, "undefined", name("effect.NO_WORDS"));
+    member(f, flags, "kept", name("effect.NO_WORDS"));
+    val control: *emit.Record = record(f, "effect.Control");
+    member(f, control, "transfer", name("effect.NONE"));
+    member(f, control, "target", name("effect.UNTARGETED"));
+    member(f, control, "conditional", name("false"));
+    member(f, control, "operand", name("field.NO_OPERAND"));
+    member(f, control, "rules", name("effect.NO_RULES"));
+    val r: *emit.Record = record(f, "effect.Effect");
+    member(f, r, "implicit", emit.Value.variant{emit.variant(f, "effect.Registers.ruled", rec_value(implicit))});
+    member(f, r, "flags", rec_value(flags));
+    member(f, r, "memory", name("effect.NO_ACCESSES"));
+    member(f, r, "control", rec_value(control));
+    member(f, r, "stack", emit.Value.variant{emit.bare(f, "effect.Stack.none")});
+    member(f, r, "latency", name("effect.ONE"));
+    member(f, r, "fixed", name("effect.NO_FIXEDS"));
+    ret rec_value(r);
+}
+
+# the class of a row that the manual lists as data-independent-time: independent under dit=on, dependent otherwise
+fun dit_class(f: *emit.File) {
+    val on: *emit.Array = emit.array(f, "requirement.Id");
+    emit.item(f, on, name("aarch64_extension.DIT_ON"));
+    emit.declare(f, "DIT_IDS", nil, emit.Value.array{on});
+    val alt: *emit.Record = record(f, "requirement.Alternative");
+    member(f, alt, "all", span(f, "requirement.Ids", "DIT_IDS", 0, 1));
+    member(f, alt, "none", name("requirement.NO_IDS"));
+    val alts: *emit.Array = emit.array(f, "requirement.Alternative");
+    emit.item(f, alts, rec_value(alt));
+    emit.declare(f, "DIT_ALTERNATIVES", nil, emit.Value.array{alts});
+    val inputs: *emit.Record = record(f, "ct.Inputs");
+    member(f, inputs, "operands", name("operand.ALL_POSITIONS"));
+    member(f, inputs, "accesses", name("true"));
+    val gate: *emit.Record = record(f, "ct.Gate");
+    member(f, gate, "condition", span(f, "requirement.Requirement", "DIT_ALTERNATIVES", 0, 1));
+    member(f, gate, "inputs", rec_value(inputs));
+    emit.declare(f, "DIT_INDEPENDENT", "ct.Class", emit.Value.variant{emit.variant(f, "ct.Class.conditional", rec_value(gate))});
+}
+
+# the handle of row `i`, a constant named by its key's identifier, refused when another row's key has that identifier
+fun handle(t: *Tables, taken: *map.Map[str, u32], i: u32) err[diag.Refusal] {
+    val f:     *emit.File = t.file;
+    val key:   str        = t.rows.data[i].key;
+    val id:    str        = emit.ident(f, key);
+    val prior: opt[*u32]  = map.get[str, u32](taken, ?id);
+    if (sel prior.some) {
+        val both: res[str, StrError] = str_join(t.alloc, t.rows.data[@prior.some].key, " and ", key);
+        if (sel both.err) { ret err[diag.Refusal].err{memory()}; }
+        ret err[diag.Refusal].err{diag.refusal(nil, 0, KEYS_MANGLE, both.ok)};
+    }
+    if (!inserted(map.insert[str, u32](taken, id, i))) { ret err[diag.Refusal].err{memory()}; }
+    emit.declare(f, id, "*row.Row", emit.element(f, "ROWS", i));
+    ret err[diag.Refusal].ok{};
+}
+
+fun rows(c: *set.Context, all: *vector.Vector[mapping.Row], tm: *timing.Timing) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "row");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    var t: Tables     = Tables{
+        alloc:   c.alloc,
+        rows:    all,
+        timing:  tm,
+        file:    f,
+        ids:     emit.pool(f, "requirement.Id"),
+        alts:    emit.pool(f, "requirement.Alternative"),
+        ops:     emit.pool(f, "operand.Operand"),
+        slices:  emit.pool(f, "field.Slice"),
+        classes: emit.pool(f, "u16"),
+        members: emit.pool(f, "operand.Enumerant"),
+        names:   emit.pool(f, "index.Entry"),
+        fields:  emit.array(f, "field.Field"),
+        table:   emit.array(f, "row.Row"),
+    };
+    emit.uses(f, "masc.core.constraint");
+    emit.uses(f, "masc.core.ct");
+    emit.uses(f, "masc.core.dispatch");
+    emit.uses(f, "masc.core.effect");
+    emit.uses(f, "masc.core.field");
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.operand");
+    emit.uses(f, "masc.core.requirement");
+    emit.uses(f, "masc.core.row");
+    emit.uses(f, "masc.isa.aarch64.gen_dispatch");
+    emit.uses(f, "masc.isa.aarch64.gen_extension");
+    emit.uses(f, "aarch64_extension: masc.isa.aarch64.extension");
+    emit.uses(f, "aarch64_field: masc.isa.aarch64.field");
+    emit.uses(f, "aarch64_register: masc.isa.aarch64.register");
+    emit.uses(f, "std.types.bool.false");
+    emit.uses(f, "std.types.bool.true");
+    dit_class(f);
+    emit.declare(f, "NO_EFFECT", "effect.Effect", no_effect(f));
+    val keys:  *emit.Array       = emit.keyed(f, "index.Entry");
+    var taken: map.Map[str, u32] = map.init[str, u32](c.alloc);
+    var i:     u32               = 0;
+    for (i < all.len::u32) {
+        row(?t, i);
+        val entry: *emit.Record = record(f, "index.Entry");
+        member(f, entry, "key", emit.Value.text{all.data[i].key});
+        member(f, entry, "row", number(i::i64));
+        emit.entry(f, keys, all.data[i].key, rec_value(entry));
+        val handled: err[diag.Refusal] = handle(?t, ?taken, i);
+        if (sel handled.err) { ret handled; }
+        i = i + 1;
+    }
+    emit.declare(f, "IDS", nil, emit.Value.array{t.ids.array});
+    emit.declare(f, "ALTERNATIVES", nil, emit.Value.array{t.alts.array});
+    emit.declare(f, "OPERANDS", nil, emit.Value.array{t.ops.array});
+    emit.declare(f, "SLICES", nil, emit.Value.array{t.slices.array});
+    emit.declare(f, "CLASS_LISTS", nil, emit.Value.array{t.classes.array});
+    emit.declare(f, "ENUMERANTS", nil, emit.Value.array{t.members.array});
+    emit.declare(f, "ENUMERANT_NAMES", nil, emit.Value.array{t.names.array});
+    emit.declare(f, "FIELDS", nil, emit.Value.array{t.fields});
+    emit.declare(f, "ROWS", nil, emit.Value.array{t.table});
+    emit.declare(f, "KEYS", nil, emit.Value.array{keys});
+    val codec: *emit.Record = record(f, "dispatch.Codec");
+    member(f, codec, "fields", emit.Value.address{"aarch64_field.TABLE"});
+    member(f, codec, "registers", emit.Value.address{"aarch64_register.FILE"});
+    member(f, codec, "rows", span_or(f, "row.Rows", "row.NO_ROWS", "ROWS", 0, all.len::u32));
+    member(f, codec, "keys", span_or(f, "index.Index", "index.NO_ENTRIES", "KEYS", 0, all.len::u32));
+    member(f, codec, "dispatch", emit.Value.address{"gen_dispatch.DISPATCH"});
+    member(f, codec, "element", number(0));
+    member(f, codec, "forms", name("form.NO_FORM_FIELDS"));
+    emit.uses(f, "masc.core.form");
+    emit.declare(f, "CODEC", "dispatch.Codec", rec_value(codec));
+    ret err[diag.Refusal].ok{};
+}
+
+# the dispatch over every row, each one cube over its word
+fun dispatched(c: *set.Context, all: *vector.Vector[mapping.Row], ks: *keys.Keys) err[diag.Refusal] {
+    val words: res[*u64, A.Error]              = A.allocate[u64](c.alloc, all.len * 2 + 1);
+    val cubes: res[*dispatch.Cube, A.Error]    = A.allocate[dispatch.Cube](c.alloc, all.len + 1);
+    val pats:  res[*dispatch.Pattern, A.Error] = A.allocate[dispatch.Pattern](c.alloc, all.len + 1);
+    if (sel words.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel cubes.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel pats.err)  { ret err[diag.Refusal].err{memory()}; }
+    var i: usize = 0;
+    for (i < all.len) {
+        val r: *mapping.Row = ?all.data[i];
+        words.ok[i * 2]     = r.fixed;
+        words.ok[i * 2 + 1] = r.mask;
+        cubes.ok[i]         = dispatch.Cube{value: ?words.ok[i * 2], mask: ?words.ok[i * 2 + 1]};
+        pats.ok[i]          = dispatch.Pattern{row: i::u32, name: r.key, cubes: ?cubes.ok[i], count: 1};
+        i                   = i + 1;
+    }
+    var space: dispatch.Space                    = dispatch.Space{words: 1, keys: ks.keys.data, key_count: ks.keys.len::u32};
+    val built: res[dispatch.Built, diag.Refusal] = dispatch.build(c.alloc, ?space, pats.ok, all.len::u32);
+    if (sel built.err) { ret err[diag.Refusal].err{built.err}; }
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "dispatch");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "aarch64_key: masc.isa.aarch64.key");
+    var b: dispatch.Built = built.ok;
+    dispatch.declare(f, "DISPATCH", "aarch64_key.KEYS", ks.keys.len::u32, ?b);
+    ret err[diag.Refusal].ok{};
+}
+
+rec Spelled {
+    mnemonic: str;
+    row:      u32;
+}
+
+fun by_mnemonic(a: *Spelled, b: *Spelled) i64 {
+    val c: i64 = str_compare(a.mnemonic, b.mnemonic);
+    if (c != 0)        { ret c; }
+    if (a.row < b.row) { ret -1; }
+    if (a.row > b.row) { ret 1; }
+    ret 0;
+}
+
+# every row's template, and the index of the rows by mnemonic
+fun syntaxes(c: *set.Context, all: *vector.Vector[mapping.Row]) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "syntax");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "masc.core.syntax");
+    emit.uses(f, "std.types.string.str");
+    val forms:   *emit.Array            = emit.array(f, "str");
+    var spelled: vector.Vector[Spelled] = vector.init[Spelled](c.alloc);
+    var i:       usize                  = 0;
+    for (i < all.len) {
+        emit.item(f, forms, emit.Value.text{all.data[i].template});
+        vector.push[Spelled](?spelled, Spelled{mnemonic: all.data[i].mnemonic, row: i::u32});
+        i = i + 1;
+    }
+    emit.declare(f, "FORM_TEXT", nil, emit.Value.array{forms});
+    emit.declare(f, "FORM_COUNT", "u32", number(all.len::i64));
+    sort.sort_by[Spelled](spelled.data, spelled.len, by_mnemonic);
+    val entries:    *emit.Array = emit.array(f, "syntax.Entry");
+    val candidates: *emit.Array = emit.array(f, "syntax.Candidate");
+    var count:      u32         = 0;
+    i = 0;
+    for (i < spelled.len) {
+        var end: usize = i;
+        for (end < spelled.len && str_equals(spelled.data[end].mnemonic, spelled.data[i].mnemonic)) {
+            val cand: *emit.Record = record(f, "syntax.Candidate");
+            member(f, cand, "row", number(spelled.data[end].row::i64));
+            member(f, cand, "alias", number(0));
+            emit.item(f, candidates, rec_value(cand));
+            end = end + 1;
+        }
+        val e: *emit.Record = record(f, "syntax.Entry");
+        member(f, e, "key", emit.Value.text{spelled.data[i].mnemonic});
+        member(f, e, "first", number(i::i64));
+        member(f, e, "len", number((end - i)::i64));
+        emit.item(f, entries, rec_value(e));
+        count = count + 1;
+        i     = end;
+    }
+    emit.declare(f, "ENTRIES", nil, emit.Value.array{entries});
+    emit.declare(f, "ENTRY_COUNT", "u32", number(count::i64));
+    emit.declare(f, "CANDIDATES", nil, emit.Value.array{candidates});
+    emit.declare(f, "CANDIDATE_COUNT", "u32", number(spelled.len::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# the tree of input `src`
+fun input(c: *set.Context, src: str) *source.Tree {
+    var i: usize = 0;
+    for (i < c.inputs.len && i < c.generator.inputs.len::usize) {
+        if (str_equals(c.generator.inputs.at[i].name, src)) { ret c.inputs.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the aarch64 rows generated from the instruction model and the aarch64 overlay
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    var archive: *source.File = nil;
+    var i:       usize        = 0;
+    for (i < c.tree.files.len) {
+        if (str_ends_with(c.tree.files.data[i].path, ".tar.gz")) {
+            if (archive != nil) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_ARCHIVE, nil)}; }
+            archive = ?c.tree.files.data[i];
+        }
+        i = i + 1;
+    }
+    if (archive == nil) { ret err[diag.Refusal].err{diag.refusal(c.generator.source.path, 0, NO_ARCHIVE, nil)}; }
+    val over: *source.Tree = input(c, "aarch64-overlay");
+    val regs: *source.Tree = input(c, "aarch64-registers");
+    if (over == nil || regs == nil) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INPUTS, nil)}; }
+    val member_ins: res[source.File, diag.Refusal] = tar.member(c.alloc, archive, instructions.INSTRUCTIONS);
+    if (sel member_ins.err) { ret err[diag.Refusal].err{member_ins.err}; }
+    var fi:    source.File                           = member_ins.ok;
+    val model: res[instructions.Model, diag.Refusal] = instructions.read(c.alloc, ?fi);
+    if (sel model.err) { ret err[diag.Refusal].err{model.err}; }
+    val member_feat: res[source.File, diag.Refusal] = tar.member(c.alloc, archive, "Features.json");
+    if (sel member_feat.err) { ret err[diag.Refusal].err{member_feat.err}; }
+    var ff:    source.File                      = member_feat.ok;
+    val feats: res[feature.Model, diag.Refusal] = feature.read(c.alloc, ?ff);
+    if (sel feats.err) { ret err[diag.Refusal].err{feats.err}; }
+    val ops: res[operands.Operands, diag.Refusal] = operands.read(c.alloc, over);
+    if (sel ops.err) { ret err[diag.Refusal].err{ops.err}; }
+    val modes: res[streaming.Streaming, diag.Refusal] = streaming.read(c.alloc, over);
+    if (sel modes.err) { ret err[diag.Refusal].err{modes.err}; }
+    val tm: res[timing.Timing, diag.Refusal] = timing.read(c.alloc, over);
+    if (sel tm.err) { ret err[diag.Refusal].err{tm.err}; }
+    val fam: res[aarch64.Families, diag.Refusal] = aarch64.families(c.alloc, regs);
+    if (sel fam.err) { ret err[diag.Refusal].err{fam.err}; }
+    val topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, over, keys.TOPIC);
+    if (sel topic.err) { ret err[diag.Refusal].err{topic.err}; }
+    var ks:  keys.Keys         = keys.Keys{keys: vector.init[dispatch.Key](c.alloc)};
+    val got: err[diag.Refusal] = keys.read(c.alloc, ?topic.ok, ?ks);
+    if (sel got.err) { ret got; }
+    var m:      instructions.Model         = model.ok;
+    var o:      operands.Operands          = ops.ok;
+    var s:      streaming.Streaming        = modes.ok;
+    var fm:     feature.Model              = feats.ok;
+    var rf:     aarch64.Families           = fam.ok;
+    var t:      timing.Timing              = tm.ok;
+    var src:    mapping.Sources            = mapping.Sources{model: ?m, operands: ?o, streaming: ?s, features: ?fm, registers: ?rf};
+    var all:    vector.Vector[mapping.Row] = vector.init[mapping.Row](c.alloc);
+    val mapped: err[diag.Refusal]          = mapping.map_rows(c.alloc, ?src, ?SLICE[0], 3, ?all);
+    if (sel mapped.err) { ret mapped; }
+    val written: err[diag.Refusal] = rows(c, ?all, ?t);
+    if (sel written.err) { ret written; }
+    val routed: err[diag.Refusal] = dispatched(c, ?all, ?ks);
+    if (sel routed.err) { ret routed; }
+    val keyed: err[diag.Refusal] = keys.generate(c, ?ks, "aarch64_bits: masc.isa.aarch64.bits", "aarch64_bits.Position");
+    if (sel keyed.err) { ret keyed; }
+    ret syntaxes(c, ?all);
+}
