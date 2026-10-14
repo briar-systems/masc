@@ -2,22 +2,65 @@
 #
 # the constant-time walk reads an encoded function through the set's decode
 # dispatch and follows secrecy from the seeds the caller gives through
-# registers and memory extents by each row's effect, refusing a secret that
-# reaches a control transfer, an address or an input a row's timing depends
-# on (`masc.core.ct`). it reads under the context the function runs under,
-# since that is what decides a conditional row: the selection and state the
-# caller compiled for, as aarch64 code that sets dit in its prologue or an
-# `__arm_streaming` function. a set whose timing is `none` refuses before any
-# walk (`ct.required`). the types land before the walk, so consumers build
-# against its shape.
+# registers and memory extents by each row's footprint, refusing a secret
+# that reaches a control transfer, an address or an input a row's timing
+# depends on (`masc.core.ct`). it reads under the context the function runs
+# under, since that is what decides a conditional row: the selection and
+# state the caller compiled for, as aarch64 code that sets dit in its
+# prologue or an `__arm_streaming` function. a set whose timing is `none`
+# refuses before any walk (`ct.required`).
+#
+# secrecy is held per register row of the set's file and per memory extent.
+# an extent is named by the register its address is formed from, the version
+# of that register's value, an offset and a length: the walk states no
+# register values, so two extents are known apart only when both are of one
+# version of one register and do not overlap, and every other pair may alias.
+# a secret stored where the address is not known, or anything secret at a
+# call, whose callee the walk does not read, may be anywhere afterwards.
+# memory is never made public again, since a store the walk cannot place
+# exactly may miss the secret it would overwrite. a register's version is
+# the offset of the instruction that last wrote it, or of the join that
+# merged two, so the states a loop reaches are finite and the worklist over
+# instruction starts reaches a fixed point.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+
+use masc.codec.walk;
+use masc.core.config;
 use masc.core.ct;
+use masc.core.dispatch;
+use masc.core.effect;
+use masc.core.field;
+use masc.core.footprint;
+use masc.core.operand;
 use masc.core.register;
+use masc.core.requirement;
 use masc.core.set;
 use masc.core.state;
+
+#[testing]
+use masc.core.diagnostic;
+#[testing]
+use masc.core.extension;
+#[testing]
+use riscv_extension: masc.isa.riscv.extension;
+#[testing]
+use masc.isa.riscv.gen_register;
+#[testing]
+use riscv_register: masc.isa.riscv.register;
+#[testing]
+use riscv_set:      masc.isa.riscv.set;
 
 # a memory extent from a register's value plus an offset
 # ---
@@ -85,5 +128,904 @@ pub tag Verdict: u8 {
     unread:  Unread;
 }
 
-# the constant-time walk of `code` under the context the function runs under, from the secrets the caller seeds
-pub def Check: fun(*Code, *state.Context, *Secrets) Verdict;
+pub val UNDECODED:  str = "bytes no row decodes under the context";
+pub val UNDECIDED:  str = "an instruction whose footprint its values and the configuration in force do not decide";
+pub val NOWHERE:    str = "a transfer to where no code is";
+pub val INDIRECT:   str = "a jump to a target a register holds, which the walk cannot follow";
+pub val UNSEEDABLE: str = "a seed names a register the set's file has no row of";
+
+# the operand values one decoded instruction holds, and the alternatives a refused decode notes
+val VALUES:       u32 = 64;
+val ALTERNATIVES: u32 = 16;
+
+# the version of a register's value on entry
+val ENTRY: u64 = 0;
+
+# an extent that may hold a secret
+# ---
+# base:    the register row its address is formed from, effect.NO_ROW for an address no register forms
+# version: the version of that register's value
+# offset:  added to it
+# length:  the bytes it covers, 0 for a length the walk does not know
+rec Held {
+    base:    u32;
+    version: u64;
+    offset:  i64;
+    length:  u64;
+}
+
+# what is secret where an instruction starts
+# ---
+# taint:    the register rows holding a secret, one bit per row
+# versions: the version of each register row's value
+# held:     the extents that may hold a secret
+# anywhere: whether a secret may be at any address
+# config:   the configuration state in force, none when not known
+rec Point {
+    taint:    vector.Vector[u64];
+    versions: vector.Vector[u64];
+    held:     vector.Vector[Held];
+    anywhere: bool;
+    config:   opt[config.State];
+}
+
+# a memory access of one instruction, placed as the walk names extents
+# ---
+# reads:   whether it reads
+# writes:  whether it writes
+# operand: the memory operand whose access it is, field.NO_OPERAND for one an effect states through a pointer or none
+# at:      the extent it touches
+rec Touch {
+    reads:   bool;
+    writes:  bool;
+    operand: u8;
+    at:      Held;
+}
+
+# the walk's storage
+# ---
+# code:    the code walked
+# ctx:     the context it runs under
+# file:    the set's register file
+# words:   the words a set over the file's rows spans
+# points:  the state at each instruction start reached, by index into `states`, NO_POINT for none
+# states:  the states
+# work:    the instruction starts whose state changed and are not walked since
+# named:   the rows the operands of the instruction walked name, one bit per row
+# touches: the memory accesses of the instruction walked
+rec Walk {
+    a:       *A.Allocator;
+    code:    *Code;
+    ctx:     *state.Context;
+    file:    *register.File;
+    words:   usize;
+    points:  vector.Vector[u32];
+    states:  vector.Vector[Point];
+    work:    vector.Vector[usize];
+    named:   vector.Vector[u64];
+    touches: vector.Vector[Touch];
+}
+
+val NO_POINT: u32 = 0xFFFF_FFFF;
+
+fun bit_of(words: *u64, row: u32) bool {
+    ret (words[row / 64] & (1::u64 << (row % 64)::u64)) != 0;
+}
+
+fun set_bit(words: *u64, row: u32, on: bool) {
+    val mask: u64 = 1::u64 << (row % 64)::u64;
+    if (on) { words[row / 64] = words[row / 64] | mask; }
+    or      { words[row / 64] = words[row / 64] & ~mask; }
+}
+
+fun failed[T](e: A.Error) res[T, A.Error] {
+    ret res[T, A.Error].err{e};
+}
+
+# a point of `w`'s file holding nothing secret, every register at its entry version
+fun blank(w: *Walk) res[Point, A.Error] {
+    var p: Point = Point{
+        taint:    vector.init[u64](w.a),
+        versions: vector.init[u64](w.a),
+        held:     vector.init[Held](w.a),
+        anywhere: false,
+        config:   opt[config.State].none{},
+    };
+    var i: usize = 0;
+    for (i < w.words) {
+        val pushed: res[usize, A.Error] = vector.push[u64](?p.taint, 0);
+        if (sel pushed.err) { ret failed[Point](pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.file.register_count::usize) {
+        val pushed: res[usize, A.Error] = vector.push[u64](?p.versions, ENTRY);
+        if (sel pushed.err) { ret failed[Point](pushed.err); }
+        i = i + 1;
+    }
+    ret res[Point, A.Error].ok{p};
+}
+
+fun drop(p: *Point) {
+    vector.dnit[u64](?p.taint);
+    vector.dnit[u64](?p.versions);
+    vector.dnit[Held](?p.held);
+}
+
+# a copy of `from`
+fun copy(w: *Walk, from: *Point) res[Point, A.Error] {
+    val made: res[Point, A.Error] = blank(w);
+    if (sel made.err) { ret made; }
+    var p: Point = made.ok;
+    var i: usize = 0;
+    for (i < w.words) {
+        p.taint.data[i] = from.taint.data[i];
+        i               = i + 1;
+    }
+    i = 0;
+    for (i < p.versions.len) {
+        p.versions.data[i] = from.versions.data[i];
+        i                  = i + 1;
+    }
+    i = 0;
+    for (i < from.held.len) {
+        val pushed: res[usize, A.Error] = vector.push[Held](?p.held, from.held.data[i]);
+        if (sel pushed.err) {
+            drop(?p);
+            ret failed[Point](pushed.err);
+        }
+        i = i + 1;
+    }
+    p.anywhere = from.anywhere;
+    p.config   = from.config;
+    ret res[Point, A.Error].ok{p};
+}
+
+fun same(x: *Held, y: *Held) bool {
+    ret x.base == y.base && x.version == y.version && x.offset == y.offset && x.length == y.length;
+}
+
+# `h` added to what `p` holds unless it holds it
+fun hold(p: *Point, h: Held) err[A.Error] {
+    var i: usize = 0;
+    for (i < p.held.len) {
+        if (same(?p.held.data[i], ?h)) { ret err[A.Error].ok{}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Held](?p.held, h);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# whether `held` and `at` may share a byte: only extents of one version of one register, both of known length, are
+# known apart, when they do not overlap
+fun may_alias(held: *Held, at: *Held) bool {
+    if (held.base != at.base || held.version != at.version || held.base == effect.NO_ROW) { ret true; }
+    if (held.length == 0 || at.length == 0)                                               { ret true; }
+    ret held.offset < at.offset + at.length::i64 && at.offset < held.offset + held.length::i64;
+}
+
+# whether the bytes of `at` may hold a secret under `p`
+fun secret_at(p: *Point, at: *Held) bool {
+    if (p.anywhere) { ret true; }
+    var i: usize = 0;
+    for (i < p.held.len) {
+        if (may_alias(?p.held.data[i], at)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# `from` merged into the point at `to`, which is the version of a register the two disagree on
+# ---
+# ret: whether the point at `to` changed
+fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[bool, A.Error] {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < w.words) {
+        val both: u64 = into.taint.data[i] | from.taint.data[i];
+        if (both != into.taint.data[i]) { changed = true; }
+        into.taint.data[i] = both;
+        i                  = i + 1;
+    }
+    val joined: u64 = to::u64 * 2 + 2;
+    i = 0;
+    for (i < into.versions.len) {
+        if (into.versions.data[i] != from.versions.data[i] && into.versions.data[i] != joined) {
+            into.versions.data[i] = joined;
+            changed               = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < from.held.len) {
+        val before: usize        = into.held.len;
+        val held:   err[A.Error] = hold(into, from.held.data[i]);
+        if (sel held.err)            { ret failed[bool](held.err); }
+        if (into.held.len != before) { changed = true; }
+        i = i + 1;
+    }
+    if (from.anywhere && !into.anywhere) {
+        into.anywhere = true;
+        changed       = true;
+    }
+    var keep: bool = true;
+    if (sel into.config.some) {
+        keep = false;
+        if (sel from.config.some) { keep = from.config.some.bits == into.config.some.bits; }
+    }
+    if (!keep) {
+        into.config = opt[config.State].none{};
+        changed     = true;
+    }
+    ret res[bool, A.Error].ok{changed};
+}
+
+# the state `p` reaching the instruction at `to`: its point made or merged into, and `to` queued when it changed
+fun reach(w: *Walk, p: *Point, to: usize) err[A.Error] {
+    val at: u32 = w.points.data[to];
+    if (at == NO_POINT) {
+        val made: res[Point, A.Error] = copy(w, p);
+        if (sel made.err) { ret err[A.Error].err{made.err}; }
+        w.points.data[to] = w.states.len::u32;
+        val kept: res[usize, A.Error] = vector.push[Point](?w.states, made.ok);
+        if (sel kept.err) { ret err[A.Error].err{kept.err}; }
+    }
+    or {
+        val merged: res[bool, A.Error] = merge(w, ?w.states.data[at], p, to);
+        if (sel merged.err) { ret err[A.Error].err{merged.err}; }
+        if (!merged.ok)     { ret err[A.Error].ok{}; }
+    }
+    val queued: res[usize, A.Error] = vector.push[usize](?w.work, to);
+    if (sel queued.err) { ret err[A.Error].err{queued.err}; }
+    ret err[A.Error].ok{};
+}
+
+fun row_index(w: *Walk, reg: register.Id) opt[u32] {
+    if (reg == register.NONE) { ret opt[u32].none{}; }
+    ret register.index_of(w.file, reg);
+}
+
+fun tainted(w: *Walk, p: *Point, reg: register.Id) bool {
+    val at: opt[u32] = row_index(w, reg);
+    if (sel at.none) { ret false; }
+    ret bit_of(p.taint.data, at.some);
+}
+
+# the rows a register value of operand `op` covers marked in `into`, and whether any of them is secret under `p`. a
+# grouped value covers the registers its operand's groups do, an address register one
+fun mark_register(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, reg: register.Id, grouped: bool, cfg: config.Configured, into: *u64) bool {
+    val at: opt[u32] = row_index(w, reg);
+    if (sel at.none) { ret false; }
+    var count: u32 = 1;
+    if (grouped) {
+        val covers: effect.Answer[u32] = footprint.covers(ins.inst.row, op, w.ctx, cfg);
+        if (sel covers.decided) {
+            if (covers.decided > 1) { count = covers.decided; }
+        }
+    }
+    var secret: bool = false;
+    var k:      u32  = 0;
+    for (k < count && at.some + k < w.file.register_count) {
+        set_bit(into, at.some + k, true);
+        if (bit_of(p.taint.data, at.some + k)) { secret = true; }
+        k = k + 1;
+    }
+    ret secret;
+}
+
+# whether a register value of operand `op` is secret under `p`, its rows marked in `into`: a register, every member of
+# a list, and a memory value's address registers, which are marked but are no data of the operand
+fun operand_secret(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, cfg: config.Configured, into: *u64) bool {
+    val v: operand.Value = ins.inst.values[op];
+    if (sel v.register) { ret mark_register(w, p, ins, op, v.register, true, cfg, into); }
+    if (sel v.list) {
+        var secret: bool = false;
+        var i:      u32  = 0;
+        for (i < v.list.len) {
+            val m: operand.Value = v.list.at[i];
+            if (sel m.register && mark_register(w, p, ins, op, m.register, false, cfg, into)) { secret = true; }
+            i = i + 1;
+        }
+        ret secret;
+    }
+    # the address registers are named, and a secret in them is refused as an address, not as the operand's data
+    if (sel v.memory) {
+        mark_register(w, p, ins, op, v.memory.base, false, cfg, into);
+        mark_register(w, p, ins, op, v.memory.index, false, cfg, into);
+    }
+    ret false;
+}
+
+# whether some register of operand `op`'s value is secret under `p`, its address registers included
+fun names_secret(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8) bool {
+    if (op == field.NO_OPERAND || op::u32 >= ins.inst.count) { ret false; }
+    val v: operand.Value = ins.inst.values[op];
+    if (sel v.register) { ret tainted(w, p, v.register); }
+    if (sel v.memory)   { ret tainted(w, p, v.memory.base) || tainted(w, p, v.memory.index); }
+    if (sel v.list) {
+        var i: u32 = 0;
+        for (i < v.list.len) {
+            val m: operand.Value = v.list.at[i];
+            if (sel m.register && tainted(w, p, m.register)) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+# the bytes access width `width` covers, 0 when the walk does not know them: a width scaling with a quantity, or a
+# count no element fixes
+fun bytes_of(width: *effect.Width) u64 {
+    val count: effect.Count = width.count;
+    if (!sel count.one || width.element.per != 0 || width.element.fixed == 0) { ret 0; }
+    ret (width.element.fixed::u64 + 7) / 8;
+}
+
+# the extent an address of `ins` touches, from the operand that is or holds it, or the register row `base` when none
+fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, length: u64, touch: *Touch) {
+    touch.operand = field.NO_OPERAND;
+    touch.at      = Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: length};
+    if (op != field.NO_OPERAND && op::u32 < ins.inst.count) {
+        val v: operand.Value = ins.inst.values[op];
+        if (sel v.memory) {
+            touch.operand   = op;
+            touch.at.offset = v.memory.disp;
+            val row: opt[u32] = row_index(w, v.memory.base);
+            if (sel row.some) { touch.at.base = row.some; }
+        }
+        or (sel v.register) {
+            val row: opt[u32] = row_index(w, v.register);
+            if (sel row.some) { touch.at.base = row.some; }
+        }
+    }
+    or                                  { touch.at.base = base; }
+    if (touch.at.base != effect.NO_ROW) { touch.at.version = p.versions.data[touch.at.base]; }
+}
+
+fun found(r: ct.Refusal) res[opt[ct.Refusal], A.Error] {
+    ret res[opt[ct.Refusal], A.Error].ok{opt[ct.Refusal].some{r}};
+}
+
+# the memory accesses of `ins` gathered into `w.touches`: each its footprint states, then each memory operand none of
+# them names. a secret in what forms an address is refused
+fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) res[opt[ct.Refusal], A.Error] {
+    w.touches.len = 0;
+    val r: *operand.Operand = ins.inst.row.operands.at;
+    var i: u32              = 0;
+    for (i < fp.memory.len) {
+        val acc:  *effect.Access = ?fp.memory.at[i];
+        var role: operand.Role   = acc.role;
+        if (role == operand.NONE && acc.operand != field.NO_OPERAND && acc.operand::u32 < ins.inst.count) { role = r[acc.operand].role; }
+        var t: Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}};
+        placed(w, p, ins, acc.operand, acc.base, bytes_of(?acc.width), ?t);
+        if (names_secret(w, p, ins, acc.operand))                                      { ret found(ct.refusal(ct.MEMORY, acc.operand)); }
+        if (acc.base != effect.NO_ROW && bit_of(p.taint.data, acc.base))               { ret found(ct.refusal(ct.MEMORY, field.NO_OPERAND)); }
+        if (acc.governor != field.NO_OPERAND && names_secret(w, p, ins, acc.governor)) { ret found(ct.refusal(ct.MEMORY, acc.governor)); }
+        var k: u32 = 0;
+        for (k < ins.inst.count && k < 32) {
+            if ((acc.forming & (1::u32 << k)) != 0 && names_secret(w, p, ins, k::u8)) { ret found(ct.refusal(ct.MEMORY, k::u8)); }
+            k = k + 1;
+        }
+        val pushed: res[usize, A.Error] = vector.push[Touch](?w.touches, t);
+        if (sel pushed.err) { ret failed[opt[ct.Refusal]](pushed.err); }
+        i = i + 1;
+    }
+    var op: u32 = 0;
+    for (op < ins.inst.count) {
+        val v: operand.Value = ins.inst.values[op];
+        if (sel v.memory) {
+            var stated: bool = false;
+            var k:      u32  = 0;
+            for (k < fp.memory.len) {
+                if (fp.memory.at[k].operand::u32 == op) { stated = true; }
+                k = k + 1;
+            }
+            if (names_secret(w, p, ins, op::u8)) { ret found(ct.refusal(ct.MEMORY, op::u8)); }
+            if (!stated) {
+                val role: operand.Role = r[op].role;
+                var t:    Touch        = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}};
+                placed(w, p, ins, op::u8, effect.NO_ROW, 0, ?t);
+                val pushed: res[usize, A.Error] = vector.push[Touch](?w.touches, t);
+                if (sel pushed.err) { ret failed[opt[ct.Refusal]](pushed.err); }
+            }
+        }
+        op = op + 1;
+    }
+    ret res[opt[ct.Refusal], A.Error].ok{opt[ct.Refusal].none{}};
+}
+
+# the latency refusal of a secret in an input of `ins`, none when its timing depends on no input holding one under the
+# walk's context, as `ct.latency` decides for each: an operand it reads, the data of a memory operand it reads, the
+# data of an access no operand names, and a register no operand names that it reads
+fun latency(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, secret: u32) opt[ct.Refusal] {
+    val c:  *ct.Class        = ins.inst.row.ct;
+    val r:  *operand.Operand = ins.inst.row.operands.at;
+    var op: u32              = 0;
+    for (op < ins.inst.count && op < 32) {
+        if ((r[op].role & operand.READ) != 0) {
+            var held: bool  = (secret & (1::u32 << op)) != 0;
+            var k:    usize = 0;
+            for (k < w.touches.len) {
+                val t: *Touch = ?w.touches.data[k];
+                if (t.operand::u32 == op && t.reads && secret_at(p, ?t.at)) { held = true; }
+                k = k + 1;
+            }
+            if (held) {
+                val refused: opt[ct.Refusal] = ct.latency(c, w.ctx, w.file, ct.Input.operand{op::u8});
+                if (sel refused.some) { ret refused; }
+            }
+        }
+        op = op + 1;
+    }
+    var k: usize = 0;
+    for (k < w.touches.len) {
+        val t: *Touch = ?w.touches.data[k];
+        if (t.operand == field.NO_OPERAND && t.reads && secret_at(p, ?t.at)) {
+            val refused: opt[ct.Refusal] = ct.latency(c, w.ctx, w.file, ct.Input.access{});
+            if (sel refused.some) { ret refused; }
+        }
+        k = k + 1;
+    }
+    var row: u32 = 0;
+    for (row < w.file.register_count) {
+        if (bit_of(fp.reads.data, row) && !bit_of(w.named.data, row) && bit_of(p.taint.data, row)) {
+            val refused: opt[ct.Refusal] = ct.latency(c, w.ctx, w.file, ct.Input.register{register.id_of(?w.file.registers[row])});
+            if (sel refused.some) { ret refused; }
+        }
+        row = row + 1;
+    }
+    ret opt[ct.Refusal].none{};
+}
+
+# the first operand of `ins` whose registers hold a secret, field.NO_OPERAND when none does
+fun first_secret(secret: u32, count: u32) u8 {
+    var op: u32 = 0;
+    for (op < count && op < 32) {
+        if ((secret & (1::u32 << op)) != 0) { ret op::u8; }
+        op = op + 1;
+    }
+    ret field.NO_OPERAND;
+}
+
+# the control refusal of `ins`: a transfer that may fall through decided by a secret, or one to a target formed from
+# one
+fun control(w: *Walk, p: *Point, ins: *walk.Decoded, c: *effect.Control, value: bool, secret: u32) opt[ct.Refusal] {
+    if (c.transfer == effect.NONE || c.transfer == effect.MERGE) { ret opt[ct.Refusal].none{}; }
+    if (c.conditional && value)                                  { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, first_secret(secret, ins.inst.count))}; }
+    if (c.target == effect.INDIRECT || (c.target == effect.UNTARGETED && c.transfer == effect.RETURN)) {
+        if (c.operand == field.NO_OPERAND) {
+            if (value) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, field.NO_OPERAND)}; }
+            ret opt[ct.Refusal].none{};
+        }
+        if (names_secret(w, p, ins, c.operand)) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, c.operand)}; }
+        var k: usize = 0;
+        for (k < w.touches.len) {
+            val t: *Touch = ?w.touches.data[k];
+            if (t.operand == c.operand && t.reads && secret_at(p, ?t.at)) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, c.operand)}; }
+            k = k + 1;
+        }
+    }
+    ret opt[ct.Refusal].none{};
+}
+
+# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, a write leaving part
+# of a register's old value keeping that part's, and its stores hold the extent they write. a call, whose callee the
+# walk does not read, leaves every register and every address secret when anything is
+fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Footprint, value: bool) err[A.Error] {
+    val version: u64 = at::u64 * 2 + 1;
+    var i:       u32 = 0;
+    for (i < w.file.register_count) {
+        if (bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i)) {
+            val row: *register.Register = ?w.file.registers[i];
+            if ((row.flags & register.ZERO) == 0) {
+                if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, i, value); }
+                or (value)                                    { set_bit(p.taint.data, i, true); }
+                p.versions.data[i] = version;
+            }
+        }
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < w.touches.len) {
+        val t: *Touch = ?w.touches.data[k];
+        if (t.writes && value) {
+            if (t.at.base == effect.NO_ROW) { p.anywhere = true; }
+            or {
+                val held: err[A.Error] = hold(p, t.at);
+                if (sel held.err) { ret held; }
+            }
+        }
+        k = k + 1;
+    }
+    if (fp.control.transfer == effect.CALL) {
+        var secret: bool  = p.anywhere || p.held.len > 0;
+        var word:   usize = 0;
+        for (word < w.words) {
+            if (p.taint.data[word] != 0) { secret = true; }
+            word = word + 1;
+        }
+        i = 0;
+        for (i < w.file.register_count) {
+            if ((w.file.registers[i].flags & register.ZERO) == 0) {
+                if (secret) { set_bit(p.taint.data, i, true); }
+                p.versions.data[i] = version;
+            }
+            i = i + 1;
+        }
+        if (secret) { p.anywhere = true; }
+    }
+    val hooks: *config.Hooks = w.code.set.config;
+    if (hooks != nil) {
+        val est: config.Established = hooks.establish(ins.inst.row, operand.Values{at: ins.inst.values, len: ins.inst.count});
+        if (sel est.sets)      { p.config = opt[config.State].some{est.sets}; }
+        if (sel est.undecided) { p.config = opt[config.State].none{}; }
+    }
+    ret err[A.Error].ok{};
+}
+
+fun unread(message: str, at: usize) opt[Verdict] {
+    ret opt[Verdict].some{Verdict.unread{Unread{message: message, offset: at::u64}}};
+}
+
+fun refused(r: ct.Refusal, at: usize) opt[Verdict] {
+    ret opt[Verdict].some{Verdict.refused{Finding{offset: at::u64, refusal: r}}};
+}
+
+# the instruction starts control reaches from `ins` at `at`, each reached with `p`
+# ---
+# ret: none when every one is in the code, else why the walk cannot follow it
+fun successors(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, c: *effect.Control) res[opt[Verdict], A.Error] {
+    val next:  usize = at + ins.len;
+    var falls: bool  = (c.transfer != effect.JUMP && c.transfer != effect.RETURN) || c.conditional;
+    if (c.transfer == effect.JUMP) {
+        if (c.target != effect.DIRECT || c.operand == field.NO_OPERAND || c.operand::u32 >= ins.inst.count) { ret res[opt[Verdict], A.Error].ok{unread(INDIRECT, at)}; }
+        val v: operand.Value = ins.inst.values[c.operand];
+        if (!sel v.relative) { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
+        var from:  i64           = at::i64;
+        val shape: operand.Shape = ins.inst.row.operands.at[c.operand].shape;
+        if (sel shape.relative && shape.relative.anchor == operand.END) { from = next::i64; }
+        val to: i64 = from + v.relative;
+        if (to < 0 || to >= w.code.len::i64) { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
+        val reached: err[A.Error] = reach(w, p, to::usize);
+        if (sel reached.err) { ret failed[opt[Verdict]](reached.err); }
+    }
+    if (falls && next < w.code.len) {
+        val reached: err[A.Error] = reach(w, p, next);
+        if (sel reached.err) { ret failed[opt[Verdict]](reached.err); }
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+# the instruction at `at` walked from the state there
+# ---
+# ret: a verdict when it ends the walk, none to go on
+fun step(w: *Walk, at: usize, store: *operand.Value, alts: *field.Admissions, fp: *footprint.Footprint) res[opt[Verdict], A.Error] {
+    val held: res[Point, A.Error] = copy(w, ?w.states.data[w.points.data[at]]);
+    if (sel held.err) { ret failed[opt[Verdict]](held.err); }
+    var p: Point = held.ok;
+    fin { drop(?p); }
+    val got: res[walk.Decoded, field.Refusal] = walk.decode(w.code.set.codec, w.ctx, w.code.data, w.code.len, at, store, VALUES, alts);
+    if (sel got.err) { ret res[opt[Verdict], A.Error].ok{unread(UNDECODED, at)}; }
+    var ins:    walk.Decoded                                      = got.ok;
+    val cfg:    config.Configured                                 = config.Configured{hooks: w.code.set.config, state: p.config};
+    val values: operand.Values                                    = operand.Values{at: ins.inst.values, len: ins.inst.count};
+    val foot:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(fp, ins.inst.row, values, w.ctx, cfg);
+    if (sel foot.err)          { ret failed[opt[Verdict]](foot.err); }
+    if (sel foot.ok.undecided) { ret res[opt[Verdict], A.Error].ok{unread(UNDECIDED, at)}; }
+    var k: usize = 0;
+    for (k < w.words) {
+        w.named.data[k] = 0;
+        k               = k + 1;
+    }
+    var secret: u32 = 0;
+    var op:     u32 = 0;
+    for (op < ins.inst.count) {
+        if (operand_secret(w, ?p, ?ins, op::u8, cfg, w.named.data) && op < 32) { secret = secret | (1::u32 << op); }
+        op = op + 1;
+    }
+    val address: res[opt[ct.Refusal], A.Error] = touches(w, ?p, ?ins, fp);
+    if (sel address.err)     { ret failed[opt[Verdict]](address.err); }
+    if (sel address.ok.some) { ret res[opt[Verdict], A.Error].ok{refused(address.ok.some, at)}; }
+    var value: bool = false;
+    k = 0;
+    for (k < w.words) {
+        if ((fp.reads.data[k] & p.taint.data[k]) != 0) { value = true; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < w.touches.len) {
+        if (w.touches.data[k].reads && secret_at(?p, ?w.touches.data[k].at)) { value = true; }
+        k = k + 1;
+    }
+    var c:        effect.Control  = fp.control;
+    val transfer: opt[ct.Refusal] = control(w, ?p, ?ins, ?c, value, secret);
+    if (sel transfer.some) { ret res[opt[Verdict], A.Error].ok{refused(transfer.some, at)}; }
+    val timing: opt[ct.Refusal] = latency(w, ?p, ?ins, fp, secret);
+    if (sel timing.some) { ret res[opt[Verdict], A.Error].ok{refused(timing.some, at)}; }
+    val applied: err[A.Error] = apply(w, ?p, at, ?ins, fp, value);
+    if (sel applied.err) { ret failed[opt[Verdict]](applied.err); }
+    ret successors(w, ?p, at, ?ins, ?c);
+}
+
+# the entry state the seeds make, refused naming a register the file has no row of
+fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
+    var i: u32 = 0;
+    for (i < secrets.len) {
+        val s: Seed = secrets.at[i];
+        if (sel s.register) {
+            val row: opt[u32] = row_index(w, s.register);
+            if (sel row.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+            set_bit(p.taint.data, row.some, true);
+        }
+        if (sel s.memory) {
+            var h: Held = Held{base: effect.NO_ROW, version: ENTRY, offset: s.memory.offset, length: s.memory.length};
+            if (s.memory.base != register.NONE) {
+                val row: opt[u32] = row_index(w, s.memory.base);
+                if (sel row.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+                h.base = row.some;
+            }
+            val held: err[A.Error] = hold(p, h);
+            if (sel held.err) { ret failed[opt[Verdict]](held.err); }
+        }
+        i = i + 1;
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+fun release(w: *Walk) {
+    var i: usize = 0;
+    for (i < w.states.len) {
+        drop(?w.states.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[Point](?w.states);
+    vector.dnit[u32](?w.points);
+    vector.dnit[usize](?w.work);
+    vector.dnit[u64](?w.named);
+    vector.dnit[Touch](?w.touches);
+}
+
+fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
+    var i: usize = 0;
+    for (i < w.code.len) {
+        val pushed: res[usize, A.Error] = vector.push[u32](?w.points, NO_POINT);
+        if (sel pushed.err) { ret failed[Verdict](pushed.err); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.words) {
+        val pushed: res[usize, A.Error] = vector.push[u64](?w.named, 0);
+        if (sel pushed.err) { ret failed[Verdict](pushed.err); }
+        i = i + 1;
+    }
+    val made: res[Point, A.Error] = blank(w);
+    if (sel made.err) { ret failed[Verdict](made.err); }
+    var entry: Point = made.ok;
+    fin { drop(?entry); }
+    val seeded: res[opt[Verdict], A.Error] = seed(w, secrets, ?entry);
+    if (sel seeded.err)     { ret failed[Verdict](seeded.err); }
+    if (sel seeded.ok.some) { ret res[Verdict, A.Error].ok{seeded.ok.some}; }
+    if (w.code.len == 0)    { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
+    val reached: err[A.Error] = reach(w, ?entry, 0);
+    if (sel reached.err) { ret failed[Verdict](reached.err); }
+    val made_fp: res[footprint.Footprint, A.Error] = footprint.make(w.a, w.file);
+    if (sel made_fp.err) { ret failed[Verdict](made_fp.err); }
+    var fp: footprint.Footprint = made_fp.ok;
+    fin { footprint.release(?fp); }
+    var store: [VALUES]operand.Value;
+    var noted: [ALTERNATIVES]requirement.Alternative;
+    var alts:  field.Admissions = field.Admissions{at: ?noted[0], cap: ALTERNATIVES, used: 0};
+    for {
+        val next: opt[usize] = vector.pop[usize](?w.work);
+        if (sel next.none) { brk; }
+        val stepped: res[opt[Verdict], A.Error] = step(w, next.some, ?store[0], ?alts, ?fp);
+        if (sel stepped.err)     { ret failed[Verdict](stepped.err); }
+        if (sel stepped.ok.some) { ret res[Verdict, A.Error].ok{stepped.ok.some}; }
+    }
+    ret res[Verdict, A.Error].ok{Verdict.clear{}};
+}
+
+# the constant-time walk of `code` under the context the function runs under, from the secrets the caller seeds. a
+# set whose timing is `none` is refused before any walk, worded UNCLASSIFIED
+# ---
+# ret: the verdict, or the allocator's refusal of the walk's storage
+pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secrets) res[Verdict, A.Error] {
+    val unclassified: opt[ct.Refusal] = ct.required(code.set.ct);
+    if (sel unclassified.some) { ret res[Verdict, A.Error].ok{Verdict.refused{Finding{offset: 0, refusal: unclassified.some}}}; }
+    val file: *register.File = code.set.codec.registers;
+    var w:    Walk           = Walk{
+        a:       a,
+        code:    code,
+        ctx:     ctx,
+        file:    file,
+        words:   effect.words(file)::usize,
+        points:  vector.init[u32](a),
+        states:  vector.init[Point](a),
+        work:    vector.init[usize](a),
+        named:   vector.init[u64](a),
+        touches: vector.init[Touch](a),
+    };
+    val verdict: res[Verdict, A.Error] = walked(?w, secrets);
+    release(?w);
+    ret verdict;
+}
+
+# risc-v code walked under `selection` from seeds `seeds`, rv64 on the i base
+#[testing]
+fun t_walk(t: *testing.Testing, selection: str, bytes: *u8, len: usize, seeds: *Seed, count: u32) Verdict {
+    val a:      *A.Allocator                              = testing.allocator_of(t);
+    val chosen: res[extension.Selection, extension.Error] = extension.select(a, ?riscv_extension.CATALOG, selection, diagnostic.START);
+    if (sel chosen.err) { ret t_unread("selection"); }
+    var picked: extension.Selection              = chosen.ok;
+    var view:   register.Available;
+    val opened: res[state.Context, state.Opened] = state.open(a, ?riscv_register.FILE, ?picked, ?riscv_extension.AXES, state.Settings{at: [state.MAX_AXES]u8{1, 0, 0, 0, 0, 0, 0, 0}}, ?view);
+    if (sel opened.err) { ret t_unread("context"); }
+    var ctx:     state.Context         = opened.ok;
+    var code:    Code                  = Code{set: ?riscv_set.SET, data: bytes, len: len};
+    var secrets: Secrets               = Secrets{at: seeds, len: count};
+    val got:     res[Verdict, A.Error] = check(a, ?code, ?ctx, ?secrets);
+    val viewed:  err[A.Error]          = register.release(?view);
+    extension.release(?picked);
+    if (sel got.err) { ret t_unread("storage"); }
+    ret got.ok;
+}
+
+#[testing]
+fun t_unread(why: str) Verdict {
+    ret Verdict.unread{Unread{message: why, offset: 0}};
+}
+
+# whether `v` refuses the instruction at `offset` for `reason`
+#[testing]
+fun t_refuses(v: Verdict, offset: u64, reason: ct.Reason) bool {
+    if (!sel v.refused) { ret false; }
+    ret v.refused.offset == offset && v.refused.refusal.reason == reason;
+}
+
+#[testing]
+val T_A0: [1]Seed = [1]Seed{Seed.register{gen_register.X10}};
+
+# beq a0, zero, 8; ret; ret
+#[testing]
+val T_BRANCH: [12]u8 = [12]u8{0x63, 0x04, 0x05, 0x00, 0x67, 0x80, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# ld a1, 0(a0); ret
+#[testing]
+val T_ADDRESS: [8]u8 = [8]u8{0x83, 0x35, 0x05, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# mul a2, a0, a1; ret
+#[testing]
+val T_MULTIPLY: [8]u8 = [8]u8{0x33, 0x06, 0xb5, 0x02, 0x67, 0x80, 0x00, 0x00};
+
+# sd a0, 8(sp); ld a1, 8(sp); beq a1, zero, 8; ret; ret
+#[testing]
+val T_RELOAD: [20]u8 = [20]u8{0x23, 0x34, 0xa1, 0x00, 0x83, 0x35, 0x81, 0x00, 0x63, 0x84, 0x05, 0x00, 0x67, 0x80, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# li a0, 5; beq a0, zero, 8; ret; ret
+#[testing]
+val T_OVERWRITE: [16]u8 = [16]u8{0x13, 0x05, 0x50, 0x00, 0x63, 0x04, 0x05, 0x00, 0x67, 0x80, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# a: beq a2, zero, b; add a2, a0, zero; j a; b: ret. the branch reads a secret only on the loop's second pass
+#[testing]
+val T_LOOP: [16]u8 = [16]u8{0x63, 0x06, 0x06, 0x00, 0x33, 0x06, 0x05, 0x00, 0x6f, 0xf0, 0x9f, 0xff, 0x67, 0x80, 0x00, 0x00};
+
+# ld a3, 16(sp); mul a2, a0, a1; sd a3, 24(sp); beq a1, zero, 8; ret; ret
+#[testing]
+val T_PUBLIC: [24]u8 = [24]u8{0x83, 0x36, 0x01, 0x01, 0x33, 0x06, 0xb5, 0x02, 0x23, 0x3c, 0xd1, 0x00, 0x63, 0x84, 0x05, 0x00, 0x67, 0x80, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# a secret may decide no branch
+test check__a_branch_on_a_secret_is_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    if (!t_refuses(t_walk(?t, "rv64i_zkt", ?T_BRANCH[0], 12, ?T_A0[0], 1), 0, ct.CONTROL)) { ret 1; }
+    ret 0;
+}
+
+# a secret may form no address
+test check__an_address_formed_from_a_secret_is_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    if (!t_refuses(t_walk(?t, "rv64i_zkt", ?T_ADDRESS[0], 8, ?T_A0[0], 1), 0, ct.MEMORY)) { ret 1; }
+    ret 0;
+}
+
+# a row whose timing depends on its inputs refuses a secret in one, naming the operand: mul with no zkt
+test check__a_variable_latency_row_on_a_secret_is_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    val v: Verdict = t_walk(?t, "rv64im", ?T_MULTIPLY[0], 8, ?T_A0[0], 1);
+    if (!t_refuses(v, 0, ct.LATENCY)) { ret 1; }
+    if (sel v.refused) {
+        if (v.refused.refusal.operand != 1) { ret 2; }
+    }
+    ret 0;
+}
+
+# the same row passes under the condition that makes it independent: mul under zkt
+test check__a_variable_latency_row_passes_under_its_condition {
+    var t: testing.Testing;
+    testing.make(?t);
+    val v: Verdict = t_walk(?t, "rv64im_zkt", ?T_MULTIPLY[0], 8, ?T_A0[0], 1);
+    if (!sel v.clear) { ret 1; }
+    ret 0;
+}
+
+# a secret stored and loaded back keeps its secrecy under zkt, whose list leaves the data a load or store moves no
+# input, and with no zkt the store itself is refused
+test check__a_secret_stored_and_reloaded_keeps_its_taint {
+    var t: testing.Testing;
+    testing.make(?t);
+    if (!t_refuses(t_walk(?t, "rv64i_zkt", ?T_RELOAD[0], 20, ?T_A0[0], 1), 8, ct.CONTROL)) { ret 1; }
+    if (!t_refuses(t_walk(?t, "rv64i", ?T_RELOAD[0], 20, ?T_A0[0], 1), 0, ct.LATENCY))     { ret 2; }
+    ret 0;
+}
+
+# a register written with a constant holds no secret after it
+test check__a_register_overwritten_with_a_constant_loses_its_taint {
+    var t: testing.Testing;
+    testing.make(?t);
+    val v: Verdict = t_walk(?t, "rv64i", ?T_OVERWRITE[0], 16, ?T_A0[0], 1);
+    if (!sel v.clear) { ret 1; }
+    ret 0;
+}
+
+# a loop is walked to a fixed point, so a secret the loop's body makes reaches the branch heading it
+test check__a_loop_reaches_a_fixed_point {
+    var t: testing.Testing;
+    testing.make(?t);
+    if (!t_refuses(t_walk(?t, "rv64i_zkt", ?T_LOOP[0], 16, ?T_A0[0], 1), 0, ct.CONTROL)) { ret 1; }
+    ret 0;
+}
+
+# a function given no secret passes whatever it runs, every dependent row included
+test check__a_public_function_passes {
+    var t: testing.Testing;
+    testing.make(?t);
+    val v: Verdict = t_walk(?t, "rv64im", ?T_PUBLIC[0], 24, nil, 0);
+    if (!sel v.clear) { ret 1; }
+    ret 0;
+}
+
+#[testing]
+val T_V0: [1]Seed = [1]Seed{Seed.register{gen_register.V0}};
+
+#[testing]
+val T_V2: [1]Seed = [1]Seed{Seed.register{gen_register.V2}};
+
+#[testing]
+val T_V3: [1]Seed = [1]Seed{Seed.register{gen_register.V3}};
+
+# vsetvli t0, a0, e32, m1, ta, ma; vadd.vv v1, v2, v3, v0.t; ret
+#[testing]
+val T_MASKED: [12]u8 = [12]u8{0xd7, 0x72, 0x05, 0x0d, 0xd7, 0x80, 0x21, 0x00, 0x67, 0x80, 0x00, 0x00};
+
+# vsetvli t0, a0, e32, m1, ta, ma; vrgather.vv v1, v2, v3; ret
+#[testing]
+val T_GATHER: [12]u8 = [12]u8{0xd7, 0x72, 0x05, 0x0d, 0xd7, 0x80, 0x21, 0x32, 0x67, 0x80, 0x00, 0x00};
+
+# zvkt leaves the mask out of data-independent latency: a secret v0 is refused under it, where secret data passes
+test check__under_zvkt_a_secret_mask_is_refused_and_secret_data_passes {
+    var t: testing.Testing;
+    testing.make(?t);
+    val mask: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_MASKED[0], 12, ?T_V0[0], 1);
+    if (!t_refuses(mask, 4, ct.LATENCY)) { ret 1; }
+    val data: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_MASKED[0], 12, ?T_V2[0], 1);
+    if (!sel data.clear)                                                                { ret 2; }
+    if (!t_refuses(t_walk(?t, "rv64iv", ?T_MASKED[0], 12, ?T_V2[0], 1), 4, ct.LATENCY)) { ret 3; }
+    ret 0;
+}
+
+# vrgather.vv keeps vs1, its index, as an input under zvkt, where secret vs2 data passes
+test check__under_zvkt_a_secret_gather_index_is_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    val index: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_GATHER[0], 12, ?T_V3[0], 1);
+    if (!t_refuses(index, 4, ct.LATENCY)) { ret 1; }
+    if (sel index.refused) {
+        if (index.refused.refusal.operand != 2) { ret 2; }
+    }
+    val data: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_GATHER[0], 12, ?T_V2[0], 1);
+    if (!sel data.clear) { ret 3; }
+    ret 0;
+}
