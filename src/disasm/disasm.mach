@@ -13,7 +13,11 @@
 # is parsed again as the assembler parses it, given the shortest form the
 # assembler would give it, and encoded, and the bytes and the relocations
 # must be the ones the object holds. a statement that does not is printed as
-# data in the set's parcels, never as a guessed instruction. a relocation
+# data in the set's parcels, never as a guessed instruction, and is refused
+# where the set's dialect has no one-byte data directive, as spir-v's. a set
+# with a typed stream is read under a stream begun with the disassembly, to
+# which every statement that reads back adds what it defines, so the
+# statements after it read as the assembler read them. a relocation
 # against a section symbol, or against a symbol with no name, names a label
 # the disassembler states at its place, spelled by the syntax's anonymous stem.
 #
@@ -86,6 +90,7 @@ use masc.core.row;
 use masc.core.set;
 use masc.core.source;
 use masc.core.state;
+use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use masc.core.trait;
 use masc.format.dialect;
@@ -103,7 +108,9 @@ use riscv_set:       masc.isa.riscv.set;
 pub val ARCH:       str = "the set does not serve the object's architecture";
 pub val NO_SYNTAX:  str = "no syntax of the set at this index";
 pub val NO_PARCEL:  str = "the set states no parcel of its code";
-pub val NO_BYTE:    str = "the set's source dialect has no one-byte data directive";
+pub val NO_BYTE:    str = "bytes no statement reads back to, which the set's source dialect has no one-byte data directive for";
+pub val STREAMED:   str = "the object's context is already in a typed stream";
+pub val DEFINED:    str = "instruction that breaks what the stream before it defined";
 pub val MEMORY:     str = "out of memory";
 pub val LINES:      str = "the object states line tables, which disassembly does not write";
 pub val GROUPS:     str = "the object states section groups, which the assembler does not read";
@@ -263,7 +270,8 @@ val REALIGN:   Attempt = 1;
 # anchors: the labels the disassembler states, in place order, each numbered after the stem
 # bound:   the set's bindings in order of relocation kind
 # count:   how many symbols the object has, the handles past it naming anchors
-# byte:    the one-byte data directive
+# byte:    the one-byte data directive, none for a set whose dialect has none, as spir-v's, whose bytes print only as
+#          statements
 # li, ri:   the next label and the next relocation to print
 # apart: the unique numbers given so far, the last of them the latest
 # full:  whether the output failed to grow
@@ -290,7 +298,7 @@ rec Disasm {
     fixups:  vector.Vector[field.Fixup];
     symbols: core_syntax.Symbols;
     count:   u32;
-    byte:    str;
+    byte:    opt[str];
     li:      usize;
     ri:      usize;
     apart:   u64;
@@ -1013,9 +1021,29 @@ fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u
         d.out.len = start;
         ret res[u64, Refusal].ok{0};
     }
+    val seen: err[Refusal] = observe(d, section, count);
+    if (sel seen.err) {
+        d.out.len = start;
+        ret res[u64, Refusal].err{seen.err};
+    }
     put_char(d, '\n');
     d.ri = end;
     ret res[u64, Refusal].ok{stop - at};
+}
+
+# what the `count` steps of the statement read back define added to the set's typed stream, in order, refused at the
+# step that breaks what the stream holds. a set with a stream states no sequences, so a refusal after the first step
+# leaves nothing behind
+fun observe(d: *Disasm, section: u32, count: u32) err[Refusal] {
+    val h: *stream.Hooks = d.s.codec.stream;
+    if (h == nil) { ret err[Refusal].ok{}; }
+    var i: u32 = 0;
+    for (i < count) {
+        val seen: err[field.Refusal] = h.observe(d.v.stream, ?d.steps[i].ins);
+        if (sel seen.err) { ret refusal(DEFINED, section, d.steps[i].at); }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
 }
 
 # the instruction decoded at the cursor printed alone, by its row's own form when the disassembler spells forms
@@ -1118,11 +1146,12 @@ fun datum(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u64) 
 }
 
 # the bytes from `at` to `end` of `data` written as one-byte data
-fun raw(d: *Disasm, data: *u8, at: u64, end: u64) {
+fun raw(d: *Disasm, section: u32, data: *u8, at: u64, end: u64) err[Refusal] {
+    if (sel d.byte.none) { ret refusal(NO_BYTE, section, at); }
     var i: u64 = at;
     for (i < end) {
         put_char(d, '\t');
-        put(d, d.byte);
+        put(d, d.byte.some);
         put_char(d, ' ');
         var n: usize = 0;
         for (i < end && n < PER_LINE) {
@@ -1133,6 +1162,7 @@ fun raw(d: *Disasm, data: *u8, at: u64, end: u64) {
         }
         put_char(d, '\n');
     }
+    ret err[Refusal].ok{};
 }
 
 # the offset of the relocation at the cursor in `section`, `none` when it has no more
@@ -1154,7 +1184,8 @@ fun data_run(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, end: u64,
         }
         var stop: u64 = end;
         if (next < stop) { stop = next; }
-        raw(d, data, i, stop);
+        val wrote: err[Refusal] = raw(d, section, data, i, stop);
+        if (sel wrote.err) { ret res[u64, Refusal].err{wrote.err}; }
         i = stop;
     }
     ret res[u64, Refusal].ok{i - at};
@@ -1837,11 +1868,20 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
         if (s.source.widths.at[i].width == 1) { one = opt[str].some{s.source.widths.at[i].name}; }
         i = i + 1;
     }
-    if (sel one.none) { ret whole(NO_BYTE); }
+    # a typed stream's state is the disassembly's, begun with it, which every scope of the object reads
+    var v: state.Context = @object;
+    val h: *stream.Hooks = s.codec.stream;
+    if (h != nil) {
+        if (object.stream != nil) { ret whole(STREAMED); }
+        val made: res[ptr, A.Error] = h.make(a);
+        if (sel made.err) { ret whole(MEMORY); }
+        h.begin(made.ok);
+        v.stream = made.ok;
+    }
     var d: Disasm = Disasm{
         a:       a,
         s:       s,
-        v:       object,
+        v:       ?v,
         syntax:  ?s.syntaxes.at[options.syntax],
         dialect: options.dialect,
         naming:  options.naming,
@@ -1858,7 +1898,7 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
         bytes:   vector.init[u8](a),
         fixups:  vector.init[field.Fixup](a),
         count:   o.symbols.count::u32,
-        byte:    one.some,
+        byte:    one,
         li:      0,
         ri:      0,
         apart:   0,
@@ -1870,6 +1910,7 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
     val start: usize        = out.len;
     val done:  err[Refusal] = written(?d);
     released(?d);
+    if (h != nil)     { h.release(a, v.stream); }
     if (sel done.err) { out.len = start; }
     ret done;
 }
