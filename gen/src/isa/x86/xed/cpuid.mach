@@ -1,0 +1,348 @@
+# the cpuid files of XED: which cpuid bits each ISA set needs
+#
+# a line is `XED_ISA_SET_<set> [, <kind>] : <bit>...`, the set needing every bit it names, or
+# `n/a` for none. a set on several lines needs any one of them, each a group of its own kind:
+# AVX10 for the form an avx10 version enumerates, which a line naming avx10_enabled is unless it
+# says otherwise, and FBIT for the rest. a bit is `name.leaf.subleaf.reg.bit`,
+# `name.leaf.subleaf.reg[bit]` or `name.leaf.subleaf.reg[lo:hi]=value`, the leaf and subleaf in
+# hex. XED reads every cpuid file as one, without regard to case, so a set given two groups of
+# one kind, a name given two different bits, and an FBIT group naming avx10_enabled are refused
+# (pysrc/cpuid_rdr.py read_file, make_cpuid_info_map)
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+use std.types.string.str_starts_with;
+use std.types.string.str_to_lower;
+use std.types.string.str_to_upper;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use gen.diag;
+use gen.isa.x86.xed.layer;
+use gen.isa.x86.xed.table;
+use gen.isa.x86.xed.text;
+use gen.lines;
+
+# one cpuid bit, or field of bits holding a value
+# ---
+# name:    its name, in lower case
+# leaf:    the cpuid leaf
+# subleaf: the subleaf
+# reg:     the register it is read from, such as `ecx`
+# lo:      its first bit
+# hi:      its last bit
+# value:   the value the bits hold, 1 for a single bit
+pub rec Bit {
+    name:    str;
+    leaf:    u32;
+    subleaf: u32;
+    reg:     str;
+    lo:      u8;
+    hi:      u8;
+    value:   u32;
+    line:    lines.Line;
+}
+
+# one alternative of an ISA set: every bit it names
+# ---
+# avx10: whether it is the form an avx10 version enumerates
+# bits:  the names of its bits
+pub rec Group {
+    avx10: bool;
+    bits:  vector.Vector[str];
+    line:  lines.Line;
+}
+
+# one ISA set and its alternatives, none when every processor has it
+# ---
+# name:   the set, as XED's ISA_SET spells it in upper case
+# groups: its alternatives, the AVX10 one first
+pub rec Set {
+    name:   str;
+    groups: vector.Vector[Group];
+    line:   lines.Line;
+}
+
+pub rec Cpuid {
+    bits:  vector.Vector[Bit];
+    sets:  vector.Vector[Set];
+    index: map.Map[str, u32];
+}
+
+pub val PREFIX: str = "XED_ISA_SET_";
+
+pub val MALFORMED:   str = "cpuid line is not a set, a colon and its bits";
+pub val BAD_KIND:    str = "cpuid group is neither AVX10 nor FBIT";
+pub val BAD_BIT:     str = "cpuid bit is not name.leaf.subleaf.reg and a bit, or bits holding a value";
+pub val GROUP_TWICE: str = "ISA set given two groups of one kind";
+pub val BIT_TWICE:   str = "cpuid name given two different bits";
+pub val AVX10_FBIT:  str = "FBIT group names avx10_enabled";
+
+fun upper(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    val s: res[str, diag.Refusal] = text.owned(a, l, v);
+    if (sel s.err) { ret s; }
+    val u: res[str, StrError] = str_to_upper(a, s.ok);
+    if (sel u.err) { ret res[str, diag.Refusal].err{text.memory(l)}; }
+    ret res[str, diag.Refusal].ok{u.ok};
+}
+
+fun hex(v: View) opt[u32] {
+    if (v.len == 0 || v.len > 8) { ret opt[u32].none{}; }
+    var n: u32   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        val c: u8  = v.data[i];
+        var d: u32 = 16;
+        if (c >= '0' && c <= '9') { d = (c - '0')::u32; }
+        or (c >= 'a' && c <= 'f') { d = (c - 'a')::u32 + 10; }
+        or (c >= 'A' && c <= 'F') { d = (c - 'A')::u32 + 10; }
+        if (d == 16)              { ret opt[u32].none{}; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    ret opt[u32].some{n};
+}
+
+fun decimal(v: View) opt[u32] {
+    if (v.len == 0 || v.len > 9) { ret opt[u32].none{}; }
+    var n: u32   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] < '0' || v.data[i] > '9') { ret opt[u32].none{}; }
+        n = n * 10 + (v.data[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret opt[u32].some{n};
+}
+
+# `w` split at each `c`
+fun split(a: *A.Allocator, l: *lines.Line, w: View, c: u8) res[vector.Vector[View], diag.Refusal] {
+    var out:  vector.Vector[View] = vector.init[View](a);
+    var from: usize               = 0;
+    var i:    usize               = 0;
+    for (i <= w.len) {
+        if (i == w.len || w.data[i] == c) {
+            if (!text.pushed(vector.push[View](?out, text.part(w, from, i - from)))) { ret res[vector.Vector[View], diag.Refusal].err{text.memory(l)}; }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    ret res[vector.Vector[View], diag.Refusal].ok{out};
+}
+
+# the bit `w` names
+fun bit(a: *A.Allocator, l: *lines.Line, w: View) res[Bit, diag.Refusal] {
+    val bad:    res[Bit, diag.Refusal]                 = res[Bit, diag.Refusal].err{lines.refuse(l, BAD_BIT, nil)};
+    val dotted: res[vector.Vector[View], diag.Refusal] = split(a, l, w, '.');
+    if (sel dotted.err) { ret res[Bit, diag.Refusal].err{dotted.err}; }
+    val d: *vector.Vector[View] = ?dotted.ok;
+    if (d.len != 4 && d.len != 5) { ret bad; }
+    var b:    Bit                    = Bit{name: nil, leaf: 0, subleaf: 0, reg: nil, lo: 0, hi: 0, value: 1, line: @l};
+    val name: res[str, diag.Refusal] = text.owned(a, l, d.data[0]);
+    if (sel name.err) { ret res[Bit, diag.Refusal].err{name.err}; }
+    val low: res[str, StrError] = str_to_lower(a, name.ok);
+    if (sel low.err) { ret res[Bit, diag.Refusal].err{text.memory(l)}; }
+    b.name = low.ok;
+    val leaf:    opt[u32] = hex(d.data[1]);
+    val subleaf: opt[u32] = hex(d.data[2]);
+    if (sel leaf.none)    { ret bad; }
+    if (sel subleaf.none) { ret bad; }
+    b.leaf    = leaf.some;
+    b.subleaf = subleaf.some;
+    var reg:  View = d.data[3];
+    var bits: View = view(nil, 0);
+    if (d.len == 5) {
+        val n: opt[u32] = decimal(d.data[4]);
+        if (sel n.none)  { ret bad; }
+        if (n.some > 31) { ret bad; }
+        b.lo = n.some::u8;
+        b.hi = b.lo;
+    }
+    or {
+        val open: opt[usize] = text.find(reg, '[');
+        if (sel open.none) { ret bad; }
+        bits = text.part(reg, open.some + 1, reg.len - open.some - 1);
+        reg  = text.part(reg, 0, open.some);
+        val close: opt[usize] = text.find(bits, ']');
+        if (sel close.none) { ret bad; }
+        val after: View = text.part(bits, close.some + 1, bits.len - close.some - 1);
+        bits = text.part(bits, 0, close.some);
+        val colon: opt[usize] = text.find(bits, ':');
+        if (sel colon.some) {
+            val lo: opt[u32] = decimal(text.part(bits, 0, colon.some));
+            val hi: opt[u32] = decimal(text.part(bits, colon.some + 1, bits.len - colon.some - 1));
+            if (sel lo.none)                           { ret bad; }
+            if (sel hi.none)                           { ret bad; }
+            if (after.len < 2 || after.data[0] != '=') { ret bad; }
+            val value: opt[u32] = decimal(text.part(after, 1, after.len - 1));
+            if (sel value.none)                                                       { ret bad; }
+            if (lo.some > hi.some || hi.some > 31)                                    { ret bad; }
+            if (hi.some - lo.some < 31 && value.some >> (hi.some - lo.some + 1) != 0) { ret bad; }
+            b.lo    = lo.some::u8;
+            b.hi    = hi.some::u8;
+            b.value = value.some;
+        }
+        or {
+            if (after.len != 0) { ret bad; }
+            val n: opt[u32] = decimal(bits);
+            if (sel n.none)  { ret bad; }
+            if (n.some > 31) { ret bad; }
+            b.lo = n.some::u8;
+            b.hi = b.lo;
+        }
+    }
+    if (reg.len != 3) { ret bad; }
+    val r: res[str, diag.Refusal] = text.owned(a, l, reg);
+    if (sel r.err) { ret res[Bit, diag.Refusal].err{r.err}; }
+    val rl: res[str, StrError] = str_to_lower(a, r.ok);
+    if (sel rl.err) { ret res[Bit, diag.Refusal].err{text.memory(l)}; }
+    b.reg = rl.ok;
+    ret res[Bit, diag.Refusal].ok{b};
+}
+
+fun same(x: *Bit, y: *Bit) bool {
+    ret x.leaf == y.leaf && x.subleaf == y.subleaf && str_equals(x.reg, y.reg) && x.lo == y.lo && x.hi == y.hi && x.value == y.value;
+}
+
+# the set `name`, spelled in upper case without XED's prefix
+pub fun find(c: *Cpuid, name: str) opt[*Set] {
+    val got: opt[*u32] = map.get[str, u32](?c.index, ?name);
+    if (sel got.none) { ret opt[*Set].none{}; }
+    ret opt[*Set].some{?c.sets.data[@got.some]};
+}
+
+# the bit named `name`, in lower case
+pub fun named(c: *Cpuid, name: str) opt[*Bit] {
+    var i: usize = 0;
+    for (i < c.bits.len) {
+        if (str_equals(c.bits.data[i].name, name)) { ret opt[*Bit].some{?c.bits.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Bit].none{};
+}
+
+fun line(a: *A.Allocator, c: *Cpuid, l: *lines.Line) err[diag.Refusal] {
+    val colon: opt[usize] = text.find(l.text, ':');
+    if (sel colon.none) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+    val head: res[vector.Vector[View], diag.Refusal] = split(a, l, text.part(l.text, 0, colon.some), ',');
+    if (sel head.err)                       { ret err[diag.Refusal].err{head.err}; }
+    if (head.ok.len < 1 || head.ok.len > 2) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, nil)}; }
+    val key: res[str, diag.Refusal] = upper(a, l, text.trim(head.ok.data[0]));
+    if (sel key.err)                      { ret err[diag.Refusal].err{key.err}; }
+    if (!str_starts_with(key.ok, PREFIX)) { ret err[diag.Refusal].err{lines.refuse(l, MALFORMED, key.ok)}; }
+    val name:  str   = ?key.ok[12];
+    var g:     Group = Group{avx10: false, bits: vector.init[str](a), line: @l};
+    var given: bool  = false;
+    if (head.ok.len == 2) {
+        val kind: res[str, diag.Refusal] = upper(a, l, text.trim(head.ok.data[1]));
+        if (sel kind.err)                 { ret err[diag.Refusal].err{kind.err}; }
+        if (str_equals(kind.ok, "AVX10")) { g.avx10 = true; }
+        or (!str_equals(kind.ok, "FBIT")) { ret err[diag.Refusal].err{lines.refuse(l, BAD_KIND, kind.ok)}; }
+        given = true;
+    }
+    var rest: lines.Line                             = lines.Line{file: l.file, number: l.number, text: text.part(l.text, colon.some + 1, l.text.len - colon.some - 1)};
+    val toks: res[vector.Vector[View], diag.Refusal] = lines.tokens(a, ?rest);
+    if (sel toks.err) { ret err[diag.Refusal].err{toks.err}; }
+    var bits: vector.Vector[Bit] = vector.init[Bit](a);
+    var i:    usize              = 0;
+    for (i < toks.ok.len) {
+        val t: View = toks.ok.data[i];
+        if (!(t.len == 3 && (t.data[0] == 'n' || t.data[0] == 'N') && t.data[1] == '/' && (t.data[2] == 'a' || t.data[2] == 'A'))) {
+            val b: res[Bit, diag.Refusal] = bit(a, l, t);
+            if (sel b.err) { ret err[diag.Refusal].err{b.err}; }
+            if (str_contains(b.ok.name, "avx10_enabled")) {
+                if (given && !g.avx10) { ret err[diag.Refusal].err{lines.refuse(l, AVX10_FBIT, name)}; }
+                if (!given)            { g.avx10 = true; }
+            }
+            if (!text.pushed(vector.push[Bit](?bits, b.ok))) { ret err[diag.Refusal].err{text.memory(l)}; }
+        }
+        i = i + 1;
+    }
+    # every bit agrees with the one of its name already read
+    i = 0;
+    for (i < bits.len) {
+        val b:    *Bit      = ?bits.data[i];
+        val seen: opt[*Bit] = named(c, b.name);
+        if (sel seen.some) {
+            if (!same(seen.some, b)) { ret err[diag.Refusal].err{lines.refuse(l, BIT_TWICE, b.name)}; }
+        }
+        or (!text.pushed(vector.push[Bit](?c.bits, @b)))     { ret err[diag.Refusal].err{text.memory(l)}; }
+        if (!text.pushed(vector.push[str](?g.bits, b.name))) { ret err[diag.Refusal].err{text.memory(l)}; }
+        i = i + 1;
+    }
+    var s:   *Set      = nil;
+    val was: opt[*Set] = find(c, name);
+    if (sel was.some) { s = was.some; }
+    or {
+        if (!text.pushed(vector.push[Set](?c.sets, Set{name: name, groups: vector.init[Group](a), line: @l}))) { ret err[diag.Refusal].err{text.memory(l)}; }
+        val put: res[bool, A.Error] = map.insert[str, u32](?c.index, name, (c.sets.len - 1)::u32);
+        if (sel put.err) { ret err[diag.Refusal].err{text.memory(l)}; }
+        s = ?c.sets.data[c.sets.len - 1];
+    }
+    var k: usize = 0;
+    for (k < s.groups.len) {
+        if (s.groups.data[k].avx10 == g.avx10) { ret err[diag.Refusal].err{lines.refuse(l, GROUP_TWICE, name)}; }
+        k = k + 1;
+    }
+    # a line naming no bit adds no group
+    if (g.bits.len == 0) { ret err[diag.Refusal].ok{}; }
+    if (g.avx10) {
+        if (!text.pushed(vector.push[Group](?s.groups, g))) { ret err[diag.Refusal].err{text.memory(l)}; }
+        var j: usize = s.groups.len - 1;
+        for (j > 0) {
+            val t: Group = s.groups.data[j - 1];
+            s.groups.data[j - 1] = s.groups.data[j];
+            s.groups.data[j]     = t;
+            j                    = j - 1;
+        }
+    }
+    or (!text.pushed(vector.push[Group](?s.groups, g))) { ret err[diag.Refusal].err{text.memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun by_name(x: *Set, y: *Set) i64 {
+    ret str_compare(x.name, y.name);
+}
+
+# every cpuid file the layers list, its sets sorted by name
+pub fun read(a: *A.Allocator, files: *vector.Vector[layer.Listed]) res[Cpuid, diag.Refusal] {
+    var c:      Cpuid                                           = Cpuid{bits: vector.init[Bit](a), sets: vector.init[Set](a), index: map.init[str, u32](a)};
+    val listed: res[vector.Vector[*layer.Listed], diag.Refusal] = layer.of(a, files, "cpuid");
+    if (sel listed.err) { ret res[Cpuid, diag.Refusal].err{listed.err}; }
+    var i: usize = 0;
+    for (i < listed.ok.len) {
+        val got: res[vector.Vector[lines.Line], diag.Refusal] = text.read(a, listed.ok.data[i].file, false);
+        if (sel got.err) { ret res[Cpuid, diag.Refusal].err{got.err}; }
+        var k: usize = 0;
+        for (k < got.ok.len) {
+            val read: err[diag.Refusal] = line(a, ?c, ?got.ok.data[k]);
+            if (sel read.err) { ret res[Cpuid, diag.Refusal].err{read.err}; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Set](c.sets.data, c.sets.len, by_name);
+    map.clear[str, u32](?c.index);
+    i = 0;
+    for (i < c.sets.len) {
+        val put: res[bool, A.Error] = map.insert[str, u32](?c.index, c.sets.data[i].name, i::u32);
+        if (sel put.err) { ret res[Cpuid, diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, nil)}; }
+        i = i + 1;
+    }
+    ret res[Cpuid, diag.Refusal].ok{c};
+}
