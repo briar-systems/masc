@@ -78,6 +78,9 @@ pub val UNKNOWN_FORMAT: str = "instruction format the directive states none of";
 pub val UNBOUND: str = "result the instruction defines that the statement binds to no name";
 pub val UNTAKEN: str = "result bound to an instruction that takes it as no operand";
 
+# the refusal of an operand the template writes again, spelled with another value than where it was first written
+pub val REPEATED: str = "operand written again with another value";
+
 # the refusal kept while candidates are tried
 # ---
 # held:     whether one is kept
@@ -267,6 +270,9 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
     var back:  usize = 0;
     var used:  u32   = 0;
     var open:  bool  = false;
+    # the operands a hole has read, so a later hole of one reads it again and must read the same value
+    var seen:  u32   = 0;
+    var kept:  u32   = 0;
     read.skip(r);
     if (r.at < r.lead) { r.at = r.lead; }
     for {
@@ -289,6 +295,7 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             group = at;
             back  = r.at;
             used  = r.used;
+            kept  = seen;
         }
         or (p.kind == core_syntax.CLOSE) {
             open = false;
@@ -308,9 +315,23 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             }
         }
         or (p.kind == core_syntax.HOLE) {
-            spans[p.operand] = r.at;
-            val got: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?values[p.operand]);
-            if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+            val bit: u32 = 1::u32 << p.operand::u32;
+            if ((seen & bit) == 0) {
+                spans[p.operand] = r.at;
+                val got: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?values[p.operand]);
+                if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+                seen = seen | bit;
+            }
+            or {
+                # an operand the template writes again, as sve's destructive `<Zdn>`, reads the value it read before
+                val at:    usize                      = r.at;
+                var again: operand.Value              = operand.Value.none{};
+                val got:   err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?again);
+                if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+                or (!operand.equal(?again, ?values[p.operand])) {
+                    failed = opt[diagnostic.Diagnostic].some{read.refuse(r, REPEATED, at, r.at - at)};
+                }
+            }
             after = true;
         }
         if (sel failed.some) {
@@ -319,6 +340,7 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             keep(best, failed.some, false);
             r.at   = back;
             r.used = used;
+            seen   = kept;
             var q: core_syntax.Piece = core_syntax.piece(template, group);
             for (q.kind != core_syntax.CLOSE && q.kind != core_syntax.END) {
                 if (q.kind == core_syntax.HOLE) { values[q.operand] = operand.Value.none{}; }
@@ -1105,20 +1127,29 @@ fun t_fits(r: res[usize, A.Error]) bool {
     ret sel r.ok;
 }
 
+# the riscv syntax with row 0's form, add's, replaced by `form`, its forms held in `forms`, the test reading it
+#[testing]
+fun t_reformed(t: *T, form: str, forms: *vector.Vector[str], out: *core_syntax.Syntax) bool {
+    @forms = vector.init[str](testing.allocator_of(?t.t));
+    var i: u32 = 0;
+    for (i < riscv_syntax.SYNTAX.forms.len) {
+        if (!t_fits(vector.push[str](forms, riscv_syntax.SYNTAX.forms.at[i]))) { ret false; }
+        i = i + 1;
+    }
+    forms.data[0] = form;
+    @out          = riscv_syntax.SYNTAX;
+    out.forms     = core_syntax.Forms{at: forms.data, len: riscv_syntax.SYNTAX.forms.len};
+    t.syntax      = out;
+    ret true;
+}
+
 # a register hole formatted `number` reads the register by its number within the operand's one class and prints it so
 test instruction__a_numbered_register_hole_reads_and_prints_the_number {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
-    var forms: vector.Vector[str] = vector.init[str](testing.allocator_of(?t.t));
-    var i:     u32                = 0;
-    for (i < riscv_syntax.SYNTAX.forms.len) {
-        if (!t_fits(vector.push[str](?forms, riscv_syntax.SYNTAX.forms.at[i]))) { ret 2; }
-        i = i + 1;
-    }
-    forms.data[0] = "add x<0:number>, <1>, <2>";
-    var numbered: core_syntax.Syntax = riscv_syntax.SYNTAX;
-    numbered.forms = core_syntax.Forms{at: forms.data, len: riscv_syntax.SYNTAX.forms.len};
-    t.syntax       = ?numbered;
+    var forms:    vector.Vector[str];
+    var numbered: core_syntax.Syntax;
+    if (!t_reformed(?t, "add x<0:number>, <1>, <2>", ?forms, ?numbered)) { ret 2; }
     val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add x5, a0, a1", diagnostic.START);
     if (sel got.err) { ret 3; }
     val ins: inst.Inst = got.ok;
@@ -1129,6 +1160,26 @@ test instruction__a_numbered_register_hole_reads_and_prints_the_number {
     if (!sel beyond.err) { ret 7; }
     val named: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add xt0, a0, a1", diagnostic.START);
     if (!sel named.err) { ret 8; }
+    ret 0;
+}
+
+# an operand the template writes again prints at each hole and reads only where every spelling reads one value, as
+# aarch64 sve's destructive `add z0.s, p0/m, z0.s, z1.s` writes its first source and destination twice
+test instruction__an_operand_written_again_reads_one_value_and_prints_at_each_hole {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var forms: vector.Vector[str];
+    var tied:  core_syntax.Syntax;
+    if (!t_reformed(?t, "add <0>, <1>, <2>, <0>", ?forms, ?tied)) { ret 2; }
+    val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add t0, a0, a1, t0", diagnostic.START);
+    if (sel got.err) { ret 3; }
+    val ins: inst.Inst = got.ok;
+    if (ins.row != gen_row.ADD || !(sel ins.values[0].register && ins.values[0].register == register.make(0, 5))) { ret 4; }
+    if (!t_prints_as(?t, "add x5, a0, a1, x5", "add t0, a0, a1, t0"))                                             { ret 5; }
+    val other: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add t0, a0, a1, t1", diagnostic.START);
+    if (!sel other.err) { ret 6; }
+    val d: diagnostic.Diagnostic = other.err;
+    if (d.message != REPEATED || d.span.start.column != 17) { ret 7; }
     ret 0;
 }
 
