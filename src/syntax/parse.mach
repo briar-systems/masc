@@ -28,12 +28,18 @@ use std.collections.vector;
 use stdprint: std.print;
 
 use masc.codec.walk;
+#[testing]
+use masc.core.constraint;
+#[testing]
+use masc.core.ct;
 use masc.core.diagnostic;
 use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.extension;
 use masc.core.field;
 use core_form: masc.core.form;
+#[testing]
+use masc.core.index;
 use masc.core.inst;
 use masc.core.mode;
 use masc.core.operand;
@@ -67,6 +73,13 @@ use masc.syntax.write;
 
 # the refusal of an instruction directive's text that starts with the name of none of its formats
 pub val UNKNOWN_FORMAT: str = "instruction format the directive states none of";
+
+# the refusals of a row whose result the statement does not bind, and of a bound result no operand of the row takes
+pub val UNBOUND: str = "result the instruction defines that the statement binds to no name";
+pub val UNTAKEN: str = "result bound to an instruction that takes it as no operand";
+
+# the refusal of an operand the template writes again, spelled with another value than where it was first written
+pub val REPEATED: str = "operand written again with another value";
 
 # the refusal kept while candidates are tried
 # ---
@@ -118,6 +131,12 @@ fun keep_refused(rd: *core_syntax.Reader, best: *Best, refusal: field.Refusal, a
 fun one(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
     val shape: *operand.Shape = ?desc.shape;
     if (sel shape.register) {
+        if (view_eq_str(format, core_syntax.NUMBER)) {
+            val numbered: res[register.Id, diagnostic.Diagnostic] = read.register_number(r, ?shape.register);
+            if (sel numbered.err) { ret err[diagnostic.Diagnostic].err{numbered.err}; }
+            @out = operand.Value.register{numbered.ok};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
         val reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, !shape.register.unviewed);
         if (sel reg.err) { ret err[diagnostic.Diagnostic].err{reg.err}; }
         @out = operand.Value.register{reg.ok};
@@ -126,8 +145,7 @@ fun one(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *oper
     if (sel shape.enumerant) {
         val e: res[u32, diagnostic.Diagnostic] = read.enumeration(r, ?shape.enumerant);
         if (sel e.err) { ret err[diagnostic.Diagnostic].err{e.err}; }
-        @out = operand.Value.enumerant{e.ok};
-        ret err[diagnostic.Diagnostic].ok{};
+        ret params(r, ?shape.enumerant, e.ok, format, out);
     }
     if (sel shape.condition) {
         val c: res[u32, diagnostic.Diagnostic] = read.enumeration(r, ?shape.condition);
@@ -141,8 +159,34 @@ fun one(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *oper
     ret h.parse(r, desc, format, out);
 }
 
-# the most members a group holds
+# the most members a group holds, and the most params an enumerant takes
 val GROUP_MEMBERS: u32 = 16;
+
+# the enumerant `value` of `e` with the params it takes read after it, each after the syntax's variadic text, into the
+# pool as one run
+fun params(r: *core_syntax.Reader, e: *operand.Enumeration, value: u32, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val count: u32 = operand.param_count(e, value);
+    if (count > GROUP_MEMBERS) { ret err[diagnostic.Diagnostic].err{read.refuse(r, field.STORAGE, r.at, 0)}; }
+    var held: [GROUP_MEMBERS]operand.Value;
+    var i:    u32 = 0;
+    for (i < count) {
+        if (!read.take(r, r.syntax.variadic)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+        read.skip(r);
+        val got: err[diagnostic.Diagnostic] = one(r, operand.param(e, value, i), format, ?held[i]);
+        if (sel got.err) { ret got; }
+        i = i + 1;
+    }
+    var first: *operand.Value = nil;
+    i = 0;
+    for (i < count) {
+        val slot: res[*operand.Value, diagnostic.Diagnostic] = read.push(r, held[i]);
+        if (sel slot.err) { ret err[diagnostic.Diagnostic].err{slot.err}; }
+        if (i == 0)       { first = slot.ok; }
+        i = i + 1;
+    }
+    @out = operand.Value.enumerant{operand.Chosen{value: value, params: operand.Values{at: first, len: count}}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
 
 # a group's members read in order, joined by the syntax's variadic text, into the pool as one run
 fun group(r: *core_syntax.Reader, g: *operand.Group, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
@@ -226,6 +270,9 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
     var back:  usize = 0;
     var used:  u32   = 0;
     var open:  bool  = false;
+    # the operands a hole has read, so a later hole of one reads it again and must read the same value
+    var seen: u32 = 0;
+    var kept: u32 = 0;
     read.skip(r);
     if (r.at < r.lead) { r.at = r.lead; }
     for {
@@ -248,6 +295,7 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             group = at;
             back  = r.at;
             used  = r.used;
+            kept  = seen;
         }
         or (p.kind == core_syntax.CLOSE) {
             open = false;
@@ -267,9 +315,23 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             }
         }
         or (p.kind == core_syntax.HOLE) {
-            spans[p.operand] = r.at;
-            val got: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?values[p.operand]);
-            if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+            val bit: u32 = 1::u32 << p.operand::u32;
+            if ((seen & bit) == 0) {
+                spans[p.operand] = r.at;
+                val got: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?values[p.operand]);
+                if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+                seen = seen | bit;
+            }
+            or {
+                # an operand the template writes again, as sve's destructive `<Zdn>`, reads the value it read before
+                val at:    usize                      = r.at;
+                var again: operand.Value              = operand.Value.none{};
+                val got:   err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?again);
+                if (sel got.err) { failed = opt[diagnostic.Diagnostic].some{got.err}; }
+                or (!operand.equal(?again, ?values[p.operand])) {
+                    failed = opt[diagnostic.Diagnostic].some{read.refuse(r, REPEATED, at, r.at - at)};
+                }
+            }
             after = true;
         }
         if (sel failed.some) {
@@ -278,6 +340,7 @@ fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, value
             keep(best, failed.some, false);
             r.at   = back;
             r.used = used;
+            seen   = kept;
             var q: core_syntax.Piece = core_syntax.piece(template, group);
             for (q.kind != core_syntax.CLOSE && q.kind != core_syntax.END) {
                 if (q.kind == core_syntax.HOLE) { values[q.operand] = operand.Value.none{}; }
@@ -346,16 +409,33 @@ fun templated(rd: *core_syntax.Reader, r: *row.Row, template: str, best: *Best) 
         keep(best, matched.err, false);
         ret opt[inst.Inst].none{};
     }
-    # an operand the template does not write is the register the row fixes it to
+    # an operand the template does not write is the register the row fixes it to, or the result the statement binds
+    var taken: bool = false;
     i = 0;
     for (i < r.operands.len) {
         if (!written(template, i::u8)) {
             val at: opt[register.Id] = effect.fixed(rd.codec.registers, r.effect, i::u8);
             if (sel at.some) { values[i] = operand.Value.register{at.some}; }
+            if (r.effect.values.defines::u32 == i + 1) {
+                if (sel rd.bound.none) {
+                    keep(best, read.refuse(rd, UNBOUND, rd.start, read.token(rd, rd.start)), true);
+                    ret opt[inst.Inst].none{};
+                }
+                values[i] = rd.bound;
+                taken     = true;
+            }
         }
         i = i + 1;
     }
+    if (!taken && !refuse_bound(rd, best)) { ret opt[inst.Inst].none{}; }
     ret admit(rd, r, ?values[0], ?spans[0], best);
+}
+
+# whether the statement binds no result, the refusal kept when it binds one that nothing takes
+fun refuse_bound(rd: *core_syntax.Reader, best: *Best) bool {
+    if (sel rd.bound.none) { ret true; }
+    keep(best, read.refuse(rd, UNTAKEN, rd.start, read.token(rd, rd.start)), true);
+    ret false;
 }
 
 # the alias `a` read and resolved to its base row
@@ -377,6 +457,8 @@ fun by_alias(rd: *core_syntax.Reader, a: *core_syntax.Alias, best: *Best) opt[in
         keep(best, matched.err, false);
         ret opt[inst.Inst].none{};
     }
+    # an alias takes no bound result, which only a row's own spelling places
+    if (!refuse_bound(rd, best)) { ret opt[inst.Inst].none{}; }
     # an alias the selection does not hold the extensions of is refused, and the next candidate is tried
     if (!state.admits(rd.ctx, a.requires)) {
         keep_unmet(rd, best, a.requires, rd.start, read.token(rd, rd.start));
@@ -645,6 +727,7 @@ fun by_sequence(rd: *core_syntax.Reader, q: *core_syntax.Sequence, best: *Best, 
         keep(best, matched.err, false);
         ret false;
     }
+    if (!refuse_bound(rd, best)) { ret false; }
     if (!seq.expand(q, ?values[0], core_syntax.OWN, out)) {
         keep(best, read.refuse(rd, read.UNEXPECTED, rd.start, read.token(rd, rd.start)), true);
         ret false;
@@ -662,12 +745,23 @@ fun by_sequence(rd: *core_syntax.Reader, q: *core_syntax.Sequence, best: *Best, 
     ret true;
 }
 
-# the statement at the reader's text, read in its syntax: the instructions of a sequence spelling, or one instruction
+# the statement at the reader's text, read in its syntax: what the syntax's statement hook reads around it, then the
+# instructions of a sequence spelling, or one instruction
 # ---
-# rd:  the reader over the statement's text, its pool holding list members
+# rd:  the reader over the statement's text, its pool holding list members. the hook's text is passed, so the
+#      instruction starts after it, and the result it binds is left in `bound`
 # out: the instructions read, in order
 # ret: ok, or the refusal at its column
 pub fun statement(rd: *core_syntax.Reader, out: *relax.Expansion) err[diagnostic.Diagnostic] {
+    rd.at    = rd.start;
+    rd.bound = operand.Value.none{};
+    if (rd.syntax.statement != nil) {
+        read.skip(rd);
+        val around: err[diagnostic.Diagnostic] = rd.syntax.statement(rd);
+        if (sel around.err) { ret around; }
+        rd.origin = diagnostic.advance(rd.origin, ?rd.text[rd.start], rd.at - rd.start);
+        rd.start  = rd.at;
+    }
     var best:      Best = Best{held: false, complete: false, refusal: diagnostic.Diagnostic{message: read.UNKNOWN_MNEMONIC, span: diagnostic.Span{start: rd.origin, len: 0}, requires: requirement.NO_ALTERNATIVES}, unmet: false, full: false};
     var keyed_any: bool = false;
     var moded:     bool = false;
@@ -1028,6 +1122,67 @@ test instruction__a_register_hook_spells_what_no_row_name_does {
     ret 0;
 }
 
+#[testing]
+fun t_fits(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the riscv syntax with row 0's form, add's, replaced by `form`, its forms held in `forms`, the test reading it
+#[testing]
+fun t_reformed(t: *T, form: str, forms: *vector.Vector[str], out: *core_syntax.Syntax) bool {
+    @forms = vector.init[str](testing.allocator_of(?t.t));
+    var i: u32 = 0;
+    for (i < riscv_syntax.SYNTAX.forms.len) {
+        if (!t_fits(vector.push[str](forms, riscv_syntax.SYNTAX.forms.at[i]))) { ret false; }
+        i = i + 1;
+    }
+    forms.data[0] = form;
+    @out          = riscv_syntax.SYNTAX;
+    out.forms     = core_syntax.Forms{at: forms.data, len: riscv_syntax.SYNTAX.forms.len};
+    t.syntax      = out;
+    ret true;
+}
+
+# a register hole formatted `number` reads the register by its number within the operand's one class and prints it so
+test instruction__a_numbered_register_hole_reads_and_prints_the_number {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var forms:    vector.Vector[str];
+    var numbered: core_syntax.Syntax;
+    if (!t_reformed(?t, "add x<0:number>, <1>, <2>", ?forms, ?numbered)) { ret 2; }
+    val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add x5, a0, a1", diagnostic.START);
+    if (sel got.err) { ret 3; }
+    val ins: inst.Inst = got.ok;
+    if (ins.row != gen_row.ADD)                                                         { ret 4; }
+    if (!(sel ins.values[0].register && ins.values[0].register == register.make(0, 5))) { ret 5; }
+    if (!t_prints_as(?t, "add x31, a0, a1", "add x31, a0, a1"))                         { ret 6; }
+    val beyond: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add x32, a0, a1", diagnostic.START);
+    if (!sel beyond.err) { ret 7; }
+    val named: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add xt0, a0, a1", diagnostic.START);
+    if (!sel named.err) { ret 8; }
+    ret 0;
+}
+
+# an operand the template writes again prints at each hole and reads only where every spelling reads one value, as
+# aarch64 sve's destructive `add z0.s, p0/m, z0.s, z1.s` writes its first source and destination twice
+test instruction__an_operand_written_again_reads_one_value_and_prints_at_each_hole {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    var forms: vector.Vector[str];
+    var tied:  core_syntax.Syntax;
+    if (!t_reformed(?t, "add <0>, <1>, <2>, <0>", ?forms, ?tied)) { ret 2; }
+    val got: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add t0, a0, a1, t0", diagnostic.START);
+    if (sel got.err) { ret 3; }
+    val ins: inst.Inst = got.ok;
+    if (ins.row != gen_row.ADD || !(sel ins.values[0].register && ins.values[0].register == register.make(0, 5))) { ret 4; }
+    if (!t_prints_as(?t, "add x5, a0, a1, x5", "add t0, a0, a1, t0"))                                             { ret 5; }
+    val other: res[inst.Inst, diagnostic.Diagnostic] = t_parse(?t, "add t0, a0, a1, t1", diagnostic.START);
+    if (!sel other.err) { ret 6; }
+    val d: diagnostic.Diagnostic = other.err;
+    if (d.message != REPEATED || d.span.start.column != 17) { ret 7; }
+    ret 0;
+}
+
 # form markers of a test codec: thumb-like `.w` after the mnemonic, and the exact form's `{exact}` before it
 #[testing]
 val T_MARKERS: [2]core_form.FormField = [2]core_form.FormField{
@@ -1201,7 +1356,7 @@ fun t_sample(t: *T, d: *operand.Operand, a: *core_syntax.Alias, k: u8, out: *ope
     if (sel shape.immediate) { ret t_sample_number(shape.immediate, false, a, k, out); }
     if (sel shape.relative)  { ret t_sample_number(shape.relative.offset, true, a, k, out); }
     if (sel shape.enumerant) {
-        @out = operand.Value.enumerant{shape.enumerant.members[0].value};
+        @out = operand.enumerant(shape.enumerant.members[0].value);
         ret true;
     }
     if (sel shape.id) {
@@ -1344,5 +1499,343 @@ test statement__la_under_pic_loads_by_the_width_whatever_the_order_of_its_spelli
     if (t_got_load("rv64i", ?other) != gen_row.LD)               { ret 2; }
     if (t_got_load("rv32i", ?riscv_syntax.SYNTAX) != gen_row.LW) { ret 3; }
     if (t_got_load("rv32i", ?other) != gen_row.LW)               { ret 4; }
+    ret 0;
+}
+
+# a word stream set of the tests, as spir-v's: every operand a 32 bit word, an enumerant's params following it, and a
+# syntax that binds a row's result as `%r =` and spells ids `%n`
+#[testing]
+val T_WORD: operand.Operand = operand.Operand{shape: operand.Shape.immediate{operand.Immediate{bits: 32, sign: operand.UNSIGNED, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS}}, role: operand.READ, width: 0, quantity: operand.ONE};
+
+#[testing]
+val T_ONE_WORD: [1]operand.Operand = [1]operand.Operand{T_WORD};
+
+#[testing]
+val T_THREE_WORDS: [3]operand.Operand = [3]operand.Operand{T_WORD, T_WORD, T_WORD};
+
+# an execution mode: Flat takes nothing and LocalSize three words
+#[testing]
+val T_MODE_MEMBERS: [2]operand.Enumerant = [2]operand.Enumerant{
+    operand.Enumerant{name: "Flat", value: 14, requires: requirement.NO_ALTERNATIVES, params: operand.NO_GROUP},
+    operand.Enumerant{name: "LocalSize", value: 17, requires: requirement.NO_ALTERNATIVES, params: operand.Group{at: ?T_THREE_WORDS[0], len: 3}},
+};
+
+#[testing]
+val T_MODE_NAMES: [2]index.Entry = [2]index.Entry{index.Entry{key: "Flat", row: 0}, index.Entry{key: "LocalSize", row: 1}};
+
+# image operands, a mask: Bias and Lod take a word each, Plain none
+#[testing]
+val T_IMAGE_MEMBERS: [4]operand.Enumerant = [4]operand.Enumerant{
+    operand.Enumerant{name: "None", value: 0, requires: requirement.NO_ALTERNATIVES, params: operand.NO_GROUP},
+    operand.Enumerant{name: "Bias", value: 1, requires: requirement.NO_ALTERNATIVES, params: operand.Group{at: ?T_ONE_WORD[0], len: 1}},
+    operand.Enumerant{name: "Lod", value: 2, requires: requirement.NO_ALTERNATIVES, params: operand.Group{at: ?T_ONE_WORD[0], len: 1}},
+    operand.Enumerant{name: "Plain", value: 4, requires: requirement.NO_ALTERNATIVES, params: operand.NO_GROUP},
+};
+
+#[testing]
+val T_IMAGE_NAMES: [4]index.Entry = [4]index.Entry{index.Entry{key: "Bias", row: 1}, index.Entry{key: "Lod", row: 2}, index.Entry{key: "None", row: 0}, index.Entry{key: "Plain", row: 3}};
+
+#[testing]
+val T_ID: operand.Operand = operand.Operand{shape: operand.Shape.id{operand.Typed{space: 0, bits: 32, fixup: operand.NO_FIXUP}}, role: operand.READ, width: 0, quantity: operand.ONE};
+
+#[testing]
+val T_MODE_OPERANDS: [1]operand.Operand = [1]operand.Operand{
+    operand.Operand{shape: operand.Shape.enumerant{operand.Enumeration{members: ?T_MODE_MEMBERS[0], count: 2, mask: false, names: index.Index{at: ?T_MODE_NAMES[0], len: 2}}}, role: operand.READ, width: 0, quantity: operand.ONE},
+};
+
+#[testing]
+val T_IMAGE_OPERANDS: [1]operand.Operand = [1]operand.Operand{
+    operand.Operand{shape: operand.Shape.enumerant{operand.Enumeration{members: ?T_IMAGE_MEMBERS[0], count: 4, mask: true, names: index.Index{at: ?T_IMAGE_NAMES[0], len: 4}}}, role: operand.READ, width: 0, quantity: operand.ONE},
+};
+
+#[testing]
+val T_THREE_IDS: [3]operand.Operand = [3]operand.Operand{T_ID, T_ID, T_ID};
+
+#[testing]
+val T_TWO_IDS: [2]operand.Operand = [2]operand.Operand{T_ID, T_ID};
+
+#[testing]
+val T_PLAIN: effect.Effect = effect.Effect{
+    implicit: effect.Registers.ruled{effect.Ruled{otherwise: effect.NO_TOUCHED, rules: effect.NO_REGISTER_RULES, may: effect.NO_TOUCHED, must: effect.NO_TOUCHED}},
+    flags:    effect.Flags{read: effect.NO_WORDS, written: effect.NO_WORDS, undefined: effect.NO_WORDS, kept: effect.NO_WORDS},
+    memory:   effect.NO_ACCESSES,
+    control:  effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: 0, rules: effect.NO_RULES},
+    stack:    effect.Stack.none{},
+    latency:  effect.ONE,
+    fixed:    effect.NO_FIXEDS,
+    values:   effect.NO_VALUES,
+};
+
+# the effect of a row defining its operand 0, as spir-v's result id
+#[testing]
+val T_DEFINES: effect.Effect = effect.Effect{
+    implicit: effect.Registers.ruled{effect.Ruled{otherwise: effect.NO_TOUCHED, rules: effect.NO_REGISTER_RULES, may: effect.NO_TOUCHED, must: effect.NO_TOUCHED}},
+    flags:    effect.Flags{read: effect.NO_WORDS, written: effect.NO_WORDS, undefined: effect.NO_WORDS, kept: effect.NO_WORDS},
+    memory:   effect.NO_ACCESSES,
+    control:  effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: 0, rules: effect.NO_RULES},
+    stack:    effect.Stack.none{},
+    latency:  effect.ONE,
+    fixed:    effect.NO_FIXEDS,
+    values:   effect.Values{defines: 1, type: 0},
+};
+
+#[testing]
+val T_WORD_FIELDS: [1]field.Field = [1]field.Field{field.Field{kind: 0, width: 0, fixed: 0, mask: 0, slices: field.NO_SLICES, operand: field.NO_OPERAND, param: 0}};
+
+#[testing]
+val T_WORD_ROWS: [4]row.Row = [4]row.Row{
+    row.Row{key: "mode", mnemonic: "OpExecutionMode", operands: row.Operands{at: ?T_MODE_OPERANDS[0], len: 1}, encoding: field.Fields{at: ?T_WORD_FIELDS[0], len: 1}, requires: requirement.NO_ALTERNATIVES, effect: ?T_PLAIN, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0, index: 0},
+    row.Row{key: "sample", mnemonic: "OpSample", operands: row.Operands{at: ?T_IMAGE_OPERANDS[0], len: 1}, encoding: field.Fields{at: ?T_WORD_FIELDS[0], len: 1}, requires: requirement.NO_ALTERNATIVES, effect: ?T_PLAIN, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0, index: 1},
+    row.Row{key: "iadd", mnemonic: "OpIAdd", operands: row.Operands{at: ?T_THREE_IDS[0], len: 3}, encoding: field.Fields{at: ?T_WORD_FIELDS[0], len: 1}, requires: requirement.NO_ALTERNATIVES, effect: ?T_DEFINES, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0, index: 2},
+    row.Row{key: "store", mnemonic: "OpStore", operands: row.Operands{at: ?T_TWO_IDS[0], len: 2}, encoding: field.Fields{at: ?T_WORD_FIELDS[0], len: 1}, requires: requirement.NO_ALTERNATIVES, effect: ?T_PLAIN, ct: ?ct.INDEPENDENT, constraints: constraint.NO_CONSTRAINTS, flags: 0, index: 3},
+};
+
+# every operand of the instruction one word, an enumerant's params after it in order
+#[testing]
+fun t_words_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    var k: u32 = 0;
+    for (k < enc.count) {
+        val v: operand.Value = enc.values[k];
+        if (sel v.enumerant) {
+            val c:    operand.Chosen     = v.enumerant;
+            val word: err[field.Refusal] = field.put(enc, c.value::u64, 4);
+            if (sel word.err) { ret word; }
+            var i: u32 = 0;
+            for (i < c.params.len) {
+                val p: operand.Value = c.params.at[i];
+                if (!sel p.immediate) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, k::u8, 0)}; }
+                val param: err[field.Refusal] = field.put(enc, p.immediate:~u64, 4);
+                if (sel param.err) { ret param; }
+                i = i + 1;
+            }
+        }
+        or (sel v.id) {
+            val word: err[field.Refusal] = field.put(enc, v.id::u64, 4);
+            if (sel word.err) { ret word; }
+        }
+        k = k + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# each operand read back as `t_words_encode` wrote it, an enumerant with the params its value takes
+#[testing]
+fun t_words_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    var k: u32 = 0;
+    for (k < dec.count) {
+        val desc: *operand.Operand        = ?dec.operands[k];
+        val word: res[u64, field.Refusal] = field.get(dec, 4);
+        if (sel word.err) { ret err[field.Refusal].err{word.err}; }
+        if (sel desc.shape.enumerant) {
+            val value: u32            = word.ok::u32;
+            val count: u32            = operand.param_count(?desc.shape.enumerant, value);
+            var first: *operand.Value = nil;
+            var i:     u32            = 0;
+            for (i < count) {
+                val param: res[u64, field.Refusal] = field.get(dec, 4);
+                if (sel param.err) { ret err[field.Refusal].err{param.err}; }
+                val slot: res[*operand.Value, field.Refusal] = field.push(dec, operand.Value.immediate{param.ok::i64});
+                if (sel slot.err) { ret err[field.Refusal].err{slot.err}; }
+                if (i == 0)       { first = slot.ok; }
+                i = i + 1;
+            }
+            field.place(dec, k::u8, operand.Value.enumerant{operand.Chosen{value: value, params: operand.Values{at: first, len: count}}});
+        }
+        or { field.place(dec, k::u8, operand.Value.id{word.ok::u32}); }
+        k = k + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+#[testing]
+val T_WORDS: field.Kind = field.Kind{name: "words", admit: nil, encode: t_words_encode, decode: t_words_decode, finish: nil, complete: nil};
+
+#[testing]
+val T_WORD_KINDS: [1]*field.Kind = [1]*field.Kind{?T_WORDS};
+
+#[testing]
+val T_WORD_TABLE: field.Table = field.Table{kinds: ?T_WORD_KINDS[0], count: 1, order: field.LITTLE};
+
+#[testing]
+val T_WORD_CODEC: dispatch.Codec = dispatch.Codec{fields: ?T_WORD_TABLE, registers: nil, rows: row.Rows{at: ?T_WORD_ROWS[0], len: 4}, keys: index.NO_ENTRIES, dispatch: nil};
+
+#[testing]
+val T_WORD_FORMS: [4]str = [4]str{"OpExecutionMode <0>", "OpSample <0>", "OpIAdd <1> <2>", "OpStore <0> <1>"};
+
+#[testing]
+val T_WORD_ENTRIES: [4]core_syntax.Entry = [4]core_syntax.Entry{
+    core_syntax.Entry{key: "OpExecutionMode", first: 0, len: 1},
+    core_syntax.Entry{key: "OpIAdd", first: 1, len: 1},
+    core_syntax.Entry{key: "OpSample", first: 2, len: 1},
+    core_syntax.Entry{key: "OpStore", first: 3, len: 1},
+};
+
+#[testing]
+val T_WORD_CANDIDATES: [4]core_syntax.Candidate = [4]core_syntax.Candidate{
+    core_syntax.Candidate{row: 0, alias: 0},
+    core_syntax.Candidate{row: 2, alias: 0},
+    core_syntax.Candidate{row: 1, alias: 0},
+    core_syntax.Candidate{row: 3, alias: 0},
+};
+
+# a number or an id `%n` read at the reader's position
+#[testing]
+fun t_word_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val id: bool = sel desc.shape.id;
+    if (id && !read.take(r, "%")) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+    val n: res[i64, diagnostic.Diagnostic] = read.number(r);
+    if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
+    if (id)        { @out = operand.Value.id{n.ok::u32}; }
+    or             { @out = operand.Value.immediate{n.ok}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+#[testing]
+fun t_word_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (sel value.immediate) { ret write.decimal(w, value.immediate); }
+    if (!sel value.id)       { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val sigil: err[field.Refusal] = write.text(w, "%");
+    if (sel sigil.err) { ret sigil; }
+    ret write.decimal(w, value.id::i64);
+}
+
+#[testing]
+val T_WORD_HOOK: core_syntax.Hook = core_syntax.Hook{parse: t_word_parse, print: t_word_print};
+
+# the `%r =` a statement may start with, its id bound
+#[testing]
+fun t_bind(r: *core_syntax.Reader) err[diagnostic.Diagnostic] {
+    if (read.peek(r) != '%') { ret err[diagnostic.Diagnostic].ok{}; }
+    var id:  operand.Value;
+    val got: err[diagnostic.Diagnostic] = t_word_parse(r, ?T_ID, View{data: nil, len: 0}, ?id);
+    if (sel got.err) { ret got; }
+    read.skip(r);
+    if (!read.take(r, "=")) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+    read.skip(r);
+    r.bound = id;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the `%r = ` of the result `ins` defines, nothing for one that defines none
+#[testing]
+fun t_lead(w: *core_syntax.Writer, ins: *inst.Inst) err[field.Refusal] {
+    val defines: u8 = ins.row.effect.values.defines;
+    if (defines == 0) { ret err[field.Refusal].ok{}; }
+    val id: err[field.Refusal] = t_word_print(w, ?T_ID, View{data: nil, len: 0}, ?ins.values[defines - 1]);
+    if (sel id.err) { ret id; }
+    ret write.text(w, " = ");
+}
+
+#[testing]
+val T_WORD_SYNTAX: core_syntax.Syntax = core_syntax.Syntax{
+    name:      "words",
+    forms:     core_syntax.Forms{at: ?T_WORD_FORMS[0], len: 4},
+    index:     core_syntax.Index{at: ?T_WORD_ENTRIES[0], len: 4, candidates: ?T_WORD_CANDIDATES[0], count: 4},
+    hooks:     core_syntax.Hooks{immediate: ?T_WORD_HOOK, memory: nil, list: nil, id: ?T_WORD_HOOK, literal: nil, register: nil},
+    register:  "",
+    join:      "|",
+    variadic:  " ",
+    anonymous: ".Lw",
+    statement: t_bind,
+    lead:      t_lead,
+};
+
+# the test made over the word set
+#[testing]
+fun t_words(t: *T) bool {
+    if (!t_make(t, "rv64i")) { ret false; }
+    t.codec  = ?T_WORD_CODEC;
+    t.syntax = ?T_WORD_SYNTAX;
+    ret true;
+}
+
+# `text` read as a statement of the word set, its one instruction into `out`
+#[testing]
+fun t_word_statement(t: *T, text: str, ex: *relax.Expansion) err[diagnostic.Diagnostic] {
+    var rd: core_syntax.Reader = t_reader(t, text, diagnostic.START);
+    ret statement(?rd, ex);
+}
+
+# whether `text` reads, encodes to `words`, decodes back to the same values and prints as `want`
+#[testing]
+fun t_word_trip(t: *T, text: str, words: *u32, count: u32, want: str) bool {
+    var ex:    relax.Expansion;
+    val read_: err[diagnostic.Diagnostic] = t_word_statement(t, text, ?ex);
+    if (sel read_.err || ex.count != 1) { ret false; }
+    var ins:    inst.Inst                  = inst.Inst{row: ex.steps[0].row, values: ?ex.steps[0].values[0], count: ex.steps[0].row.operands.len, form: ex.steps[0].form};
+    var bytes:  vector.Vector[u8]          = vector.init[u8](testing.allocator_of(?t.t));
+    var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](testing.allocator_of(?t.t));
+    val coded:  res[usize, field.Refusal]  = walk.encode(t.codec, ?t.ctx, ?ins, ?bytes, ?fixups);
+    if (sel coded.err)                  { ret false; }
+    if (coded.ok != (count * 4)::usize) { ret false; }
+    var k: u32 = 0;
+    for (k < count) {
+        val got: u32 = bytes.data[k * 4]::u32 | (bytes.data[k * 4 + 1]::u32 << 8) | (bytes.data[k * 4 + 2]::u32 << 16) | (bytes.data[k * 4 + 3]::u32 << 24);
+        if (got != words[k]) { ret false; }
+        k = k + 1;
+    }
+    var store: [8]operand.Value;
+    val back:  res[walk.Decoded, field.Refusal] = walk.decode_row(t.codec, ?t.ctx, ins.row, bytes.data, bytes.len, 0, ?store[0], 8);
+    if (sel back.err)             { ret false; }
+    if (back.ok.len != bytes.len) { ret false; }
+    var decoded: inst.Inst = back.ok.inst;
+    k = 0;
+    for (k < ins.count) {
+        if (!operand.equal(?ins.values[k], ?decoded.values[k])) { ret false; }
+        k = k + 1;
+    }
+    vector.dnit[u8](?bytes);
+    vector.dnit[field.Fixup](?fixups);
+    if (!t_print(t, ?decoded)) { ret false; }
+    ret str_equals(t.out.data, want);
+}
+
+# an enumerant's params follow it through the reader, the encoder, the decoder and the printer, a mask's in the order of
+# its bits whatever the order its members are written in: LocalSize is 17 and its three words, Bias|Lod is 3 then
+# Bias's word, bit 0, and Lod's, bit 1
+test statement__an_enumerant_reads_encodes_decodes_and_prints_with_its_params {
+    var t: T;
+    if (!t_words(?t)) { ret 1; }
+    val local: [4]u32 = [4]u32{17, 8, 4, 1};
+    if (!t_word_trip(?t, "OpExecutionMode LocalSize 8 4 1", ?local[0], 4, "OpExecutionMode LocalSize 8 4 1")) { ret 2; }
+    val flat: [1]u32 = [1]u32{14};
+    if (!t_word_trip(?t, "OpExecutionMode Flat", ?flat[0], 1, "OpExecutionMode Flat")) { ret 3; }
+    val sampled: [3]u32 = [3]u32{3, 5, 6};
+    if (!t_word_trip(?t, "OpSample Bias|Lod 5 6", ?sampled[0], 3, "OpSample Bias|Lod 5 6")) { ret 4; }
+    if (!t_word_trip(?t, "OpSample Lod|Bias 5 6", ?sampled[0], 3, "OpSample Bias|Lod 5 6")) { ret 5; }
+    val plain: [2]u32 = [2]u32{6, 7};
+    if (!t_word_trip(?t, "OpSample Lod|Plain 7", ?plain[0], 2, "OpSample Lod|Plain 7")) { ret 6; }
+    # a member short of its params is refused as it reads, and encoding refuses params its value does not take
+    var ex:    relax.Expansion;
+    val short: err[diagnostic.Diagnostic] = t_word_statement(?t, "OpExecutionMode LocalSize 8 4", ?ex);
+    if (!sel short.err)                     { ret 7; }
+    if (short.err.message != read.EXPECTED) { ret 8; }
+    var none:     [1]operand.Value   = [1]operand.Value{operand.enumerant(17)};
+    var bare:     inst.Inst          = inst.Inst{row: ?T_WORD_ROWS[0], values: ?none[0], count: 1};
+    val unfilled: err[field.Refusal] = walk.admits(t.codec, ?t.ctx, ?bare);
+    if (!sel unfilled.err)                    { ret 9; }
+    if (unfilled.err.message != field.PARAMS) { ret 10; }
+    ret 0;
+}
+
+# a statement binds the result its row defines by `%r =`, which prints back before it, and a row whose result nothing
+# binds, or a binding no row takes, is refused
+test statement__a_bound_result_reads_into_the_defined_operand_and_prints_before_the_instruction {
+    var t: T;
+    if (!t_words(?t)) { ret 1; }
+    var ex:  relax.Expansion;
+    val got: err[diagnostic.Diagnostic] = t_word_statement(?t, "%3 = OpIAdd %1 %2", ?ex);
+    if (sel got.err || ex.count != 1 || ex.steps[0].row != ?T_WORD_ROWS[2]) { ret 2; }
+    val result: operand.Value = ex.steps[0].values[0];
+    if (!sel result.id) { ret 3; }
+    if (result.id != 3) { ret 4; }
+    var ins: inst.Inst = inst.Inst{row: ex.steps[0].row, values: ?ex.steps[0].values[0], count: 3, form: ex.steps[0].form};
+    if (!t_print(?t, ?ins) || !str_equals(t.out.data, "%3 = OpIAdd %1 %2")) { ret 5; }
+    val unbound: err[diagnostic.Diagnostic] = t_word_statement(?t, "OpIAdd %1 %2", ?ex);
+    if (!sel unbound.err)               { ret 6; }
+    if (unbound.err.message != UNBOUND) { ret 7; }
+    val untaken: err[diagnostic.Diagnostic] = t_word_statement(?t, "%4 = OpStore %1 %2", ?ex);
+    if (!sel untaken.err)                                                     { ret 8; }
+    if (untaken.err.message != UNTAKEN || untaken.err.span.start.column != 6) { ret 9; }
     ret 0;
 }
