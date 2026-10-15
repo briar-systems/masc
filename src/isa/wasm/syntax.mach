@@ -1,0 +1,776 @@
+# the wasm instruction text, the WebAssembly text format's plain instructions
+#
+# every row's template and the index by mnemonic are generated (gen_syntax): an instruction is its mnemonic and its
+# immediates in the order the text spells them, an index the text may leave out written only when it is not 0, a
+# memarg's `offset=` and `align=` only when they are not 0 and the natural alignment. what is written here is how the
+# values are spelled (WebAssembly Specification release 3.0, tag wg-3.0, 6.0-text.lexical, 6.1-text.values,
+# 6.2-text.types and 6.3-text.instructions): an index by its number or a `$` name its space holds in the stream, a
+# label by its depth or the name of a block around it, a type use `(type x)` with or without its params and results
+# or by them alone, an integer in decimal or after `0x` with `_` between digits, a float (`masc.isa.wasm.float`), a
+# value type by its name or `(ref null? <heap type>)`, a heap type by its name or an index, and a block type
+# `(result t)` or a type use, after the `$` name a block's label takes. names resolve through the context's stream,
+# which a module's reader defines, so with no stream only numbers read.
+#
+# a label's name and the end of a block are a function body's structure, which its reader keeps (`masc.isa.wasm.body`):
+# a name after `end` or `else` is its to check, and the name after `block` is pending in the stream until the stream
+# observes the block. folded instructions are the body reader's to unfold.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.operand;
+use core_syntax: masc.core.syntax;
+use masc.syntax.read;
+use masc.syntax.write;
+
+use wasm_field:  masc.isa.wasm.field;
+use wasm_float:  masc.isa.wasm.float;
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+
+use masc.isa.wasm.gen_row;
+use masc.isa.wasm.gen_syntax;
+
+pub val NO_INDEX:    str = "expected an index, a number or a `$` name";
+pub val UNNAMED:     str = "a name resolves only within a module's stream";
+pub val UNKNOWN:     str = "name its index space does not hold";
+pub val NO_NUMBER:   str = "malformed integer";
+pub val RANGE:       str = "integer out of range";
+pub val NO_TYPE:     str = "expected a value type";
+pub val NO_HEAP:     str = "expected a heap type";
+pub val NO_CLOSE:    str = "expected `)`";
+pub val NO_USE:      str = "type use's params and results the module defines no type of";
+pub val MISMATCH:    str = "type use's params or results differ from its type's";
+pub val NO_SHAPE:    str = "expected a v128 shape, i8x16, i16x8, i32x4, i64x2, f32x4 or f64x2";
+pub val NO_CATCH:    str = "expected a catch clause";
+pub val NO_FOLLOWER: str = "index read only before another operand";
+
+# whether `c` ends a token
+fun ends(c: u8) bool {
+    ret read.blank(c) || c == '(' || c == ')' || c == 0;
+}
+
+# the length of the token at the reader's position, up to white space or a parenthesis
+fun token(r: *core_syntax.Reader) usize {
+    var i: usize = r.at;
+    for (i < r.end && !ends(r.text[i])) { i = i + 1; }
+    ret i - r.at;
+}
+
+fun fail[T](r: *core_syntax.Reader, message: str, at: usize, len: usize) res[T, diagnostic.Diagnostic] {
+    ret res[T, diagnostic.Diagnostic].err{read.refuse(r, message, at, len)};
+}
+
+fun refused(r: *core_syntax.Reader, message: str, at: usize, len: usize) err[diagnostic.Diagnostic] {
+    ret err[diagnostic.Diagnostic].err{read.refuse(r, message, at, len)};
+}
+
+# whether the text at the position starts with `word` ending at a token's end, passed when it does
+fun keyword(r: *core_syntax.Reader, word: str) bool {
+    val n: usize = str_len(word);
+    if (r.end - r.at < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (r.text[r.at + i] != word[i]) { ret false; }
+        i = i + 1;
+    }
+    if (r.at + n < r.end && !ends(r.text[r.at + n])) { ret false; }
+    r.at = r.at + n;
+    ret true;
+}
+
+# `(` and then `word`, passed with the white space after, or the reader as it was
+fun opens(r: *core_syntax.Reader, word: str) bool {
+    val back: usize = r.at;
+    read.skip(r);
+    if (read.peek(r) != '(') {
+        r.at = back;
+        ret false;
+    }
+    r.at = r.at + 1;
+    read.skip(r);
+    if (!keyword(r, word)) {
+        r.at = back;
+        ret false;
+    }
+    read.skip(r);
+    ret true;
+}
+
+fun close(r: *core_syntax.Reader) err[diagnostic.Diagnostic] {
+    read.skip(r);
+    if (read.peek(r) != ')') { ret refused(r, NO_CLOSE, r.at, 1); }
+    r.at = r.at + 1;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun digit(c: u8, base: u64) i64 {
+    var d: i64 = -1;
+    if (c >= '0' && c <= '9') { d = (c - '0')::i64; }
+    or (c >= 'a' && c <= 'f') { d = (c - 'a')::i64 + 10; }
+    or (c >= 'A' && c <= 'F') { d = (c - 'A')::i64 + 10; }
+    if (d >= base::i64)       { ret -1; }
+    ret d;
+}
+
+# an integer as the text spells it: its sign and its magnitude
+rec Integer {
+    negative:  bool;
+    signed:    bool;
+    magnitude: u64;
+}
+
+# the integer of the token at the position, `_` between digits, the reader passed it
+fun integer(r: *core_syntax.Reader) res[Integer, diagnostic.Diagnostic] {
+    val at:  usize   = r.at;
+    val len: usize   = token(r);
+    var out: Integer = Integer{negative: false, signed: false, magnitude: 0};
+    var i:   usize   = at;
+    val end: usize   = at + len;
+    if (i < end && (r.text[i] == '+' || r.text[i] == '-')) {
+        out.signed   = true;
+        out.negative = r.text[i] == '-';
+        i            = i + 1;
+    }
+    var base: u64 = 10;
+    if (end - i > 2 && r.text[i] == '0' && r.text[i + 1] == 'x') {
+        base = 16;
+        i    = i + 2;
+    }
+    if (i == end) { ret fail[Integer](r, NO_NUMBER, at, len); }
+    var last: bool = false;
+    for (i < end) {
+        val c: u8 = r.text[i];
+        if (c == '_') {
+            if (!last || i + 1 == end) { ret fail[Integer](r, NO_NUMBER, at, len); }
+            last = false;
+        }
+        or {
+            val d: i64 = digit(c, base);
+            if (d < 0)                                     { ret fail[Integer](r, NO_NUMBER, at, len); }
+            if (out.magnitude > (~0::u64 - d::u64) / base) { ret fail[Integer](r, RANGE, at, len); }
+            out.magnitude = out.magnitude * base + d::u64;
+            last          = true;
+        }
+        i = i + 1;
+    }
+    r.at = end;
+    ret res[Integer, diagnostic.Diagnostic].ok{out};
+}
+
+# the index the token at the position names in space `space`: a number, or a `$` name the stream holds
+pub fun index_read(r: *core_syntax.Reader, space: u16) res[u32, diagnostic.Diagnostic] {
+    val at:  usize = r.at;
+    val len: usize = token(r);
+    if (len == 0) { ret fail[u32](r, NO_INDEX, at, 1); }
+    if (r.text[at] == '$') {
+        if (len == 1)                            { ret fail[u32](r, NO_INDEX, at, len); }
+        if (r.ctx == nil || r.ctx.stream == nil) { ret fail[u32](r, UNNAMED, at, len); }
+        val found: opt[u32] = wasm_stream.resolve(r.ctx.stream, space, View{data: ?r.text[at + 1], len: len - 1});
+        if (sel found.none) { ret fail[u32](r, UNKNOWN, at, len); }
+        r.at = at + len;
+        ret res[u32, diagnostic.Diagnostic].ok{found.some};
+    }
+    if (r.text[at] < '0' || r.text[at] > '9') { ret fail[u32](r, NO_INDEX, at, len); }
+    val n: res[Integer, diagnostic.Diagnostic] = integer(r);
+    if (sel n.err)                    { ret res[u32, diagnostic.Diagnostic].err{n.err}; }
+    if (n.ok.magnitude > 0xFFFF_FFFF) { ret fail[u32](r, RANGE, at, len); }
+    ret res[u32, diagnostic.Diagnostic].ok{n.ok.magnitude::u32};
+}
+
+# the value type codes of a list of params or results, read after `(param` or `(result`, onto `out`, nil to read
+# them only
+fun types_read(r: *core_syntax.Reader, out: *vector.Vector[u32], named: bool) err[diagnostic.Diagnostic] {
+    read.skip(r);
+    # a single param may be named, whose name a function's reader keeps for its locals
+    if (named && read.peek(r) == '$') { r.at = r.at + token(r); }
+    for {
+        read.skip(r);
+        if (read.peek(r) == ')' || read.peek(r) == 0) { brk; }
+        val t: res[i64, diagnostic.Diagnostic] = valtype_read(r);
+        if (sel t.err) { ret err[diagnostic.Diagnostic].err{t.err}; }
+        if (out != nil) {
+            val pushed: res[usize, A.Error] = vector.push[u32](out, t.ok:~u64::u32);
+            if (sel pushed.err) { ret refused(r, field.MEMORY, r.at, 1); }
+        }
+    }
+    ret close(r);
+}
+
+# a type use: `(type x)`, then its params and results, which with no `(type x)` name the first type the stream defines
+# of them, and which with one must be that type's. none for no type use at all where `empty_ok`
+fun typeuse_read(r: *core_syntax.Reader, empty_ok: bool) res[opt[u32], diagnostic.Diagnostic] {
+    val at: usize    = r.at;
+    var x:  opt[u32] = opt[u32].none{};
+    if (opens(r, "type")) {
+        val got: res[u32, diagnostic.Diagnostic] = index_read(r, wasm_kind.TYPES);
+        if (sel got.err) { ret res[opt[u32], diagnostic.Diagnostic].err{got.err}; }
+        val shut: err[diagnostic.Diagnostic] = close(r);
+        if (sel shut.err) { ret res[opt[u32], diagnostic.Diagnostic].err{shut.err}; }
+        x = opt[u32].some{got.ok};
+    }
+    var used: *wasm_stream.FuncType = nil;
+    if (r.ctx != nil && r.ctx.stream != nil) { used = wasm_stream.used(r.ctx.stream); }
+    var params:  *vector.Vector[u32] = nil;
+    var results: *vector.Vector[u32] = nil;
+    if (used != nil) {
+        params  = ?used.params;
+        results = ?used.results;
+    }
+    var stated: bool = false;
+    for (opens(r, "param")) {
+        val p: err[diagnostic.Diagnostic] = types_read(r, params, true);
+        if (sel p.err) { ret res[opt[u32], diagnostic.Diagnostic].err{p.err}; }
+        stated = true;
+    }
+    for (opens(r, "result")) {
+        val q: err[diagnostic.Diagnostic] = types_read(r, results, false);
+        if (sel q.err) { ret res[opt[u32], diagnostic.Diagnostic].err{q.err}; }
+        stated = true;
+    }
+    if (sel x.some) {
+        if (stated && used != nil) {
+            val t: opt[*wasm_stream.FuncType] = wasm_stream.func_type(r.ctx.stream, x.some);
+            if (sel t.some) {
+                if (!same_codes(?t.some.params, params) || !same_codes(?t.some.results, results)) { ret fail[opt[u32]](r, MISMATCH, at, r.at - at); }
+            }
+        }
+        ret res[opt[u32], diagnostic.Diagnostic].ok{x};
+    }
+    if (!stated && empty_ok) { ret res[opt[u32], diagnostic.Diagnostic].ok{opt[u32].none{}}; }
+    if (used == nil)         { ret fail[opt[u32]](r, UNNAMED, at, 1); }
+    val found: opt[u32] = wasm_stream.find_type(r.ctx.stream, params.data, params.len::u32, results.data, results.len::u32);
+    if (sel found.none) { ret fail[opt[u32]](r, NO_USE, at, r.at - at + 1); }
+    ret res[opt[u32], diagnostic.Diagnostic].ok{found};
+}
+
+fun same_codes(a: *vector.Vector[u32], b: *vector.Vector[u32]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether the token at `at` of `len` bytes is `name`
+fun spells(r: *core_syntax.Reader, at: usize, len: usize, name: str) bool {
+    if (str_len(name) != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (r.text[at + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a heap type: an abstract one by its name, as its s33, or a type index
+fun heaptype_read(r: *core_syntax.Reader) res[i64, diagnostic.Diagnostic] {
+    val at:  usize = r.at;
+    val len: usize = token(r);
+    var i:   u32   = 0;
+    for (i < gen_row.HEAP_NAMES_COUNT) {
+        if (spells(r, at, len, gen_row.HEAP_NAMES[i].name)) {
+            r.at = at + len;
+            ret res[i64, diagnostic.Diagnostic].ok{gen_row.HEAP_NAMES[i].code::i64 - 0x80};
+        }
+        i = i + 1;
+    }
+    val x: res[u32, diagnostic.Diagnostic] = index_read(r, wasm_kind.TYPES);
+    if (sel x.err) { ret fail[i64](r, NO_HEAP, at, len); }
+    ret res[i64, diagnostic.Diagnostic].ok{x.ok::i64};
+}
+
+# a value type: its name, or `(ref null? <heap type>)`, held as its byte and a heap type above it
+pub fun valtype_read(r: *core_syntax.Reader) res[i64, diagnostic.Diagnostic] {
+    val at: usize = r.at;
+    if (opens(r, "ref")) {
+        var code: i64 = wasm_field.REF::i64;
+        if (keyword(r, "null")) {
+            code = wasm_field.REF_NULL::i64;
+            read.skip(r);
+        }
+        val ht: res[i64, diagnostic.Diagnostic] = heaptype_read(r);
+        if (sel ht.err) { ret ht; }
+        val shut: err[diagnostic.Diagnostic] = close(r);
+        if (sel shut.err) { ret res[i64, diagnostic.Diagnostic].err{shut.err}; }
+        ret res[i64, diagnostic.Diagnostic].ok{(ht.ok << 8) | code};
+    }
+    val len: usize = token(r);
+    var i:   u32   = 0;
+    for (i < gen_row.TYPE_NAMES_COUNT) {
+        if (spells(r, at, len, gen_row.TYPE_NAMES[i].name)) {
+            r.at = at + len;
+            ret res[i64, diagnostic.Diagnostic].ok{gen_row.TYPE_NAMES[i].code::i64};
+        }
+        i = i + 1;
+    }
+    ret fail[i64](r, NO_TYPE, at, len);
+}
+
+fun heaptype_write(w: *core_syntax.Writer, ht: i64) err[field.Refusal] {
+    if (ht >= 0) { ret write.decimal(w, ht); }
+    val code: i64 = ht + 0x80;
+    var i:    u32 = 0;
+    for (i < gen_row.HEAP_NAMES_COUNT) {
+        if (gen_row.HEAP_NAMES[i].code::i64 == code) { ret write.text(w, gen_row.HEAP_NAMES[i].name); }
+        i = i + 1;
+    }
+    ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND);
+}
+
+fun valtype_write(w: *core_syntax.Writer, v: i64) err[field.Refusal] {
+    val code: i64 = v & 0xFF;
+    if (code == wasm_field.REF::i64 || code == wasm_field.REF_NULL::i64) {
+        var lead: str = "(ref ";
+        if (code == wasm_field.REF_NULL::i64) { lead = "(ref null "; }
+        val opened: err[field.Refusal] = write.text(w, lead);
+        if (sel opened.err) { ret opened; }
+        val ht: err[field.Refusal] = heaptype_write(w, v >> 8);
+        if (sel ht.err) { ret ht; }
+        ret write.text(w, ")");
+    }
+    var i: u32 = 0;
+    for (i < gen_row.TYPE_NAMES_COUNT) {
+        if (gen_row.TYPE_NAMES[i].code::i64 == v) { ret write.text(w, gen_row.TYPE_NAMES[i].name); }
+        i = i + 1;
+    }
+    ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND);
+}
+
+fun is(format: View, name: str) bool {
+    if (format.len != str_len(name)) { ret false; }
+    var i: usize = 0;
+    for (i < format.len) {
+        if (format.data[i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# an integer of `bits` read as the text spells it: a signed one from -2^(bits-1) up to 2^bits - 1, the high half
+# wrapping to its two's complement, and an unsigned one from 0
+fun integer_value(r: *core_syntax.Reader, imm: *operand.Immediate) res[i64, diagnostic.Diagnostic] {
+    val at:  usize                               = r.at;
+    val len: usize                               = token(r);
+    val n:   res[Integer, diagnostic.Diagnostic] = integer(r);
+    if (sel n.err) { ret res[i64, diagnostic.Diagnostic].err{n.err}; }
+    val bits: u64 = imm.bits::u64;
+    val m:    u64 = n.ok.magnitude;
+    var most: u64 = ~0::u64;
+    if (bits < 64) { most = (1::u64 << bits) - 1; }
+    if (imm.sign == operand.UNSIGNED) {
+        if (n.ok.negative || m > most) { ret fail[i64](r, RANGE, at, len); }
+        ret res[i64, diagnostic.Diagnostic].ok{m:~i64};
+    }
+    if (n.ok.negative) {
+        if (m > (1::u64 << (bits - 1))) { ret fail[i64](r, RANGE, at, len); }
+        ret res[i64, diagnostic.Diagnostic].ok{(0::u64 - m):~i64};
+    }
+    if (m > most) { ret fail[i64](r, RANGE, at, len); }
+    # the high half of an unsigned spelling is its two's complement
+    var v: u64 = m;
+    if (bits < 64 && m >= (1::u64 << (bits - 1))) { v = m | ~most; }
+    ret res[i64, diagnostic.Diagnostic].ok{v:~i64};
+}
+
+fun immediate_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.immediate) { ret refused(r, read.EXPECTED, r.at, read.token(r, r.at)); }
+    val imm: *operand.Immediate = ?desc.shape.immediate;
+    if (is(format, "result")) {
+        val at: usize = r.at;
+        if (!opens(r, "result")) { ret refused(r, NO_TYPE, at, 1); }
+        val t: res[i64, diagnostic.Diagnostic] = valtype_read(r);
+        if (sel t.err) { ret err[diagnostic.Diagnostic].err{t.err}; }
+        val shut: err[diagnostic.Diagnostic] = close(r);
+        if (sel shut.err) { ret shut; }
+        @out = operand.Value.immediate{t.ok};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (is(format, "heaptype")) {
+        val ht: res[i64, diagnostic.Diagnostic] = heaptype_read(r);
+        if (sel ht.err) { ret err[diagnostic.Diagnostic].err{ht.err}; }
+        @out = operand.Value.immediate{ht.ok};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (imm.format == operand.FLOAT) {
+        val at:  usize         = r.at;
+        val len: usize         = token(r);
+        val got: res[u64, str] = wasm_float.read(?r.text[at], len, imm.bits::u32);
+        if (sel got.err) { ret refused(r, got.err, at, len); }
+        r.at = at + len;
+        @out = operand.Value.immediate{got.ok:~i64};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val v: res[i64, diagnostic.Diagnostic] = integer_value(r, imm);
+    if (sel v.err) { ret err[diagnostic.Diagnostic].err{v.err}; }
+    @out = operand.Value.immediate{v.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun float_write(w: *core_syntax.Writer, v: u64, bits: u32) err[field.Refusal] {
+    val from: usize = w.out.len;
+    wasm_float.write(w.out, v, bits);
+    if (w.out.len == from) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    ret err[field.Refusal].ok{};
+}
+
+fun immediate_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel desc.shape.immediate) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (!sel value.immediate)      { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val imm: *operand.Immediate = ?desc.shape.immediate;
+    val v:   i64                = value.immediate;
+    if (is(format, "result")) {
+        val opened: err[field.Refusal] = write.text(w, "(result ");
+        if (sel opened.err) { ret opened; }
+        val t: err[field.Refusal] = valtype_write(w, v);
+        if (sel t.err) { ret t; }
+        ret write.text(w, ")");
+    }
+    if (is(format, "heaptype"))                { ret heaptype_write(w, v); }
+    if (imm.format == operand.FLOAT)           { ret float_write(w, v:~u64, imm.bits::u32); }
+    if (imm.sign == operand.UNSIGNED && v < 0) { ret write.hexadecimal(w, v:~u64); }
+    ret write.decimal(w, v);
+}
+
+val IMMEDIATE: core_syntax.Hook = core_syntax.Hook{parse: immediate_parse, print: immediate_print};
+
+fun id_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.id) { ret refused(r, read.EXPECTED, r.at, read.token(r, r.at)); }
+    if (is(format, "typeuse")) {
+        val used: res[opt[u32], diagnostic.Diagnostic] = typeuse_read(r, false);
+        if (sel used.err)     { ret err[diagnostic.Diagnostic].err{used.err}; }
+        if (sel used.ok.some) { @out = operand.Value.id{used.ok.some}; }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val at:  usize                           = r.at;
+    val got: res[u32, diagnostic.Diagnostic] = index_read(r, desc.shape.id.space);
+    if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+    if (is(format, "lead")) {
+        # an index another operand follows reads only where a token follows it
+        var next: usize = r.at;
+        for (next < r.end && read.blank(r.text[next])) { next = next + 1; }
+        if (next >= r.end) {
+            r.at = at;
+            ret refused(r, NO_FOLLOWER, at, 1);
+        }
+    }
+    @out = operand.Value.id{got.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun id_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel value.id) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (is(format, "typeuse")) {
+        val opened: err[field.Refusal] = write.text(w, "(type ");
+        if (sel opened.err) { ret opened; }
+        val n: err[field.Refusal] = write.decimal(w, value.id::i64);
+        if (sel n.err) { ret n; }
+        ret write.text(w, ")");
+    }
+    ret write.decimal(w, value.id::i64);
+}
+
+val ID: core_syntax.Hook = core_syntax.Hook{parse: id_parse, print: id_print};
+
+# the lanes of a v128 by its shape: their count and their bits, and whether they are floats
+rec Shape {
+    lanes: u32;
+    bits:  u32;
+    float: bool;
+}
+
+val SHAPE_NAMES: [6]str   = [6]str{"i8x16", "i16x8", "i32x4", "i64x2", "f32x4", "f64x2"};
+val SHAPES:      [6]Shape = [6]Shape{Shape{lanes: 16, bits: 8, float: false}, Shape{lanes: 8, bits: 16, float: false}, Shape{lanes: 4, bits: 32, float: false}, Shape{lanes: 2, bits: 64, float: false}, Shape{lanes: 4, bits: 32, float: true}, Shape{lanes: 2, bits: 64, float: true}};
+
+fun put_lane(at: *u8, v: u64, bytes: u32) {
+    var i: u32 = 0;
+    for (i < bytes) {
+        at[i] = ((v >> (i * 8)::u64) & 0xFF)::u8;
+        i     = i + 1;
+    }
+}
+
+fun literal_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.literal) { ret refused(r, read.EXPECTED, r.at, read.token(r, r.at)); }
+    val room: res[*u8, diagnostic.Diagnostic] = read.reserve(r, 16);
+    if (sel room.err) { ret err[diagnostic.Diagnostic].err{room.err}; }
+    var shape: Shape = Shape{lanes: 16, bits: 8, float: false};
+    if (is(format, "v128")) {
+        val at:  usize = r.at;
+        val len: usize = token(r);
+        var k:   u32   = 0;
+        for (k < 6 && !spells(r, at, len, SHAPE_NAMES[k])) { k = k + 1; }
+        if (k == 6) { ret refused(r, NO_SHAPE, at, len); }
+        shape = SHAPES[k];
+        r.at  = at + len;
+    }
+    val lane:     operand.Immediate = operand.Immediate{bits: shape.bits::u8, sign: operand.SIGNED, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS};
+    var unsigned: operand.Immediate = lane;
+    unsigned.sign = operand.UNSIGNED;
+    var i: u32 = 0;
+    for (i < shape.lanes) {
+        read.skip(r);
+        var v: u64 = 0;
+        if (shape.float) {
+            val at:  usize         = r.at;
+            val len: usize         = token(r);
+            val got: res[u64, str] = wasm_float.read(?r.text[at], len, shape.bits);
+            if (sel got.err) { ret refused(r, got.err, at, len); }
+            r.at = at + len;
+            v    = got.ok;
+        }
+        or {
+            var as: *operand.Immediate = ?lane;
+            if (!is(format, "v128")) { as = ?unsigned; }
+            val got: res[i64, diagnostic.Diagnostic] = integer_value(r, as);
+            if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+            v = got.ok:~u64;
+        }
+        put_lane(?room.ok[i * shape.bits / 8], v, shape.bits / 8);
+        i = i + 1;
+    }
+    @out = operand.Value.literal{operand.Bytes{at: room.ok, len: 16}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun lane_of(b: operand.Bytes, at: u32, bytes: u32) u64 {
+    var v: u64 = 0;
+    var i: u32 = 0;
+    for (i < bytes) {
+        v = v | (b.at[at + i]::u64 << (i * 8)::u64);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# a v128 as wasm2wat writes it, its four i32 lanes in hexadecimal, and a shuffle's lanes in decimal
+fun literal_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel value.literal) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val b: operand.Bytes = value.literal;
+    if (b.len != 16) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (is(format, "v128")) {
+        val shape: err[field.Refusal] = write.text(w, "i32x4");
+        if (sel shape.err) { ret shape; }
+        var i: u32 = 0;
+        for (i < 4) {
+            val v:   u64                = lane_of(b, i * 4, 4);
+            val pad: err[field.Refusal] = write.text(w, " 0x");
+            if (sel pad.err) { ret pad; }
+            var shift: i64 = 28;
+            for (shift >= 0) {
+                val d:   u8                 = "0123456789abcdef"[((v >> shift::u64) & 0xF)::usize];
+                val one: err[field.Refusal] = write.bytes(w, ?d, 1);
+                if (sel one.err) { ret one; }
+                shift = shift - 4;
+            }
+            i = i + 1;
+        }
+        ret err[field.Refusal].ok{};
+    }
+    var i: u32 = 0;
+    for (i < 16) {
+        if (i > 0) {
+            val sp: err[field.Refusal] = write.text(w, " ");
+            if (sel sp.err) { ret sp; }
+        }
+        val n: err[field.Refusal] = write.decimal(w, b.at[i]::i64);
+        if (sel n.err) { ret n; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+val LITERAL: core_syntax.Hook = core_syntax.Hook{parse: literal_parse, print: literal_print};
+
+# `values` pushed into the reader's pool as one group
+fun grouped(r: *core_syntax.Reader, values: *operand.Value, count: u32, out: *operand.Value) err[diagnostic.Diagnostic] {
+    var first: *operand.Value = nil;
+    var i:     u32            = 0;
+    for (i < count) {
+        val slot: res[*operand.Value, diagnostic.Diagnostic] = read.push(r, values[i]);
+        if (sel slot.err) { ret err[diagnostic.Diagnostic].err{slot.err}; }
+        if (i == 0)       { first = slot.ok; }
+        i = i + 1;
+    }
+    @out = operand.Value.group{operand.Values{at: first, len: count}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the block type of `members`, a value type or a type index, into the pool as a group, and the name the text gave the
+# block's label pending in the stream, none for a block whose text names none
+fun blocktyped(r: *core_syntax.Reader, label: View, members: *operand.Value, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (r.ctx != nil && r.ctx.stream != nil) {
+        val named: err[str] = wasm_stream.label(r.ctx.stream, label);
+        if (sel named.err) { ret refused(r, named.err, r.at, 1); }
+    }
+    if (sel members[0].none && sel members[1].none) {
+        @out = operand.Value.none{};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    ret grouped(r, members, 2, out);
+}
+
+# a block type after the `$` name a block's label takes: a single result's value type, the type a type use names, or
+# none for the empty block type
+fun blocktype_parse(r: *core_syntax.Reader, out: *operand.Value) err[diagnostic.Diagnostic] {
+    read.skip(r);
+    var label: View = View{data: nil, len: 0};
+    if (read.peek(r) == '$') {
+        val at:  usize = r.at;
+        val len: usize = token(r);
+        if (len == 1)                            { ret refused(r, NO_INDEX, at, len); }
+        if (r.ctx == nil || r.ctx.stream == nil) { ret refused(r, UNNAMED, at, len); }
+        label = View{data: ?r.text[at + 1], len: len - 1};
+        r.at  = at + len;
+        read.skip(r);
+    }
+    var members: [2]operand.Value = [2]operand.Value{operand.Value.none{}, operand.Value.none{}};
+    val back:    usize            = r.at;
+    # a single result and no params is a value type, as the binary spells it
+    if (opens(r, "result")) {
+        val t: res[i64, diagnostic.Diagnostic] = valtype_read(r);
+        if (sel t.ok) {
+            read.skip(r);
+            if (read.peek(r) == ')') {
+                r.at = r.at + 1;
+                val more: usize = r.at;
+                read.skip(r);
+                if (!keyword_ahead(r, "result")) {
+                    r.at       = more;
+                    members[0] = operand.Value.immediate{t.ok};
+                    ret blocktyped(r, label, ?members[0], out);
+                }
+            }
+        }
+        r.at = back;
+    }
+    val used: res[opt[u32], diagnostic.Diagnostic] = typeuse_read(r, true);
+    if (sel used.err)     { ret err[diagnostic.Diagnostic].err{used.err}; }
+    if (sel used.ok.some) { members[1] = operand.Value.id{used.ok.some}; }
+    ret blocktyped(r, label, ?members[0], out);
+}
+
+# whether `(` and `word` follow, the reader left where it was
+fun keyword_ahead(r: *core_syntax.Reader, word: str) bool {
+    val back: usize = r.at;
+    val seen: bool  = opens(r, word);
+    r.at = back;
+    ret seen;
+}
+
+# a catch clause, `(catch x l)`, `(catch_ref x l)`, `(catch_all l)` or `(catch_all_ref l)`
+fun catch_parse(r: *core_syntax.Reader, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val at: usize = r.at;
+    read.skip(r);
+    if (read.peek(r) != '(') { ret refused(r, NO_CATCH, at, 1); }
+    r.at = r.at + 1;
+    read.skip(r);
+    val from: usize = r.at;
+    val len:  usize = token(r);
+    var kind: u32   = 4;
+    var k:    u32   = 0;
+    for (k < wasm_kind.CATCH_KINDS.count) {
+        if (spells(r, from, len, wasm_kind.CATCH_KINDS.members[k].name)) { kind = wasm_kind.CATCH_KINDS.members[k].value; }
+        k = k + 1;
+    }
+    if (kind == 4) { ret refused(r, NO_CATCH, from, len); }
+    r.at = from + len;
+    var members: [3]operand.Value = [3]operand.Value{operand.enumerant(kind), operand.Value.none{}, operand.Value.none{}};
+    if (wasm_kind.tagged(kind)) {
+        read.skip(r);
+        val tag: res[u32, diagnostic.Diagnostic] = index_read(r, wasm_kind.TAGS);
+        if (sel tag.err) { ret err[diagnostic.Diagnostic].err{tag.err}; }
+        members[1] = operand.Value.id{tag.ok};
+    }
+    read.skip(r);
+    val label: res[u32, diagnostic.Diagnostic] = index_read(r, wasm_kind.LABELS);
+    if (sel label.err) { ret err[diagnostic.Diagnostic].err{label.err}; }
+    members[2] = operand.Value.id{label.ok};
+    val shut: err[diagnostic.Diagnostic] = close(r);
+    if (sel shut.err) { ret shut; }
+    ret grouped(r, ?members[0], 3, out);
+}
+
+fun group_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (!sel desc.shape.group)     { ret refused(r, read.EXPECTED, r.at, read.token(r, r.at)); }
+    if (desc.shape.group.len == 2) { ret blocktype_parse(r, out); }
+    ret catch_parse(r, out);
+}
+
+fun group_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel value.group) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val m: operand.Values = value.group;
+    if (m.len == 2) {
+        if (sel m.at[0].immediate) {
+            val opened: err[field.Refusal] = write.text(w, "(result ");
+            if (sel opened.err) { ret opened; }
+            val t: err[field.Refusal] = valtype_write(w, m.at[0].immediate);
+            if (sel t.err) { ret t; }
+            ret write.text(w, ")");
+        }
+        if (!sel m.at[1].id) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+        val opened: err[field.Refusal] = write.text(w, "(type ");
+        if (sel opened.err) { ret opened; }
+        val n: err[field.Refusal] = write.decimal(w, m.at[1].id::i64);
+        if (sel n.err) { ret n; }
+        ret write.text(w, ")");
+    }
+    if (m.len != 3) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val kind_of:  *operand.Value = ?m.at[0];
+    val tag_of:   *operand.Value = ?m.at[1];
+    val label_of: *operand.Value = ?m.at[2];
+    if (!sel kind_of.enumerant) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (!sel label_of.id)       { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val opened: err[field.Refusal] = write.text(w, "(");
+    if (sel opened.err) { ret opened; }
+    val kind: err[field.Refusal] = write.enumeration(w, ?wasm_kind.CATCH_KINDS, kind_of.enumerant.value, field.NO_OPERAND);
+    if (sel kind.err) { ret kind; }
+    if (sel tag_of.id) {
+        val sp: err[field.Refusal] = write.text(w, " ");
+        if (sel sp.err) { ret sp; }
+        val tag: err[field.Refusal] = write.decimal(w, tag_of.id::i64);
+        if (sel tag.err) { ret tag; }
+    }
+    val sp: err[field.Refusal] = write.text(w, " ");
+    if (sel sp.err) { ret sp; }
+    val label: err[field.Refusal] = write.decimal(w, label_of.id::i64);
+    if (sel label.err) { ret label; }
+    ret write.text(w, ")");
+}
+
+val GROUP: core_syntax.Hook = core_syntax.Hook{parse: group_parse, print: group_print};
+
+# the WebAssembly text format's instructions, as wat2wasm reads them and wasm2wat writes them
+pub val SYNTAX: core_syntax.Syntax = core_syntax.Syntax{
+    name:       "wat",
+    forms:      core_syntax.Forms{at: ?gen_syntax.FORM_TEXT[0], len: gen_syntax.FORM_COUNT},
+    aliases:    core_syntax.NO_ALIASES,
+    index:      core_syntax.Index{at: ?gen_syntax.ENTRIES[0], len: gen_syntax.ENTRY_COUNT, candidates: ?gen_syntax.CANDIDATES[0], count: gen_syntax.CANDIDATE_COUNT},
+    specifiers: core_syntax.NO_SPECIFIERS,
+    sequences:  core_syntax.NO_SEQUENCES,
+    hooks:      core_syntax.Hooks{immediate: ?IMMEDIATE, memory: nil, list: nil, id: ?ID, literal: ?LITERAL, register: nil, group: ?GROUP},
+    register:   "",
+    aliased:    false,
+    join:       " ",
+    variadic:   " ",
+    fold:       false,
+    anonymous:  ".Ltmp",
+    own:        nil,
+    statement:  nil,
+    lead:       nil,
+};
