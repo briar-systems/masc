@@ -1,0 +1,384 @@
+# the reader of the spir-v grammars of SPIRV-Headers
+#
+# the core grammar states every instruction by its opcode and operands, each operand by its kind and quantifier, and
+# every operand kind: the id and literal kinds, the value and bit enumerations with each enumerant's value, params and
+# availability, and the composite pairs by their bases. an extended instruction set's grammar states its instructions
+# by number and operands the same way. availability is a core version from which, and to which, the thing exists, the
+# extensions that bring it, and the capabilities that enable it, as the grammar states them.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use json;
+
+use masc.core.operand;
+
+use gen.diag;
+use gen.document;
+use gen.source;
+
+pub val BAD_QUANTIFIER: str = "operand quantifier is not `?` or `*`";
+pub val BAD_VALUE:      str = "enumerant value is not an integer or a hexadecimal string";
+pub val KIND_TWICE:     str = "operand kind stated twice";
+pub val OPNAME_TWICE:   str = "instruction stated twice";
+
+# a version the grammar states as "None", which no core version makes available
+pub val NONE: str = "None";
+
+# an operand of an instruction or a param of an enumerant
+# ---
+# kind:     its operand kind's name
+# name:     its name, nil when the grammar gives none
+# quantity: how many values it takes, as the grammar's quantifier states it
+pub rec Ref {
+    kind:     str;
+    name:     str;
+    quantity: operand.Quantity;
+}
+
+# what makes something available, as the grammar states it
+# ---
+# version:      the first core version holding it, nil for one the grammar states as NONE or not at all
+# last:         the last core version holding it, nil for every one since
+# extensions:   the extensions that bring it
+# capabilities: the capabilities, any one of which enables it
+pub rec Gate {
+    version:      str;
+    last:         str;
+    extensions:   vector.Vector[str];
+    capabilities: vector.Vector[str];
+}
+
+# one enumerant of a value or bit enumeration
+# ---
+# name:    its name
+# value:   its value, or its bit
+# params:  the operands that follow it
+# gate:    its availability
+# aliases: its further names
+pub rec Enumerant {
+    name:    str;
+    value:   u32;
+    params:  vector.Vector[Ref];
+    gate:    Gate;
+    aliases: vector.Vector[str];
+}
+
+# one operand kind
+# ---
+# name:       its name
+# category:   `Id`, `Literal`, `ValueEnum`, `BitEnum` or `Composite`
+# enumerants: an enumeration's enumerants, in the grammar's order
+# bases:      a composite's members' kinds
+pub rec Kind {
+    name:       str;
+    category:   str;
+    enumerants: vector.Vector[Enumerant];
+    bases:      vector.Vector[str];
+}
+
+# one instruction of the core grammar or of an extended set
+# ---
+# name:     its opname
+# opcode:   its opcode, or its number in its extended set
+# operands: its operands in order
+# gate:     its availability
+# aliases:  its further opnames
+pub rec Instruction {
+    name:     str;
+    opcode:   u32;
+    operands: vector.Vector[Ref];
+    gate:     Gate;
+    aliases:  vector.Vector[str];
+}
+
+# a grammar read whole
+# ---
+# major:        the core version's major number, 0 for an extended set
+# minor:        its minor number
+# revision:     its revision
+# kinds:        the operand kinds, in the grammar's order
+# by_name:      each kind's index by its name
+# instructions: the instructions, in the grammar's order
+# by_opname:    each instruction's index by its opname
+pub rec Grammar {
+    major:        i64;
+    minor:        i64;
+    revision:     i64;
+    kinds:        vector.Vector[Kind];
+    by_name:      map.Map[str, u32];
+    instructions: vector.Vector[Instruction];
+    by_opname:    map.Map[str, u32];
+}
+
+fun memory(f: *source.File) diag.Refusal {
+    ret diag.refusal(f.path, 0, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the text of member `key` of `v`, nil when it is absent
+fun optional_text(a: *A.Allocator, d: *document.Document, v: *json.Value, key: str) res[str, diag.Refusal] {
+    val found: res[opt[*json.Value], diag.Refusal] = document.optional(d, v, key);
+    if (sel found.err)     { ret res[str, diag.Refusal].err{found.err}; }
+    if (sel found.ok.none) { ret res[str, diag.Refusal].ok{nil}; }
+    ret document.text(a, d, found.ok.some, key);
+}
+
+# the text of member `key` of `v`
+fun text_of(a: *A.Allocator, d: *document.Document, v: *json.Value, key: str) res[str, diag.Refusal] {
+    val found: res[*json.Value, diag.Refusal] = document.member(d, v, key);
+    if (sel found.err) { ret res[str, diag.Refusal].err{found.err}; }
+    ret document.text(a, d, found.ok, key);
+}
+
+# the strings of the array member `key` of `v` appended to `out`, none when it is absent
+fun texts(a: *A.Allocator, d: *document.Document, v: *json.Value, key: str, out: *vector.Vector[str]) err[diag.Refusal] {
+    val found: res[opt[*json.Value], diag.Refusal] = document.optional(d, v, key);
+    if (sel found.err)     { ret err[diag.Refusal].err{found.err}; }
+    if (sel found.ok.none) { ret err[diag.Refusal].ok{}; }
+    val n: res[usize, diag.Refusal] = document.count(d, found.ok.some, key);
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    var i: usize = 0;
+    for (i < n.ok) {
+        val t: res[str, diag.Refusal] = document.text(a, d, document.item(found.ok.some, i), key);
+        if (sel t.err)                            { ret err[diag.Refusal].err{t.err}; }
+        if (!pushed(vector.push[str](out, t.ok))) { ret err[diag.Refusal].err{memory(d.file)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the availability `v` states
+fun gate(a: *A.Allocator, d: *document.Document, v: *json.Value, out: *Gate) err[diag.Refusal] {
+    out.extensions   = vector.init[str](a);
+    out.capabilities = vector.init[str](a);
+    val version: res[str, diag.Refusal] = optional_text(a, d, v, "version");
+    if (sel version.err) { ret err[diag.Refusal].err{version.err}; }
+    out.version = version.ok;
+    if (out.version != nil && str_equals(out.version, NONE)) { out.version = nil; }
+    val last: res[str, diag.Refusal] = optional_text(a, d, v, "lastVersion");
+    if (sel last.err) { ret err[diag.Refusal].err{last.err}; }
+    out.last = last.ok;
+    val ext: err[diag.Refusal] = texts(a, d, v, "extensions", ?out.extensions);
+    if (sel ext.err) { ret ext; }
+    ret texts(a, d, v, "capabilities", ?out.capabilities);
+}
+
+# the operands of the array member `key` of `v` appended to `out`, none when it is absent
+fun refs(a: *A.Allocator, d: *document.Document, v: *json.Value, key: str, out: *vector.Vector[Ref]) err[diag.Refusal] {
+    val found: res[opt[*json.Value], diag.Refusal] = document.optional(d, v, key);
+    if (sel found.err)     { ret err[diag.Refusal].err{found.err}; }
+    if (sel found.ok.none) { ret err[diag.Refusal].ok{}; }
+    val n: res[usize, diag.Refusal] = document.count(d, found.ok.some, key);
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    var i: usize = 0;
+    for (i < n.ok) {
+        val o:    *json.Value            = document.item(found.ok.some, i);
+        val kind: res[str, diag.Refusal] = text_of(a, d, o, "kind");
+        if (sel kind.err) { ret err[diag.Refusal].err{kind.err}; }
+        val name: res[str, diag.Refusal] = optional_text(a, d, o, "name");
+        if (sel name.err) { ret err[diag.Refusal].err{name.err}; }
+        val q: res[str, diag.Refusal] = optional_text(a, d, o, "quantifier");
+        if (sel q.err) { ret err[diag.Refusal].err{q.err}; }
+        var quantity: operand.Quantity = operand.ONE;
+        if (q.ok != nil) {
+            if (str_equals(q.ok, "?")) { quantity = operand.OPTIONAL; }
+            or (str_equals(q.ok, "*")) { quantity = operand.VARIADIC; }
+            or                         { ret err[diag.Refusal].err{diag.refusal(d.file.path, 0, BAD_QUANTIFIER, q.ok)}; }
+        }
+        if (!pushed(vector.push[Ref](out, Ref{kind: kind.ok, name: name.ok, quantity: quantity}))) { ret err[diag.Refusal].err{memory(d.file)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the value of hexadecimal text `t`, after its `0x`
+fun hex(t: str) opt[u32] {
+    if (t[0] != '0' || (t[1] != 'x' && t[1] != 'X') || t[2] == 0) { ret opt[u32].none{}; }
+    var n: u64   = 0;
+    var i: usize = 2;
+    for (t[i] != 0) {
+        val c: u8  = t[i];
+        var k: u64 = 99;
+        if (c >= '0' && c <= '9') { k = (c - '0')::u64; }
+        or (c >= 'a' && c <= 'f') { k = (c - 'a')::u64 + 10; }
+        or (c >= 'A' && c <= 'F') { k = (c - 'A')::u64 + 10; }
+        if (k > 15)               { ret opt[u32].none{}; }
+        n = n * 16 + k;
+        if (n > 0xFFFF_FFFF) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    ret opt[u32].some{n::u32};
+}
+
+# the enumerant value of `v`: an integer, or a hexadecimal string as a bit enumeration states its bits
+fun value_of(a: *A.Allocator, d: *document.Document, v: *json.Value) res[u32, diag.Refusal] {
+    if (v.kind == json.STRING) {
+        val t: res[str, diag.Refusal] = document.text(a, d, v, "value");
+        if (sel t.err) { ret res[u32, diag.Refusal].err{t.err}; }
+        val n: opt[u32] = hex(t.ok);
+        if (sel n.none) { ret res[u32, diag.Refusal].err{diag.refusal(d.file.path, 0, BAD_VALUE, t.ok)}; }
+        ret res[u32, diag.Refusal].ok{n.some};
+    }
+    val n: res[i64, diag.Refusal] = document.integer(d, v, "value");
+    if (sel n.err)                      { ret res[u32, diag.Refusal].err{n.err}; }
+    if (n.ok < 0 || n.ok > 0xFFFF_FFFF) { ret res[u32, diag.Refusal].err{diag.refusal(d.file.path, 0, BAD_VALUE, "value")}; }
+    ret res[u32, diag.Refusal].ok{n.ok::u32};
+}
+
+# the instructions of the array member `instructions` of `root` appended to `out`, each opcode read from `key`
+fun instructions(a: *A.Allocator, d: *document.Document, root: *json.Value, g: *Grammar) err[diag.Refusal] {
+    val out: *vector.Vector[Instruction]    = ?g.instructions;
+    val all: res[*json.Value, diag.Refusal] = document.member(d, root, "instructions");
+    if (sel all.err) { ret err[diag.Refusal].err{all.err}; }
+    val n: res[usize, diag.Refusal] = document.count(d, all.ok, "instructions");
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    var i: usize = 0;
+    for (i < n.ok) {
+        val v:    *json.Value            = document.item(all.ok, i);
+        var ins:  Instruction            = Instruction{name: nil, opcode: 0, operands: vector.init[Ref](a), aliases: vector.init[str](a)};
+        val name: res[str, diag.Refusal] = text_of(a, d, v, "opname");
+        if (sel name.err) { ret err[diag.Refusal].err{name.err}; }
+        ins.name = name.ok;
+        val code: res[*json.Value, diag.Refusal] = document.member(d, v, "opcode");
+        if (sel code.err) { ret err[diag.Refusal].err{code.err}; }
+        val op: res[u32, diag.Refusal] = value_of(a, d, code.ok);
+        if (sel op.err) { ret err[diag.Refusal].err{op.err}; }
+        ins.opcode = op.ok;
+        val ops: err[diag.Refusal] = refs(a, d, v, "operands", ?ins.operands);
+        if (sel ops.err) { ret ops; }
+        val gated: err[diag.Refusal] = gate(a, d, v, ?ins.gate);
+        if (sel gated.err) { ret gated; }
+        val al: err[diag.Refusal] = texts(a, d, v, "aliases", ?ins.aliases);
+        if (sel al.err) { ret al; }
+        var key:   str       = ins.name;
+        val known: opt[*u32] = map.get[str, u32](?g.by_opname, ?key);
+        if (sel known.some) { ret err[diag.Refusal].err{diag.refusal(d.file.path, 0, OPNAME_TWICE, ins.name)}; }
+        val put: res[bool, A.Error] = map.insert[str, u32](?g.by_opname, ins.name, out.len::u32);
+        if (sel put.err)                                 { ret err[diag.Refusal].err{memory(d.file)}; }
+        if (!pushed(vector.push[Instruction](out, ins))) { ret err[diag.Refusal].err{memory(d.file)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the operand kinds of `root` appended to `g`
+fun kinds(a: *A.Allocator, d: *document.Document, root: *json.Value, g: *Grammar) err[diag.Refusal] {
+    val all: res[*json.Value, diag.Refusal] = document.member(d, root, "operand_kinds");
+    if (sel all.err) { ret err[diag.Refusal].err{all.err}; }
+    val n: res[usize, diag.Refusal] = document.count(d, all.ok, "operand_kinds");
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    var i: usize = 0;
+    for (i < n.ok) {
+        val v:    *json.Value            = document.item(all.ok, i);
+        var k:    Kind                   = Kind{name: nil, category: nil, enumerants: vector.init[Enumerant](a), bases: vector.init[str](a)};
+        val name: res[str, diag.Refusal] = text_of(a, d, v, "kind");
+        if (sel name.err) { ret err[diag.Refusal].err{name.err}; }
+        k.name = name.ok;
+        val cat: res[str, diag.Refusal] = text_of(a, d, v, "category");
+        if (sel cat.err) { ret err[diag.Refusal].err{cat.err}; }
+        k.category = cat.ok;
+        val bases: err[diag.Refusal] = texts(a, d, v, "bases", ?k.bases);
+        if (sel bases.err) { ret bases; }
+        val es: res[opt[*json.Value], diag.Refusal] = document.optional(d, v, "enumerants");
+        if (sel es.err) { ret err[diag.Refusal].err{es.err}; }
+        if (sel es.ok.some) {
+            val list:  *json.Value              = es.ok.some;
+            val count: res[usize, diag.Refusal] = document.count(d, list, "enumerants");
+            if (sel count.err) { ret err[diag.Refusal].err{count.err}; }
+            var j: usize = 0;
+            for (j < count.ok) {
+                val ev:    *json.Value            = document.item(list, j);
+                var e:     Enumerant              = Enumerant{name: nil, value: 0, params: vector.init[Ref](a), aliases: vector.init[str](a)};
+                val ename: res[str, diag.Refusal] = text_of(a, d, ev, "enumerant");
+                if (sel ename.err) { ret err[diag.Refusal].err{ename.err}; }
+                e.name = ename.ok;
+                val raw: res[*json.Value, diag.Refusal] = document.member(d, ev, "value");
+                if (sel raw.err) { ret err[diag.Refusal].err{raw.err}; }
+                val value: res[u32, diag.Refusal] = value_of(a, d, raw.ok);
+                if (sel value.err) { ret err[diag.Refusal].err{value.err}; }
+                e.value = value.ok;
+                val ps: err[diag.Refusal] = refs(a, d, ev, "parameters", ?e.params);
+                if (sel ps.err) { ret ps; }
+                val eg: err[diag.Refusal] = gate(a, d, ev, ?e.gate);
+                if (sel eg.err) { ret eg; }
+                val al: err[diag.Refusal] = texts(a, d, ev, "aliases", ?e.aliases);
+                if (sel al.err)                                        { ret al; }
+                if (!pushed(vector.push[Enumerant](?k.enumerants, e))) { ret err[diag.Refusal].err{memory(d.file)}; }
+                j = j + 1;
+            }
+        }
+        var key:   str       = k.name;
+        val known: opt[*u32] = map.get[str, u32](?g.by_name, ?key);
+        if (sel known.some) { ret err[diag.Refusal].err{diag.refusal(d.file.path, 0, KIND_TWICE, k.name)}; }
+        val put: res[bool, A.Error] = map.insert[str, u32](?g.by_name, k.name, g.kinds.len::u32);
+        if (sel put.err)                             { ret err[diag.Refusal].err{memory(d.file)}; }
+        if (!pushed(vector.push[Kind](?g.kinds, k))) { ret err[diag.Refusal].err{memory(d.file)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun fresh(a: *A.Allocator) Grammar {
+    ret Grammar{major: 0, minor: 0, revision: 0, kinds: vector.init[Kind](a), by_name: map.init[str, u32](a), instructions: vector.init[Instruction](a), by_opname: map.init[str, u32](a)};
+}
+
+fun number(d: *document.Document, root: *json.Value, key: str) res[i64, diag.Refusal] {
+    val v: res[*json.Value, diag.Refusal] = document.member(d, root, key);
+    if (sel v.err) { ret res[i64, diag.Refusal].err{v.err}; }
+    ret document.integer(d, v.ok, key);
+}
+
+# the core grammar `f`, or an extended set's, read whole into `out`
+# ---
+# core: whether it is the core grammar, which states its version, or an extended set's, whose operand kinds, if it
+#       states any, no instruction of it names
+pub fun read(a: *A.Allocator, f: *source.File, core: bool, out: *Grammar) err[diag.Refusal] {
+    @out = fresh(a);
+    val parsed: res[document.Document, diag.Refusal] = document.read(a, f);
+    if (sel parsed.err) { ret err[diag.Refusal].err{parsed.err}; }
+    var d:    document.Document = parsed.ok;
+    val root: *json.Value       = ?d.root;
+    if (core) {
+        val major: res[i64, diag.Refusal] = number(?d, root, "major_version");
+        if (sel major.err) { ret err[diag.Refusal].err{major.err}; }
+        val minor: res[i64, diag.Refusal] = number(?d, root, "minor_version");
+        if (sel minor.err) { ret err[diag.Refusal].err{minor.err}; }
+        out.major = major.ok;
+        out.minor = minor.ok;
+        val k: err[diag.Refusal] = kinds(a, ?d, root, out);
+        if (sel k.err) { ret k; }
+    }
+    val revision: res[i64, diag.Refusal] = number(?d, root, "revision");
+    if (sel revision.err) { ret err[diag.Refusal].err{revision.err}; }
+    out.revision = revision.ok;
+    ret instructions(a, ?d, root, out);
+}
+
+# the instruction of `g` named `name`, nil when the grammar states none
+pub fun instruction(g: *Grammar, name: str) *Instruction {
+    var key:   str       = name;
+    val known: opt[*u32] = map.get[str, u32](?g.by_opname, ?key);
+    if (sel known.none) { ret nil; }
+    ret ?g.instructions.data[@known.some];
+}
+
+# the kind of `g` named `name`, none when the grammar states none
+pub fun kind(g: *Grammar, name: str) opt[*Kind] {
+    var key:   str       = name;
+    val known: opt[*u32] = map.get[str, u32](?g.by_name, ?key);
+    if (sel known.none) { ret opt[*Kind].none{}; }
+    ret opt[*Kind].some{?g.kinds.data[@known.some]};
+}

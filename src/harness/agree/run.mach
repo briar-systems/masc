@@ -76,12 +76,15 @@ use masc.core.inst;
 use masc.core.mode;
 use masc.core.operand;
 use masc.core.register;
+use masc.core.relax;
 use masc.core.requirement;
 use masc.core.row;
 use masc.core.set;
 use masc.core.state;
+use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use masc.format.dialect;
+use masc.syntax.parse;
 use masc.syntax.print;
 
 use masc.harness.agree.agreement;
@@ -128,6 +131,8 @@ pub tag Printed: u8 {
 # printed: masc's printing of its own bytes, by the alias it prefers
 # trip:    the bytes masc assembles that printing to
 # lent:    the exception of `read` that excuses this vector's decode disagreement, nil for none
+# dropped: whether the disassembler refused it by its place in a file of many, so the reference assembler's file was
+#          written again without it
 pub rec Case {
     inst:    inst.Inst;
     text:    str;
@@ -141,6 +146,7 @@ pub rec Case {
     printed: Printed;
     trip:    Outcome;
     lent:    *agreement.Exception;
+    dropped: bool;
 }
 
 # the rows of one variant whose selections spell the same, and their vectors
@@ -152,6 +158,7 @@ pub rec Case {
 # spelled:    the selection in the catalog's syntax
 # cases:      every vector of its rows, each row's together
 # references: the reference assembler's objects of the vectors it assembled, one per batch that assembled
+# needs:      what its vectors need the context's stream to hold, each provided to it once, none for a set of no stream
 pub rec Group {
     number:     u32;
     selection:  extension.Selection;
@@ -160,6 +167,7 @@ pub rec Group {
     spelled:    str;
     cases:      vector.Vector[Case];
     references: vector.Vector[str];
+    needs:      vector.Vector[vectors.Need];
 }
 
 # what a row came to at one variant
@@ -254,6 +262,7 @@ pub rec Result {
 # result:     the result
 # exceptions: the exception table by row key, each an index into it
 # scopes:     each exception's extensions whose absence it excuses, by its index, none for every selection
+# withs:      each exception's extensions it applies with, by its index, none for every selection
 # seen:       the notes so far, so each is kept once
 # modes:      the assembler modes the rows are read under
 # formats:    the format registry masc's and the tools' objects are read and written through
@@ -265,6 +274,7 @@ pub rec Run {
     result:     *Result;
     exceptions: map.Map[str, u32];
     scopes:     vector.Vector[requirement.Ids];
+    withs:      vector.Vector[requirement.Ids];
     seen:       map.Map[str, u32];
     modes:      mode.State;
     formats:    *registry.Registry;
@@ -276,6 +286,20 @@ val UNSERVED: str = "the set serves no architecture of the variant";
 # the store a decode walk holds operand values in, and the alternatives it notes
 val STORE:        u32 = 64;
 val ALTERNATIVES: u32 = 8;
+
+# the values a vector's reading holds its list members in
+val POOL: u32 = 256;
+
+fun no_symbol(context: ptr, name: View) res[core_syntax.Resolved, str] {
+    ret res[core_syntax.Resolved, str].err{"a vector names no symbol"};
+}
+
+fun no_name(context: ptr, id: u32) View {
+    ret View{data: "", len: 0};
+}
+
+# the symbols of a vector read under a typed stream, which names none
+val NO_SYMBOLS: core_syntax.Symbols = core_syntax.Symbols{context: nil, resolve: no_symbol, name: no_name};
 
 # `s` copied into `a`, none when it refuses
 fun copied(a: *A.Allocator, s: str) opt[str] {
@@ -393,8 +417,19 @@ fun attempt(r: *Run, base: requirement.Ids, alternative: requirement.Alternative
     ret res[opt[extension.Selection], str].err{MEMORY};
 }
 
-# `s` widened by every extension of its catalog, in order, that keeps it closed
-fun widen(r: *Run, s: *extension.Selection) err[str] {
+# whether `s` holds any of `ids`
+fun holds_any(s: *extension.Selection, ids: requirement.Ids) bool {
+    var i: u32 = 0;
+    for (i < ids.len) {
+        if (extension.has(s, ids.at[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# `s` widened by every extension of its catalog, in order, that keeps it closed and holding none of what `excluded`
+# names, as a row a later version removes is checked without that version
+fun widen(r: *Run, s: *extension.Selection, excluded: requirement.Ids) err[str] {
     val catalog: *extension.Catalog = s.catalog;
     var x:       u32                = 0;
     for (x < catalog.count) {
@@ -415,8 +450,12 @@ fun widen(r: *Run, s: *extension.Selection) err[str] {
             extension.request_add(?q, x);
             val closed: res[extension.Selection, extension.Error] = extension.close(q);
             if (sel closed.ok) {
-                extension.release(s);
-                @s = closed.ok;
+                var grown: extension.Selection = closed.ok;
+                if (holds_any(?grown, excluded)) { extension.release(?grown); }
+                or {
+                    extension.release(s);
+                    @s = grown;
+                }
             }
             if (sel closed.err) {
                 if (!sel closed.err.conflict) { ret err[str].err{MEMORY}; }
@@ -427,10 +466,74 @@ fun widen(r: *Run, s: *extension.Selection) err[str] {
     ret err[str].ok{};
 }
 
+# `s` widened by `ids` when it closes with them, kept as it is when they conflict
+fun widen_by(r: *Run, s: *extension.Selection, ids: requirement.Ids) err[str] {
+    val catalog: *extension.Catalog                      = s.catalog;
+    val made:    res[extension.Request, extension.Error] = extension.request(r.a, catalog, "", diagnostic.START);
+    if (sel made.err) { ret err[str].err{MEMORY}; }
+    var q: extension.Request = made.ok;
+    var y: u32               = 0;
+    for (y < catalog.count) {
+        if (extension.has(s, y)) { extension.request_add(?q, y); }
+        y = y + 1;
+    }
+    y = 0;
+    for (y < s.stated.len) {
+        extension.request_add(?q, s.stated.at[y]);
+        y = y + 1;
+    }
+    y = 0;
+    for (y < ids.len) {
+        extension.request_add(?q, ids.at[y]);
+        y = y + 1;
+    }
+    val closed: res[extension.Selection, extension.Error] = extension.close(q);
+    if (sel closed.ok) {
+        extension.release(s);
+        @s = closed.ok;
+        ret err[str].ok{};
+    }
+    if (sel closed.err) {
+        if (!sel closed.err.conflict) { ret err[str].err{MEMORY}; }
+    }
+    ret err[str].ok{};
+}
+
+# `s` widened by what each enumeration operand of `row_` needs where it admits none of its members: the first
+# alternative of the first member's requirement, as a spir-v memory model needs a capability whichever it is
+fun enumerated(r: *Run, row_: *row.Row, s: *extension.Selection) err[str] {
+    var k: u32 = 0;
+    for (k < row_.operands.len) {
+        val shape: *operand.Shape = ?row_.operands.at[k].shape;
+        if (sel shape.enumerant) {
+            val e:  *operand.Enumeration            = ?shape.enumerant;
+            val at: res[state.Context, state.Error] = state.make(s, ?r.agreement.set.states, state.initial(?r.agreement.set.states));
+            if (sel at.err) { ret err[str].err{MEMORY}; }
+            var ctx:   state.Context = at.ok;
+            var any:   bool          = e.count == 0;
+            var first: u32           = e.count;
+            var i:     u32           = 0;
+            for (i < e.count && !any) {
+                val required: requirement.Requirement = e.members[i].requires;
+                if (state.admits(?ctx, required))         { any = true; }
+                or (first == e.count && required.len > 0) { first = i; }
+                i = i + 1;
+            }
+            if (!any && first < e.count) {
+                val grown: err[str] = widen_by(r, s, e.members[first].requires.at[0].all);
+                if (sel grown.err) { ret grown; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[str].ok{};
+}
+
 # the selection `r` is checked under at `variant`, none when no alternative of its requirement closes with the base
 fun choose(r: *Run, variant: *agreement.Variant, row_: *row.Row) res[opt[extension.Selection], str] {
-    val none:   requirement.Alternative  = requirement.Alternative{all: requirement.NO_IDS, none: requirement.NO_IDS};
-    var chosen: opt[extension.Selection] = opt[extension.Selection].none{};
+    val none:     requirement.Alternative  = requirement.Alternative{all: requirement.NO_IDS, none: requirement.NO_IDS};
+    var chosen:   opt[extension.Selection] = opt[extension.Selection].none{};
+    var excluded: requirement.Ids          = requirement.NO_IDS;
     if (row_.requires.len == 0) {
         val got: res[opt[extension.Selection], str] = attempt(r, variant.base, none);
         if (sel got.err) { ret got; }
@@ -440,13 +543,16 @@ fun choose(r: *Run, variant: *agreement.Variant, row_: *row.Row) res[opt[extensi
     for (i < row_.requires.len && sel chosen.none) {
         val got: res[opt[extension.Selection], str] = attempt(r, variant.base, row_.requires.at[i]);
         if (sel got.err) { ret got; }
-        chosen = got.ok;
-        i      = i + 1;
+        chosen   = got.ok;
+        excluded = row_.requires.at[i].none;
+        i        = i + 1;
     }
-    if (!r.result.options.full) { ret res[opt[extension.Selection], str].ok{chosen}; }
-    if (sel chosen.none)        { ret res[opt[extension.Selection], str].ok{chosen}; }
-    var s:       extension.Selection = chosen.some;
-    val widened: err[str]            = widen(r, ?s);
+    if (sel chosen.none) { ret res[opt[extension.Selection], str].ok{chosen}; }
+    var s:      extension.Selection = chosen.some;
+    val needed: err[str]            = enumerated(r, row_, ?s);
+    if (sel needed.err)         { ret res[opt[extension.Selection], str].err{needed.err}; }
+    if (!r.result.options.full) { ret res[opt[extension.Selection], str].ok{opt[extension.Selection].some{s}}; }
+    val widened: err[str] = widen(r, ?s, excluded);
     if (sel widened.err) { ret res[opt[extension.Selection], str].err{widened.err}; }
     ret res[opt[extension.Selection], str].ok{opt[extension.Selection].some{s}};
 }
@@ -479,6 +585,51 @@ fun assemble(r: *Run, w: *Width, g: *Group, source: str) Outcome {
     mink_object.release(?o);
     if (sel bytes.err) { ret refused(r, bytes.err); }
     ret Outcome.bytes{bytes.ok};
+}
+
+# `head` and `message` as a refused outcome, in the run's storage
+fun refused_by(r: *Run, head: str, message: str) Outcome {
+    val joined_: res[str, str] = joined(r, head, message, "");
+    if (sel joined_.err) { ret Outcome.refused{MEMORY}; }
+    ret Outcome.refused{joined_.ok};
+}
+
+# `source`, one statement of masc's syntax, read and encoded by masc under the stream of `g`, as an assembler of a
+# typed stream reads one line of a source whose earlier lines defined what the group's vectors need, into the run's
+# storage
+fun encoded(r: *Run, g: *Group, source: str) Outcome {
+    val s:    *set.Set                     = r.agreement.set;
+    val len:  usize                        = str_len(source);
+    val pool: res[*operand.Value, A.Error] = A.allocate[operand.Value](r.scratch, POOL::usize);
+    val lits: res[*u8, A.Error]            = A.allocate[u8](r.scratch, len + 1);
+    if (sel pool.err) { ret Outcome.refused{MEMORY}; }
+    if (sel lits.err) { ret Outcome.refused{MEMORY}; }
+    var room: [ALTERNATIVES]requirement.Alternative;
+    var ex:   relax.Expansion;
+    var rd:   core_syntax.Reader         = core_syntax.Reader{text: source, start: 0, at: 0, end: len, origin: diagnostic.START, codec: s.codec, ctx: ?g.context, syntax: ?s.syntaxes.at[r.agreement.syntax], modes: ?r.modes, symbols: ?NO_SYMBOLS, context: nil, row: nil, pool: pool.ok, cap: POOL, used: 0, bytes: lits.ok, room: (len + 1)::u32, taken: 0, refused: field.Admissions{at: ?room[0], cap: ALTERNATIVES, used: 0}};
+    val read: err[diagnostic.Diagnostic] = parse.statement(?rd, ?ex);
+    if (sel read.err) { ret refused_by(r, "masc cannot read it: ", read.err.message); }
+    var out:    vector.Vector[u8]          = vector.init[u8](r.scratch);
+    var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](r.scratch);
+    var i:      u32                        = 0;
+    for (i < ex.count) {
+        val step:  *relax.Emitted            = ?ex.steps[i];
+        var ins:   inst.Inst                 = inst.Inst{row: step.row, values: ?step.values[0], count: step.row.operands.len, form: step.form};
+        val wrote: res[usize, field.Refusal] = walk.encode(s.codec, ?g.context, ?ins, ?out, ?fixups);
+        if (sel wrote.err) { ret refused_by(r, "masc cannot encode it: ", wrote.err.message); }
+        i = i + 1;
+    }
+    if (fixups.len != 0) { ret Outcome.refused{"masc encodes it with a fixup, which no vector of a typed stream takes"}; }
+    val bytes: opt[operand.Bytes] = object.own(r.a, out.data, out.len);
+    if (sel bytes.none) { ret Outcome.refused{MEMORY}; }
+    ret Outcome.bytes{bytes.some};
+}
+
+# `source` assembled by masc under `g` at `w`: one line assembled alone, or read under the group's stream for a set
+# of a typed stream
+fun assembled(r: *Run, w: *Width, g: *Group, source: str) Outcome {
+    if (r.agreement.stream != nil) { ret encoded(r, g, source); }
+    ret assemble(r, w, g, source);
 }
 
 # `ins`, whose encoding is `len` bytes, with each relative target anchored at its end restated from its start and
@@ -671,7 +822,7 @@ fun by_masc(r: *Run, w: *Width, g: *Group) err[str] {
         c.text = kept.some;
         c.tool = c.text;
         arena.reset(r.area);
-        c.masc = assemble(r, w, g, c.text);
+        c.masc = assembled(r, w, g, c.text);
         if (r.agreement.targets == agreement.LABEL && targeted(?c.inst)) {
             c.tool = nil;
             if (sel c.masc.bytes) {
@@ -686,7 +837,7 @@ fun by_masc(r: *Run, w: *Width, g: *Group) err[str] {
             c.printed = decode(r, g, c.masc.bytes, false, 8, ?mine);
             if (sel c.printed.text) {
                 arena.reset(r.area);
-                c.trip = assemble(r, w, g, c.printed.text);
+                c.trip = assembled(r, w, g, c.printed.text);
             }
         }
         i = i + 1;
@@ -756,6 +907,159 @@ fun give_all(g: *Group, pending: *vector.Vector[u32], j: usize, why: Outcome) {
     }
 }
 
+# what the vectors of `g` need, as every job of the group states it
+fun needs_of(g: *Group) vectors.Needs {
+    ret vectors.Needs{at: g.needs.data, len: g.needs.len::u32};
+}
+
+# the lines `t` ends after, counted on from `lines` past offset `seen`, which both advance to its end
+fun lines_of(t: *text.Text, seen: *usize, lines: *u32) u32 {
+    for (@seen < t.out.len) {
+        if (t.out.data[@seen] == '\n') { @lines = @lines + 1; }
+        @seen = @seen + 1;
+    }
+    ret @lines;
+}
+
+# the source of the cases `pending` lists laid out by `layout` as one file, the lines of the kth pending case's text
+# from `first[k]` to `last[k]`
+fun layout_of(r: *Run, g: *Group, job: *agreement.Job, layout: *agreement.Layout, pending: *vector.Vector[u32], first: *vector.Vector[u32], last: *vector.Vector[u32], path: str) err[str] {
+    var t:     text.Text = text.make(r.scratch);
+    var seen:  usize     = 0;
+    var lines: u32       = 0;
+    layout.open(job, ?t);
+    var k: usize = 0;
+    for (k < pending.len) {
+        val c:    *Case               = ?g.cases.data[pending.data[k]];
+        val from: res[usize, A.Error] = vector.push[u32](first, lines_of(?t, ?seen, ?lines) + 1);
+        layout.vector(job, ?c.inst, c.tool, ?t);
+        val to: res[usize, A.Error] = vector.push[u32](last, lines_of(?t, ?seen, ?lines));
+        if (sel from.err || sel to.err) { ret err[str].err{MEMORY}; }
+        k = k + 1;
+    }
+    layout.close(job, ?t);
+    if (t.failed) { ret err[str].err{MEMORY}; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, t.out.data, t.out.len, 0o644);
+    if (sel wrote.err) { ret err[str].err{"a source file cannot be written"}; }
+    ret err[str].ok{};
+}
+
+# the cases of `g` assembler `j` assembles from one source its layout makes, its outcome given each, each vector's
+# bytes found by the layout's split of the file it writes
+fun by_layout(r: *Run, w: *Width, g: *Group, j: usize, pending: *vector.Vector[u32]) err[str] {
+    val found:  *tool.Found          = ?r.result.assemblers.data[j];
+    val asmr:   *agreement.Assembler = ?r.agreement.assemblers.at[j];
+    val layout: *agreement.Layout    = asmr.layout;
+    val named:  res[str, str]        = stem(r, w, g, found.tool.name);
+    if (sel named.err) { ret err[str].err{named.err}; }
+    val base:   str           = named.ok;
+    val source: res[str, str] = joined(r, r.result.options.work, "/", base);
+    if (sel source.err) { ret err[str].err{source.err}; }
+    val src: res[str, str] = joined(r, source.ok, ".s", "");
+    if (sel src.err) { ret err[str].err{MEMORY}; }
+    val obj: res[str, str] = joined(r, source.ok, ".o", "");
+    if (sel obj.err) { ret err[str].err{MEMORY}; }
+    for (pending.len > 0) {
+        arena.reset(r.area);
+        var job:   agreement.Job      = agreement.Job{variant: w.variant, selection: ?g.selection, source: src.ok, object: obj.ok, needs: needs_of(g)};
+        var first: vector.Vector[u32] = vector.init[u32](r.scratch);
+        var last:  vector.Vector[u32] = vector.init[u32](r.scratch);
+        val wrote: err[str]           = layout_of(r, g, ?job, layout, pending, ?first, ?last, src.ok);
+        if (sel wrote.err) { ret wrote; }
+        var args: agreement.Args = agreement.Args{a: r.scratch, list: vector.init[str](r.scratch), failed: false};
+        asmr.spell(?job, ?args);
+        val ran: res[tool.Ran, str] = tool.run(r.scratch, found.path, ?args, r.result.options.work, base);
+        if (sel ran.err) {
+            give_all(g, pending, j, refused(r, ran.err));
+            brk;
+        }
+        val said: res[tool.Said, str] = tool.said(r.scratch, ran.ok.err, src.ok);
+        if (sel said.err) { ret err[str].err{said.err}; }
+        var k: usize = 0;
+        for (k < said.ok.notes.len) {
+            val noted: err[str] = note(r, found.tool.name, said.ok.notes.data[k]);
+            if (sel noted.err) { ret noted; }
+            k = k + 1;
+        }
+        if (ran.ok.ok) {
+            val loaded: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(r.scratch, obj.ok);
+            if (sel loaded.err) {
+                give_all(g, pending, j, Outcome.refused{"the file it wrote cannot be read"});
+                brk;
+            }
+            val held: res[*inst.Inst, A.Error] = A.allocate[inst.Inst](r.scratch, pending.len);
+            if (sel held.err) { ret err[str].err{MEMORY}; }
+            k = 0;
+            for (k < pending.len) {
+                held.ok[k] = g.cases.data[pending.data[k]].inst;
+                k          = k + 1;
+            }
+            var split:  agreement.Split              = agreement.Split{a: r.a, job: ?job, codec: r.agreement.set.codec, ctx: ?g.context, formats: r.formats, vectors: held.ok, count: pending.len::u32};
+            var pieces: vector.Vector[operand.Bytes] = vector.init[operand.Bytes](r.a);
+            val parted: err[str]                     = layout.split(?split, operand.Bytes{at: loaded.ok.data, len: loaded.ok.len::u32}, ?pieces);
+            if (sel parted.err) {
+                give_all(g, pending, j, refused(r, parted.err));
+                brk;
+            }
+            if (pieces.len != pending.len) {
+                give_all(g, pending, j, Outcome.refused{"the layout's split found another count of vectors than the file holds"});
+                brk;
+            }
+            k = 0;
+            for (k < pending.len) {
+                g.cases.data[pending.data[k]].tools[j] = Outcome.bytes{pieces.data[k]};
+                k                                      = k + 1;
+            }
+            if (j == 0) {
+                val kept: res[usize, A.Error] = vector.push[str](?g.references, obj.ok);
+                if (sel kept.err) { ret err[str].err{MEMORY}; }
+            }
+            brk;
+        }
+        var removed: vector.Vector[bool] = vector.init[bool](r.scratch);
+        k = 0;
+        for (k < pending.len) {
+            val pushed: res[usize, A.Error] = vector.push[bool](?removed, false);
+            if (sel pushed.err) { ret err[str].err{MEMORY}; }
+            k = k + 1;
+        }
+        var any: bool = false;
+        k = 0;
+        for (k < said.ok.located.len) {
+            val l:  tool.Located = said.ok.located.data[k];
+            var at: usize        = 0;
+            for (at < pending.len) {
+                if (l.line >= first.data[at] && l.line <= last.data[at] && !removed.data[at]) {
+                    removed.data[at]                        = true;
+                    g.cases.data[pending.data[at]].tools[j] = refused(r, l.message);
+                    any                                     = true;
+                }
+                at = at + 1;
+            }
+            k = k + 1;
+        }
+        if (!any) {
+            var why: Outcome = Outcome.refused{"it exited with a failure and named no line of a vector"};
+            if (said.ok.general != nil)  { why = refused(r, said.ok.general); }
+            if (said.ok.located.len > 0) { why = refused(r, said.ok.located.data[0].message); }
+            give_all(g, pending, j, why);
+            brk;
+        }
+        var kept: usize = 0;
+        k = 0;
+        for (k < pending.len) {
+            if (!removed.data[k]) {
+                pending.data[kept] = pending.data[k];
+                kept               = kept + 1;
+            }
+            k = k + 1;
+        }
+        pending.len = kept;
+    }
+    arena.reset(r.area);
+    ret err[str].ok{};
+}
+
 # the cases of `g` assembler `j` assembles, its outcome given each. the cases are assembled in batches, the first of
 # them all: a batch the tool refuses vectors of at their lines is run again without them, and one it fails naming no
 # line, as a fixup no line holds, is run again as its two halves, so one vector never hides another's bytes. each
@@ -767,13 +1071,14 @@ fun by_tool(r: *Run, w: *Width, g: *Group, j: usize) err[str] {
     var all:     vector.Vector[u32]                = vector.init[u32](r.a);
     var i:       usize                             = 0;
     for (i < g.cases.len) {
-        if (g.cases.data[i].tool != nil) {
+        if (g.cases.data[i].tool != nil && !g.cases.data[i].dropped) {
             val pushed: res[usize, A.Error] = vector.push[u32](?all, i::u32);
             if (sel pushed.err) { ret err[str].err{MEMORY}; }
         }
         i = i + 1;
     }
-    if (all.len == 0) { ret err[str].ok{}; }
+    if (all.len == 0)       { ret err[str].ok{}; }
+    if (asmr.layout != nil) { ret by_layout(r, w, g, j, ?all); }
     val first: res[usize, A.Error] = vector.push[vector.Vector[u32]](?batches, all);
     if (sel first.err) { ret err[str].err{MEMORY}; }
     val base: res[str, str] = stem(r, w, g, found.tool.name);
@@ -798,7 +1103,7 @@ fun by_tool(r: *Run, w: *Width, g: *Group, j: usize) err[str] {
         arena.reset(r.area);
         val wrote: err[str] = source_of(r, g, ?pending, src.ok);
         if (sel wrote.err) { ret wrote; }
-        var job:  agreement.Job  = agreement.Job{variant: w.variant, selection: ?g.selection, source: src.ok, object: obj.ok};
+        var job:  agreement.Job  = agreement.Job{variant: w.variant, selection: ?g.selection, source: src.ok, object: obj.ok, needs: needs_of(g)};
         var args: agreement.Args = agreement.Args{a: r.scratch, list: vector.init[str](r.scratch), failed: false};
         asmr.spell(?job, ?args);
         val ran: res[tool.Ran, str] = tool.run(r.scratch, found.path, ?args, r.result.options.work, named.some);
@@ -897,9 +1202,120 @@ fun by_tool(r: *Run, w: *Width, g: *Group, j: usize) err[str] {
     ret err[str].ok{};
 }
 
+# whether the reference object holds case `c`
+fun in_reference(c: *Case) bool {
+    ret sel c.tools[0].bytes && !c.dropped;
+}
+
+# how many vectors the reference object of `g` holds
+fun listed_count(g: *Group) u32 {
+    var count: u32   = 0;
+    var i:     usize = 0;
+    for (i < g.cases.len) {
+        if (in_reference(?g.cases.data[i])) { count = count + 1; }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# the case of `g` the reference object holds `k`th, nil past its end
+fun referenced(g: *Group, k: u32) *Case {
+    var n: u32   = 0;
+    var i: usize = 0;
+    for (i < g.cases.len) {
+        val c: *Case = ?g.cases.data[i];
+        if (in_reference(c)) {
+            if (n == k) { ret c; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# what the disassembler's standard error `err` says first, copied into the run's storage
+fun first_said(r: *Run, err: str) str {
+    val said: res[tool.Said, str] = tool.said(r.scratch, err, "");
+    var why:  str                 = "it exited with a failure";
+    if (sel said.ok) {
+        if (said.ok.general != nil)  { why = said.ok.general; }
+        if (said.ok.located.len > 0) { why = said.ok.located.data[0].message; }
+    }
+    val kept: opt[str] = copied(r.a, why);
+    if (sel kept.none) { ret MEMORY; }
+    ret kept.some;
+}
+
+# the disassembler's listing `out` of the reference object of `g` read back by its own reading, each printing given its
+# case into `listed`, or why it cannot be
+fun listed_by(r: *Run, job: *agreement.Job, g: *Group, out: str, listed: *vector.Vector[listing.Listed]) str {
+    val count: u32                = listed_count(g);
+    var i:     usize              = 0;
+    var texts: vector.Vector[str] = vector.init[str](r.a);
+    val read:  err[str]           = r.agreement.disassembler.listed(job, out, count, ?texts);
+    if (sel read.err)              { ret read.err; }
+    if (texts.len != count::usize) { ret "the disassembler's reading found another count of vectors than the object holds"; }
+    var k: usize = 0;
+    i = 0;
+    for (i < g.cases.len) {
+        if (in_reference(?g.cases.data[i])) {
+            val pushed: res[usize, A.Error] = vector.push[listing.Listed](listed, listing.Listed{vector: i::u32, text: texts.data[k]});
+            if (sel pushed.err) { ret MEMORY; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the one reference object of `g` a layout writes listed by the disassembler, read back by its own reading. a vector the
+# disassembler refuses by its place is left out, and the reference file is written and listed again without it
+fun by_listing(r: *Run, w: *Width, g: *Group) err[str] {
+    val found:  *tool.Found                   = ?r.result.disassembler;
+    val d:      *agreement.Disassembler       = ?r.agreement.disassembler;
+    var why:    str                           = nil;
+    var listed: vector.Vector[listing.Listed] = vector.init[listing.Listed](r.a);
+    val base:   res[str, str]                 = stem(r, w, g, found.tool.name);
+    if (sel base.err) { ret err[str].err{base.err}; }
+    for (g.references.len > 0) {
+        arena.reset(r.area);
+        var job:  agreement.Job  = agreement.Job{variant: w.variant, selection: ?g.selection, source: nil, object: g.references.data[0], needs: needs_of(g)};
+        var args: agreement.Args = agreement.Args{a: r.scratch, list: vector.init[str](r.scratch), failed: false};
+        d.spell(?job, ?args);
+        val ran: res[tool.Ran, str] = tool.run(r.scratch, found.path, ?args, r.result.options.work, base.ok);
+        if (sel ran.err) {
+            why = ran.err;
+            brk;
+        }
+        if (ran.ok.ok) {
+            why = listed_by(r, ?job, g, ran.ok.out, ?listed);
+            brk;
+        }
+        why = "it exited with a failure";
+        if (d.named == nil) { brk; }
+        val named: opt[u32] = d.named(?job, ran.ok.err, listed_count(g));
+        if (sel named.none) { brk; }
+        val c: *Case = referenced(g, named.some);
+        if (c == nil) { brk; }
+        c.listed         = Printed.refused{first_said(r, ran.ok.err)};
+        c.dropped        = true;
+        g.references.len = 0;
+        why              = nil;
+        val again: err[str] = by_tool(r, w, g, 0);
+        if (sel again.err) { ret again; }
+    }
+    if (why != nil) {
+        val kept: opt[str] = copied(r.a, why);
+        if (sel kept.none) { ret err[str].err{MEMORY}; }
+        why = kept.some;
+    }
+    ret judged(r, w, g, why, ?listed);
+}
+
 # each reference object of `g` listed by the disassembler, and masc's printing of the reference bytes beside it
 fun by_disassembler(r: *Run, w: *Width, g: *Group) err[str] {
-    if (g.references.len == 0) { ret err[str].ok{}; }
+    if (g.references.len == 0)                  { ret err[str].ok{}; }
+    if (r.agreement.disassembler.listed != nil) { ret by_listing(r, w, g); }
     val found:  *tool.Found                   = ?r.result.disassembler;
     var why:    str                           = nil;
     var listed: vector.Vector[listing.Listed] = vector.init[listing.Listed](r.a);
@@ -914,7 +1330,7 @@ fun by_disassembler(r: *Run, w: *Width, g: *Group) err[str] {
         val named: opt[str] = text.copy(?t, r.a);
         if (sel named.none) { ret err[str].err{MEMORY}; }
         arena.reset(r.area);
-        var job:  agreement.Job  = agreement.Job{variant: w.variant, selection: ?g.selection, source: nil, object: g.references.data[o]};
+        var job:  agreement.Job  = agreement.Job{variant: w.variant, selection: ?g.selection, source: nil, object: g.references.data[o], needs: needs_of(g)};
         var args: agreement.Args = agreement.Args{a: r.scratch, list: vector.init[str](r.scratch), failed: false};
         r.agreement.disassembler.spell(?job, ?args);
         val ran: res[tool.Ran, str] = tool.run(r.scratch, found.path, ?args, r.result.options.work, named.some);
@@ -943,6 +1359,12 @@ fun by_disassembler(r: *Run, w: *Width, g: *Group) err[str] {
         }
         o = o + 1;
     }
+    ret judged(r, w, g, why, ?listed);
+}
+
+# the listing of `g`'s vectors given each, every other vector the reference holds refused with `why`, or as one the
+# listing holds no section of, and masc's printing of the reference bytes beside it
+fun judged(r: *Run, w: *Width, g: *Group, why: str, listed: *vector.Vector[listing.Listed]) err[str] {
     var address: u8                     = 8;
     val pointer: opt[mink_arch.Pointer] = w.variant.arch.pointer;
     if (sel pointer.some) { address = pointer.some.bytes; }
@@ -951,7 +1373,7 @@ fun by_disassembler(r: *Run, w: *Width, g: *Group) err[str] {
     var i: usize = 0;
     for (i < g.cases.len) {
         val c: *Case = ?g.cases.data[i];
-        if (sel c.tools[0].bytes) { c.listed = Printed.refused{unlisted}; }
+        if (in_reference(c)) { c.listed = Printed.refused{unlisted}; }
         i = i + 1;
     }
     i = 0;
@@ -1003,11 +1425,20 @@ fun group_of(r: *Run, w: *Width, groups: *map.Map[str, u32], s: extension.Select
     g.spelled    = key.some;
     g.cases      = vector.init[Case](r.a);
     g.references = vector.init[str](r.a);
+    g.needs      = vector.init[vectors.Need](r.a);
     val arch: opt[*set.Arch] = set.arch_of(r.agreement.set, w.variant.arch);
     if (sel arch.none) { ret res[*Group, str].err{UNSERVED}; }
     val opened: res[state.Context, state.Opened] = set.open(r.a, r.agreement.set, arch.some, ?g.selection, ?g.available);
     if (sel opened.err) { ret res[*Group, str].err{MEMORY}; }
     g.context = opened.ok;
+    # the group's vectors read under one stream, which holds what they need before any of them
+    val h: *stream.Hooks = r.agreement.set.codec.stream;
+    if (h != nil) {
+        val made: res[ptr, A.Error] = h.make(r.a);
+        if (sel made.err) { ret res[*Group, str].err{MEMORY}; }
+        h.begin(made.ok);
+        g.context.stream = made.ok;
+    }
     val pushed: res[usize, A.Error] = vector.push[*Group](?w.groups, g);
     if (sel pushed.err) { ret res[*Group, str].err{MEMORY}; }
     val inserted: res[bool, A.Error] = map.insert[str, u32](groups, key.some, g.number);
@@ -1021,6 +1452,12 @@ fun exception_of(run: *Run, r_: *row.Row, variant: *agreement.Variant, s: *exten
     if (sel at.none) { ret nil; }
     val e: *agreement.Exception = ?run.agreement.exceptions.at[@at.some];
     if (str_len(e.variant) != 0 && !str_equals(e.variant, variant.name)) { ret nil; }
+    val with: requirement.Ids = run.withs.data[@at.some];
+    var w:    u32             = 0;
+    for (w < with.len) {
+        if (!extension.has(s, with.at[w])) { ret nil; }
+        w = w + 1;
+    }
     val scope: requirement.Ids = run.scopes.data[@at.some];
     if (scope.len == 0) { ret e; }
     var i: u32 = 0;
@@ -1029,6 +1466,21 @@ fun exception_of(run: *Run, r_: *row.Row, variant: *agreement.Variant, s: *exten
         i = i + 1;
     }
     ret nil;
+}
+
+# the stream of every group of `w` given back
+fun release_streams(r: *Run, w: *Width) {
+    val h: *stream.Hooks = r.agreement.set.codec.stream;
+    if (h == nil) { ret; }
+    var k: usize = 0;
+    for (k < w.groups.len) {
+        val g: *Group = w.groups.data[k];
+        if (g.context.stream != nil) {
+            h.release(r.a, g.context.stream);
+            g.context.stream = nil;
+        }
+        k = k + 1;
+    }
 }
 
 # every row of the set at `variant`, generated, assembled, decoded and judged
@@ -1041,7 +1493,8 @@ fun width(r: *Run, variant: *agreement.Variant) err[str] {
     }
     val spoken: opt[*dialect.Dialect] = dialect.of(r.agreement.format, variant.arch);
     if (sel spoken.none) { ret err[str].err{"masc states no assembly dialect of the agreement's format for a variant's architecture"}; }
-    var w:      Width                    = Width{variant: variant, abi: given, dialect: spoken.some, groups: vector.init[*Group](r.a), verdicts: vector.init[Verdict](r.a)};
+    var w: Width = Width{variant: variant, abi: given, dialect: spoken.some, groups: vector.init[*Group](r.a), verdicts: vector.init[Verdict](r.a)};
+    fin { release_streams(r, ?w); }
     var groups: map.Map[str, u32]        = map.init[str, u32](r.a);
     var found:  vector.Vector[inst.Inst] = vector.init[inst.Inst](r.a);
     val codec:  *dispatch.Codec          = r.agreement.set.codec;
@@ -1061,9 +1514,15 @@ fun width(r: *Run, variant: *agreement.Variant) err[str] {
                 if (sel g.err) { ret err[str].err{g.err}; }
                 found.len = 0;
                 var gen: vectors.Generation = vectors.make(r.a, codec, ?g.ok.context, r_, ?found);
+                gen.chooses = r.agreement.edges;
+                if (r.agreement.stream != nil) {
+                    gen.needs   = ?g.ok.needs;
+                    gen.provide = r.agreement.stream.provide;
+                }
                 vectors.generate(?gen, r.agreement.hook);
                 vectors.release(?gen);
-                if (gen.failed) { ret err[str].err{MEMORY}; }
+                if (gen.failed && gen.why != nil) { ret err[str].err{gen.why}; }
+                if (gen.failed)                   { ret err[str].err{MEMORY}; }
                 v.group     = g.ok;
                 v.exception = exception_of(r, r_, variant, ?g.ok.selection);
                 v.first     = g.ok.cases.len::u32;
@@ -1077,7 +1536,8 @@ fun width(r: *Run, variant: *agreement.Variant) err[str] {
                         tools.ok[j] = Outcome.none{};
                         j           = j + 1;
                     }
-                    val c:      Case                = Case{inst: found.data[k], text: nil, tool: nil, masc: Outcome.none{}, tools: tools.ok, decoded: Printed.none{}, read: nil, listed: Printed.none{}, agrees: false, printed: Printed.none{}, trip: Outcome.none{}, lent: nil};
+                    var c: Case = Case{inst: found.data[k], text: nil, tool: nil, masc: Outcome.none{}, tools: tools.ok, decoded: Printed.none{}, read: nil, listed: Printed.none{}, agrees: false, printed: Printed.none{}, trip: Outcome.none{}, lent: nil, dropped: false};
+                    if (r.agreement.stream != nil) { r.agreement.stream.place(?c.inst, g.ok.cases.len::u32); }
                     val pushed: res[usize, A.Error] = vector.push[Case](?g.ok.cases, c);
                     if (sel pushed.err) { ret err[str].err{MEMORY}; }
                     k = k + 1;
@@ -1211,6 +1671,10 @@ fun index_exceptions(r: *Run) err[str] {
         if (sel scope.err) { ret err[str].err{scope.err}; }
         val kept: res[usize, A.Error] = vector.push[requirement.Ids](?r.scopes, scope.ok);
         if (sel kept.err) { ret err[str].err{MEMORY}; }
+        val with: res[requirement.Ids, str] = scope_of(r, r.agreement.set.extensions, e.when);
+        if (sel with.err) { ret err[str].err{with.err}; }
+        val held: res[usize, A.Error] = vector.push[requirement.Ids](?r.withs, with.ok);
+        if (sel held.err) { ret err[str].err{MEMORY}; }
         val inserted: res[bool, A.Error] = map.insert[str, u32](?r.exceptions, e.row, i);
         if (sel inserted.err) { ret err[str].err{MEMORY}; }
         i = i + 1;
@@ -1223,7 +1687,8 @@ fun index_exceptions(r: *Run) err[str] {
 # ret: ok, with the result's failures counting the rows that fail it, or why it could not run
 pub fun agree(a: *A.Allocator, ag: *agreement.Agreement, options: Options, out: *Result) err[str] {
     @out = Result{agreement: ag, options: options, assemblers: vector.init[tool.Found](a), disassembler: tool.Found{tool: nil, path: nil, version: "", pinned: false}, widths: vector.init[Width](a), notes: vector.init[str](a), failures: 0};
-    if (ag.assemblers.len == 0) { ret err[str].err{"the agreement names no reference assembler"}; }
+    if (ag.assemblers.len == 0)                             { ret err[str].err{"the agreement names no reference assembler"}; }
+    if ((ag.stream == nil) != (ag.set.codec.stream == nil)) { ret err[str].err{"the agreement states a stream record for a set of no typed stream, or none for a set of one"}; }
     var back: A.Allocator;
     page.make(?back);
     var area: arena.Arena;
@@ -1236,7 +1701,7 @@ pub fun agree(a: *A.Allocator, ag: *agreement.Agreement, options: Options, out: 
     if (sel built.err) { ret err[str].err{"mink's format registry cannot be built"}; }
     var formats: registry.Registry = built.ok;
     fin { registry.release(?formats); }
-    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats};
+    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), withs: vector.init[requirement.Ids](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats};
     val indexed: err[str] = index_exceptions(?r);
     if (sel indexed.err) { ret indexed; }
     val dir: err[fs.FsError] = fs.create_dir_all(a, options.work, 0o755);
