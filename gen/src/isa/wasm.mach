@@ -1,0 +1,1038 @@
+# the wasm generator
+#
+# it reads wabt's opcode.def, the specification's index of instructions and masc's facts under gen/data/wasm, and
+# emits the wasm tables beside masc's wasm modules: the rows with their operands, fields, requirements, effects and
+# stack signatures, the handle of each and the structure each holds open or closes (gen_row), the value and heap
+# types by name (gen_row), the decode dispatch (gen_dispatch), the text template of every row (gen_syntax) and the
+# index of instructions the rows are walked against (gen_index). the feature catalog is its own generator's,
+# catalog's over gen/data/wasm/features.
+#
+# a row is one instruction of opcode.def that no omission names. its fields are its opcode, a prefix byte and its
+# index's u32 when it has a prefix, then a field per immediate in binary order: a memory instruction's memarg first,
+# as its access size marks it, then what immediates.txt states. its requirement is the features of every
+# features.txt range it lies in, its control what control.txt states, and its stack signature its type columns, its
+# address the memory its memarg names, or what signatures.txt states over them. every row is untimed and its
+# constant-time class the dependent one, since the set classifies no timing. the generator holds the rows to the
+# index: every row's opcode is an instruction the index names, but under a prefix omissions.txt names unindexed, and
+# every instruction the index names is a row or omissions.txt names it unrowed.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use gen.catalog;
+use gen.diag;
+use gen.dispatch;
+use gen.emit;
+use wasm_facts:   gen.isa.wasm.facts;
+use wasm_index:   gen.isa.wasm.index;
+use wasm_opcodes: gen.isa.wasm.opcodes;
+use gen.set;
+use gen.source;
+
+pub val NO_INPUTS:   str = "wasm generator reads the index, the overlay and the features beside its source";
+pub val NO_FEATURE:  str = "features names a feature the catalog does not hold";
+pub val NO_TYPE:     str = "signature names a type types.txt does not state";
+pub val ANY:         str = "type column is Any and no signature states the instruction's";
+pub val NO_OPERAND:  str = "signature or control names an operand the row does not have";
+pub val UNINDEXED:   str = "row's opcode is no instruction the index names";
+pub val UNROWED:     str = "instruction the index names is no row";
+pub val KEYS_MANGLE: str = "two row keys mangle to one identifier";
+pub val TOO_MANY:    str = "row has more operands than a row holds";
+pub val MEMARG:      str = "memory access size is no power of two up to 16";
+
+# the most operands a row has
+val MAX_OPERANDS: usize = 16;
+
+# what one operand of a row is
+# ---
+# kind:     the immediate it is, or MEMIDX, OFFSET or ALIGN of a memarg
+# optional: whether the text may leave it out
+# width:    the bits of memory a memarg's memory index names
+rec Op {
+    kind:     u8;
+    optional: bool;
+    width:    u16;
+}
+
+# the parts of a memarg beside its memory index
+val OFFSET: u8 = 100;
+val ALIGN:  u8 = 101;
+
+# one row
+# ---
+# o:         its instruction in opcode.def
+# ops:       its operands, in binary order
+# order:     its operands in text order
+# paired:    whether its two optional indices are one pair
+# alts:      the features it requires, each a catalog atom's name, none for wasm 1.0
+# control:   its control transfer, none for one that falls through
+# structure: what it does to the block the stream holds open
+# pops:      the types it takes, deepest first
+# pushes:    the types it leaves
+rec Row {
+    o:         *wasm_opcodes.Opcode;
+    ops:       vector.Vector[Op];
+    order:     vector.Vector[u8];
+    paired:    bool;
+    alts:      vector.Vector[str];
+    control:   opt[wasm_facts.Control];
+    structure: wasm_facts.Structure;
+    pops:      vector.Vector[wasm_facts.Type];
+    pushes:    vector.Vector[wasm_facts.Type];
+}
+
+# the generator's state
+rec Gen {
+    alloc:   *A.Allocator;
+    ops:     *wasm_opcodes.Opcodes;
+    facts:   *wasm_facts.Facts;
+    index:   vector.Vector[wasm_index.Entry];
+    atoms:   map.Map[str, bool];
+    rows:    vector.Vector[Row];
+    file:    *emit.File;
+    operand: emit.Pool;
+    groups:  emit.Pool;
+    fields:  emit.Pool;
+    slices:  emit.Pool;
+    effects: emit.Pool;
+    types:   emit.Pool;
+    ids:     emit.Pool;
+    alts:    emit.Pool;
+}
+
+fun memory() diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, nil);
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun rec_value(r: *emit.Record) emit.Value {
+    ret emit.Value.record{r};
+}
+
+fun boolean(b: bool) emit.Value {
+    if (b) { ret name("true"); }
+    ret name("false");
+}
+
+fun join(g: *Gen, a: str, b: str) str {
+    val got: res[str, StrError] = str_join(g.alloc, a, b);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+fun join3(g: *Gen, a: str, b: str, c: str) str {
+    val got: res[str, StrError] = str_join(g.alloc, a, b, c);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+fun decimal(g: *Gen, n: u64) str {
+    var rev: [24]u8;
+    var len: usize = 0;
+    var m:   u64   = n;
+    for {
+        rev[len] = '0' + (m % 10)::u8;
+        len      = len + 1;
+        m        = m / 10;
+        if (m == 0) { brk; }
+    }
+    var digits: [24]u8;
+    var k:      usize = 0;
+    for (k < len) {
+        digits[k] = rev[len - 1 - k];
+        k         = k + 1;
+    }
+    val got: res[str, StrError] = str_copy_slice(g.alloc, ?digits[0], 0, len);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# a span `of` over `count` items from item `at` of `array`
+fun span(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = emit.record(f, of);
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", number(count::i64));
+    ret rec_value(r);
+}
+
+# whether opcode `code` under `prefix` lies in a range of `ranges`
+fun ranged(ranges: *vector.Vector[wasm_facts.Range], prefix: u32, code: u32) bool {
+    var i: usize = 0;
+    for (i < ranges.len) {
+        if (wasm_facts.within(?ranges.data[i], prefix, code)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun omitted(g: *Gen, o: *wasm_opcodes.Opcode) bool {
+    var key:  str        = o.name;
+    val held: opt[*bool] = map.get[str, bool](?g.facts.omitted, ?key);
+    ret sel held.some;
+}
+
+# the stack type opcode.def's column `t` spells
+fun column_type(g: *Gen, t: str) wasm_facts.Type {
+    var n: str = "v128";
+    if (str_equals(t, "I32")) { n = "i32"; }
+    if (str_equals(t, "I64")) { n = "i64"; }
+    if (str_equals(t, "F32")) { n = "f32"; }
+    if (str_equals(t, "F64")) { n = "f64"; }
+    ret wasm_facts.Type{ref: wasm_facts.FIXED, n: 0, name: n};
+}
+
+# the signature of `r` from its type columns, its address the type of its memarg's memory
+fun columns(g: *Gen, r: *Row) err[diag.Refusal] {
+    val o: *wasm_opcodes.Opcode = r.o;
+    var k: usize                = 0;
+    for (k < wasm_opcodes.TYPES) {
+        if (str_equals(o.types[k], "Any")) { ret err[diag.Refusal].err{diag.refusal(o.line.file, o.line.number, ANY, o.name)}; }
+        k = k + 1;
+    }
+    k = 2;
+    for (k < 5) {
+        if (!str_equals(o.types[k], "___")) {
+            var t: wasm_facts.Type = column_type(g, o.types[k]);
+            if (k == 2 && o.memory > 0) { t = wasm_facts.Type{ref: wasm_facts.OPERAND, n: 0, name: nil}; }
+            vector.push[wasm_facts.Type](?r.pops, t);
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < 2) {
+        if (!str_equals(o.types[k], "___")) { vector.push[wasm_facts.Type](?r.pushes, column_type(g, o.types[k])); }
+        k = k + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun copy_types(into: *vector.Vector[wasm_facts.Type], from: *vector.Vector[wasm_facts.Type]) {
+    var i: usize = 0;
+    for (i < from.len) {
+        vector.push[wasm_facts.Type](into, from.data[i]);
+        i = i + 1;
+    }
+}
+
+# every type of `ts` one types.txt names, and every operand one the row has
+fun held_types(g: *Gen, r: *Row, ts: *vector.Vector[wasm_facts.Type]) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < ts.len) {
+        val t:    *wasm_facts.Type = ?ts.data[i];
+        val code: opt[u32]         = wasm_facts.type_code(g.facts, t.name);
+        if (t.ref == wasm_facts.FIXED && sel code.none)             { ret err[diag.Refusal].err{diag.refusal(r.o.line.file, r.o.line.number, NO_TYPE, t.name)}; }
+        if (t.ref == wasm_facts.OPERAND && t.n::usize >= r.ops.len) { ret err[diag.Refusal].err{diag.refusal(r.o.line.file, r.o.line.number, NO_OPERAND, r.o.name)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# log2 of a memory access of `bytes`, none for a size that is no power of two up to 16
+fun natural(bytes: u32) opt[u64] {
+    if (bytes == 1)  { ret opt[u64].some{0}; }
+    if (bytes == 2)  { ret opt[u64].some{1}; }
+    if (bytes == 4)  { ret opt[u64].some{2}; }
+    if (bytes == 8)  { ret opt[u64].some{3}; }
+    if (bytes == 16) { ret opt[u64].some{4}; }
+    ret opt[u64].none{};
+}
+
+# the row of instruction `o`
+fun build_row(g: *Gen, o: *wasm_opcodes.Opcode) res[Row, diag.Refusal] {
+    var r: Row = Row{o: o, ops: vector.init[Op](g.alloc), order: vector.init[u8](g.alloc), paired: false, alts: vector.init[str](g.alloc), control: opt[wasm_facts.Control].none{}, structure: wasm_facts.NONE, pops: vector.init[wasm_facts.Type](g.alloc), pushes: vector.init[wasm_facts.Type](g.alloc)};
+    if (o.memory > 0) {
+        val log: opt[u64] = natural(o.memory);
+        if (sel log.none) { ret res[Row, diag.Refusal].err{diag.refusal(o.line.file, o.line.number, MEMARG, o.name)}; }
+        vector.push[Op](?r.ops, Op{kind: wasm_facts.MEMIDX, optional: true, width: (o.memory * 8)::u16});
+        vector.push[Op](?r.ops, Op{kind: OFFSET, optional: true, width: 0});
+        vector.push[Op](?r.ops, Op{kind: ALIGN, optional: true, width: 0});
+    }
+    val lead: usize                       = r.ops.len;
+    var key:  str                         = o.name;
+    val imm:  opt[*wasm_facts.Immediates] = map.get[str, wasm_facts.Immediates](?g.facts.immediates, ?key);
+    if (sel imm.some) {
+        val x: *wasm_facts.Immediates = imm.some;
+        var k: usize                  = 0;
+        for (k < x.immediates.len) {
+            val im: wasm_facts.Immediate = x.immediates.data[k];
+            if (im.kind == wasm_facts.BLOCKTYPE) { r.structure = wasm_facts.OPEN; }
+            # the empty block type is the text's to leave out
+            if (im.kind != wasm_facts.ZERO) { vector.push[Op](?r.ops, Op{kind: im.kind, optional: im.optional || im.kind == wasm_facts.BLOCKTYPE, width: 0}); }
+            k = k + 1;
+        }
+        r.paired = x.paired;
+    }
+    if (r.ops.len > MAX_OPERANDS) { ret res[Row, diag.Refusal].err{diag.refusal(o.line.file, o.line.number, TOO_MANY, o.name)}; }
+    # the text order: the memarg's parts, then the immediates in their stated order
+    var k: usize = 0;
+    for (k < lead) {
+        vector.push[u8](?r.order, k::u8);
+        k = k + 1;
+    }
+    var stated: *vector.Vector[u8] = nil;
+    if (sel imm.some) { stated = ?imm.some.order; }
+    if (stated != nil && stated.len > 0) {
+        k = 0;
+        for (k < stated.len) {
+            vector.push[u8](?r.order, (lead + stated.data[k]::usize)::u8);
+            k = k + 1;
+        }
+    }
+    or {
+        k = lead;
+        for (k < r.ops.len) {
+            vector.push[u8](?r.order, k::u8);
+            k = k + 1;
+        }
+    }
+    val st: opt[*wasm_facts.Structure] = map.get[str, wasm_facts.Structure](?g.facts.structures, ?key);
+    if (sel st.some) { r.structure = @st.some; }
+    val ctl: opt[*wasm_facts.Control] = map.get[str, wasm_facts.Control](?g.facts.controls, ?key);
+    if (sel ctl.some) {
+        if (ctl.some.operand != 0xFF && ctl.some.operand::usize >= r.ops.len) { ret res[Row, diag.Refusal].err{diag.refusal(o.line.file, o.line.number, NO_OPERAND, o.name)}; }
+        r.control = opt[wasm_facts.Control].some{@ctl.some};
+    }
+    val sig: opt[*wasm_facts.Signature] = map.get[str, wasm_facts.Signature](?g.facts.signatures, ?key);
+    if (sel sig.some) {
+        copy_types(?r.pops, ?sig.some.pops);
+        copy_types(?r.pushes, ?sig.some.pushes);
+    }
+    or {
+        val cols: err[diag.Refusal] = columns(g, ?r);
+        if (sel cols.err) { ret res[Row, diag.Refusal].err{cols.err}; }
+    }
+    val p1: err[diag.Refusal] = held_types(g, ?r, ?r.pops);
+    if (sel p1.err) { ret res[Row, diag.Refusal].err{p1.err}; }
+    val p2: err[diag.Refusal] = held_types(g, ?r, ?r.pushes);
+    if (sel p2.err) { ret res[Row, diag.Refusal].err{p2.err}; }
+    k = 0;
+    for (k < g.facts.features.len) {
+        val f: *wasm_facts.Feature = ?g.facts.features.data[k];
+        if (wasm_facts.within(?f.range, o.prefix, o.code)) {
+            var j: usize = 0;
+            for (j < f.features.len) {
+                var probe: str        = f.features.data[j];
+                val known: opt[*bool] = map.get[str, bool](?g.atoms, ?probe);
+                if (sel known.none) { ret res[Row, diag.Refusal].err{diag.refusal(f.line.fact.line.file, f.line.fact.line.number, NO_FEATURE, probe)}; }
+                vector.push[str](?r.alts, probe);
+                j = j + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret res[Row, diag.Refusal].ok{r};
+}
+
+fun build_rows(g: *Gen) err[diag.Refusal] {
+    g.rows = vector.init[Row](g.alloc);
+    var i: usize = 0;
+    for (i < g.ops.all.len) {
+        val o: *wasm_opcodes.Opcode = ?g.ops.all.data[i];
+        if (!omitted(g, o)) {
+            val r: res[Row, diag.Refusal] = build_row(g, o);
+            if (sel r.err) { ret err[diag.Refusal].err{r.err}; }
+            vector.push[Row](?g.rows, r.ok);
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the rows held to the index: each row's opcode one the index names, but under an unindexed prefix, and each
+# instruction the index names a row or unrowed
+fun walked(g: *Gen) err[diag.Refusal] {
+    var named: map.Map[u64, bool] = map.init[u64, bool](g.alloc);
+    var i:     usize              = 0;
+    for (i < g.index.len) {
+        val e: *wasm_index.Entry = ?g.index.data[i];
+        if (e.named) { map.insert[u64, bool](?named, (e.prefix::u64 << 32) | e.code::u64, true); }
+        i = i + 1;
+    }
+    var rowed: map.Map[u64, bool] = map.init[u64, bool](g.alloc);
+    i = 0;
+    for (i < g.rows.len) {
+        val o:   *wasm_opcodes.Opcode = g.rows.data[i].o;
+        var key: u64                  = (o.prefix::u64 << 32) | o.code::u64;
+        map.insert[u64, bool](?rowed, key, true);
+        var free: bool  = false;
+        var k:    usize = 0;
+        for (k < g.facts.unindexed.len) {
+            if (g.facts.unindexed.data[k] == o.prefix) { free = true; }
+            k = k + 1;
+        }
+        val found: opt[*bool] = map.get[u64, bool](?named, ?key);
+        if (!free && sel found.none) { ret err[diag.Refusal].err{diag.refusal(o.line.file, o.line.number, UNINDEXED, o.name)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < g.index.len) {
+        val e:   *wasm_index.Entry = ?g.index.data[i];
+        var key: u64               = (e.prefix::u64 << 32) | e.code::u64;
+        val got: opt[*bool]        = map.get[u64, bool](?rowed, ?key);
+        if (e.named && sel got.none && !ranged(?g.facts.unrowed, e.prefix, e.code)) { ret err[diag.Refusal].err{diag.refusal(e.line.file, e.line.number, UNROWED, nil)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun immediate_shape(f: *emit.File, bits: i64, sign: str, format: str) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Immediate");
+    emit.member(f, r, "bits", number(bits));
+    emit.member(f, r, "sign", name(sign));
+    emit.member(f, r, "scale", number(0));
+    emit.member(f, r, "bias", number(0));
+    emit.member(f, r, "fixup", name("operand.NO_FIXUP"));
+    emit.member(f, r, "format", name(format));
+    emit.member(f, r, "excluded", name("operand.NO_INTEGERS"));
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.immediate", rec_value(r))};
+}
+
+fun id_shape(f: *emit.File, space: str) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Typed");
+    emit.member(f, r, "space", name(space));
+    emit.member(f, r, "bits", number(32));
+    emit.member(f, r, "fixup", name("operand.NO_FIXUP"));
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.id", rec_value(r))};
+}
+
+fun literal_shape(f: *emit.File, max: i64) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Literal");
+    emit.member(f, r, "max", number(max));
+    emit.member(f, r, "content", name("operand.NUMBER"));
+    emit.member(f, r, "width_of", number(0));
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.literal", rec_value(r))};
+}
+
+fun operand_value(f: *emit.File, s: emit.Value, quantity: str, width: u16) emit.Value {
+    val r: *emit.Record = emit.record(f, "operand.Operand");
+    emit.member(f, r, "shape", s);
+    emit.member(f, r, "role", name("operand.READ"));
+    emit.member(f, r, "width", number(width::i64));
+    emit.member(f, r, "quantity", name(quantity));
+    emit.member(f, r, "write", name("operand.AS_ROW"));
+    ret rec_value(r);
+}
+
+# the members of a group as a pooled `operand.Group` shape
+fun group_shape(g: *Gen, members: *emit.Value, count: u32) emit.Value {
+    val f:  *emit.File = g.file;
+    val at: u32        = emit.pooled(f, ?g.groups, members, count);
+    ret emit.Value.variant{emit.variant(f, "operand.Shape.group", span(f, "operand.Group", "GROUPS", at, count))};
+}
+
+# the space an index immediate names
+fun space_of(kind: u8) str {
+    if (kind == wasm_facts.LABELIDX || kind == wasm_facts.LABELS) { ret "wasm_kind.LABELS"; }
+    if (kind == wasm_facts.TYPEIDX || kind == wasm_facts.TYPEUSE) { ret "wasm_kind.TYPES"; }
+    if (kind == wasm_facts.FUNCIDX)                               { ret "wasm_kind.FUNCS"; }
+    if (kind == wasm_facts.TABLEIDX)                              { ret "wasm_kind.TABLES"; }
+    if (kind == wasm_facts.MEMIDX)                                { ret "wasm_kind.MEMORIES"; }
+    if (kind == wasm_facts.GLOBALIDX)                             { ret "wasm_kind.GLOBALS"; }
+    if (kind == wasm_facts.LOCALIDX)                              { ret "wasm_kind.LOCALS"; }
+    if (kind == wasm_facts.TAGIDX)                                { ret "wasm_kind.TAGS"; }
+    if (kind == wasm_facts.DATAIDX)                               { ret "wasm_kind.DATAS"; }
+    if (kind == wasm_facts.ELEMIDX)                               { ret "wasm_kind.ELEMS"; }
+    ret nil;
+}
+
+# the operand of op `p`
+fun op_value(g: *Gen, p: *Op) emit.Value {
+    val f: *emit.File = g.file;
+    var q: str        = "operand.ONE";
+    if (p.optional) { q = "operand.OPTIONAL"; }
+    val k: u8 = p.kind;
+    if (k == OFFSET)                                   { ret operand_value(f, immediate_shape(f, 64, "operand.UNSIGNED", "operand.INTEGER"), q, 0); }
+    if (k == ALIGN)                                    { ret operand_value(f, immediate_shape(f, 32, "operand.UNSIGNED", "operand.INTEGER"), q, 0); }
+    if (k == wasm_facts.I32)                           { ret operand_value(f, immediate_shape(f, 32, "operand.SIGNED", "operand.INTEGER"), q, 0); }
+    if (k == wasm_facts.I64)                           { ret operand_value(f, immediate_shape(f, 64, "operand.SIGNED", "operand.INTEGER"), q, 0); }
+    if (k == wasm_facts.F32)                           { ret operand_value(f, immediate_shape(f, 32, "operand.UNSIGNED", "operand.FLOAT"), q, 0); }
+    if (k == wasm_facts.F64)                           { ret operand_value(f, immediate_shape(f, 64, "operand.UNSIGNED", "operand.FLOAT"), q, 0); }
+    if (k == wasm_facts.LANE)                          { ret operand_value(f, immediate_shape(f, 8, "operand.UNSIGNED", "operand.INTEGER"), q, 0); }
+    if (k == wasm_facts.HEAPTYPE)                      { ret operand_value(f, immediate_shape(f, 33, "operand.SIGNED", "operand.INTEGER"), q, 0); }
+    if (k == wasm_facts.V128 || k == wasm_facts.LANES) { ret operand_value(f, literal_shape(f, 16), q, 0); }
+    if (k == wasm_facts.VALTYPES)                      { ret operand_value(f, immediate_shape(f, 64, "operand.SIGNED", "operand.INTEGER"), "operand.VARIADIC", 0); }
+    if (k == wasm_facts.LABELS)                        { ret operand_value(f, id_shape(f, "wasm_kind.LABELS"), "operand.VARIADIC", 0); }
+    if (k == wasm_facts.BLOCKTYPE) {
+        var members: [2]emit.Value = [2]emit.Value{
+            operand_value(f, immediate_shape(f, 64, "operand.SIGNED", "operand.INTEGER"), "operand.OPTIONAL", 0),
+            operand_value(f, id_shape(f, "wasm_kind.TYPES"), "operand.OPTIONAL", 0),
+        };
+        ret operand_value(f, group_shape(g, ?members[0], 2), "operand.OPTIONAL", 0);
+    }
+    if (k == wasm_facts.CATCHES) {
+        var members: [3]emit.Value = [3]emit.Value{
+            operand_value(f, emit.Value.variant{emit.variant(f, "operand.Shape.enumerant", name("wasm_kind.CATCH_KINDS"))}, "operand.ONE", 0),
+            operand_value(f, id_shape(f, "wasm_kind.TAGS"), "operand.OPTIONAL", 0),
+            operand_value(f, id_shape(f, "wasm_kind.LABELS"), "operand.ONE", 0),
+        };
+        ret operand_value(f, group_shape(g, ?members[0], 3), "operand.VARIADIC", 0);
+    }
+    ret operand_value(f, id_shape(f, space_of(k)), q, p.width);
+}
+
+fun field_value(f: *emit.File, kind: str, width: i64, fixed: u64, mask: u64, slices: emit.Value, op: str, param: u64) emit.Value {
+    val r: *emit.Record = emit.record(f, "field.Field");
+    emit.member(f, r, "kind", name(kind));
+    emit.member(f, r, "width", number(width));
+    emit.member(f, r, "fixed", emit.Value.hex{fixed});
+    emit.member(f, r, "mask", emit.Value.hex{mask});
+    emit.member(f, r, "slices", slices);
+    emit.member(f, r, "operand", name(op));
+    emit.member(f, r, "param", emit.Value.hex{param});
+    emit.member(f, r, "data", name("nil"));
+    ret rec_value(r);
+}
+
+# a unit of `bits` holding operand `op` whole
+fun unit_value(g: *Gen, bits: i64, op: usize) emit.Value {
+    val f: *emit.File   = g.file;
+    val s: *emit.Record = emit.record(f, "field.Slice");
+    emit.member(f, s, "operand", number(op::i64));
+    emit.member(f, s, "part", name("field.NUMBER"));
+    emit.member(f, s, "lo", number(0));
+    emit.member(f, s, "len", number(bits));
+    emit.member(f, s, "at", number(0));
+    emit.member(f, s, "invert", name("false"));
+    var one: [1]emit.Value = [1]emit.Value{rec_value(s)};
+    val at:  u32           = emit.pooled(f, ?g.slices, ?one[0], 1);
+    ret field_value(f, "wasm_kind.UNIT", bits, 0, 0, span(f, "field.Slices", "SLICES", at, 1), decimal(g, op::u64), 0);
+}
+
+# the fields of row `r`: its opcode, then a field per immediate in binary order
+fun fields_of(g: *Gen, r: *Row) emit.Value {
+    val f:     *emit.File                = g.file;
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    val o:     *wasm_opcodes.Opcode      = r.o;
+    vector.push[emit.Value](?items, field_value(f, "wasm_kind.OPCODE", 8, o.code::u64, 0xFF, name("field.NO_SLICES"), "field.NO_OPERAND", o.prefix::u64));
+    var k:   usize    = 0;
+    val log: opt[u64] = natural(o.memory);
+    if (sel log.some) {
+        vector.push[emit.Value](?items, field_value(f, "wasm_kind.MEMARG", 8, 0, 0, name("field.NO_SLICES"), "0", log.some));
+        k = 3;
+    }
+    for (k < r.ops.len) {
+        val p:  *Op = ?r.ops.data[k];
+        val op: str = decimal(g, k::u64);
+        val kd: u8  = p.kind;
+        if (kd == wasm_facts.F32)                            { vector.push[emit.Value](?items, unit_value(g, 32, k)); }
+        or (kd == wasm_facts.F64)                            { vector.push[emit.Value](?items, unit_value(g, 64, k)); }
+        or (kd == wasm_facts.LANE)                           { vector.push[emit.Value](?items, unit_value(g, 8, k)); }
+        or (kd == wasm_facts.I32)                            { vector.push[emit.Value](?items, field_value(f, "wasm_kind.SLEB", 8, 0, 0, name("field.NO_SLICES"), op, 32)); }
+        or (kd == wasm_facts.I64)                            { vector.push[emit.Value](?items, field_value(f, "wasm_kind.SLEB", 8, 0, 0, name("field.NO_SLICES"), op, 64)); }
+        or (kd == wasm_facts.HEAPTYPE)                       { vector.push[emit.Value](?items, field_value(f, "wasm_kind.SLEB", 8, 0, 0, name("field.NO_SLICES"), op, 33)); }
+        or (kd == wasm_facts.V128 || kd == wasm_facts.LANES) { vector.push[emit.Value](?items, field_value(f, "wasm_kind.BYTES", 8, 0, 0, name("field.NO_SLICES"), op, 16)); }
+        or (kd == wasm_facts.BLOCKTYPE)                      { vector.push[emit.Value](?items, field_value(f, "wasm_kind.BLOCKTYPE", 8, 0, 0, name("field.NO_SLICES"), op, 0)); }
+        or (kd == wasm_facts.LABELS)                         { vector.push[emit.Value](?items, field_value(f, "wasm_kind.TARGETS", 8, 0, 0, name("field.NO_SLICES"), op, 0)); }
+        or (kd == wasm_facts.CATCHES)                        { vector.push[emit.Value](?items, field_value(f, "wasm_kind.CATCHES", 8, 0, 0, name("field.NO_SLICES"), op, 0)); }
+        or (kd == wasm_facts.VALTYPES)                       { vector.push[emit.Value](?items, field_value(f, "wasm_kind.VALTYPES", 8, 0, 0, name("field.NO_SLICES"), op, 0)); }
+        or {
+            # an index, its partner the other of a pair, by its operand plus one
+            var param: u64 = 32;
+            if (r.paired) {
+                var partner: usize = r.ops.len - 2;
+                if (k == r.ops.len - 2) { partner = r.ops.len - 1; }
+                param = param | ((partner + 1)::u64 << 8);
+            }
+            vector.push[emit.Value](?items, field_value(f, "wasm_kind.ULEB", 8, 0, 0, name("field.NO_SLICES"), op, param));
+        }
+        k = k + 1;
+    }
+    # a fixed byte, atomic.fence's reserved 0
+    var key: str                         = o.name;
+    val imm: opt[*wasm_facts.Immediates] = map.get[str, wasm_facts.Immediates](?g.facts.immediates, ?key);
+    if (sel imm.some) {
+        var j: usize = 0;
+        for (j < imm.some.immediates.len) {
+            if (imm.some.immediates.data[j].kind == wasm_facts.ZERO) { vector.push[emit.Value](?items, field_value(f, "wasm_kind.UNIT", 8, 0, 0xFF, name("field.NO_SLICES"), "field.NO_OPERAND", 0)); }
+            j = j + 1;
+        }
+    }
+    val at: u32 = emit.pooled(f, ?g.fields, items.data, items.len::u32);
+    ret span(f, "field.Fields", "FIELDS", at, items.len::u32);
+}
+
+fun type_value(g: *Gen, t: *wasm_facts.Type) emit.Value {
+    val f: *emit.File = g.file;
+    if (t.ref == wasm_facts.FIXED) {
+        val found: opt[u32] = wasm_facts.type_code(g.facts, t.name);
+        if (sel found.some) { ret emit.Value.variant{emit.variant(f, "effect.TypeRef.fixed", emit.Value.hex{found.some::u64})}; }
+    }
+    if (t.ref == wasm_facts.VARIABLE) { ret emit.Value.variant{emit.variant(f, "effect.TypeRef.variable", number(t.n::i64))}; }
+    if (t.ref == wasm_facts.OPERAND)  { ret emit.Value.variant{emit.variant(f, "effect.TypeRef.operand", number(t.n::i64))}; }
+    if (t.ref == wasm_facts.RESULTS)  { ret emit.Value.variant{emit.bare(f, "effect.TypeRef.results")}; }
+    ret emit.Value.variant{emit.bare(f, "effect.TypeRef.polymorphic")};
+}
+
+fun types_value(g: *Gen, ts: *vector.Vector[wasm_facts.Type]) emit.Value {
+    if (ts.len == 0) { ret name("effect.NO_TYPES"); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    var i:     usize                     = 0;
+    for (i < ts.len) {
+        vector.push[emit.Value](?items, type_value(g, ?ts.data[i]));
+        i = i + 1;
+    }
+    val at: u32 = emit.pooled(g.file, ?g.types, items.data, items.len::u32);
+    ret span(g.file, "effect.Types", "TYPES", at, items.len::u32);
+}
+
+fun effect_of(g: *Gen, r: *Row) emit.Value {
+    val f:  *emit.File   = g.file;
+    val ru: *emit.Record = emit.record(f, "effect.Ruled");
+    emit.member(f, ru, "otherwise", name("effect.NO_TOUCHED"));
+    emit.member(f, ru, "rules", name("effect.NO_REGISTER_RULES"));
+    emit.member(f, ru, "may", name("effect.NO_TOUCHED"));
+    emit.member(f, ru, "must", name("effect.NO_TOUCHED"));
+    val fl: *emit.Record = emit.record(f, "effect.Flags");
+    emit.member(f, fl, "read", name("effect.NO_WORDS"));
+    emit.member(f, fl, "written", name("effect.NO_WORDS"));
+    emit.member(f, fl, "undefined", name("effect.NO_WORDS"));
+    emit.member(f, fl, "kept", name("effect.NO_WORDS"));
+    val c: *emit.Record = emit.record(f, "effect.Control");
+    if (sel r.control.some) {
+        val x: wasm_facts.Control = r.control.some;
+        emit.member(f, c, "transfer", name(x.transfer));
+        emit.member(f, c, "target", name(x.target));
+        emit.member(f, c, "conditional", boolean(x.conditional));
+        if (x.operand == 0xFF) { emit.member(f, c, "operand", name("field.NO_OPERAND")); }
+        or                     { emit.member(f, c, "operand", number(x.operand::i64)); }
+    }
+    or {
+        emit.member(f, c, "transfer", name("effect.NONE"));
+        emit.member(f, c, "target", name("effect.UNTARGETED"));
+        emit.member(f, c, "conditional", name("false"));
+        emit.member(f, c, "operand", name("field.NO_OPERAND"));
+    }
+    emit.member(f, c, "rules", name("effect.NO_RULES"));
+    val sg: *emit.Record = emit.record(f, "effect.Signature");
+    emit.member(f, sg, "pops", types_value(g, ?r.pops));
+    emit.member(f, sg, "pushes", types_value(g, ?r.pushes));
+    val e: *emit.Record = emit.record(f, "effect.Effect");
+    emit.member(f, e, "implicit", emit.Value.variant{emit.variant(f, "effect.Registers.ruled", rec_value(ru))});
+    emit.member(f, e, "flags", rec_value(fl));
+    emit.member(f, e, "memory", name("effect.NO_ACCESSES"));
+    emit.member(f, e, "control", rec_value(c));
+    emit.member(f, e, "stack", emit.Value.variant{emit.bare(f, "effect.Stack.none")});
+    emit.member(f, e, "latency", name("effect.UNTIMED"));
+    emit.member(f, e, "fixed", name("effect.NO_FIXEDS"));
+    emit.member(f, e, "writes", name("effect.NO_WRITES"));
+    if (r.pops.len == 0 && r.pushes.len == 0) { emit.member(f, e, "signature", name("effect.NO_SIGNATURE")); }
+    or                                        { emit.member(f, e, "signature", rec_value(sg)); }
+    emit.member(f, e, "values", name("effect.NO_VALUES"));
+    var one: [1]emit.Value = [1]emit.Value{rec_value(e)};
+    ret emit.element(f, "EFFECTS", emit.pooled(f, ?g.effects, ?one[0], 1));
+}
+
+# the requirement of `r`: every feature it names, one alternative, none for wasm 1.0
+fun requirement_value(g: *Gen, r: *Row) emit.Value {
+    val f: *emit.File = g.file;
+    if (r.alts.len == 0) { ret name("requirement.NO_ALTERNATIVES"); }
+    var ids: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    var i:   usize                     = 0;
+    for (i < r.alts.len) {
+        vector.push[emit.Value](?ids, name(emit.concat(f, "wasm_extension.id.", emit.ident(f, r.alts.data[i]))));
+        i = i + 1;
+    }
+    val at: u32          = emit.pooled(f, ?g.ids, ids.data, ids.len::u32);
+    val a:  *emit.Record = emit.record(f, "requirement.Alternative");
+    emit.member(f, a, "all", span(f, "requirement.Ids", "REQUIRE_IDS", at, ids.len::u32));
+    emit.member(f, a, "none", name("requirement.NO_IDS"));
+    var one: [1]emit.Value = [1]emit.Value{rec_value(a)};
+    val alt: u32           = emit.pooled(f, ?g.alts, ?one[0], 1);
+    ret span(f, "requirement.Requirement", "REQUIRE_ALTERNATIVES", alt, 1);
+}
+
+fun structure_name(s: wasm_facts.Structure) str {
+    if (s == wasm_facts.OPEN)  { ret "wasm_kind.OPEN"; }
+    if (s == wasm_facts.ELSE)  { ret "wasm_kind.ELSE"; }
+    if (s == wasm_facts.CLOSE) { ret "wasm_kind.CLOSE"; }
+    ret "wasm_kind.NONE";
+}
+
+fun row_value(g: *Gen, r: *Row, i: u32) emit.Value {
+    val f:   *emit.File                = g.file;
+    var ops: vector.Vector[emit.Value] = vector.init[emit.Value](g.alloc);
+    var k:   usize                     = 0;
+    for (k < r.ops.len) {
+        vector.push[emit.Value](?ops, op_value(g, ?r.ops.data[k]));
+        k = k + 1;
+    }
+    var operands: emit.Value = name("row.NO_OPERANDS");
+    if (ops.len > 0) { operands = span(f, "row.Operands", "OPERANDS", emit.pooled(f, ?g.operand, ops.data, ops.len::u32), ops.len::u32); }
+    val rr: *emit.Record = emit.record(f, "row.Row");
+    emit.member(f, rr, "key", emit.Value.text{r.o.name});
+    emit.member(f, rr, "mnemonic", emit.Value.text{r.o.text});
+    emit.member(f, rr, "operands", operands);
+    emit.member(f, rr, "encoding", fields_of(g, r));
+    emit.member(f, rr, "requires", requirement_value(g, r));
+    emit.member(f, rr, "effect", effect_of(g, r));
+    emit.member(f, rr, "ct", emit.Value.address{"ct.DEPENDENT"});
+    emit.member(f, rr, "constraints", name("constraint.NO_CONSTRAINTS"));
+    emit.member(f, rr, "flags", number(0));
+    emit.member(f, rr, "index", number(i::i64));
+    ret rec_value(rr);
+}
+
+# the types by name, as the stream spells them
+fun names_value(g: *Gen, list: *vector.Vector[wasm_facts.Named], decl: str) {
+    val f:   *emit.File  = g.file;
+    val arr: *emit.Array = emit.array(f, "stream.Name");
+    var i:   usize       = 0;
+    for (i < list.len) {
+        val r: *emit.Record = emit.record(f, "stream.Name");
+        emit.member(f, r, "code", emit.Value.hex{list.data[i].code::u64});
+        emit.member(f, r, "name", emit.Value.text{list.data[i].name});
+        emit.item(f, arr, rec_value(r));
+        i = i + 1;
+    }
+    emit.declare_array(f, decl, arr);
+    emit.declare(f, join(g, decl, "_COUNT"), "u32", number(list.len::i64));
+}
+
+# the rows, their keys, handles and structures, and the types by name
+fun rows(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "row");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    g.file    = f;
+    g.operand = emit.pool(f, "operand.Operand");
+    g.groups  = emit.pool(f, "operand.Operand");
+    g.fields  = emit.pool(f, "field.Field");
+    g.slices  = emit.pool(f, "field.Slice");
+    g.effects = emit.pool(f, "effect.Effect");
+    g.types   = emit.pool(f, "effect.TypeRef");
+    g.ids     = emit.pool(f, "requirement.Id");
+    g.alts    = emit.pool(f, "requirement.Alternative");
+    emit.uses(f, "std.types.bool.false");
+    emit.uses(f, "std.types.bool.true");
+    emit.uses(f, "masc.core.constraint");
+    emit.uses(f, "masc.core.ct");
+    emit.uses(f, "masc.core.effect");
+    emit.uses(f, "masc.core.field");
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.operand");
+    emit.uses(f, "masc.core.requirement");
+    emit.uses(f, "masc.core.row");
+    emit.uses(f, "masc.core.stream");
+    emit.uses(f, "wasm_extension: masc.isa.wasm.extension");
+    emit.uses(f, "wasm_kind: masc.isa.wasm.kind");
+    val table:      *emit.Array       = emit.array(f, "row.Row");
+    val keys:       *emit.Array       = emit.keyed(f, "index.Entry");
+    val structures: *emit.Array       = emit.array(f, "u8");
+    var taken:      map.Map[str, u32] = map.init[str, u32](g.alloc);
+    var i:          u32               = 0;
+    for (i < g.rows.len::u32) {
+        val r: *Row = ?g.rows.data[i];
+        emit.item(f, table, row_value(g, r, i));
+        emit.item(f, structures, name(structure_name(r.structure)));
+        val entry: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, entry, "key", emit.Value.text{r.o.name});
+        emit.member(f, entry, "row", number(i::i64));
+        emit.entry(f, keys, r.o.name, rec_value(entry));
+        val id:    str       = emit.ident(f, r.o.name);
+        var probe: str       = id;
+        val prior: opt[*u32] = map.get[str, u32](?taken, ?probe);
+        if (sel prior.some) { ret err[diag.Refusal].err{diag.refusal(nil, 0, KEYS_MANGLE, join3(g, g.rows.data[@prior.some].o.name, " and ", r.o.name))}; }
+        map.insert[str, u32](?taken, id, i);
+        emit.declare(f, id, "*row.Row", emit.element(f, "ROWS", i));
+        i = i + 1;
+    }
+    emit.seal(f, keys);
+    emit.declare(f, "OPERANDS", nil, emit.Value.array{g.operand.array});
+    emit.declare(f, "GROUPS", nil, emit.Value.array{g.groups.array});
+    emit.declare(f, "FIELDS", nil, emit.Value.array{g.fields.array});
+    emit.declare(f, "SLICES", nil, emit.Value.array{g.slices.array});
+    emit.declare(f, "EFFECTS", nil, emit.Value.array{g.effects.array});
+    emit.declare(f, "TYPES", nil, emit.Value.array{g.types.array});
+    emit.declare(f, "REQUIRE_IDS", nil, emit.Value.array{g.ids.array});
+    emit.declare(f, "REQUIRE_ALTERNATIVES", nil, emit.Value.array{g.alts.array});
+    emit.declare(f, "ROWS", nil, emit.Value.array{table});
+    emit.declare(f, "KEYS", nil, emit.Value.array{keys});
+    emit.declare(f, "STRUCTURES", nil, emit.Value.array{structures});
+    emit.declare(f, "COUNT", "u32", number(g.rows.len::i64));
+    names_value(g, ?g.facts.types, "TYPE_NAMES");
+    names_value(g, ?g.facts.heaps, "HEAP_NAMES");
+    ret err[diag.Refusal].ok{};
+}
+
+# the generator-side reading of each runtime key of masc's wasm key module, in its order: the opcode byte and the
+# index a prefix byte is followed by
+val KEYS: [2]dispatch.Key = [2]dispatch.Key{
+    dispatch.Key{name: "opcode", word: 0, lo: 0, len: 8},
+    dispatch.Key{name: "index", word: 1, lo: 0, len: 32},
+};
+
+fun dispatched(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val n:     usize                           = g.rows.len;
+    val words: res[*u64, A.Error]              = A.allocate[u64](g.alloc, n * 4 + 1);
+    val cubes: res[*dispatch.Cube, A.Error]    = A.allocate[dispatch.Cube](g.alloc, n + 1);
+    val pats:  res[*dispatch.Pattern, A.Error] = A.allocate[dispatch.Pattern](g.alloc, n + 1);
+    if (sel words.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel cubes.err) { ret err[diag.Refusal].err{memory()}; }
+    if (sel pats.err)  { ret err[diag.Refusal].err{memory()}; }
+    var i: usize = 0;
+    for (i < n) {
+        val o: *wasm_opcodes.Opcode = g.rows.data[i].o;
+        val w: *u64                 = ?words.ok[i * 4];
+        w[0] = o.code::u64;
+        w[1] = 0;
+        w[2] = 0xFF;
+        w[3] = 0;
+        if (o.prefix != 0) {
+            w[0] = o.prefix::u64;
+            w[1] = o.code::u64;
+            w[3] = 0xFFFF_FFFF;
+        }
+        cubes.ok[i] = dispatch.Cube{value: w, mask: ?w[2]};
+        pats.ok[i]  = dispatch.Pattern{row: i::u32, name: o.name, cubes: ?cubes.ok[i], count: 1};
+        i           = i + 1;
+    }
+    var space: dispatch.Space                    = dispatch.Space{words: 2, keys: ?KEYS[0], key_count: 2};
+    val built: res[dispatch.Built, diag.Refusal] = dispatch.build(g.alloc, ?space, pats.ok, n::u32);
+    if (sel built.err) { ret err[diag.Refusal].err{built.err}; }
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "dispatch");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "wasm_key: masc.isa.wasm.key");
+    var b: dispatch.Built = built.ok;
+    dispatch.declare(f, "DISPATCH", "wasm_key.KEYS", 2, ?b);
+    ret err[diag.Refusal].ok{};
+}
+
+fun put(out: *vector.Vector[u8], s: str) {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        vector.push[u8](out, s[i]);
+        i = i + 1;
+    }
+}
+
+fun hole(g: *Gen, out: *vector.Vector[u8], k: u8, format: str) {
+    put(out, "<");
+    put(out, decimal(g, k::u64));
+    if (format != nil) {
+        put(out, ":");
+        put(out, format);
+    }
+    put(out, ">");
+}
+
+# the format a hole of op `p` hands its hook, nil for none
+fun format_of(p: *Op) str {
+    if (p.kind == wasm_facts.TYPEUSE)  { ret "typeuse"; }
+    if (p.kind == wasm_facts.HEAPTYPE) { ret "heaptype"; }
+    if (p.kind == wasm_facts.VALTYPES) { ret "result"; }
+    if (p.kind == wasm_facts.V128)     { ret "v128"; }
+    if (p.kind == wasm_facts.LANES)    { ret "lanes"; }
+    ret nil;
+}
+
+# the text template of row `r`: its mnemonic, a memarg's index and its `offset=` and `align=` each where present,
+# then its immediates in text order, an optional one where present. an optional index another operand follows reads
+# only when another token follows it (`lead`), and a pair reads both or neither
+fun template(g: *Gen, r: *Row) str {
+    var out: vector.Vector[u8] = vector.init[u8](g.alloc);
+    put(?out, r.o.text);
+    var k: usize = 0;
+    if (r.paired) {
+        put(?out, "<[ ");
+        hole(g, ?out, (r.ops.len - 2)::u8, nil);
+        put(?out, " ");
+        hole(g, ?out, (r.ops.len - 1)::u8, nil);
+        put(?out, "]>");
+        vector.push[u8](?out, 0);
+        ret out.data;
+    }
+    for (k < r.order.len) {
+        val at: u8  = r.order.data[k];
+        val p:  *Op = ?r.ops.data[at];
+        if (p.kind == OFFSET) {
+            put(?out, "<[ offset=");
+            hole(g, ?out, at, nil);
+            put(?out, "]>");
+        }
+        or (p.kind == ALIGN) {
+            put(?out, "<[ align=");
+            hole(g, ?out, at, nil);
+            put(?out, "]>");
+        }
+        or (p.optional) {
+            var format: str = format_of(p);
+            # an optional index before an operand an index or a number spells reads only before another token
+            if (k + 1 < r.order.len && space_of(p.kind) != nil) {
+                val next: *Op = ?r.ops.data[r.order.data[k + 1]];
+                if (next.kind != OFFSET && next.kind != wasm_facts.TYPEUSE) { format = "lead"; }
+                if (next.kind == OFFSET && r.ops.len > 3)                   { format = "lead"; }
+            }
+            put(?out, "<[ ");
+            hole(g, ?out, at, format);
+            put(?out, "]>");
+        }
+        or {
+            put(?out, " ");
+            hole(g, ?out, at, format_of(p));
+        }
+        k = k + 1;
+    }
+    vector.push[u8](?out, 0);
+    ret out.data;
+}
+
+# a mnemonic and the group of its rows
+rec Named {
+    name:  str;
+    group: u32;
+}
+
+fun by_name(a: *Named, b: *Named) i64 {
+    ret str_compare(a.name, b.name);
+}
+
+# the template of every row and the index of rows by mnemonic, each mnemonic's rows in row order
+fun syntaxes(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "syntax");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "std.types.string.str");
+    emit.uses(f, "masc.core.syntax");
+    val forms:  *emit.Array                       = emit.array(f, "str");
+    var firsts: map.Map[str, u32]                 = map.init[str, u32](g.alloc);
+    var groups: vector.Vector[vector.Vector[u32]] = vector.init[vector.Vector[u32]](g.alloc);
+    var names:  vector.Vector[Named]              = vector.init[Named](g.alloc);
+    var i:      u32                               = 0;
+    for (i < g.rows.len::u32) {
+        val r: *Row = ?g.rows.data[i];
+        emit.item(f, forms, emit.Value.text{template(g, r)});
+        var key:   str       = r.o.text;
+        val known: opt[*u32] = map.get[str, u32](?firsts, ?key);
+        if (sel known.some) { vector.push[u32](?groups.data[@known.some], i); }
+        or {
+            map.insert[str, u32](?firsts, r.o.text, groups.len::u32);
+            var one: vector.Vector[u32] = vector.init[u32](g.alloc);
+            vector.push[u32](?one, i);
+            vector.push[vector.Vector[u32]](?groups, one);
+            vector.push[Named](?names, Named{name: r.o.text, group: groups.len::u32 - 1});
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Named](names.data, names.len, by_name);
+    val entries:    *emit.Array = emit.array(f, "syntax.Entry");
+    val candidates: *emit.Array = emit.array(f, "syntax.Candidate");
+    var at:         u32         = 0;
+    var k:          usize       = 0;
+    for (k < names.len) {
+        val rows_: *vector.Vector[u32] = ?groups.data[names.data[k].group];
+        val e:     *emit.Record        = emit.record(f, "syntax.Entry");
+        emit.member(f, e, "key", emit.Value.text{names.data[k].name});
+        emit.member(f, e, "first", number(at::i64));
+        emit.member(f, e, "len", number(rows_.len::i64));
+        emit.item(f, entries, rec_value(e));
+        var j: usize = 0;
+        for (j < rows_.len) {
+            val cd: *emit.Record = emit.record(f, "syntax.Candidate");
+            emit.member(f, cd, "row", number(rows_.data[j]::i64));
+            emit.member(f, cd, "alias", number(0));
+            emit.item(f, candidates, rec_value(cd));
+            j = j + 1;
+        }
+        at = at + rows_.len::u32;
+        k  = k + 1;
+    }
+    emit.declare(f, "FORM_TEXT", nil, emit.Value.array{forms});
+    emit.declare(f, "FORM_COUNT", "u32", number(g.rows.len::i64));
+    emit.declare(f, "ENTRIES", nil, emit.Value.array{entries});
+    emit.declare(f, "ENTRY_COUNT", "u32", number(names.len::i64));
+    emit.declare(f, "CANDIDATES", nil, emit.Value.array{candidates});
+    emit.declare(f, "CANDIDATE_COUNT", "u32", number(at::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+# the index of instructions as the rows are walked against it, each entry's opcode and whether it names one
+fun indexed(g: *Gen, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "index");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "std.types.bool.false");
+    emit.uses(f, "std.types.bool.true");
+    emit.uses(f, "wasm_kind: masc.isa.wasm.kind");
+    val arr: *emit.Array = emit.array(f, "wasm_kind.Indexed");
+    var i:   usize       = 0;
+    for (i < g.index.len) {
+        val e: *wasm_index.Entry = ?g.index.data[i];
+        val r: *emit.Record      = emit.record(f, "wasm_kind.Indexed");
+        emit.member(f, r, "prefix", emit.Value.hex{e.prefix::u64});
+        emit.member(f, r, "code", emit.Value.hex{e.code::u64});
+        emit.member(f, r, "named", boolean(e.named));
+        emit.item(f, arr, rec_value(r));
+        i = i + 1;
+    }
+    emit.declare_array(f, "INDEX", arr);
+    emit.declare(f, "INDEX_COUNT", "u32", number(g.index.len::i64));
+    val unindexed: *emit.Array = emit.array(f, "u32");
+    i = 0;
+    for (i < g.facts.unindexed.len) {
+        emit.item(f, unindexed, emit.Value.hex{g.facts.unindexed.data[i]::u64});
+        i = i + 1;
+    }
+    emit.declare_array(f, "UNINDEXED", unindexed);
+    emit.declare(f, "UNINDEXED_COUNT", "u32", number(g.facts.unindexed.len::i64));
+    ret err[diag.Refusal].ok{};
+}
+
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    if (c.inputs.len != 3) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INPUTS, nil)}; }
+    var ops:  wasm_opcodes.Opcodes;
+    val read: err[diag.Refusal] = wasm_opcodes.read(c.alloc, c.tree, ?ops);
+    if (sel read.err) { ret read; }
+    var g: Gen;
+    g.alloc = c.alloc;
+    g.ops   = ?ops;
+    val idx: err[diag.Refusal] = wasm_index.read(c.alloc, c.inputs.data[0], ?g.index);
+    if (sel idx.err) { ret idx; }
+    var x:     wasm_facts.Facts;
+    val known: err[diag.Refusal] = wasm_facts.read(c.alloc, c.inputs.data[1], ?ops, ?x);
+    if (sel known.err) { ret known; }
+    g.facts = ?x;
+    var atoms: vector.Vector[str] = vector.init[str](c.alloc);
+    val named: err[diag.Refusal]  = catalog.atom_names(c.alloc, c.inputs.data[2], ?atoms);
+    if (sel named.err) { ret named; }
+    g.atoms = map.init[str, bool](c.alloc);
+    var i: usize = 0;
+    for (i < atoms.len) {
+        map.insert[str, bool](?g.atoms, atoms.data[i], true);
+        i = i + 1;
+    }
+    val built: err[diag.Refusal] = build_rows(?g);
+    if (sel built.err) { ret built; }
+    val walk: err[diag.Refusal] = walked(?g);
+    if (sel walk.err) { ret walk; }
+    val wrote: err[diag.Refusal] = rows(?g, c);
+    if (sel wrote.err) { ret wrote; }
+    val spread: err[diag.Refusal] = dispatched(?g, c);
+    if (sel spread.err) { ret spread; }
+    val spelled: err[diag.Refusal] = syntaxes(?g, c);
+    if (sel spelled.err) { ret spelled; }
+    ret indexed(?g, c);
+}
