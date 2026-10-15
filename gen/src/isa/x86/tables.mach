@@ -28,11 +28,13 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_compare;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use std.collections.map;
 use std.collections.sort;
 use std.collections.vector;
+use debug_print: std.print;
 
 use masc.core.operand;
 use x86_opcode: masc.isa.x86.opcode;
@@ -266,7 +268,7 @@ fun address_classes(in: *Input, mode: u8, out: *str) err[diag.Refusal] {
 fun memory_shape(p: *Pools, in: *Input, a: *A.Allocator, r: *rows.Row, o: *forms.Operand) res[emit.Value, diag.Refusal] {
     val f:    *emit.File        = p.f;
     val m:    *emit.Record      = emit.record(f, "operand.Memory");
-    val w:    u8                = forms.width_of(r.mode);
+    val w:    u8                = forms.width_of(rows.first_mode(r.modes));
     var seg:  [1]str            = [1]str{nil};
     val segs: opt[*forms.Named] = forms.named(in.reader, "ES");
     if (sel segs.none) { ret res[emit.Value, diag.Refusal].err{diag.refusal(nil, 0, forms.NO_NAMED, "ES")}; }
@@ -284,7 +286,7 @@ fun memory_shape(p: *Pools, in: *Input, a: *A.Allocator, r: *rows.Row, o: *forms
     }
     or {
         var cs:  [2]str;
-        val got: err[diag.Refusal] = address_classes(in, r.mode, ?cs[0]);
+        val got: err[diag.Refusal] = address_classes(in, rows.first_mode(r.modes), ?cs[0]);
         if (sel got.err) { ret res[emit.Value, diag.Refusal].err{got.err}; }
         var four: vector.Vector[u32] = vector.init[u32](a);
         vector.push[u32](?four, 4);
@@ -402,7 +404,18 @@ fun stack_pointer(in: *Input, mode: u8) res[*forms.Named, diag.Refusal] {
     ret res[*forms.Named, diag.Refusal].err{diag.refusal(nil, 0, NO_STACK, cls.ok.class)};
 }
 
-# the flag rows XED's flags of `ins` read, write and leave undefined
+# the row of XED's flag `flag`: an rflags flag by its name, or the x87 condition code fcN, which is fsw's cN (XED
+# datafiles/xed-flags.txt, Intel SDM 325462-093US Vol. 1 8.1.3)
+fun flag_row(f: *emit.File, in: *Input, flag: str) opt[*forms.Named] {
+    if (str_len(flag) == 3 && flag[0] == 'f' && flag[1] == 'c') { ret forms.named(in.reader, emit.concat(f, "fsw.c", ?flag[2])); }
+    ret forms.named(in.reader, emit.concat(f, "RFLAGS.", flag));
+}
+
+# the flag rows XED's flags of `ins` read, write and leave undefined, and the ones some operand values keep: a list
+# under MAY, and one of the counts no immediate of 1 gives, IMMx, which a count of 0 is, a shift by which affects no
+# flag (Intel SDM 325462-093US Vol. 2B SAL/SAR/SHL/SHR, RCL/RCR/ROL/ROR). the lists of one instruction under IMM0, IMM1,
+# IMMx, REP and NOREP are the effects of some operand values each, so a flag one writes and another leaves undefined is
+# in both. pop and ah write a flag from the stack and from ah
 fun flags_of(p: *Pools, a: *A.Allocator, in: *Input, ins: *xed.instruction.Instruction) res[emit.Value, diag.Refusal] {
     var read:      vector.Vector[u32] = vector.init[u32](a);
     var written:   vector.Vector[u32] = vector.init[u32](a);
@@ -411,20 +424,21 @@ fun flags_of(p: *Pools, a: *A.Allocator, in: *Input, ins: *xed.instruction.Instr
     var i:         usize              = 0;
     for (i < ins.flags.len) {
         val list: *xed.instruction.Flags = ?ins.flags.data[i];
-        if (list.qualifier != nil) { ret res[emit.Value, diag.Refusal].err{diag.refusal(ins.line.file, ins.line.number, NO_SPELL, list.qualifier)}; }
-        val may: bool  = str_equals(list.semantics, "MAY");
+        val q:    str                    = list.qualifier;
+        if (q != nil && !str_equals(q, "IMM0") && !str_equals(q, "IMM1") && !str_equals(q, "IMMx") && !str_equals(q, "REP") && !str_equals(q, "NOREP")) { ret res[emit.Value, diag.Refusal].err{diag.refusal(ins.line.file, ins.line.number, NO_SPELL, q)}; }
+        val may: bool  = str_equals(list.semantics, "MAY") || (q != nil && str_equals(q, "IMMx"));
         var k:   usize = 0;
         for (k < list.actions.len) {
-            val act:  *xed.instruction.FlagAction = ?list.actions.data[k];
-            val full: str                         = emit.concat(p.f, "RFLAGS.", act.flag);
-            val n:    opt[*forms.Named]           = forms.named(in.reader, full);
+            val act: *xed.instruction.FlagAction = ?list.actions.data[k];
+            val n:   opt[*forms.Named]           = flag_row(p.f, in, act.flag);
             if (sel n.none) { ret res[emit.Value, diag.Refusal].err{diag.refusal(ins.line.file, ins.line.number, NO_FLAG, act.flag)}; }
             val row: u32 = n.some.row;
-            if (str_equals(act.action, "tst"))                                                               { add_row(?read, row); }
-            or (str_equals(act.action, "mod") || str_equals(act.action, "0") || str_equals(act.action, "1")) { add_row(?written, row); }
-            or (str_equals(act.action, "u"))                                                                 { add_row(?undefined, row); }
-            or                                                                                               { ret res[emit.Value, diag.Refusal].err{diag.refusal(ins.line.file, ins.line.number, NO_SPELL, act.action)}; }
-            if (may && !str_equals(act.action, "tst"))                                                       { add_row(?kept, row); }
+            val how: str = act.action;
+            if (str_equals(how, "tst")) { add_row(?read, row); }
+            or (str_equals(how, "mod") || str_equals(how, "0") || str_equals(how, "1") || str_equals(how, "pop") || str_equals(how, "ah")) { add_row(?written, row); }
+            or (str_equals(how, "u")) { add_row(?undefined, row); }
+            or                        { ret res[emit.Value, diag.Refusal].err{diag.refusal(ins.line.file, ins.line.number, NO_SPELL, how)}; }
+            if (may && !str_equals(how, "tst")) { add_row(?kept, row); }
             k = k + 1;
         }
         i = i + 1;
@@ -502,7 +516,7 @@ fun effect_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[u32, dia
         val m:   *forms.Implied = ?r.form.implied.data[i];
         var row: *forms.Named   = m.register;
         if (row == nil) {
-            val sp: res[*forms.Named, diag.Refusal] = stack_pointer(in, r.mode);
+            val sp: res[*forms.Named, diag.Refusal] = stack_pointer(in, rows.first_mode(r.modes));
             if (sel sp.err) { ret res[u32, diag.Refusal].err{sp.err}; }
             row     = sp.ok;
             stacked = true;
@@ -686,8 +700,8 @@ fun requirement_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[emi
     if (sel found.none) { ret res[emit.Value, diag.Refusal].err{diag.refusal(r.ins.line.file, r.ins.line.number, rows.NO_SET, r.set)}; }
     val alts:  *vector.Vector[vector.Vector[str]] = @found.some;
     var width: str                                = "width=16";
-    if (r.mode == 1)                                { width = "width=32"; }
-    if (r.mode == 2)                                { width = "width=64"; }
+    if (rows.first_mode(r.modes) == 1)                                { width = "width=32"; }
+    if (rows.first_mode(r.modes) == 2)                                { width = "width=64"; }
     if (!map.contains[str, u32](?in.atoms, ?width)) { ret res[emit.Value, diag.Refusal].err{diag.refusal(nil, 0, NO_ATOM, width)}; }
     var run:   vector.Vector[emit.Value] = vector.init[emit.Value](a);
     var count: usize                     = alts.len;
@@ -837,45 +851,221 @@ fun row_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] {
     ret err[diag.Refusal].ok{};
 }
 
-# the dispatch over every row's configurations, each a cube over the keys
+# bits fixed under a mask, one cube of a row's match word
+rec Bits {
+    value: u64;
+    mask:  u64;
+}
+
+fun bits_of(ks: *keys.Keys, which: u32) u64 {
+    val k: *dispatch.Key = ?ks.field[which];
+    if (k.len >= 64) { ret ~0::u64; }
+    ret ((1::u64 << k.len::u64) - 1) << k.lo::u64;
+}
+
+fun value_at(ks: *keys.Keys, which: u32, c: *Bits) u64 {
+    val k: *dispatch.Key = ?ks.field[which];
+    ret (c.value & bits_of(ks, which)) >> k.lo::u64;
+}
+
+# whether `r` has an operand of kind `what` that broadcasts, any of kind `what` when `broadcast` is false
+fun holds(r: *rows.Row, what: forms.What, broadcast: bool) bool {
+    var i: usize = 0;
+    for (i < r.form.operands.len) {
+        val o: *forms.Operand = ?r.form.operands.data[i];
+        if (o.what == what && (!broadcast || o.broadcast)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the 66 the osz key reads of `r` under `cf`: the configuration's in the legacy space and evex map 4, where it is 66, else
+# whether its pp is 01
+fun osz_key(r: *rows.Row, cf: forms.Config) u64 {
+    if (r.space == forms.LEGACY || (r.space == forms.EVEX && r.form.map == forms.APX_MAP)) { ret cf.osz::u64; }
+    if (r.reading.simd == x86_opcode.P66) { ret 1; }
+    ret 0;
+}
+
+# the values of the rep key `r` admits, as bit v for value v, 0 for any
+fun reps_of(r: *rows.Row) u64 {
+    if (r.space != forms.LEGACY) {
+        if (r.reading.simd == x86_opcode.PF3) { ret 0x8; }
+        if (r.reading.simd == x86_opcode.PF2) { ret 0x4; }
+        ret 0x1;
+    }
+    ret r.reading.reps::u64;
+}
+
+# the evex.aaa an evex row of no opmask operand reads: apx's condition's low bits, nf, else none
+fun aaa_of(r: *rows.Row) u64 {
+    if (r.reading.scc != x86_opcode.NO_SCC)        { ret r.reading.scc::u64 & 7; }
+    if ((r.reading.flags & x86_opcode.NF) != 0) { ret 4; }
+    ret 0;
+}
+
+fun add_bits(out: *vector.Vector[Bits], c: Bits) bool {
+    var i: usize = 0;
+    for (i < out.len) {
+        if (out.data[i].value == c.value && out.data[i].mask == c.mask) { ret true; }
+        i = i + 1;
+    }
+    ret pushed(vector.push[Bits](out, c));
+}
+
+# the cube of `r` under configuration `cf` before its repeat prefix and the registers its low bits and rex bits hold
+fun config_cube(ks: *keys.Keys, r: *rows.Row, cf: forms.Config) Bits {
+    var c:   Bits = Bits{value: 0, mask: 0};
+    val ev:  bool = r.space == forms.EVEX;
+    keys.fix(ks, keys.MAP, ((r.space::u64) << 5) | r.form.map::u64, ?c.value, ?c.mask);
+    keys.fix(ks, keys.OPCODE, r.form.opcode::u64, ?c.value, ?c.mask);
+    keys.fix(ks, keys.MODE, cf.mode::u64, ?c.value, ?c.mask);
+    if (r.form.modrm)                   { keys.fix(ks, keys.DIRECT, r.form.direct::u64, ?c.value, ?c.mask); }
+    if (r.form.digit != forms.NO_DIGIT) { keys.fix(ks, keys.REG, r.form.digit::u64, ?c.value, ?c.mask); }
+    keys.fix(ks, keys.OSZ, osz_key(r, cf), ?c.value, ?c.mask);
+    keys.fix(ks, keys.W, cf.rexw::u64, ?c.value, ?c.mask);
+    keys.fix(ks, keys.REX2, cf.rex2::u64, ?c.value, ?c.mask);
+    if ((r.flags & x86_opcode.LOCKED) != 0) { keys.fix(ks, keys.LOCK, 1, ?c.value, ?c.mask); }
+    keys.fix(ks, keys.ASZ, cf.asz::u64, ?c.value, ?c.mask);
+    # evex.l'l of a register form under evex.b is its rounding, which sae ignores
+    val rounded: bool = ev && r.form.direct && cf.bcrc == 1 && holds(r, forms.ROUNDING, false);
+    if (r.space != forms.LEGACY && r.reading.length != x86_opcode.LIG && !rounded) { keys.fix(ks, keys.VL, r.reading.length::u64, ?c.value, ?c.mask); }
+    # evex.b of a memory form that broadcasts is the operand's
+    if (ev && (r.form.direct || !holds(r, forms.MEMORY, true))) { keys.fix(ks, keys.B, cf.bcrc::u64, ?c.value, ?c.mask); }
+    if (r.reading.rmdigit != forms.NO_DIGIT)                    { keys.fix(ks, keys.RM, r.reading.rmdigit::u64, ?c.value, ?c.mask); }
+    if (ev && placed(r, forms.MASK) == 0xFF)                    { keys.fix(ks, keys.AAA, aaa_of(r), ?c.value, ?c.mask); }
+    if (r.reading.scc != x86_opcode.NO_SCC)                     { keys.fix(ks, keys.V4, (r.reading.scc >> 3)::u64, ?c.value, ?c.mask); }
+    ret c;
+}
+
+# the cubes of `r` into `out`: one per configuration, repeat prefix it admits, register its opcode's low bits and rex
+# bits hold and rex bits it admits
+fun row_cubes(ks: *keys.Keys, r: *rows.Row, out: *vector.Vector[Bits]) bool {
+    val reps: u64   = reps_of(r);
+    var k:    usize = 0;
+    for (k < r.configs.len) {
+        val cf:   forms.Config = r.configs.data[k];
+        val base: Bits         = config_cube(ks, r, cf);
+        var rep:  u64          = 0;
+        for (rep < 4) {
+            if (reps == 0 || ((reps >> rep) & 1) != 0) {
+                var c: Bits = base;
+                if (reps != 0) { keys.fix(ks, keys.REP, rep, ?c.value, ?c.mask); }
+                if (placed(r, forms.LOW) != 0xFF) {
+                    val o: *forms.Operand = ?r.form.operands.data[placed(r, forms.LOW)];
+                    debug_print.printlnf("TNUMS {} {}", r.key, o.numbers);
+                    var n: u64            = 0;
+                    for (n < 32) {
+                        val reached: bool = (cf.mode == 2 || n < 8) && (cf.rex2 == 1 || n < 16);
+                        if (reached && ((o.numbers >> n) & 1) != 0) {
+                            var d: Bits = c;
+                            keys.fix(ks, keys.OPCODE, (r.form.opcode::u64 | (n & 7)), ?d.value, ?d.mask);
+                            keys.fix(ks, keys.REXB, (n >> 3) & 3, ?d.value, ?d.mask);
+                            if (!add_bits(out, d)) { ret false; }
+                        }
+                        n = n + 1;
+                    }
+                }
+                or (r.reading.rexb != 0) {
+                    var b: u64 = 0;
+                    for (b < 4) {
+                        if (((r.reading.rexb >> b::u8) & 1) != 0 && (cf.mode == 2 || b == 0) && (cf.rex2 == 1 || b < 2)) {
+                            var d: Bits = c;
+                            keys.fix(ks, keys.REXB, b, ?d.value, ?d.mask);
+                            if (!add_bits(out, d)) { ret false; }
+                        }
+                        b = b + 1;
+                    }
+                }
+                or (!add_bits(out, c)) { ret false; }
+            }
+            rep = rep + 1;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the cubes of `cubes` joined where every value a field's reader returns is a cube that is otherwise one, the field
+# left open, until no more join
+fun join_cubes(a: *A.Allocator, ks: *keys.Keys, cubes: *vector.Vector[Bits]) bool {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var f: u32 = 0;
+        for (f < keys.FIELD_COUNT) {
+            val k: *dispatch.Key = ?ks.field[f];
+            if (k.len <= 6) {
+                val bits: u64                 = bits_of(ks, f);
+                val dom:  u64                 = keys.domain(f, k.len);
+                var kept: vector.Vector[Bits] = vector.init[Bits](a);
+                var dead: vector.Vector[bool] = vector.init[bool](a);
+                var i:    usize               = 0;
+                for (i < cubes.len) {
+                    if (!pushed(vector.push[bool](?dead, false))) { ret false; }
+                    i = i + 1;
+                }
+                i = 0;
+                for (i < cubes.len) {
+                    if (!dead.data[i]) {
+                        val c: *Bits = ?cubes.data[i];
+                        if ((c.mask & bits) == bits) {
+                            var seen: u64   = 1::u64 << value_at(ks, f, c);
+                            var j:    usize = i + 1;
+                            for (j < cubes.len) {
+                                val d: *Bits = ?cubes.data[j];
+                                if (!dead.data[j] && d.mask == c.mask && (d.value & ~bits) == (c.value & ~bits)) { seen = seen | (1::u64 << value_at(ks, f, d)); }
+                                j = j + 1;
+                            }
+                            if ((seen & dom) == dom) {
+                                j = i + 1;
+                                for (j < cubes.len) {
+                                    val d: *Bits = ?cubes.data[j];
+                                    if (!dead.data[j] && d.mask == c.mask && (d.value & ~bits) == (c.value & ~bits)) { dead.data[j] = true; }
+                                    j = j + 1;
+                                }
+                                if (!pushed(vector.push[Bits](?kept, Bits{value: c.value & ~bits, mask: c.mask & ~bits}))) { ret false; }
+                                changed = true;
+                            }
+                            or (!pushed(vector.push[Bits](?kept, @c))) { ret false; }
+                        }
+                        or (!pushed(vector.push[Bits](?kept, @c))) { ret false; }
+                    }
+                    i = i + 1;
+                }
+                @cubes = kept;
+            }
+            f = f + 1;
+        }
+    }
+    ret true;
+}
+
+# the dispatch over every row's configurations, each a cube over the keys, joined where they cover a field
 fun dispatch_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] {
     val rs:   *vector.Vector[*rows.Row]       = in.rows;
     var pats: vector.Vector[dispatch.Pattern] = vector.init[dispatch.Pattern](a);
     var i:    usize                           = 0;
     for (i < rs.len) {
-        val r:    *rows.Row = rs.data[i];
-        var lows: u32       = 1;
-        if (r.form.low) { lows = 8; }
-        val n:     usize                        = r.configs.len * lows::usize;
+        val r:     *rows.Row           = rs.data[i];
+        var cubes: vector.Vector[Bits] = vector.init[Bits](a);
+        if (!row_cubes(in.keys, r, ?cubes))    { ret err[diag.Refusal].err{memory(r.key)}; }
+        if (!join_cubes(a, in.keys, ?cubes)) { ret err[diag.Refusal].err{memory(r.key)}; }
+        val n:     usize                        = cubes.len;
+        var dk: usize = 0;
+        for (dk < n) { debug_print.printlnf("CUBE {} {} {}", r.key, cubes.data[dk].value, cubes.data[dk].mask); dk = dk + 1; }
         val words: res[*u64, A.Error]           = A.allocate[u64](a, n * 2);
-        val cubes: res[*dispatch.Cube, A.Error] = A.allocate[dispatch.Cube](a, n);
+        val made:  res[*dispatch.Cube, A.Error] = A.allocate[dispatch.Cube](a, n);
         if (sel words.err) { ret err[diag.Refusal].err{memory(r.key)}; }
-        if (sel cubes.err) { ret err[diag.Refusal].err{memory(r.key)}; }
-        var at: usize = 0;
-        var k:  usize = 0;
-        for (k < r.configs.len) {
-            val cf: forms.Config = r.configs.data[k];
-            var l:  u32          = 0;
-            for (l < lows) {
-                val value: *u64 = ?words.ok[at * 2];
-                val mask:  *u64 = ?words.ok[at * 2 + 1];
-                @value = 0;
-                @mask  = 0;
-                keys.fix(in.keys, keys.MAP, r.form.map::u64, value, mask);
-                keys.fix(in.keys, keys.OPCODE, (r.form.opcode::u32 | l)::u64, value, mask);
-                keys.fix(in.keys, keys.MODE, r.mode::u64, value, mask);
-                if (r.form.modrm)                   { keys.fix(in.keys, keys.DIRECT, (r.form.direct)::u64, value, mask); }
-                if (r.form.digit != forms.NO_DIGIT) { keys.fix(in.keys, keys.REG, r.form.digit::u64, value, mask); }
-                keys.fix(in.keys, keys.OSZ, cf.osz::u64, value, mask);
-                keys.fix(in.keys, keys.W, cf.rexw::u64, value, mask);
-                keys.fix(in.keys, keys.REX2, cf.rex2::u64, value, mask);
-                cubes.ok[at] = dispatch.Cube{value: value, mask: mask};
-                at           = at + 1;
-                l            = l + 1;
-            }
-            k = k + 1;
+        if (sel made.err)  { ret err[diag.Refusal].err{memory(r.key)}; }
+        var k: usize = 0;
+        for (k < n) {
+            words.ok[k * 2]     = cubes.data[k].value;
+            words.ok[k * 2 + 1] = cubes.data[k].mask;
+            made.ok[k]          = dispatch.Cube{value: ?words.ok[k * 2], mask: ?words.ok[k * 2 + 1]};
+            k                   = k + 1;
         }
-        vector.push[dispatch.Pattern](?pats, dispatch.Pattern{row: i::u32, name: r.key, cubes: cubes.ok, count: n::u32});
+        vector.push[dispatch.Pattern](?pats, dispatch.Pattern{row: i::u32, name: r.key, cubes: made.ok, count: n::u32});
         i = i + 1;
     }
     var space: dispatch.Space                    = dispatch.Space{words: 1, keys: in.keys.keys.data, key_count: in.keys.keys.len::u32};
