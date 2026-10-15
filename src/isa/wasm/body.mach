@@ -63,6 +63,7 @@ pub val BROKEN_TEXT:        str = "malformed text";
 # modes:  the assembler modes, none for wasm
 # pool:   each instruction's values and their members, grown to what its text may hold
 # fixups: what the codec appends, which no wasm field makes
+# datas:  whether an instruction read names a data segment, which the binary counts before the code that names it
 pub rec Reader {
     text:   *u8;
     origin: diagnostic.Position;
@@ -71,10 +72,11 @@ pub rec Reader {
     modes:  mode.State;
     pool:   vector.Vector[operand.Value];
     fixups: vector.Vector[field.Fixup];
+    datas:  bool;
 }
 
 pub fun make(a: *A.Allocator, text: *u8, origin: diagnostic.Position, codec: *dispatch.Codec, ctx: *state.Context) Reader {
-    ret Reader{text: text, origin: origin, codec: codec, ctx: ctx, modes: mode.initial(?mode.NO_MODES), pool: vector.init[operand.Value](a), fixups: vector.init[field.Fixup](a)};
+    ret Reader{text: text, origin: origin, codec: codec, ctx: ctx, modes: mode.initial(?mode.NO_MODES), pool: vector.init[operand.Value](a), fixups: vector.init[field.Fixup](a), datas: false};
 }
 
 pub fun release(b: *Reader) {
@@ -113,6 +115,11 @@ fun row_of(b: *Reader, t: wasm_text.Token) opt[u32] {
 fun mnemonic(b: *Reader, t: wasm_text.Token) bool {
     val r: opt[u32] = row_of(b, t);
     ret sel r.some;
+}
+
+# whether the atom `t` is an instruction's mnemonic, so `(` and it start a folded instruction
+pub fun instruction(b: *Reader, t: wasm_text.Token) bool {
+    ret mnemonic(b, t);
 }
 
 # whether the token after `(` at the lexer starts a folded instruction or an if's arm, the end of an operand's text
@@ -202,8 +209,20 @@ fun one(b: *Reader, at: usize, end: usize, out: *vector.Vector[u8]) err[diagnost
     if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
     var ins:  inst.Inst                 = got.ok;
     val done: res[usize, field.Refusal] = walk.encode(b.codec, b.ctx, ?ins, out, ?b.fixups);
-    if (sel done.err) { ret refuse(b, done.err.message, at, end - at); }
+    if (sel done.err)        { ret refuse(b, done.err.message, at, end - at); }
+    if (names_data(ins.row)) { b.datas = true; }
     ret observed(b, ?ins, at, end - at);
+}
+
+# whether an operand of row `r` indexes the data segments
+fun names_data(r: *row.Row) bool {
+    var k: u32 = 0;
+    for (k < r.operands.len) {
+        val desc: *operand.Operand = ?r.operands.at[k];
+        if (sel desc.shape.id && desc.shape.id.space == wasm_kind.DATAS) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 # a plain instruction at the lexer, its mnemonic `m` read, and the label a plain `end` or `else` repeats checked
@@ -334,4 +353,76 @@ pub fun function(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[d
     val shut: wasm_text.Token = wasm_text.ahead(l);
     if (wasm_stream.count(b.ctx.stream, wasm_kind.LABELS) != 1) { ret refuse(b, UNCLOSED_BLOCK, shut.at, 1); }
     ret bare(b, gen_row.END, shut.at, out);
+}
+
+# a constant expression's instructions at the lexer, as a global's initializer or a segment's offset, up to the `)`
+# around them, which is left for the caller, and the `end` it takes
+pub fun expression(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val entered: err[str] = wasm_stream.enter_expression(b.ctx.stream);
+    if (sel entered.err) { ret refuse(b, entered.err, l.at, 1); }
+    ret function(b, l, out);
+}
+
+# a constant expression of the one folded instruction at the lexer, as an element segment's item, and its `end`
+pub fun folded_expression(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val entered: err[str] = wasm_stream.enter_expression(b.ctx.stream);
+    if (sel entered.err) { ret refuse(b, entered.err, l.at, 1); }
+    var copy:   wasm_text.Lexer = @l;
+    val opened: wasm_text.Token = wasm_text.next(?copy);
+    if (opened.kind != wasm_text.OPEN) { ret at_token(b, NOT_AN_INSTRUCTION, opened); }
+    val m: wasm_text.Token = wasm_text.next(?copy);
+    val r: opt[u32]        = row_of(b, m);
+    if (sel r.none) { ret at_token(b, NOT_AN_INSTRUCTION, m); }
+    @l = copy;
+    val got: err[diagnostic.Diagnostic] = folded(b, l, m, r.some, out);
+    if (sel got.err) { ret got; }
+    ret bare(b, gen_row.END, l.at, out);
+}
+
+# the types the type uses of the instructions at the lexer imply, up to the `)` around them, added to the stream in
+# the order the text gives them, the lexer left where it was. a module's reader takes them with the type uses of its
+# fields, so a type a body implies is numbered where the body is
+pub fun imply(b: *Reader, l: *wasm_text.Lexer) err[diagnostic.Diagnostic] {
+    var copy:  wasm_text.Lexer = @l;
+    var depth: usize           = 0;
+    for {
+        val t: wasm_text.Token = wasm_text.next(?copy);
+        if (t.kind == wasm_text.END || t.kind == wasm_text.BROKEN) { brk; }
+        if (t.kind == wasm_text.OPEN) {
+            depth = depth + 1;
+            cnt;
+        }
+        if (t.kind == wasm_text.CLOSE) {
+            if (depth == 0) { brk; }
+            depth = depth - 1;
+            cnt;
+        }
+        val r: opt[u32] = row_of(b, t);
+        if (sel r.none) { cnt; }
+        var noted: [8]requirement.Alternative;
+        var rd:    core_syntax.Reader = core_syntax.Reader{
+            text:    b.text,
+            start:   t.at,
+            at:      t.at + t.len,
+            end:     l.end,
+            origin:  diagnostic.advance(b.origin, b.text, t.at),
+            codec:   b.codec,
+            ctx:     b.ctx,
+            syntax:  ?wasm_syntax.SYNTAX,
+            modes:   ?b.modes,
+            symbols: ?SYMBOLS,
+            context: nil,
+            row:     nil,
+            pool:    nil,
+            cap:     0,
+            used:    0,
+            bytes:   nil,
+            room:    0,
+            taken:   0,
+            refused: field.Admissions{at: ?noted[0], cap: 8, used: 0},
+        };
+        val got: err[diagnostic.Diagnostic] = wasm_syntax.imply(?rd, ?gen_row.ROWS[r.some]);
+        if (sel got.err) { ret got; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
 }
