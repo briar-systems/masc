@@ -288,6 +288,7 @@ val REALIGN:   Attempt = 1;
 # full:    whether the output failed to grow
 # forms:   whether instructions are spelled by their rows' own forms
 # named:   the handles the statement being verified names, which its parse resolves
+# marked:  the set's rows that take a marker operand, which a decoded instruction a marker relocation lies at is tried as
 # mapping: the mapping symbols the text's assembler writes, none when the dialect's writes none
 # marks:   the object's mapping symbols, in place order
 # mi:      the next mapping symbol to read
@@ -305,6 +306,7 @@ rec Disasm {
     sites:   vector.Vector[Site];
     anchors: vector.Vector[Label];
     marks:   vector.Vector[Mapped];
+    marked:  vector.Vector[*row.Row];
     mapping: source.Mapping;
     mi:      usize;
     bound:   vector.Vector[Bound];
@@ -816,6 +818,17 @@ fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
         var given: bool  = false;
         var k:     u32   = 0;
         for (k < st.ins.count && !given) {
+            # a marker operand takes the relocation of its kind at the instruction's start, as a marked row's does
+            val desc: *operand.Operand = ?st.ins.row.operands.at[k];
+            if (sel desc.shape.marker) {
+                if (off == 0 && sel st.values[k].none && binds(d, r.kind, desc.shape.marker)) {
+                    if (!note(d, aimed.ok.some.handle)) { ret res[bool, Refusal].ok{false}; }
+                    st.values[k] = operand.Value.symbol{operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: desc.shape.marker}};
+                    given        = true;
+                }
+                k = k + 1;
+                cnt;
+            }
             val at: opt[usize] = probe(d, ?st.ins, k);
             if (sel at.some && at.some == off) {
                 val f: operand.FixupKind = fixup_for(d, r.kind, operand.default_fixup(?st.ins.row.operands.at[k]));
@@ -880,6 +893,57 @@ fun laid_out(d: *Disasm, section: u32, at: u64, chosen: *relax.Emitted, out: *re
     ret false;
 }
 
+# step `ins` at `offset` of section `section` encoded into the disassembler's bytes and fixups as the builder writes it:
+# a value naming by its distance from the program counter a place of the section the builder folds it to
+# (`build.folds`), with no instruction the linker may resize between, encoded as that distance from the step's anchor,
+# answering its length, none when it does not encode
+fun encoded(d: *Disasm, section: u32, offset: u64, ins: *inst.Inst) opt[usize] {
+    d.bytes.len  = 0;
+    d.fixups.len = 0;
+    val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ins, ?d.bytes, ?d.fixups);
+    if (sel done.err) { ret opt[usize].none{}; }
+    var values: [row.MAX_OPERANDS]operand.Value;
+    var any:    bool = false;
+    var k:      u32  = 0;
+    for (k < ins.count) {
+        values[k] = ins.values[k];
+        val desc: *operand.Operand    = ?ins.row.operands.at[k];
+        val sym:  opt[operand.Symbol] = operand.pc_symbol(desc, ?values[k]);
+        if (sel sym.some) {
+            var fx: operand.FixupKind = operand.default_fixup(desc);
+            if (sym.some.fixup != operand.NO_FIXUP) { fx = sym.some.fixup; }
+            val reach: opt[i64] = reach_of(d, section, offset, sym.some.id, sym.some.addend);
+            var by:    i64      = 0;
+            var near:  bool     = false;
+            if (sel reach.some) {
+                by   = reach.some;
+                near = true;
+            }
+            if (near && build.folds(desc, ?values[k], kind_of(d, fx))) {
+                val to: i64 = offset:~i64 + by;
+                var lo: u64 = offset;
+                var hi: u64 = offset + 1;
+                if (to >= 0 && to:~u64 < lo) { lo = to:~u64; }
+                if (to >= 0 && to:~u64 > hi) { hi = to:~u64; }
+                if (!resized(d, section, lo, hi)) {
+                    var dist: i64 = by;
+                    if (operand.anchor_of(desc) == operand.END) { dist = dist - done.ok::i64; }
+                    values[k] = operand.resolved(?values[k], dist);
+                    any       = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if (!any) { ret opt[usize].some{done.ok}; }
+    var again: inst.Inst = inst.Inst{row: ins.row, values: ?values[0], count: ins.count, form: ins.form};
+    d.bytes.len  = 0;
+    d.fixups.len = 0;
+    val redone: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?again, ?d.bytes, ?d.fixups);
+    if (sel redone.err) { ret opt[usize].none{}; }
+    ret opt[usize].some{redone.ok};
+}
+
 # whether the expansion `ex` encoded at `at` of section `section` as the builder writes it is the bytes of `data` up to
 # `stop` and makes exactly the relocations among `first` to `end`
 fun matches(d: *Disasm, section: u32, ex: *relax.Expansion, data: *u8, len: usize, at: u64, stop: u64, first: usize, end: usize) bool {
@@ -922,14 +986,12 @@ fun matches(d: *Disasm, section: u32, ex: *relax.Expansion, data: *u8, len: usiz
         for (l < laid.count) {
             val step: *relax.Emitted = ?laid.steps[l];
             l = l + 1;
-            var ins: inst.Inst = inst.Inst{row: step.row, values: ?step.values[0], count: step.row.operands.len, form: step.form};
-            d.bytes.len  = 0;
-            d.fixups.len = 0;
-            val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?ins, ?d.bytes, ?d.fixups);
-            if (sel done.err)                     { ret false; }
-            if (offset + done.ok::u64 > len::u64) { ret false; }
+            var ins:  inst.Inst  = inst.Inst{row: step.row, values: ?step.values[0], count: step.row.operands.len, form: step.form};
+            val done: opt[usize] = encoded(d, section, offset, ?ins);
+            if (sel done.none)                      { ret false; }
+            if (offset + done.some::u64 > len::u64) { ret false; }
             var b: usize = 0;
-            for (b < done.ok) {
+            for (b < done.some) {
                 if (d.bytes.data[b] != data[offset::usize + b]) { ret false; }
                 b = b + 1;
             }
@@ -981,7 +1043,7 @@ fun matches(d: *Disasm, section: u32, ex: *relax.Expansion, data: *u8, len: usiz
                 }
                 if (!hit) { ret false; }
             }
-            offset = offset + done.ok::u64;
+            offset = offset + done.some::u64;
         }
     }
     u = 0;
@@ -1137,18 +1199,15 @@ fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u
             }
         }
     }
-    or {
-        val given: res[bool, Refusal] = take(d, ?d.steps[0], d.ri, end);
-        if (sel given.err) { ret res[u64, Refusal].err{given.err}; }
-        if (given.ok)      { printed = alone(d, ?w); }
+    var read: bool = false;
+    if (sel sp.some) {
+        var ex: relax.Expansion;
+        read = printed && !d.full && reparse(d, text, ?ex) && matches(d, section, ?ex, data, len, at, stop, d.ri, end);
     }
-    var ex:   relax.Expansion;
-    var read: bool = printed && !d.full && reparse(d, text, ?ex) && matches(d, section, ?ex, data, len, at, stop, d.ri, end);
-    # an instruction alone that reads back only in its exact form is printed with the marker of it, where one spells it
-    if (!read && sel sp.none && printed && exact_marked(d) && !core_form.exact(d.steps[0].ins.form)) {
-        d.out.len                = text;
-        d.steps[0].ins.form.bits = d.steps[0].ins.form.bits | core_form.EXACT;
-        read                     = alone(d, ?w) && !d.full && reparse(d, text, ?ex) && matches(d, section, ?ex, data, len, at, stop, d.ri, end);
+    or {
+        val one_: res[bool, Refusal] = single(d, section, data, len, at, stop, end, text, ?w);
+        if (sel one_.err) { ret res[u64, Refusal].err{one_.err}; }
+        read = one_.ok;
     }
     if (!read) {
         d.out.len = start;
@@ -1157,6 +1216,171 @@ fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u
     put_char(d, '\n');
     d.ri = end;
     ret res[u64, Refusal].ok{stop - at};
+}
+
+# the most marked rows a decoded instruction is tried as
+val MARKED_TRIED: u32 = 4;
+
+# the rows the instruction decoded at `at` is tried as, into `rows`: its own, then each marked row whose marker the
+# relocations among the cursor's to `end` at `at` are of, which takes its operands in order around its marker, found
+# through the set's marked rows and held to the bytes by encoding, as `add.tprel_add` for an add a TPREL_ADD marks
+fun rows_of(d: *Disasm, at: u64, end: usize, rows: **row.Row) u32 {
+    val decoded: *row.Row = d.steps[0].ins.row;
+    rows[0] = decoded;
+    var n: u32   = 1;
+    var j: usize = d.ri;
+    for (j < end) {
+        val site: *Site              = ?d.sites.data[j];
+        val r:    *mink.object.Reloc = reloc_of(d, site);
+        j = j + 1;
+        if (site.offset != at || sel r.target.none) { cnt; }
+        var m: usize = 0;
+        for (m < d.marked.len && n < MARKED_TRIED + 1) {
+            val mr: *row.Row = d.marked.data[m];
+            m = m + 1;
+            var takes: bool = false;
+            var plain: u32  = 0;
+            var k:     u32  = 0;
+            for (k < mr.operands.len) {
+                val desc: *operand.Operand = ?mr.operands.at[k];
+                if (sel desc.shape.marker) { takes = takes || binds(d, r.kind, desc.shape.marker); }
+                or                         { plain = plain + 1; }
+                k = k + 1;
+            }
+            if (takes && plain == decoded.operands.len) {
+                rows[n] = mr;
+                n       = n + 1;
+            }
+        }
+    }
+    ret n;
+}
+
+# the step at the cursor made an instruction of row `r` from the values `base` decoded, its markers none and its other
+# operands taking the decoded values in order
+fun as_row(d: *Disasm, base: *Step, r: *row.Row) {
+    d.steps[0]            = @base;
+    d.steps[0].ins.values = ?d.steps[0].values[0];
+    if (r == base.ins.row) { ret; }
+    var k: u32 = 0;
+    var p: u32 = 0;
+    for (k < r.operands.len) {
+        if (sel r.operands.at[k].shape.marker) { d.steps[0].values[k] = operand.Value.none{}; }
+        or {
+            d.steps[0].values[k] = base.values[p];
+            p                    = p + 1;
+        }
+        k = k + 1;
+    }
+    d.steps[0].ins.row   = r;
+    d.steps[0].ins.count = r.operands.len;
+}
+
+# each resolved target of a relative operand of the step at the cursor in `section` that a label no other object may
+# preempt is at, given as that label, answering whether any was
+fun labelled(d: *Disasm, section: u32) bool {
+    val st:  *Step = ?d.steps[0];
+    var any: bool  = false;
+    var k:   u32   = 0;
+    for (k < st.ins.count) {
+        val desc: *operand.Operand = ?st.ins.row.operands.at[k];
+        val v:    operand.Value    = st.values[k];
+        var to:   opt[u64]         = opt[u64].none{};
+        if (sel desc.shape.relative) {
+            if (sel v.relative) { to = target_of(st.at, st.len, desc, v.relative); }
+        }
+        if (sel to.some) {
+            val got: opt[u32] = local_label_at(d, section, to.some);
+            if (sel got.some) {
+                if (note(d, got.some)) {
+                    st.values[k] = operand.Value.symbol{operand.Symbol{id: got.some, addend: 0, fixup: operand.NO_FIXUP}};
+                    any          = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret any;
+}
+
+# the first label at `offset` of section `section` that names a place no other object may preempt, an object's local
+# symbol or an anchor, a binary search of the labels in place order
+fun local_label_at(d: *Disasm, section: u32, offset: u64) opt[u32] {
+    var want: Label = Label{section: section, offset: offset, handle: 0};
+    var lo:   usize = 0;
+    var hi:   usize = d.labels.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (by_place(?d.labels.data[mid], ?want) < 0) { lo = mid + 1; }
+        or                                            { hi = mid; }
+    }
+    for (lo < d.labels.len && d.labels.data[lo].section == section && d.labels.data[lo].offset == offset) {
+        val h: u32 = d.labels.data[lo].handle;
+        if (h > d.count)                                                           { ret opt[u32].some{h}; }
+        if (!mink.symbol.binds(symbol_of(d, h - 1).binding, mink.symbol.EXTERNAL)) { ret opt[u32].some{h}; }
+        lo = lo + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the place a relative operand `desc` of an instruction of `len` bytes at `at` reaches by `offset`, from its start or
+# its end as the operand measures it, none before the section's start
+fun target_of(at: u64, len: usize, desc: *operand.Operand, offset: i64) opt[u64] {
+    var from: i64 = at:~i64;
+    if (operand.anchor_of(desc) == operand.END) { from = from + len::i64; }
+    val to: i64 = from + offset;
+    if (to < 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{to:~u64};
+}
+
+# the instruction at the cursor, decoded at `at` up to `stop`, written alone from `text` by the first spelling that
+# reads back to its bytes and the relocations from the cursor to `end`: as each row it is tried as, its resolved targets
+# as the labels at them before as numbers, and under ALIASES a compressed instruction by the instruction it is
+# shortened from before as itself, which then reads back only by compressing to it again, and last in its exact form
+# where a marker spells one. answering whether one does, with the output from `text` taken back when none does
+fun single(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, stop: u64, end: usize, text: usize, w: *core_syntax.Writer) res[bool, Refusal] {
+    var base: Step = d.steps[0];
+    var rows: [MARKED_TRIED + 1]*row.Row;
+    val n:    u32  = rows_of(d, at, end, ?rows[0]);
+    var r:    u32  = 0;
+    for (r < n) {
+        var labels: u32 = 0;
+        for (labels < 2) {
+            as_row(d, ?base, rows[r]);
+            d.names = 0;
+            val tried: u32 = labels;
+            labels = labels + 1;
+            if (tried == 0 && !labelled(d, section)) { cnt; }
+            val given: res[bool, Refusal] = take(d, ?d.steps[0], d.ri, end);
+            if (sel given.err) { ret given; }
+            if (!given.ok)     { cnt; }
+            var spelling: u32 = 0;
+            for (spelling < 3) {
+                val way: u32 = spelling;
+                spelling  = spelling + 1;
+                d.out.len = text;
+                var printed: bool = false;
+                if (way == 0 && !d.forms) {
+                    var wide: relax.Emitted;
+                    if (cmp.expand(d.s.codec, d.s.compress, d.s.relax, d.v, ?d.steps[0].ins, ?wide)) {
+                        var ins: inst.Inst          = inst.Inst{row: wide.row, values: ?wide.values[0], count: wide.row.operands.len, form: wide.form};
+                        val got: err[field.Refusal] = print.instruction(w, ?ins);
+                        printed = sel got.ok;
+                    }
+                }
+                if (way == 1) { printed = alone(d, w); }
+                if (way == 2 && exact_marked(d) && !core_form.exact(d.steps[0].ins.form)) {
+                    d.steps[0].ins.form.bits = d.steps[0].ins.form.bits | core_form.EXACT;
+                    printed                  = alone(d, w);
+                }
+                var ex: relax.Expansion;
+                if (printed && !d.full && reparse(d, text, ?ex) && matches(d, section, ?ex, data, len, at, stop, d.ri, end)) { ret res[bool, Refusal].ok{true}; }
+            }
+        }
+        r = r + 1;
+    }
+    d.out.len = text;
+    ret res[bool, Refusal].ok{false};
 }
 
 # the instruction decoded at the cursor printed alone, by its row's own form when the disassembler spells forms
@@ -1872,6 +2096,12 @@ fun index(d: *Disasm) err[Refusal] {
         }
         i = i + 1;
     }
+    sort.sort_by[Mapped](d.marks.data, d.marks.len, by_mark);
+    val rows: err[Refusal] = marked_rows(d);
+    if (sel rows.err) { ret rows; }
+    sort.sort_by[Label](d.labels.data, d.labels.len, by_place);
+    val targets: err[Refusal] = branch_targets(d);
+    if (sel targets.err) { ret targets; }
     # the anchors kept once per place, each numbered by the lowest number no name of the object spells with the stem
     sort.sort_by[Label](d.anchors.data, d.anchors.len, by_place);
     var kept: usize = 0;
@@ -1900,8 +2130,156 @@ fun index(d: *Disasm) err[Refusal] {
         k = k + 1;
     }
     sort.sort_by[Label](d.labels.data, d.labels.len, by_place);
-    sort.sort_by[Mapped](d.marks.data, d.marks.len, by_mark);
     ret err[Refusal].ok{};
+}
+
+# the set's rows that take a marker operand
+fun marked_rows(d: *Disasm) err[Refusal] {
+    val rows: row.Rows = d.s.codec.rows;
+    var i:    u32      = 0;
+    for (i < rows.len) {
+        val r: *row.Row = ?rows.at[i];
+        var k: u32      = 0;
+        for (k < r.operands.len) {
+            if (sel r.operands.at[k].shape.marker) {
+                if (!held(vector.push[*row.Row](?d.marked, r))) { ret whole(MEMORY); }
+                brk;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# an instruction decoded where the code of a section is read for its targets
+rec Decoded {
+    at:  u64;
+    len: u64;
+}
+
+fun by_start(x: *Decoded, y: *Decoded) i64 {
+    if (x.at < y.at) { ret -1; }
+    if (x.at > y.at) { ret 1; }
+    ret 0;
+}
+
+# whether `to` lies strictly inside one of the instructions `spans` holds, in start order
+fun splits(spans: *vector.Vector[Decoded], to: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = spans.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (spans.data[mid].at <= to) { lo = mid + 1; }
+        or                            { hi = mid; }
+    }
+    if (lo == 0) { ret false; }
+    val before: *Decoded = ?spans.data[lo - 1];
+    ret to > before.at && to < before.at + before.len;
+}
+
+# the length of the sequence a relocation at `at` of section `section` covers, its instructions decoded up to `limit`, 0
+# when none covers more than its own instruction or they do not decode. it decodes into the steps past the first
+fun sequence_len(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u64) u64 {
+    var want: Site  = Site{section: section, offset: at, reloc: 0};
+    var lo:   usize = 0;
+    var hi:   usize = d.sites.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (by_site(?d.sites.data[mid], ?want) < 0) { lo = mid + 1; }
+        or                                          { hi = mid; }
+    }
+    var end: usize = lo;
+    for (end < d.sites.len && d.sites.data[end].section == section && d.sites.data[end].offset == at) {
+        end = end + 1;
+    }
+    val sp: opt[*core_fixup.Span] = span_at(d, at, lo, end);
+    if (sel sp.none)                     { ret 0; }
+    if (sp.some.count > relax.MAX_STEPS) { ret 0; }
+    var to: u64 = at + d.steps[0].len::u64;
+    var k:  u32 = 1;
+    for (k < sp.some.count) {
+        if (!decode_step(d, k, data, len, to, limit)) { ret 0; }
+        to = to + d.steps[k].len::u64;
+        k  = k + 1;
+    }
+    ret to - at;
+}
+
+# an anchor at the target of every relative operand of an instruction the code of a section holds whose value the
+# assembler resolved, with no relocation left: one inside its section that splits no instruction decoded there, read
+# under the object's selection as its mapping symbols or else its flags mark code. a target outside its section, or one
+# that splits an instruction, has no label to name it, and its instruction keeps its number
+fun branch_targets(d: *Disasm) err[Refusal] {
+    var spans:   vector.Vector[Decoded] = vector.init[Decoded](d.a);
+    var targets: vector.Vector[u64]     = vector.init[u64](d.a);
+    var done:    err[Refusal]           = err[Refusal].ok{};
+    var m:       usize                  = 0;
+    var i:       u32                    = 0;
+    for (i < d.o.sections.count::u32 && sel done.ok) {
+        val sec:  *mink.object.Section = section_of(d, i);
+        val size: u64                  = size_of(d, i);
+        var code: bool                 = (sec.flags & mink.section.EXEC) != 0;
+        spans.len   = 0;
+        targets.len = 0;
+        if (sel sec.contents.held) {
+            val bytes: mink.store.Bytes = mink.object.bytes(d.o, ?sec.contents);
+            var at:    u64              = 0;
+            for (at < size && sel done.ok) {
+                for (m < d.marks.len && d.marks.data[m].section == i && d.marks.data[m].offset <= at) {
+                    code = d.marks.data[m].code;
+                    m    = m + 1;
+                }
+                var next: u64 = size;
+                if (m < d.marks.len && d.marks.data[m].section == i) { next = d.marks.data[m].offset; }
+                if (!code) {
+                    at = next;
+                    cnt;
+                }
+                if (!decode_step(d, 0, bytes.data, bytes.len, at, next)) {
+                    var unit: u64 = d.s.parcel(bytes.data, bytes.len, at::usize)::u64;
+                    if (unit == 0 || at + unit > next) { unit = next - at; }
+                    at = at + unit;
+                    cnt;
+                }
+                val st:   *Step = ?d.steps[0];
+                val step: u64   = st.len::u64;
+                # a sequence a relocation covers, as a call pair, is one statement, which a label inside would split
+                var whole_: u64 = sequence_len(d, i, bytes.data, bytes.len, at, next);
+                if (whole_ < step)                                                     { whole_ = step; }
+                if (!held(vector.push[Decoded](?spans, Decoded{at: at, len: whole_}))) { done = whole(MEMORY); }
+                var k: u32 = 0;
+                for (k < st.ins.count) {
+                    val desc: *operand.Operand = ?st.ins.row.operands.at[k];
+                    if (sel desc.shape.relative) {
+                        if (sel st.values[k].relative) {
+                            val to: opt[u64] = target_of(at, st.len, desc, st.values[k].relative);
+                            if (sel to.some) {
+                                if (to.some <= size && !held(vector.push[u64](?targets, to.some))) { done = whole(MEMORY); }
+                            }
+                        }
+                    }
+                    k = k + 1;
+                }
+                at = at + whole_;
+            }
+        }
+        for (m < d.marks.len && d.marks.data[m].section == i) {
+            m = m + 1;
+        }
+        sort.sort_by[Decoded](spans.data, spans.len, by_start);
+        var t: usize = 0;
+        for (t < targets.len && sel done.ok) {
+            val to:    u64      = targets.data[t];
+            val named: opt[u32] = local_label_at(d, i, to);
+            if (!splits(?spans, to) && sel named.none && !held(vector.push[Label](?d.anchors, Label{section: i, offset: to, handle: 0}))) { done = whole(MEMORY); }
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+    vector.dnit[Decoded](?spans);
+    vector.dnit[u64](?targets);
+    ret done;
 }
 
 fun released(d: *Disasm) {
@@ -1909,6 +2287,7 @@ fun released(d: *Disasm) {
     vector.dnit[Site](?d.sites);
     vector.dnit[Label](?d.anchors);
     vector.dnit[Mapped](?d.marks);
+    vector.dnit[*row.Row](?d.marked);
     vector.dnit[Bound](?d.bound);
     var i: usize = 0;
     for (i < d.scopes.len) {
@@ -2033,6 +2412,7 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
         sites:   vector.init[Site](a),
         anchors: vector.init[Label](a),
         marks:   vector.init[Mapped](a),
+        marked:  vector.init[*row.Row](a),
         mapping: mapping_of(s, options.dialect),
         mi:      0,
         bound:   vector.init[Bound](a),
@@ -2566,6 +2946,68 @@ test disassemble__a_relocation_the_reassembly_would_resolve_is_refused_naming_it
     # a branch across a call the linker may resize keeps its relocation, as masc's builder keeps it
     if (!t_disassemble(?t, "\tbeqz a0, 1f\n\tcall f\n1:\n\tnop\n")) { ret 8; }
     if (!t_done(?t))                                                { ret 9; }
+    ret 0;
+}
+
+# whether `text` disassembles to output holding `want` that reassembles to the same bytes
+#[testing]
+fun t_trip(t: *T, text: str, want: str) bool {
+    val a:    *A.Allocator      = testing.allocator_of(?t.t);
+    var from: vector.Vector[u8] = vector.init[u8](a);
+    var back: vector.Vector[u8] = vector.init[u8](a);
+    val ok:   bool              = t_text(t, text, str_len(text), ?from) && t_disassemble(t, text) && t_holds(t, want) && t_text(t, t.out.data, t.out.len - 1, ?back) && t_same(?from, ?back);
+    vector.dnit[u8](?from);
+    vector.dnit[u8](?back);
+    ret ok;
+}
+
+# a forward and a backward branch the assembler resolved print as branches to labels made at their targets, once per
+# target in address order, or to a local label already there, and read back as the same instructions (#197)
+test disassemble__a_resolved_local_branch_prints_as_a_branch_to_a_label {
+    var t: T;
+    if (!t_make(?t, "rv64i"))                                                                                                   { ret 1; }
+    if (!t_trip(?t, "\tnop\n1:\tbeqz a0, 2f\n\tnop\n2:\tj 1b\n", "\n.Ltmp0:\n\tbeqz a0, .Ltmp1\n\tnop\n.Ltmp1:\n\tj .Ltmp0\n")) { ret 2; }
+    if (!t_trip(?t, "f:\tbeqz a0, f\n", "\nf:\n\tbeqz a0, f\n"))                                                                { ret 3; }
+    if (!t_done(?t))                                                                                                            { ret 4; }
+    ret 0;
+}
+
+# under ALIASES a compressed instruction prints by the instruction it is shortened from, spelled by its preferred alias,
+# as llvm-objdump prints it, and reads back by compressing to it again. FORMS prints its own row (#198)
+test disassemble__a_compressed_instruction_prints_by_its_alias {
+    var t: T;
+    if (!t_make(?t, "rv64ic"))                                                     { ret 1; }
+    if (!t_trip(?t, "\tc.jr ra\n\tc.addi a0, 1\n", "\n\tret\n\taddi a0, a0, 1\n")) { ret 2; }
+    t.spelling = FORMS;
+    if (!t_trip(?t, "\tc.jr ra\n\tc.addi a0, 1\n", "\n\tc.jr ra\n\tc.addi a0, 1\n")) { ret 3; }
+    if (!t_done(?t))                                                                 { ret 4; }
+    ret 0;
+}
+
+# an object holding TPREL_ADD and TLSDESC_CALL relocations prints both marked rows, which read back to the same bytes and
+# relocations, and a marker relocation no marked row takes is refused (#212)
+test disassemble__marked_rows_print_by_their_markers {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val a:       *A.Allocator  = testing.allocator_of(?t.t);
+    val text:    str           = "\tadd a0, a0, tp, %tprel_add(x)\n.L1:\n\tauipc a0, %tlsdesc_hi(y)\n\tjalr t0, 0(a1), %tlsdesc_call(.L1)\n";
+    val options: model.Options = model.Options{arch: ?mink.arch_riscv.RISCV64, formats: ?t.formats, syntax: 0, abi: trait.t_abi(?mink.arch_riscv.RISCV64, "lp64d"), dialect: ?dialect.ELF, layers: model.NO_LAYERS};
+    var why:     Refusal       = Refusal{message: nil, section: NO_SECTION, offset: 0};
+    var none:    [2]bool       = [2]bool{false, false};
+    if (!t_nameless(?t, text, ?none[0], 2, ?why) || why.message != nil)                                              { ret 2; }
+    if (!t_holds(?t, "\tadd a0, a0, tp, %tprel_add(x)\n") || !t_holds(?t, "\tjalr t0, 0(a1), %tlsdesc_call(.L1)\n")) { ret 3; }
+    # the same marker on an instruction no marked row is of
+    var got: res[mink.object.Object, model.Refusal] = asm.assemble(a, ?riscv_set.SET, ?t.ctx, options, text, str_len(text), diagnostic.START);
+    if (sel got.err) { ret 4; }
+    var o:     mink.object.Object = got.ok;
+    val bytes: mink.store.Bytes   = mink.object.bytes(?o, ?o.sections.items[0].contents);
+    # add a0, a0, tp made sub a0, a0, tp, whose row takes no marker
+    bytes.data[3] = 0x40;
+    val done: err[Refusal] = disassemble(a, ?riscv_set.SET, ?t.ctx, Options{syntax: 0, spelling: ALIASES, dialect: ?dialect.ELF, naming: t.naming}, ?o, ?t.out);
+    mink.object.release(?o);
+    if (!sel done.err)                                       { ret 5; }
+    if (done.err.message != UNTAKEN || done.err.offset != 0) { ret 6; }
+    if (!t_done(?t))                                         { ret 7; }
     ret 0;
 }
 
