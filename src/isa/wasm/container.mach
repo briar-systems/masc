@@ -1,0 +1,163 @@
+# a wasm module put in mink's wasm container
+#
+# the container is mink's model of a module's bytes (`mink.format.wasm.model`), which mink's writer writes. the module
+# reader (`masc.isa.wasm.module`) adds each entry to the model's flat table of its kind in the order the binary takes
+# them, and `close` states the sections: the types the stream holds, then a section of each kind of entry in the order
+# the specification lays them out (type, import, function, table, memory, tag, global, export, start, element, data
+# count, code, data), one with no entries left out. every number is written at its shortest (`model.SHORTEST`). where
+# the binary leaves a choice the text does not make, the container takes wat2wasm 1.0.42's under wasm 3.0's features
+# less gc (wabt's ir.cc and binary-writer.cc): an element segment's flags (`element_flags`), and the data count section
+# only where a body names a data segment.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink_model:  mink.format.wasm.model;
+use mink_tables: mink.format.wasm.tables;
+
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+
+# a number at its shortest
+pub fun leb(v: u64) mink_model.Leb {
+    ret mink_model.Leb{value: v, width: mink_model.SHORTEST};
+}
+
+# `count` entries from `first` of a flat table, their count at its shortest
+pub fun run(first: usize, count: usize) mink_model.Run {
+    ret mink_model.Run{first: first, count: count, width: mink_model.SHORTEST};
+}
+
+# a name of the `len` bytes at `data`, owned by the model, its length at its shortest
+pub fun name(m: *mink_model.Module, data: *u8, len: usize) res[mink_model.Name, Fail] {
+    val held: res[Held, Fail] = store.own(?m.store, data, len);
+    if (sel held.err) { ret res[mink_model.Name, Fail].err{held.err}; }
+    ret res[mink_model.Name, Fail].ok{mink_model.Name{bytes: held.ok, width: mink_model.SHORTEST}};
+}
+
+# the bytes of `v`, owned by the model
+pub fun held(m: *mink_model.Module, v: *vector.Vector[u8]) res[Held, Fail] {
+    ret store.own(?m.store, v.data, v.len);
+}
+
+# the segment modes, by their flag bits: an active segment has none, a passive one the passive bit, and a declared
+# element segment the passive and the table bits
+pub val ACTIVE:   u64 = 0;
+pub val PASSIVE:  u64 = 1;
+pub val DECLARED: u64 = 3;
+
+# the flags of an element segment of mode `mode`, at table `table` when active, whose element type is `(ref func)`
+# where `funcs`, or the reference type `type`: a table index written for an active segment of a table other than 0 or
+# of a type other than a function reference, and the items written as expressions unless the type is `(ref func)`,
+# as wat2wasm writes them under wasm 3.0's typed function references (`--enable-function-references`)
+pub fun element_flags(mode: u64, table: u32, funcs: bool, type: u8) u64 {
+    var flags: u64 = mode;
+    if (mode == ACTIVE && (table != 0 || (!funcs && type != FUNCREF))) { flags = flags | mink_tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value; }
+    if (!funcs)                                                        { flags = flags | mink_tables.WASM_ELEM_SEGMENT_HAS_INIT_EXPRS.value; }
+    ret flags;
+}
+
+# the byte of funcref, the element kind a segment of function indices writes as 0
+pub val FUNCREF: u8 = 0x70;
+
+# the flags of a data segment of mode `mode`, at memory `memory` when active: a memory index written for one other than 0
+pub fun data_flags(mode: u64, memory: u32) u64 {
+    if (mode == ACTIVE && memory != 0) { ret mink_tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value; }
+    ret mode;
+}
+
+fun pushed[T](got: res[table.Id[T], Fail]) err[Fail] {
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    ret err[Fail].ok{};
+}
+
+val NO_NAME: mink_model.Name = mink_model.Name{bytes: Held.borrowed{Bytes{data: nil, len: 0}}, width: 0};
+
+# a section of id `id` holding `body`, its size the writer's to give at its shortest
+fun section(m: *mink_model.Module, id: u64, body: mink_model.Body) err[Fail] {
+    val s: mink_model.Section = mink_model.Section{id: id::u8, at: 0, payload: 0, size: leb(0), name: NO_NAME, body: body};
+    ret pushed[mink_model.Section](table.push[mink_model.Section](?m.sections, s));
+}
+
+# the value types of `codes` onto the module's valtypes, their run
+fun valtypes(m: *mink_model.Module, codes: *vector.Vector[u32]) res[mink_model.Run, Fail] {
+    val first: usize = table.count[u8](?m.valtypes);
+    var i:     usize = 0;
+    for (i < codes.len) {
+        if (codes.data[i] > 0xFF) { ret res[mink_model.Run, Fail].err{fail.unsupported("a value type wider than one byte")}; }
+        val e: err[Fail] = pushed[u8](table.push[u8](?m.valtypes, codes.data[i]::u8));
+        if (sel e.err) { ret res[mink_model.Run, Fail].err{e.err}; }
+        i = i + 1;
+    }
+    ret res[mink_model.Run, Fail].ok{run(first, codes.len)};
+}
+
+# the function types the stream holds, onto the module's types
+fun types(m: *mink_model.Module, stream: ptr) err[Fail] {
+    val count: u32 = wasm_stream.count(stream, wasm_kind.TYPES);
+    var i:     u32 = 0;
+    for (i < count) {
+        val t: opt[*wasm_stream.FuncType] = wasm_stream.func_type(stream, i);
+        if (sel t.none) { ret err[Fail].err{fail.internal("a type index the stream counts holds no function type")}; }
+        val params: res[mink_model.Run, Fail] = valtypes(m, ?t.some.params);
+        if (sel params.err) { ret err[Fail].err{params.err}; }
+        val results: res[mink_model.Run, Fail] = valtypes(m, ?t.some.results);
+        if (sel results.err) { ret err[Fail].err{results.err}; }
+        val form: u8        = mink_tables.WASM_TYPE_FUNC.value::u8;
+        val e:    err[Fail] = pushed[mink_model.FuncType](table.push[mink_model.FuncType](?m.types, mink_model.FuncType{form: form, params: params.ok, results: results.ok}));
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a section of the `count` entries of a flat table, none when it is empty
+fun of(m: *mink_model.Module, id: u64, count: usize, body: mink_model.Body) err[Fail] {
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret section(m, id, body);
+}
+
+# the module's sections, its entries added: its types those `stream` holds, its start function `start`, and its data
+# count where `counted`, as when a body names a data segment
+pub fun close(m: *mink_model.Module, stream: ptr, start: opt[u32], counted: bool) err[Fail] {
+    m.version = mink_tables.VERSION::u32;
+    val typed: err[Fail] = types(m, stream);
+    if (sel typed.err) { ret typed; }
+    val nt: usize     = table.count[mink_model.FuncType](?m.types);
+    val ni: usize     = table.count[mink_model.Import](?m.imports);
+    val nf: usize     = table.count[mink_model.Leb](?m.functions);
+    val nb: usize     = table.count[mink_model.TableType](?m.tables);
+    val nm: usize     = table.count[mink_model.Limits](?m.memories);
+    val ng: usize     = table.count[mink_model.Tag](?m.tags);
+    val nv: usize     = table.count[mink_model.Global](?m.globals);
+    val nx: usize     = table.count[mink_model.Export](?m.exports);
+    val ne: usize     = table.count[mink_model.Element](?m.elements);
+    val nc: usize     = table.count[mink_model.Function](?m.code);
+    val nd: usize     = table.count[mink_model.Segment](?m.data);
+    var e:  err[Fail] = of(m, mink_tables.WASM_SEC_TYPE.value, nt, mink_model.Body.types{run(0, nt)});
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_IMPORT.value, ni, mink_model.Body.imports{run(0, ni)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_FUNCTION.value, nf, mink_model.Body.functions{run(0, nf)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_TABLE.value, nb, mink_model.Body.tables{run(0, nb)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_MEMORY.value, nm, mink_model.Body.memories{run(0, nm)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_TAG.value, ng, mink_model.Body.tags{run(0, ng)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_GLOBAL.value, nv, mink_model.Body.globals{run(0, nv)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_EXPORT.value, nx, mink_model.Body.exports{run(0, nx)}));
+    if (sel start.some) { e = fail.kept(e, section(m, mink_tables.WASM_SEC_START.value, mink_model.Body.start{leb(start.some::u64)})); }
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_ELEM.value, ne, mink_model.Body.elements{run(0, ne)}));
+    if (counted) { e = fail.kept(e, section(m, mink_tables.WASM_SEC_DATACOUNT.value, mink_model.Body.datacount{leb(nd::u64)})); }
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_CODE.value, nc, mink_model.Body.code{run(0, nc)}));
+    e = fail.kept(e, of(m, mink_tables.WASM_SEC_DATA.value, nd, mink_model.Body.data{run(0, nd)}));
+    if (sel e.err) { ret e; }
+    ret mink_model.index_imports(m);
+}
