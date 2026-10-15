@@ -1,0 +1,699 @@
+# the x86 rows of XED's instructions: one per encoding, operand size and code width
+#
+# every instruction of SLICE, the GA1 slice J3's full catalog replaces, is evaluated under each configuration of the
+# prefixes at each code width (gen.isa.x86.forms), and the configurations whose forms agree on everything a row states,
+# its opcode, ModRM's facts, its operands and what it touches beyond them, are one row. a row's operand size and its
+# flags are the ones under which the kind's rule (masc.isa.x86.opcode.admits) admits exactly the row's configurations
+# of every configuration of its width, the fewest flags first: no size where its forms ignore 66 and rex.w, else the
+# effective operand size the configurations share, with DEFAULT_64, IMMUNE_66, NO_REX2 and REFINED_W where XED's
+# patterns ask for them. a row XED gives the kind no size and flags for is refused, so the rule a decoder reads prefixes
+# by and XED's patterns are held to one another.
+#
+# two register forms of one instruction, size and width whose operands trade ModRM.rm and ModRM.reg, as add's 01 and
+# 03, are one instruction's two directions: the rm-from-reg one, which llvm-mc 23.1.1 writes, is STORE and the other
+# LOAD, which {load} selects. each row's mnemonic is its ICLASS in lower case, or what the mnemonics topic of the
+# overlay states where llvm spells it otherwise (gen/data/x86/mnemonics.txt). rows are in the order the encoder prefers
+# them, the shortest encoding first: a mnemonic's candidates are tried in row order, so `add eax, 5` takes 83's imm8
+# and `add eax, 200` 05's imm32, as llvm-mc writes them. a row whose operand size 66 overrides the width's to comes
+# after every row of the width's own, as an operand that names no size, a target or an immediate, never chooses it:
+# `push 65408` in 64-bit code is 68's push of the qword, not 66 6a's of the word 0xff80, and `je` with a target past
+# a disp8 is 0f 84's rel32, not 66 0f 84's rel16, which truncates the instruction pointer.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.string.str_to_lower;
+use std.types.string.str_to_upper;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+
+use masc.core.operand;
+use x86_opcode: masc.isa.x86.opcode;
+
+use gen.diag;
+use gen.isa.x86.forms;
+use gen.isa.x86.xed;
+use gen.overlay;
+
+pub val MNEMONICS_TOPIC: str = "mnemonics";
+
+pub val NO_SIZES:  str = "no operand size and flags of the kind admit exactly the configurations XED gives the row";
+pub val TWO_ROWS:  str = "two rows of one key state otherwise";
+pub val NO_SET:    str = "instruction's ISA set has no requirement";
+pub val BAD_FACT:  str = "mnemonics line is not `<ICLASS> [op=<hex>] [size=o16|o32|o64] [width=16|32|64] | <mnemonic>`";
+pub val NO_ROW:    str = "mnemonics line names no row of the slice";
+pub val TWO_FACTS: str = "two mnemonics lines name one row";
+
+# the instructions of the GA1 slice, by ICLASS, which J3's catalog of every instruction replaces (#30)
+pub val SLICE_COUNT: u32 = 27;
+
+pub val SLICE: [SLICE_COUNT]str = [SLICE_COUNT]str{
+    "ADD", "CALL_NEAR", "CMP", "DEC", "INC", "JB", "JBE", "JL", "JLE", "JNB", "JNBE", "JNL", "JNLE", "JNO", "JNP", "JNS",
+    "JNZ", "JO", "JP", "JS", "JZ", "LEA", "MOV", "MOVZX", "POP", "PUSH", "RET_NEAR",
+};
+
+# the section of XED's instruction files holding the legacy encoding space
+pub val LEGACY_TABLE: str = "INSTRUCTIONS";
+
+# one row
+# ---
+# ins:      the first XED instruction whose forms are the row's
+# index:    that instruction's position among XED's instructions
+# mode:     the code width as XED's MODE holds it
+# size:     the operand size it encodes, as masc.isa.x86.opcode.Size holds it
+# flags:    what else it states, as masc.isa.x86.opcode.Flags holds it
+# form:     the form its configurations share
+# configs:  the configurations it is
+# set:      the ISA set it requires, upper case
+# key:      its key
+# mnemonic: its mnemonic
+# length:   the bytes it encodes to, with a memory operand's displacement as wide as the width's addressing takes
+pub rec Row {
+    ins:      *xed.instruction.Instruction;
+    index:    u32;
+    mode:     u8;
+    size:     u8;
+    flags:    u16;
+    form:     forms.Form;
+    configs:  vector.Vector[forms.Config];
+    set:      str;
+    key:      str;
+    mnemonic: str;
+    length:   u32;
+}
+
+fun memory(subject: str) diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, subject);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun in_slice(iclass: str) bool {
+    var i: u32 = 0;
+    for (i < SLICE_COUNT) {
+        if (str_equals(SLICE[i], iclass)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# text built a piece at a time
+rec Text {
+    alloc:  *A.Allocator;
+    bytes:  vector.Vector[u8];
+    failed: bool;
+}
+
+fun text(a: *A.Allocator) Text {
+    ret Text{alloc: a, bytes: vector.init[u8](a), failed: false};
+}
+
+fun put(t: *Text, s: str) {
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        if (!pushed(vector.push[u8](?t.bytes, s[i]))) { t.failed = true; }
+        i = i + 1;
+    }
+}
+
+fun put_number(t: *Text, n: u64) {
+    var digits: [24]u8;
+    val len:    usize = format.put_u64(?digits[0], n);
+    digits[len] = 0;
+    put(t, ?digits[0]);
+}
+
+fun put_hex(t: *Text, n: u8) {
+    val hex: str   = "0123456789abcdef";
+    var two: [3]u8 = [3]u8{hex[n >> 4], hex[n & 15], 0};
+    put(t, ?two[0]);
+}
+
+# the text built, owned, nil when its storage was refused
+fun done(t: *Text) str {
+    if (t.failed)                              { ret nil; }
+    if (!pushed(vector.push[u8](?t.bytes, 0))) { ret nil; }
+    ret t.bytes.data;
+}
+
+# what the forms of a row share, spelled: whatever tells two rows apart
+fun content(a: *A.Allocator, ins: *xed.instruction.Instruction, set: str, f: *forms.Form) str {
+    var t: Text = text(a);
+    put(?t, ins.iclass);
+    put(?t, "|");
+    put(?t, set);
+    put(?t, "|");
+    put_number(?t, f.map::u64);
+    put(?t, ":");
+    put_number(?t, f.opcode::u64);
+    if (f.low)    { put(?t, ":low"); }
+    if (f.modrm)  { put(?t, ":modrm"); }
+    if (f.direct) { put(?t, ":direct"); }
+    if (f.memory) { put(?t, ":memory"); }
+    if (f.locked) { put(?t, ":locked"); }
+    put(?t, ":");
+    put_number(?t, f.digit::u64);
+    var i: usize = 0;
+    for (i < f.operands.len) {
+        val o: *forms.Operand = ?f.operands.data[i];
+        put(?t, "|");
+        put_number(?t, o.what::u64);
+        put(?t, ",");
+        put_number(?t, o.role::u64);
+        put(?t, ",");
+        put_number(?t, o.width::u64);
+        put(?t, ",");
+        put_number(?t, o.place::u64);
+        # the registers a field encodes are the union over the configurations, which the kind tells apart
+        if (o.what != forms.REGISTER || o.place == forms.FIXED) {
+            var k: u8 = 0;
+            for (k < o.count) {
+                put(?t, ",");
+                put(?t, o.classes[k].class);
+                k = k + 1;
+            }
+            put(?t, ",");
+            put_number(?t, o.numbers);
+        }
+        if (o.fixed != nil) {
+            put(?t, ",");
+            put(?t, o.fixed.name);
+        }
+        if (o.what == forms.IMM || o.what == forms.RELATIVE || o.what == forms.MOFFS) {
+            put(?t, ",");
+            put_number(?t, o.taken.bits::u64);
+            if (o.taken.signed) { put(?t, "s"); }
+            if (o.taken.scaled) { put(?t, "z"); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.implied.len) {
+        val m: *forms.Implied = ?f.implied.data[i];
+        put(?t, "|+");
+        if (m.register != nil) { put(?t, m.register.name); }
+        or (m.push)            { put(?t, "push"); }
+        or                     { put(?t, "pop"); }
+        put(?t, ",");
+        put_number(?t, m.role::u64);
+        put(?t, ",");
+        put_number(?t, m.width::u64);
+        i = i + 1;
+    }
+    ret done(?t);
+}
+
+# a group of configurations whose forms agree, before it is sized
+rec Group {
+    ins:     *xed.instruction.Instruction;
+    index:   u32;
+    content: str;
+    set:     str;
+    form:    forms.Form;
+    configs: vector.Vector[forms.Config];
+    eosz:    u8;
+    eoszs:   u8;
+}
+
+fun opcode_with(size: u8, flags: u16) x86_opcode.Opcode {
+    var op: x86_opcode.Opcode;
+    op.size  = size;
+    op.flags = flags;
+    ret op;
+}
+
+fun holds_config(g: *Group, c: forms.Config) bool {
+    var i: usize = 0;
+    for (i < g.configs.len) {
+        val x: forms.Config = g.configs.data[i];
+        if (x.osz == c.osz && x.rexw == c.rexw && x.rex2 == c.rex2) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the kind's rule admits under `size` and `flags` exactly the configurations of `g` among `all`
+fun exact(g: *Group, all: *vector.Vector[forms.Config], size: u8, flags: u16) bool {
+    var op: x86_opcode.Opcode = opcode_with(size, flags);
+    val w:  u8                = forms.width_of(g.form.config.mode);
+    var i:  usize             = 0;
+    for (i < all.len) {
+        val c:     forms.Config = all.data[i];
+        val admit: bool         = x86_opcode.admits(w, c.osz != 0, c.rexw != 0, c.rex2 != 0, ?op);
+        if (admit != holds_config(g, c)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the flags the size search tries, each subset of them in order of how many it holds
+val SIZE_FLAGS: [4]u16 = [4]u16{x86_opcode.DEFAULT_64, x86_opcode.IMMUNE_66, x86_opcode.NO_REX2, x86_opcode.REFINED_W};
+
+fun ones(v: u32) u32 {
+    var n: u32 = 0;
+    var x: u32 = v;
+    for (x != 0) {
+        n = n + (x & 1);
+        x = x >> 1;
+    }
+    ret n;
+}
+
+# the size and flags under which the rule admits exactly `g`'s configurations, no size before the shared one and fewer
+# flags before more, none when no size and flags do
+fun sizing(g: *Group, all: *vector.Vector[forms.Config], size: *u8, flags: *u16) bool {
+    var tries: [2]u8 = [2]u8{x86_opcode.NO_SIZE, g.eosz};
+    var count: u32   = 1;
+    if (ones(g.eoszs::u32) == 1) { count = 2; }
+    var t: u32 = 0;
+    for (t < count) {
+        var held: u32 = 0;
+        for (held <= 4) {
+            var subset: u32 = 0;
+            for (subset < 16) {
+                if (ones(subset) == held) {
+                    var fl: u16 = 0;
+                    var k:  u32 = 0;
+                    for (k < 4) {
+                        if (((subset >> k) & 1) != 0) { fl = fl | SIZE_FLAGS[k]; }
+                        k = k + 1;
+                    }
+                    if (exact(g, all, tries[t], fl)) {
+                        @size  = tries[t];
+                        @flags = fl;
+                        ret true;
+                    }
+                }
+                subset = subset + 1;
+            }
+            held = held + 1;
+        }
+        t = t + 1;
+    }
+    ret false;
+}
+
+# the bits of operand size `size`, 0 for none
+pub fun size_bits(size: u8) u8 {
+    if (size == x86_opcode.O16) { ret 16; }
+    if (size == x86_opcode.O32) { ret 32; }
+    if (size == x86_opcode.O64) { ret 64; }
+    ret 0;
+}
+
+# the escape bytes and opcode of map `m` and opcode `op` as a row key spells them: 0f, 0f38 or 0f3a and the byte in hex
+fun put_opcode(t: *Text, m: u8, op: u8) {
+    if (m >= 1) { put(t, "0f"); }
+    if (m == 2) { put(t, "38"); }
+    if (m == 3) { put(t, "3a"); }
+    put_hex(t, op);
+}
+
+fun lower(a: *A.Allocator, s: str) str {
+    val got: res[str, StrError] = str_to_lower(a, s);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# the key of `r`: its ICLASS and its operands in lower case, its opcode and digit, its operand size and its width, as
+# add_gpr32_imm8_83r0_o32_w64
+fun key_of(a: *A.Allocator, r: *Row) str {
+    var t: Text = text(a);
+    put(?t, lower(a, r.ins.iclass));
+    var i: usize = 0;
+    for (i < r.form.operands.len) {
+        val o: *forms.Operand = ?r.form.operands.data[i];
+        put(?t, "_");
+        if (o.what == forms.REGISTER) {
+            if (o.place == forms.FIXED) { put(?t, o.fixed.name); }
+            or                          { put(?t, o.classes[0].class); }
+        }
+        or (o.what == forms.MEMORY) {
+            put(?t, "mem");
+            put_number(?t, o.width::u64);
+        }
+        or (o.what == forms.AGEN) { put(?t, "agen"); }
+        or (o.what == forms.MOFFS) {
+            put(?t, "moffs");
+            put_number(?t, o.width::u64);
+        }
+        or (o.what == forms.IMM) {
+            put(?t, "imm");
+            put_number(?t, o.taken.bits::u64);
+        }
+        or {
+            put(?t, "rel");
+            put_number(?t, o.taken.bits::u64);
+        }
+        i = i + 1;
+    }
+    put(?t, "_");
+    put_opcode(?t, r.form.map, r.form.opcode);
+    if (r.form.digit != forms.NO_DIGIT) {
+        put(?t, "r");
+        put_number(?t, r.form.digit::u64);
+    }
+    if (r.size != x86_opcode.NO_SIZE) {
+        put(?t, "_o");
+        put_number(?t, size_bits(r.size)::u64);
+    }
+    put(?t, "_w");
+    put_number(?t, forms.width_of(r.mode)::u64);
+    ret done(?t);
+}
+
+# the bytes a memory operand's displacement takes at width `w` for the encoding's length: 2 in 16-bit code and 4
+# otherwise, so an absolute address ranks as a0 to a3's address does against ModRM's
+fun disp_bytes(mode: u8) u32 {
+    if (mode == 0) { ret 2; }
+    ret 4;
+}
+
+# the bytes `r` encodes to
+fun length_of(r: *Row) u32 {
+    val w:   u8  = forms.width_of(r.mode);
+    var len: u32 = 1;
+    if (r.form.map == 1)                                                                { len = len + 1; }
+    if (r.form.map >= 2)                                                                { len = len + 2; }
+    if ((r.size == x86_opcode.O16 && w != 16) || (r.size == x86_opcode.O32 && w == 16)) { len = len + 1; }
+    if (r.size == x86_opcode.O64 && (r.flags & x86_opcode.DEFAULT_64) == 0)             { len = len + 1; }
+    if (r.form.locked)                                                                  { len = len + 1; }
+    if (r.form.modrm)                                                                   { len = len + 1; }
+    var i: usize = 0;
+    for (i < r.form.operands.len) {
+        val o: *forms.Operand = ?r.form.operands.data[i];
+        if (o.what == forms.MEMORY || o.what == forms.AGEN)                           { len = len + disp_bytes(r.mode); }
+        if (o.what == forms.IMM || o.what == forms.RELATIVE || o.what == forms.MOFFS) { len = len + o.taken.bits::u32 / 8; }
+        i = i + 1;
+    }
+    ret len;
+}
+
+# whether row `r` encodes an operand size its width's code does not default to, which 66 overrides it to: 16 bits in
+# 32-bit and 64-bit code, 32 in 16-bit code
+fun overriding(r: *Row) bool {
+    if (r.size == x86_opcode.O16) { ret r.mode != 0; }
+    if (r.size == x86_opcode.O32) { ret r.mode == 0; }
+    ret false;
+}
+
+# the order of two rows: their width, then a row of the width's operand size before one 66 overrides it in, then the
+# shorter encoding, then a rm-from-reg form before its twin, then XED's order
+fun by_preference(x: **Row, y: **Row) i64 {
+    val a: *Row = @x;
+    val b: *Row = @y;
+    if (a.mode != b.mode) { ret a.mode::i64 - b.mode::i64; }
+    val oa: bool = overriding(a);
+    val ob: bool = overriding(b);
+    if (oa && !ob)            { ret 1; }
+    if (ob && !oa)            { ret -1; }
+    if (a.length != b.length) { ret a.length::i64 - b.length::i64; }
+    val la: bool = (a.flags & x86_opcode.LOAD) != 0;
+    val lb: bool = (b.flags & x86_opcode.LOAD) != 0;
+    if (la && !lb)          { ret 1; }
+    if (lb && !la)          { ret -1; }
+    if (a.index != b.index) { ret a.index::i64 - b.index::i64; }
+    ret str_compare(a.key, b.key);
+}
+
+# the spelling of a register-to-register form for finding its twin: its ICLASS, width, size and each operand's class
+# and role, in operand order, with the places of its two operands swapped when `swap`
+fun twin_text(a: *A.Allocator, r: *Row, swap: bool) str {
+    var t: Text = text(a);
+    put(?t, r.ins.iclass);
+    put(?t, "|");
+    put_number(?t, r.mode::u64);
+    put(?t, "|");
+    put_number(?t, r.size::u64);
+    var i: usize = 0;
+    for (i < r.form.operands.len) {
+        val o: *forms.Operand = ?r.form.operands.data[i];
+        put(?t, "|");
+        put(?t, o.classes[0].class);
+        put(?t, ",");
+        put_number(?t, o.role::u64);
+        var place: forms.Place = o.place;
+        if (swap && place == forms.RM)  { place = forms.REG; }
+        or (swap && place == forms.REG) { place = forms.RM; }
+        put(?t, ",");
+        put_number(?t, place::u64);
+        i = i + 1;
+    }
+    ret done(?t);
+}
+
+# whether `r` is a register-to-register form of two operands, one in ModRM.rm and one in ModRM.reg
+fun two_way(r: *Row) bool {
+    if (!r.form.modrm || !r.form.direct || r.form.operands.len != 2) { ret false; }
+    val p0: forms.Place = r.form.operands.data[0].place;
+    val p1: forms.Place = r.form.operands.data[1].place;
+    ret (p0 == forms.RM && p1 == forms.REG) || (p0 == forms.REG && p1 == forms.RM);
+}
+
+# the twins among `rows` marked: the one whose first operand is in ModRM.rm STORE, the other LOAD
+fun directions(a: *A.Allocator, rows: *vector.Vector[*Row]) err[diag.Refusal] {
+    var by: map.Map[str, u32] = map.init[str, u32](a);
+    var i:  usize             = 0;
+    for (i < rows.len) {
+        if (two_way(rows.data[i])) {
+            val put_in: res[bool, A.Error] = map.insert[str, u32](?by, twin_text(a, rows.data[i], false), i::u32);
+            if (sel put_in.err) { ret err[diag.Refusal].err{memory(rows.data[i].key)}; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < rows.len) {
+        val r: *Row = rows.data[i];
+        if (two_way(r)) {
+            var other: str       = twin_text(a, r, true);
+            val found: opt[*u32] = map.get[str, u32](?by, ?other);
+            if (sel found.some && @found.some != i::u32) {
+                if (r.form.operands.data[0].place == forms.RM) { r.flags = r.flags | x86_opcode.STORE; }
+                or                                             { r.flags = r.flags | x86_opcode.LOAD; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# one line of the mnemonics topic, read
+rec Spelling {
+    fact:   *overlay.Fact;
+    iclass: str;
+    opcode: str;
+    size:   u8;
+    width:  u8;
+    used:   bool;
+}
+
+# whether spelling `s` names row `r`
+fun names(a: *A.Allocator, s: *Spelling, r: *Row) bool {
+    if (!str_equals(s.iclass, r.ins.iclass))               { ret false; }
+    if (s.size != 0xFF && s.size != r.size)                { ret false; }
+    if (s.width != 0 && s.width != forms.width_of(r.mode)) { ret false; }
+    if (s.opcode != nil) {
+        var t: Text = text(a);
+        put_opcode(?t, r.form.map, r.form.opcode);
+        if (!str_equals(done(?t), s.opcode)) { ret false; }
+    }
+    ret true;
+}
+
+# the line `f` of the mnemonics topic read
+fun spelling(a: *A.Allocator, f: *overlay.Fact) res[Spelling, diag.Refusal] {
+    var l:    overlay.Line;
+    val read: err[diag.Refusal] = overlay.line(a, f, ?l);
+    if (sel read.err)                    { ret res[Spelling, diag.Refusal].err{read.err}; }
+    if (l.key.len == 0 || l.ws.len != 1) { ret res[Spelling, diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    var s: Spelling = Spelling{fact: f, iclass: l.key.data[0], opcode: nil, size: 0xFF, width: 0, used: false};
+    if (!in_slice(s.iclass)) { ret res[Spelling, diag.Refusal].err{overlay.refuse(f, NO_ROW, s.iclass)}; }
+    var i: usize = 1;
+    for (i < l.key.len) {
+        val w: str = l.key.data[i];
+        if (str_starts_with(w, "op=")) { s.opcode = ?w[3]; }
+        or (str_starts_with(w, "size=")) {
+            val v: str = ?w[5];
+            if (str_equals(v, "o16")) { s.size = x86_opcode.O16; }
+            or (str_equals(v, "o32")) { s.size = x86_opcode.O32; }
+            or (str_equals(v, "o64")) { s.size = x86_opcode.O64; }
+            or                        { ret res[Spelling, diag.Refusal].err{overlay.refuse(f, BAD_FACT, w)}; }
+        }
+        or (str_starts_with(w, "width=")) {
+            val v: str = ?w[6];
+            if (str_equals(v, "16")) { s.width = 16; }
+            or (str_equals(v, "32")) { s.width = 32; }
+            or (str_equals(v, "64")) { s.width = 64; }
+            or                       { ret res[Spelling, diag.Refusal].err{overlay.refuse(f, BAD_FACT, w)}; }
+        }
+        or { ret res[Spelling, diag.Refusal].err{overlay.refuse(f, BAD_FACT, w)}; }
+        i = i + 1;
+    }
+    ret res[Spelling, diag.Refusal].ok{s};
+}
+
+# what XED states a mnemonics line's rows are spelled: the ICLASS in lower case
+fun spelled(ctx: ptr, f: *overlay.Fact) opt[str] {
+    val a:   *A.Allocator      = ctx::*A.Allocator;
+    var l:   overlay.Line;
+    val got: err[diag.Refusal] = overlay.line(a, f, ?l);
+    if (sel got.err || l.key.len == 0) { ret opt[str].none{}; }
+    val low: str = lower(a, l.key.data[0]);
+    if (low == nil) { ret opt[str].none{}; }
+    ret opt[str].some{low};
+}
+
+# each row's mnemonic: its ICLASS in lower case, or the one line of `t` that names it
+fun mnemonics(a: *A.Allocator, t: *overlay.Topic, rows: *vector.Vector[*Row]) err[diag.Refusal] {
+    val checked: err[diag.Refusal] = overlay.check(t, a::ptr, spelled);
+    if (sel checked.err) { ret checked; }
+    var lines_read: vector.Vector[Spelling] = vector.init[Spelling](a);
+    var i:          usize                   = 0;
+    for (i < t.facts.len) {
+        val s: res[Spelling, diag.Refusal] = spelling(a, ?t.facts.data[i]);
+        if (sel s.err)                                         { ret err[diag.Refusal].err{s.err}; }
+        if (!pushed(vector.push[Spelling](?lines_read, s.ok))) { ret err[diag.Refusal].err{memory(MNEMONICS_TOPIC)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < rows.len) {
+        val r: *Row = rows.data[i];
+        r.mnemonic = lower(a, r.ins.iclass);
+        var named_by: *Spelling = nil;
+        var k:        usize     = 0;
+        for (k < lines_read.len) {
+            val s: *Spelling = ?lines_read.data[k];
+            if (names(a, s, r)) {
+                if (named_by != nil) { ret err[diag.Refusal].err{overlay.refuse(s.fact, TWO_FACTS, r.key)}; }
+                named_by = s;
+            }
+            k = k + 1;
+        }
+        if (named_by != nil) {
+            r.mnemonic    = named_by.fact.fact;
+            named_by.used = true;
+        }
+        if (r.mnemonic == nil) { ret err[diag.Refusal].err{memory(r.key)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < lines_read.len) {
+        if (!lines_read.data[i].used) { ret err[diag.Refusal].err{overlay.refuse(lines_read.data[i].fact, NO_ROW, lines_read.data[i].fact.key)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun upper(a: *A.Allocator, s: str) str {
+    val got: res[str, StrError] = str_to_upper(a, s);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# the rows of the slice: every slice instruction of XED's legacy space evaluated at each width, its agreeing
+# configurations made rows, sized, keyed, spelled and put in the encoder's order
+# ---
+# a:   allocator for the rows
+# r:   the evaluation's reader
+# t:   the mnemonics topic
+# out: the rows, in order
+pub fun build(a: *A.Allocator, r: *forms.Reader, t: *overlay.Topic, out: *vector.Vector[*Row]) err[diag.Refusal] {
+    val x:    *xed.Xed = r.xed;
+    var mode: u8       = 0;
+    for (mode < 3) {
+        val all:    vector.Vector[forms.Config] = forms.configs(a, mode);
+        var groups: vector.Vector[Group]        = vector.init[Group](a);
+        var by:     map.Map[str, u32]           = map.init[str, u32](a);
+        var i:      usize                       = 0;
+        for (i < x.instructions.len) {
+            val ins: *xed.instruction.Instruction = ?x.instructions.data[i];
+            if (str_equals(ins.table, LEGACY_TABLE) && in_slice(ins.iclass)) {
+                val set: str   = upper(a, ins.isa_set);
+                var c:   usize = 0;
+                for (c < all.len) {
+                    val got: res[forms.Form, diag.Refusal] = forms.form(r, ins, all.data[c]);
+                    if (sel got.err) { ret err[diag.Refusal].err{got.err}; }
+                    if (got.ok.admitted) {
+                        var f:     forms.Form = got.ok;
+                        var spell: str        = content(a, ins, set, ?f);
+                        if (spell == nil || set == nil) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
+                        val at: opt[*u32] = map.get[str, u32](?by, ?spell);
+                        var g:  *Group    = nil;
+                        if (sel at.some) { g = ?groups.data[@at.some]; }
+                        or {
+                            val made: Group = Group{ins: ins, index: i::u32, content: spell, set: set, form: f, configs: vector.init[forms.Config](a), eosz: f.eosz, eoszs: 0};
+                            if (!pushed(vector.push[Group](?groups, made))) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
+                            val put_in: res[bool, A.Error] = map.insert[str, u32](?by, spell, (groups.len - 1)::u32);
+                            if (sel put_in.err) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
+                            g = ?groups.data[groups.len - 1];
+                        }
+                        if (g.configs.len > 0) {
+                            var k: usize = 0;
+                            for (k < f.operands.len) {
+                                val o: *forms.Operand = ?f.operands.data[k];
+                                if (o.what == forms.REGISTER && o.place != forms.FIXED) {
+                                    val joined: err[diag.Refusal] = forms.join(?g.form.operands.data[k], o, ?ins.line);
+                                    if (sel joined.err) { ret joined; }
+                                }
+                                k = k + 1;
+                            }
+                        }
+                        g.eosz  = f.eosz;
+                        g.eoszs = g.eoszs | (1::u8 << f.eosz);
+                        if (!pushed(vector.push[forms.Config](?g.configs, all.data[c]))) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
+                    }
+                    c = c + 1;
+                }
+            }
+            i = i + 1;
+        }
+        i = 0;
+        for (i < groups.len) {
+            val g:     *Group = ?groups.data[i];
+            var size:  u8     = 0;
+            var flags: u16    = 0;
+            if (!sizing(g, ?all, ?size, ?flags)) { ret err[diag.Refusal].err{diag.refusal(g.ins.line.file, g.ins.line.number, NO_SIZES, g.ins.iclass)}; }
+            if (g.form.locked)                   { flags = flags | x86_opcode.LOCKED; }
+            val got: res[*Row, A.Error] = A.allocate[Row](a, 1);
+            if (sel got.err) { ret err[diag.Refusal].err{memory(g.ins.iclass)}; }
+            val row: *Row = got.ok;
+            @row       = Row{ins: g.ins, index: g.index, mode: mode, size: size, flags: flags, form: g.form, configs: g.configs, set: g.set, key: nil, mnemonic: nil, length: 0};
+            row.key    = key_of(a, row);
+            row.length = length_of(row);
+            if (row.key == nil)                       { ret err[diag.Refusal].err{memory(g.ins.iclass)}; }
+            if (!pushed(vector.push[*Row](out, row))) { ret err[diag.Refusal].err{memory(g.ins.iclass)}; }
+            i = i + 1;
+        }
+        mode = mode + 1;
+    }
+    var keys: map.Map[str, u32] = map.init[str, u32](a);
+    var i:    usize             = 0;
+    for (i < out.len) {
+        val k: str = out.data[i].key;
+        if (map.contains[str, u32](?keys, ?k)) { ret err[diag.Refusal].err{diag.refusal(out.data[i].ins.line.file, out.data[i].ins.line.number, TWO_ROWS, k)}; }
+        val put_in: res[bool, A.Error] = map.insert[str, u32](?keys, k, i::u32);
+        if (sel put_in.err) { ret err[diag.Refusal].err{memory(k)}; }
+        i = i + 1;
+    }
+    val twins: err[diag.Refusal] = directions(a, out);
+    if (sel twins.err) { ret twins; }
+    sort.sort_by[*Row](out.data, out.len, by_preference);
+    ret mnemonics(a, t, out);
+}

@@ -1,0 +1,140 @@
+# the x86 decode dispatch keys, read from the keys topic and written as gen_key
+#
+# each line of gen/data/x86/keys.txt is a key, `key <name> | lo=<bit> len=<bits>`, in the order the dispatch prefers
+# them, over masc's one-word match space of what tells x86 rows apart. a key's name is the field it reads, one of the
+# fields the row generator states a row's cubes over (FIELDS), and masc reads it by the reader of that name in its key
+# module, so gen_key binds each to `x86_key.<name>`. the generator builds the dispatch over the keys in process and
+# writes their names and readers in order.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use gen.diag;
+use gen.dispatch;
+use gen.emit;
+use gen.overlay;
+use gen.set;
+
+pub val TOPIC: str = "keys";
+
+pub val BAD_KEY: str = "keys line is not `key <name> | lo=<bit> len=<bits>`";
+pub val WIDE:    str = "key reads past the match word's 64 bits";
+pub val NO_KEYS: str = "keys topic states no key";
+pub val UNNAMED: str = "key names no field the row generator states cubes over";
+pub val OVERLAP: str = "key's bits overlap another key's, or it is stated twice";
+pub val MISSING: str = "a field the row generator states cubes over has no key";
+
+# the fields of the match word, each the name of its key and of masc's reader of it
+pub val MAP:    u32 = 0;
+pub val OPCODE: u32 = 1;
+pub val MODE:   u32 = 2;
+pub val DIRECT: u32 = 3;
+pub val REG:    u32 = 4;
+pub val OSZ:    u32 = 5;
+pub val W:      u32 = 6;
+pub val REX2:   u32 = 7;
+pub val REP:    u32 = 8;
+
+pub val FIELD_COUNT: u32 = 9;
+
+pub val FIELDS: [FIELD_COUNT]str = [FIELD_COUNT]str{"map", "opcode", "mode", "direct", "reg", "osz", "w", "rex2", "rep"};
+
+# the keys in preference order, and each field's key
+pub rec Keys {
+    keys:  vector.Vector[dispatch.Key];
+    field: [FIELD_COUNT]dispatch.Key;
+}
+
+fun field_of(name: str) opt[u32] {
+    var i: u32 = 0;
+    for (i < FIELD_COUNT) {
+        if (str_equals(FIELDS[i], name)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun ones(len: u8) u64 {
+    if (len >= 64) { ret ~0::u64; }
+    ret (1::u64 << len::u64) - 1;
+}
+
+# the keys topic `t` read into `out`
+pub fun read(a: *A.Allocator, t: *overlay.Topic, out: *Keys) err[diag.Refusal] {
+    out.keys = vector.init[dispatch.Key](a);
+    val checked: err[diag.Refusal] = overlay.check(t, nil, overlay.unstated);
+    if (sel checked.err) { ret checked; }
+    var used: u64   = 0;
+    var seen: u32   = 0;
+    var i:    usize = 0;
+    for (i < t.facts.len) {
+        val f: *overlay.Fact = ?t.facts.data[i];
+        val k: str           = f.key;
+        if (str_len(k) < 5 || k[0] != 'k' || k[1] != 'e' || k[2] != 'y' || k[3] != ' ') { ret err[diag.Refusal].err{overlay.refuse(f, BAD_KEY, k)}; }
+        val name:  str      = ?k[4];
+        val which: opt[u32] = field_of(name);
+        if (sel which.none) { ret err[diag.Refusal].err{overlay.refuse(f, UNNAMED, name)}; }
+        val ws: res[vector.Vector[str], diag.Refusal] = overlay.words(a, f, f.fact);
+        if (sel ws.err)     { ret err[diag.Refusal].err{ws.err}; }
+        if (ws.ok.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_KEY, f.fact)}; }
+        val lo:  opt[str] = overlay.value(?ws.ok, "lo");
+        val len: opt[str] = overlay.value(?ws.ok, "len");
+        if (sel lo.none)  { ret err[diag.Refusal].err{overlay.refuse(f, BAD_KEY, f.fact)}; }
+        if (sel len.none) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_KEY, f.fact)}; }
+        val l: res[i64, diag.Refusal] = overlay.number(f, lo.some);
+        val n: res[i64, diag.Refusal] = overlay.number(f, len.some);
+        if (sel l.err)                                { ret err[diag.Refusal].err{l.err}; }
+        if (sel n.err)                                { ret err[diag.Refusal].err{n.err}; }
+        if (l.ok < 0 || n.ok < 1 || l.ok + n.ok > 64) { ret err[diag.Refusal].err{overlay.refuse(f, WIDE, name)}; }
+        val bits: u64 = ones(n.ok::u8) << l.ok::u64;
+        if ((used & bits) != 0 || ((seen >> which.some) & 1) != 0) { ret err[diag.Refusal].err{overlay.refuse(f, OVERLAP, name)}; }
+        used = used | bits;
+        seen = seen | (1::u32 << which.some);
+        val key: dispatch.Key = dispatch.Key{name: FIELDS[which.some], word: 0, lo: l.ok::u8, len: n.ok::u8};
+        out.field[which.some] = key;
+        val pushed: res[usize, A.Error] = vector.push[dispatch.Key](?out.keys, key);
+        if (sel pushed.err) { ret err[diag.Refusal].err{overlay.refuse(f, diag.MEMORY, nil)}; }
+        i = i + 1;
+    }
+    if (out.keys.len == 0)                   { ret err[diag.Refusal].err{diag.refusal(t.path, 0, NO_KEYS, nil)}; }
+    if (seen != (1::u32 << FIELD_COUNT) - 1) { ret err[diag.Refusal].err{diag.refusal(t.path, 0, MISSING, nil)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# field `which` of the match word fixed to `v` in the cube `value` and `mask`
+pub fun fix(ks: *Keys, which: u32, v: u64, value: *u64, mask: *u64) {
+    val k:    *dispatch.Key = ?ks.field[which];
+    val bits: u64           = ones(k.len) << k.lo::u64;
+    @value = (@value & ~bits) | ((v << k.lo::u64) & bits);
+    @mask  = @mask | bits;
+}
+
+# the keys written as gen_key: each key's name and masc's reader of it, in preference order
+pub fun generate(c: *set.Context, ks: *Keys) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "key");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "masc.core.dispatch");
+    emit.uses(f, "x86_key: masc.isa.x86.key");
+    val keys: *emit.Array = emit.array(f, "dispatch.Key");
+    var i:    usize       = 0;
+    for (i < ks.keys.len) {
+        val k: *dispatch.Key = ?ks.keys.data[i];
+        val r: *emit.Record  = emit.record(f, "dispatch.Key");
+        emit.member(f, r, "name", emit.Value.text{k.name});
+        emit.member(f, r, "extract", emit.Value.name{emit.concat(f, "x86_key.", k.name)});
+        emit.item(f, keys, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare(f, "KEYS", nil, emit.Value.array{keys});
+    emit.declare(f, "KEY_COUNT", "u32", emit.Value.number{ks.keys.len::i64});
+    ret err[diag.Refusal].ok{};
+}
