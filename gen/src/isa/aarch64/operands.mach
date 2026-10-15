@@ -2,24 +2,13 @@
 #
 # the model states an operand symbol's text and the fields it is encoded in, never what the text means, so the topic
 # gen/data/aarch64/operands.txt states it, one line for each rule the model's instructions use as an operand, keyed by
-# the rule's id. the model dedups its rules on their full meaning, so one id is one meaning wherever it appears:
+# the rule's id. the model dedups its rules on their full meaning, so one id is one meaning wherever it appears. the
+# file's header states the grammar of each line: register, immediate, relative, choice, element, role and withheld
+# lines. a register or immediate states its number as an expression of its fields where the fields alone do not hold
+# it, so the mapping reads the number over each row's free bits rather than this reader shaping it.
 #
-#   register <rule> | class=<classes> role=<role> [first=<n>]
-#     a register named by the bits of its fields, a member of the first class, or the last where the text is the
-#     choice of the class's one name and the numbered text, as `(XZR|X{UInteger})` names xzr by 31. `first` is the
-#     number the encoded zero names, as w12 for MOVA's `Rs plus 12`
-#   immediate <rule> | <unsigned|signed> [scale=<n>] [bias=<n>]
-#     a number held by the bits of its fields the row leaves free, `scale` low zero bits no field holds and `bias`
-#     added to the encoded bits
-#   choice <rule> | <rows|enumerant> <member>=<bits> ...
-#     a choice of texts, each member by the text it spells and the bits of the choice's fields it encodes, from the
-#     high bit, `x` for a bit it leaves to another operand and `:` separating fields for reading. a choice of `rows`
-#     makes one row of each member, as an element size that decides other operands' widths does, and an
-#     `enumerant` is one operand of its members' values
-#   element <specifier> | bits=<n> [lanes=<n>]
-#     the width of each element a register written with `.<specifier>` holds, and how many it holds
-#
-# a role is read, write, read-write or none. the model states nothing any line states, so no line overrides it.
+# a role is read, write, read-write or none. a register line states its rule's role, and a role line an
+# instruction's own where it differs. the model states nothing any line states, so no line overrides it.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -33,6 +22,7 @@ use std.types.string.str;
 use std.types.string.str_copy_slice;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 use std.collections.map;
@@ -41,60 +31,130 @@ use std.collections.vector;
 use masc.core.operand;
 
 use gen.diag;
+use gen.isa.aarch64.expr;
 use topic: gen.overlay;
 use gen.source;
 
 pub val TOPIC: str = "operands";
 
-pub val BAD_KIND:    str = "operands line is no register, immediate, choice or element";
+pub val BAD_KIND:    str = "operands line is no register, immediate, relative, choice, element, role, fixed or withheld";
 pub val BAD_ROLE:    str = "role is not read, write, read-write or none";
-pub val BAD_SIGN:    str = "immediate is neither unsigned nor signed";
-pub val BAD_CHOICE:  str = "choice is neither rows nor enumerant";
+pub val BAD_SIGN:    str = "immediate is not unsigned, signed, float8 or bitmask";
+pub val BAD_CHOICE:  str = "choice is not rows, enumerant, mask or one";
+pub val BAD_EXPR:    str = "expression of the line does not read";
+pub val BAD_CUBE:    str = "by cube is not `<bits>=<expr>` over the by fields";
 pub val BAD_MEMBER:  str = "choice member is not `<text>=<bits>`";
 pub val BAD_PATTERN: str = "member bits are not 0, 1 and x";
-pub val TWICE:       str = "operand rule or specifier stated twice";
+pub val BAD_RANGE:   str = "range is not `<lo>,<hi>` with lo at most hi";
+pub val NO_DEFAULT:  str = "choice default names no member";
+pub val TWICE:       str = "operand rule, specifier or instruction stated twice";
 
 # how an operand rule is used
 pub def Use: u8;
 
 pub val REGISTER:  Use = 0;
 pub val IMMEDIATE: Use = 1;
-pub val CHOICE:    Use = 2;
+pub val RELATIVE:  Use = 2;
+pub val CHOICE:    Use = 3;
+pub val ONE:       Use = 4;
+
+# what an immediate's bits hold
+# ---
+# NUMBER:  a number
+# FLOAT8:  the 8-bit floating-point immediate, a sign, 3-bit exponent and 4-bit fraction
+# BITMASK: the logical immediate N:immr:imms
+pub def Kind: u8;
+
+pub val NUMBER:  Kind = 0;
+pub val FLOAT8:  Kind = 1;
+pub val BITMASK: Kind = 2;
+
+# how a choice is one operand or many rows
+# ---
+# ROWS:      a row of each member
+# ENUMERANT: one operand of the members' values
+# MASK:      one operand of any union of the members' bits
+pub def How: u8;
+
+pub val ROWS:      How = 0;
+pub val ENUMERANT: How = 1;
+pub val MASK:      How = 2;
+
+# a role as the topic states it
+pub def Role: u8;
+
+pub val READ:       Role = 0;
+pub val WRITE:      Role = 1;
+pub val READ_WRITE: Role = 2;
+pub val NONE:       Role = 3;
+pub val UNSTATED:   Role = 4;
 
 # one member of a choice
 # ---
-# text: the text it spells, as the model writes it
-# bits: the bits of the choice's fields it encodes, from the high bit, `x` for a bit it leaves
+# text:  the text it spells, as the model writes it, or for a choice the model encodes in no field the rule of its
+#        branch
+# cubes: the bits of the choice's fields it encodes, from the high bit, `x` for a bit it leaves, one pattern per cube
 pub rec Member {
-    text: str;
-    bits: str;
+    text:  str;
+    cubes: vector.Vector[str];
+}
+
+# a number by the bits of other fields: the bits, from the high bit of the by fields, and the number under them
+pub rec Cube {
+    bits:  str;
+    value: expr.Expr;
 }
 
 # what one operand rule is
 # ---
-# rule:    the rule's id
-# use:     how it is used
-# fact:    its line, for refusals
-# classes: a register's classes by name, the numbered class first
-# role:    a register's role
-# first:   the number a register's encoded zero names
-# sign:    an immediate's sign
-# scale:   an immediate's low zero bits
-# bias:    added to an immediate's encoded bits
-# rows:    whether a choice makes one row of each member
-# members: a choice's members, in the line's order
+# rule:      the rule's id
+# use:       how it is used
+# fact:      its line, for refusals
+# classes:   a register's classes by name, the numbered class first
+# role:      a register's role
+# valued:    whether `value` states the number, false for its fields' bits alone
+# value:     a register's number, an immediate's value or a relative target's offset
+# step:      the stride of the numbers a register admits, 1 for every number
+# by:        the fields whose bits choose among `cubes`, empty for none
+# cubes:     the number under each pattern of the by fields
+# kind:      what an immediate's bits hold
+# sign:      an immediate's sign
+# ranged:    whether `lo` and `hi` bound an immediate's values
+# lo:        the least value a ranged immediate admits
+# hi:        the most
+# defaulted: whether an immediate has a value its left out text takes
+# default:   that value
+# page:      whether a relative target's offset is from the instruction's 4KB page
+# how:       how a choice is used
+# fields:    the field a choice of branches is by, empty for a choice the model encodes
+# members:   a choice's members, in the line's order
+# omitted:   the member an enumerant takes where its text is left out, or the register a register takes, by name, nil
+#            for none
+# one:       the rule a choice of branches is one operand of, nil for none
 pub rec Fact {
-    rule:    str;
-    use:     Use;
-    fact:    *topic.Fact;
-    classes: vector.Vector[str];
-    role:    operand.Role;
-    first:   u32;
-    sign:    operand.Sign;
-    scale:   u8;
-    bias:    i64;
-    rows:    bool;
-    members: vector.Vector[Member];
+    rule:      str;
+    use:       Use;
+    fact:      *topic.Fact;
+    classes:   vector.Vector[str];
+    role:      Role;
+    valued:    bool;
+    value:     expr.Expr;
+    step:      u32;
+    by:        vector.Vector[str];
+    cubes:     vector.Vector[Cube];
+    kind:      Kind;
+    sign:      operand.Sign;
+    ranged:    bool;
+    lo:        i64;
+    hi:        i64;
+    defaulted: bool;
+    default:   i64;
+    page:      bool;
+    how:       How;
+    fields:    vector.Vector[str];
+    members:   vector.Vector[Member];
+    omitted:   str;
+    one:       str;
 }
 
 # an element specifier
@@ -104,17 +164,49 @@ pub rec Element {
     lanes: u8;
 }
 
+# a role line's role for one rule
+pub rec Roled {
+    rule: str;
+    role: Role;
+}
+
+# the role lines of one instruction
+pub rec Roles {
+    instruction: str;
+    fact:        *topic.Fact;
+    roles:       vector.Vector[Roled];
+}
+
 # the topic as read
 # ---
-# facts:      every operand rule's fact, in file order
-# rules:      each fact's index by its rule
-# elements:   every specifier
-# specifiers: each specifier's index by its name
+# facts:        every operand rule's fact, in file order
+# rules:        each fact's index by its rule
+# elements:     every specifier
+# specifiers:   each specifier's index by its name
+# roles:        every role line
+# instructions: each role line's index by its instruction
+# fixed:        each instruction's fixed lines, by name
+# withheld:     every withheld instruction, by name, with the index of its line in `reasons`
+# reasons:      each withheld line
 pub rec Operands {
-    facts:      vector.Vector[Fact];
-    rules:      map.Map[str, u32];
-    elements:   vector.Vector[Element];
-    specifiers: map.Map[str, u32];
+    facts:        vector.Vector[Fact];
+    rules:        map.Map[str, u32];
+    elements:     vector.Vector[Element];
+    specifiers:   map.Map[str, u32];
+    roles:        vector.Vector[Roles];
+    instructions: map.Map[str, u32];
+    fixed:        map.Map[str, vector.Vector[Fixed]];
+    withheld:     map.Map[str, u32];
+    reasons:      vector.Vector[*topic.Fact];
+}
+
+# a field an instruction's decode refuses every other value of, which no operand holds
+# ---
+# field: the field
+# bits:  its one value, from the high bit
+pub rec Fixed {
+    field: str;
+    bits:  str;
 }
 
 fun fits(r: res[usize, A.Error]) bool {
@@ -137,25 +229,23 @@ fun memory(l: *topic.Line) err[diag.Refusal] {
     ret reject(l, diag.MEMORY, nil);
 }
 
-fun role(l: *topic.Line, out: *operand.Role) err[diag.Refusal] {
-    var w:      str               = nil;
-    val needed: err[diag.Refusal] = topic.needed(l, "role", ?w);
-    if (sel needed.err)              { ret needed; }
-    if (str_equals(w, "read"))       { @out = operand.READ; }
-    or (str_equals(w, "write"))      { @out = operand.WRITE; }
-    or (str_equals(w, "read-write")) { @out = operand.READ_WRITE; }
-    or (str_equals(w, "none"))       { @out = operand.NONE; }
+# the role `w` names
+fun role_of(l: *topic.Line, w: str, out: *Role) err[diag.Refusal] {
+    if (str_equals(w, "read"))       { @out = READ; }
+    or (str_equals(w, "write"))      { @out = WRITE; }
+    or (str_equals(w, "read-write")) { @out = READ_WRITE; }
+    or (str_equals(w, "none"))       { @out = NONE; }
     or                               { ret reject(l, BAD_ROLE, w); }
     ret err[diag.Refusal].ok{};
 }
 
-# the classes of `text`, split on commas
-fun classes(a: *A.Allocator, l: *topic.Line, text: str, out: *vector.Vector[str]) err[diag.Refusal] {
+# the words of `text` split on `sep`
+fun split(a: *A.Allocator, l: *topic.Line, text: str, sep: u8, out: *vector.Vector[str]) err[diag.Refusal] {
     val len:  usize = str_len(text);
     var from: usize = 0;
     var i:    usize = 0;
     for (i <= len) {
-        if (i == len || text[i] == ',') {
+        if (i == len || text[i] == sep) {
             val got: res[str, StrError] = str_copy_slice(a, text, from, i - from);
             if (sel got.err)                          { ret memory(l); }
             if (!fits(vector.push[str](out, got.ok))) { ret memory(l); }
@@ -166,7 +256,28 @@ fun classes(a: *A.Allocator, l: *topic.Line, text: str, out: *vector.Vector[str]
     ret err[diag.Refusal].ok{};
 }
 
-# a member `<text>=<bits>`, its `:` separators taken out of its bits
+# the first `len` bits of `w` with its `:` separators taken out, refused when they hold other than 0, 1 and x
+fun pattern(a: *A.Allocator, l: *topic.Line, w: str, len: usize, out: *str) err[diag.Refusal] {
+    val got: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel got.err) { ret memory(l); }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = w[i];
+        if (c == '0' || c == '1' || c == 'x') {
+            got.ok[n] = c;
+            n         = n + 1;
+        }
+        or (c != ':') { ret reject(l, BAD_PATTERN, w); }
+        i = i + 1;
+    }
+    if (n == 0) { ret reject(l, BAD_PATTERN, w); }
+    got.ok[n] = 0;
+    @out      = got.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+# a member `<text>=<bits>[,<bits>]`, the last `=` dividing them
 fun member(a: *A.Allocator, l: *topic.Line, w: str, out: *vector.Vector[Member]) err[diag.Refusal] {
     val len: usize = str_len(w);
     var eq:  usize = len;
@@ -177,22 +288,20 @@ fun member(a: *A.Allocator, l: *topic.Line, w: str, out: *vector.Vector[Member])
     }
     if (eq == len || eq + 1 == len) { ret reject(l, BAD_MEMBER, w); }
     val text: res[str, StrError] = str_copy_slice(a, w, 0, eq);
-    val got:  res[*u8, A.Error]  = A.allocate[u8](a, len - eq);
     if (sel text.err) { ret memory(l); }
-    if (sel got.err)  { ret memory(l); }
-    var n: usize = 0;
-    i = eq + 1;
-    for (i < len) {
-        val c: u8 = w[i];
-        if (c == '0' || c == '1' || c == 'x') {
-            got.ok[n] = c;
-            n         = n + 1;
-        }
-        or (c != ':') { ret reject(l, BAD_PATTERN, w); }
+    var words: vector.Vector[str] = vector.init[str](a);
+    val parts: err[diag.Refusal]  = split(a, l, ?w[eq + 1], ',', ?words);
+    if (sel parts.err) { ret parts; }
+    var m: Member = Member{text: text.ok, cubes: vector.init[str](a)};
+    i = 0;
+    for (i < words.len) {
+        var bits: str               = nil;
+        val read: err[diag.Refusal] = pattern(a, l, words.data[i], str_len(words.data[i]), ?bits);
+        if (sel read.err)                            { ret read; }
+        if (!fits(vector.push[str](?m.cubes, bits))) { ret memory(l); }
         i = i + 1;
     }
-    got.ok[n] = 0;
-    if (!fits(vector.push[Member](out, Member{text: text.ok, bits: got.ok}))) { ret memory(l); }
+    if (!fits(vector.push[Member](out, m))) { ret memory(l); }
     ret err[diag.Refusal].ok{};
 }
 
@@ -203,67 +312,245 @@ fun number(l: *topic.Line, w: str, out: *i64) err[diag.Refusal] {
     ret err[diag.Refusal].ok{};
 }
 
-fun fact_of(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
-    @out = Fact{rule: l.key.data[1], use: REGISTER, fact: l.fact, classes: vector.init[str](a), role: operand.READ, first: 0, sign: operand.UNSIGNED, scale: 0, bias: 0, rows: false, members: vector.init[Member](a)};
-    if (topic.is(l, "register", 2)) {
-        val names: [3]str            = [3]str{"class", "role", "first"};
-        val known: err[diag.Refusal] = topic.known(l, ?names[0], 3);
-        if (sel known.err) { ret known; }
-        var c:      str               = nil;
-        val needed: err[diag.Refusal] = topic.needed(l, "class", ?c);
-        if (sel needed.err) { ret needed; }
-        val split: err[diag.Refusal] = classes(a, l, c, ?out.classes);
-        if (sel split.err) { ret split; }
-        val roled: err[diag.Refusal] = role(l, ?out.role);
-        if (sel roled.err) { ret roled; }
-        var first: i64               = 0;
-        val f:     str               = topic.optional(l, "first", "0");
-        val read:  err[diag.Refusal] = number(l, f, ?first);
-        if (sel read.err) { ret read; }
-        out.first = first::u32;
+# the named number `name`, `otherwise` when the line does not give it
+fun named(l: *topic.Line, name: str, otherwise: i64, out: *i64) err[diag.Refusal] {
+    val v: opt[str] = topic.value(?l.ws, name);
+    if (sel v.none) {
+        @out = otherwise;
         ret err[diag.Refusal].ok{};
     }
-    if (topic.is(l, "immediate", 2)) {
-        out.use  = IMMEDIATE;
-        out.role = operand.READ;
-        if (l.ws.len == 0) { ret reject(l, BAD_SIGN, nil); }
-        val sign: str = l.ws.data[0];
-        if (str_equals(sign, "unsigned")) { out.sign = operand.UNSIGNED; }
-        or (str_equals(sign, "signed"))   { out.sign = operand.SIGNED; }
-        or                                { ret reject(l, BAD_SIGN, sign); }
-        var i: usize = 1;
-        for (i < l.ws.len) {
-            val w: str = l.ws.data[i];
-            var v: i64 = 0;
-            if (str_len(w) > 6 && w[0] == 's' && w[1] == 'c' && w[2] == 'a' && w[3] == 'l' && w[4] == 'e' && w[5] == '=') {
-                val got: err[diag.Refusal] = number(l, ?w[6], ?v);
-                if (sel got.err) { ret got; }
-                out.scale = v::u8;
-            }
-            or (str_len(w) > 5 && w[0] == 'b' && w[1] == 'i' && w[2] == 'a' && w[3] == 's' && w[4] == '=') {
-                val got: err[diag.Refusal] = number(l, ?w[5], ?v);
-                if (sel got.err) { ret got; }
-                out.bias = v;
-            }
-            or { ret reject(l, topic.UNKNOWN_WORD, w); }
-            i = i + 1;
+    ret number(l, v.some, out);
+}
+
+# the expression `w`
+fun expression(a: *A.Allocator, l: *topic.Line, w: str, out: *expr.Expr) err[diag.Refusal] {
+    val got: res[expr.Expr, str] = expr.parse(a, w);
+    if (sel got.err) { ret reject(l, BAD_EXPR, w); }
+    @out = got.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+# the named expression `name`, `valued` set when the line gives it
+fun valued(a: *A.Allocator, l: *topic.Line, name: str, out: *Fact) err[diag.Refusal] {
+    val v: opt[str] = topic.value(?l.ws, name);
+    if (sel v.none) { ret err[diag.Refusal].ok{}; }
+    out.valued = true;
+    ret expression(a, l, v.some, ?out.value);
+}
+
+# `by=<fields>` and the cubes `<bits>=<expr>` after it
+fun cubes(a: *A.Allocator, l: *topic.Line, from: usize, out: *Fact) err[diag.Refusal] {
+    val by: opt[str] = topic.value(?l.ws, "by");
+    if (sel by.none) { ret err[diag.Refusal].ok{}; }
+    val split_by: err[diag.Refusal] = split(a, l, by.some, ':', ?out.by);
+    if (sel split_by.err) { ret split_by; }
+    var i: usize = from;
+    for (i < l.ws.len) {
+        val w:   str   = l.ws.data[i];
+        val len: usize = str_len(w);
+        var eq:  usize = 0;
+        for (eq < len && w[eq] != '=') { eq = eq + 1; }
+        if (is_cube(w)) {
+            var pat: str               = nil;
+            val got: err[diag.Refusal] = pattern(a, l, w, eq, ?pat);
+            if (sel got.err) { ret got; }
+            var c:  Cube              = Cube{bits: pat, value: expr.Expr{nodes: vector.init[expr.Node](a), pieces: vector.init[expr.Piece](a)}};
+            val ex: err[diag.Refusal] = expression(a, l, ?w[eq + 1], ?c.value);
+            if (sel ex.err)                              { ret ex; }
+            if (!fits(vector.push[Cube](?out.cubes, c))) { ret memory(l); }
         }
+        i = i + 1;
+    }
+    if (out.cubes.len == 0) { ret reject(l, BAD_CUBE, by.some); }
+    ret err[diag.Refusal].ok{};
+}
+
+# whether word `w` is a cube `<bits>=...`
+fun is_cube(w: str) bool {
+    val len: usize = str_len(w);
+    var k:   usize = 0;
+    for (k < len && w[k] != '=') {
+        if (w[k] != '0' && w[k] != '1' && w[k] != 'x' && w[k] != ':') { ret false; }
+        k = k + 1;
+    }
+    ret k > 0 && k < len;
+}
+
+# every word of `l` past `from` one of `names` or a cube
+fun only_named(l: *topic.Line, from: usize, names: *str, count: usize) err[diag.Refusal] {
+    var i: usize = from;
+    for (i < l.ws.len) {
+        val w:  str   = l.ws.data[i];
+        var ok: bool  = is_cube(w);
+        var k:  usize = 0;
+        for (k < count && !ok) {
+            val n: str = names[k];
+            if (str_starts_with(w, n) && w[str_len(n)] == '=') { ok = true; }
+            k = k + 1;
+        }
+        if (!ok) { ret reject(l, topic.UNKNOWN_WORD, w); }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun register(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    val names: [6]str            = [6]str{"class", "role", "number", "step", "by", "default"};
+    val known: err[diag.Refusal] = only_named(l, 0, ?names[0], 6);
+    if (sel known.err) { ret known; }
+    var c:      str               = nil;
+    val needed: err[diag.Refusal] = topic.needed(l, "class", ?c);
+    if (sel needed.err) { ret needed; }
+    val split_classes: err[diag.Refusal] = split(a, l, c, ',', ?out.classes);
+    if (sel split_classes.err) { ret split_classes; }
+    var r:    str               = nil;
+    val role: err[diag.Refusal] = topic.needed(l, "role", ?r);
+    if (sel role.err) { ret role; }
+    val roled: err[diag.Refusal] = role_of(l, r, ?out.role);
+    if (sel roled.err) { ret roled; }
+    var step: i64               = 1;
+    val s:    err[diag.Refusal] = named(l, "step", 1, ?step);
+    if (sel s.err) { ret s; }
+    out.step = step::u32;
+    val d: opt[str] = topic.value(?l.ws, "default");
+    if (sel d.some) { out.omitted = d.some; }
+    val v: err[diag.Refusal] = valued(a, l, "number", out);
+    if (sel v.err) { ret v; }
+    ret cubes(a, l, 0, out);
+}
+
+fun immediate(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    if (l.ws.len == 0) { ret reject(l, BAD_SIGN, nil); }
+    val sign: str = l.ws.data[0];
+    if (str_equals(sign, "unsigned")) { out.sign = operand.UNSIGNED; }
+    or (str_equals(sign, "signed"))   { out.sign = operand.SIGNED; }
+    or (str_equals(sign, "float8"))   { out.kind = FLOAT8; }
+    or (str_equals(sign, "bitmask"))  { out.kind = BITMASK; }
+    or                                { ret reject(l, BAD_SIGN, sign); }
+    val names: [4]str            = [4]str{"value", "by", "range", "default"};
+    val known: err[diag.Refusal] = only_named(l, 1, ?names[0], 4);
+    if (sel known.err) { ret known; }
+    val v: err[diag.Refusal] = valued(a, l, "value", out);
+    if (sel v.err) { ret v; }
+    val by: err[diag.Refusal] = cubes(a, l, 1, out);
+    if (sel by.err) { ret by; }
+    val d: opt[str] = topic.value(?l.ws, "default");
+    if (sel d.some) {
+        out.defaulted = true;
+        val got: err[diag.Refusal] = number(l, d.some, ?out.default);
+        if (sel got.err) { ret got; }
+    }
+    val range: opt[str] = topic.value(?l.ws, "range");
+    if (sel range.some) {
+        var bounds: vector.Vector[str] = vector.init[str](a);
+        val parts:  err[diag.Refusal]  = split(a, l, range.some, ',', ?bounds);
+        if (sel parts.err)   { ret parts; }
+        if (bounds.len != 2) { ret reject(l, BAD_RANGE, range.some); }
+        val lo: err[diag.Refusal] = number(l, bounds.data[0], ?out.lo);
+        if (sel lo.err) { ret lo; }
+        val hi: err[diag.Refusal] = number(l, bounds.data[1], ?out.hi);
+        if (sel hi.err)      { ret hi; }
+        if (out.lo > out.hi) { ret reject(l, BAD_RANGE, range.some); }
+        out.ranged = true;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun relative(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    val names: [2]str            = [2]str{"value", "page"};
+    val known: err[diag.Refusal] = topic.known(l, ?names[0], 2);
+    if (sel known.err) { ret known; }
+    var w:      str               = nil;
+    val needed: err[diag.Refusal] = topic.needed(l, "value", ?w);
+    if (sel needed.err) { ret needed; }
+    out.valued = true;
+    val ex: err[diag.Refusal] = expression(a, l, w, ?out.value);
+    if (sel ex.err) { ret ex; }
+    out.sign = operand.SIGNED;
+    val page: res[bool, diag.Refusal] = topic.yes(l, "page", false);
+    if (sel page.err) { ret err[diag.Refusal].err{page.err}; }
+    out.page = page.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+fun choice(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    if (l.ws.len == 0) { ret reject(l, BAD_CHOICE, nil); }
+    val how: str = l.ws.data[0];
+    if (str_starts_with(how, "one=")) {
+        if (l.ws.len != 1) { ret reject(l, BAD_CHOICE, how); }
+        out.use = ONE;
+        out.one = ?how[4];
         ret err[diag.Refusal].ok{};
+    }
+    if (l.ws.len < 2)                 { ret reject(l, BAD_CHOICE, nil); }
+    if (str_equals(how, "rows"))      { out.how = ROWS; }
+    or (str_equals(how, "enumerant")) { out.how = ENUMERANT; }
+    or (str_equals(how, "mask"))      { out.how = MASK; }
+    or                                { ret reject(l, BAD_CHOICE, how); }
+    var i: usize = 1;
+    for (i < l.ws.len) {
+        val w: str = l.ws.data[i];
+        if (str_starts_with(w, "fields=")) {
+            val got: err[diag.Refusal] = split(a, l, ?w[7], ',', ?out.fields);
+            if (sel got.err) { ret got; }
+        }
+        or (str_starts_with(w, "default=")) { out.omitted = ?w[8]; }
+        or {
+            val got: err[diag.Refusal] = member(a, l, w, ?out.members);
+            if (sel got.err) { ret got; }
+        }
+        i = i + 1;
+    }
+    if (out.omitted != nil) {
+        var held: bool  = false;
+        var k:    usize = 0;
+        for (k < out.members.len) {
+            if (str_equals(out.members.data[k].text, out.omitted)) { held = true; }
+            k = k + 1;
+        }
+        if (!held) { ret reject(l, NO_DEFAULT, out.omitted); }
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun fact_of(a: *A.Allocator, l: *topic.Line, out: *Fact) err[diag.Refusal] {
+    @out = Fact{
+        rule:      l.key.data[1],
+        use:       REGISTER,
+        fact:      l.fact,
+        classes:   vector.init[str](a),
+        role:      READ,
+        valued:    false,
+        value:     expr.Expr{nodes: vector.init[expr.Node](a), pieces: vector.init[expr.Piece](a)},
+        step:      1,
+        by:        vector.init[str](a),
+        cubes:     vector.init[Cube](a),
+        kind:      NUMBER,
+        sign:      operand.UNSIGNED,
+        ranged:    false,
+        lo:        0,
+        hi:        0,
+        defaulted: false,
+        default:   0,
+        page:      false,
+        how:       ROWS,
+        fields:    vector.init[str](a),
+        members:   vector.init[Member](a),
+        omitted:   nil,
+        one:       nil,
+    };
+    if (topic.is(l, "register", 2)) { ret register(a, l, out); }
+    if (topic.is(l, "immediate", 2)) {
+        out.use = IMMEDIATE;
+        ret immediate(a, l, out);
+    }
+    if (topic.is(l, "relative", 2)) {
+        out.use = RELATIVE;
+        ret relative(a, l, out);
     }
     if (topic.is(l, "choice", 2)) {
-        out.use  = CHOICE;
-        out.role = operand.READ;
-        if (l.ws.len < 2) { ret reject(l, BAD_CHOICE, nil); }
-        val how: str = l.ws.data[0];
-        if (str_equals(how, "rows"))       { out.rows = true; }
-        or (!str_equals(how, "enumerant")) { ret reject(l, BAD_CHOICE, how); }
-        var i: usize = 1;
-        for (i < l.ws.len) {
-            val got: err[diag.Refusal] = member(a, l, l.ws.data[i], ?out.members);
-            if (sel got.err) { ret got; }
-            i = i + 1;
-        }
-        ret err[diag.Refusal].ok{};
+        out.use = CHOICE;
+        ret choice(a, l, out);
     }
     ret reject(l, BAD_KIND, l.key.data[0]);
 }
@@ -279,10 +566,34 @@ fun element_of(l: *topic.Line, out: *Element) err[diag.Refusal] {
     var lanes: i64               = 0;
     val got:   err[diag.Refusal] = number(l, b, ?bits);
     if (sel got.err) { ret got; }
-    val counted: err[diag.Refusal] = number(l, topic.optional(l, "lanes", "0"), ?lanes);
+    val counted: err[diag.Refusal] = named(l, "lanes", 0, ?lanes);
     if (sel counted.err) { ret counted; }
     @out = Element{name: l.key.data[1], bits: bits::u16, lanes: lanes::u8};
     ret err[diag.Refusal].ok{};
+}
+
+fun roles_of(a: *A.Allocator, l: *topic.Line, out: *Roles) err[diag.Refusal] {
+    @out = Roles{instruction: l.key.data[1], fact: l.fact, roles: vector.init[Roled](a)};
+    var i: usize = 0;
+    for (i < l.ws.len) {
+        val w:   str   = l.ws.data[i];
+        val len: usize = str_len(w);
+        var eq:  usize = 0;
+        for (eq < len && w[eq] != '=') { eq = eq + 1; }
+        if (eq == 0 || eq + 1 >= len) { ret reject(l, BAD_ROLE, w); }
+        val rule: res[str, StrError] = str_copy_slice(a, w, 0, eq);
+        if (sel rule.err) { ret memory(l); }
+        var r:  Role              = READ;
+        val ok: err[diag.Refusal] = role_of(l, ?w[eq + 1], ?r);
+        if (sel ok.err)                                                           { ret ok; }
+        if (!fits(vector.push[Roled](?out.roles, Roled{rule: rule.ok, role: r}))) { ret memory(l); }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun refused(l: *topic.Line, message: str, subject: str) res[Operands, diag.Refusal] {
+    ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, message, subject)};
 }
 
 # the operands topic of the data tree `tree`
@@ -292,28 +603,74 @@ pub fun read(a: *A.Allocator, tree: *source.Tree) res[Operands, diag.Refusal] {
     var t:       topic.Topic       = got.ok;
     val checked: err[diag.Refusal] = topic.check(?t, nil, topic.unstated);
     if (sel checked.err) { ret res[Operands, diag.Refusal].err{checked.err}; }
-    var out: Operands = Operands{facts: vector.init[Fact](a), rules: map.init[str, u32](a), elements: vector.init[Element](a), specifiers: map.init[str, u32](a)};
-    var i:   usize    = 0;
+    var out: Operands = Operands{
+        facts:        vector.init[Fact](a),
+        rules:        map.init[str, u32](a),
+        elements:     vector.init[Element](a),
+        specifiers:   map.init[str, u32](a),
+        roles:        vector.init[Roles](a),
+        instructions: map.init[str, u32](a),
+        fixed:        map.init[str, vector.Vector[Fixed]](a),
+        withheld:     map.init[str, u32](a),
+        reasons:      vector.init[*topic.Fact](a),
+    };
+    var i: usize = 0;
     for (i < t.facts.len) {
         var l:    topic.Line        = topic.Line{fact: nil, key: vector.init[str](a), ws: vector.init[str](a)};
         val read: err[diag.Refusal] = topic.line(a, ?t.facts.data[i], ?l);
         if (sel read.err)   { ret res[Operands, diag.Refusal].err{read.err}; }
-        if (l.key.len != 2) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, BAD_KIND, nil)}; }
+        if (l.key.len != 2) { ret refused(?l, BAD_KIND, nil); }
         if (topic.is(?l, "element", 2)) {
             var e:  Element           = Element{name: nil, bits: 0, lanes: 0};
             val ok: err[diag.Refusal] = element_of(?l, ?e);
             if (sel ok.err)                                                                      { ret res[Operands, diag.Refusal].err{ok.err}; }
-            if (found(map.get[str, u32](?out.specifiers, ?e.name)))                              { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, TWICE, e.name)}; }
-            if (!inserted(map.insert[str, u32](?out.specifiers, e.name, out.elements.len::u32))) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
-            if (!fits(vector.push[Element](?out.elements, e)))                                   { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+            if (found(map.get[str, u32](?out.specifiers, ?e.name)))                              { ret refused(?l, TWICE, e.name); }
+            if (!inserted(map.insert[str, u32](?out.specifiers, e.name, out.elements.len::u32))) { ret refused(?l, diag.MEMORY, nil); }
+            if (!fits(vector.push[Element](?out.elements, e)))                                   { ret refused(?l, diag.MEMORY, nil); }
+        }
+        or (topic.is(?l, "fixed", 2)) {
+            val name: str                  = l.key.data[1];
+            var fs:   vector.Vector[Fixed] = vector.init[Fixed](a);
+            var k:    usize                = 0;
+            for (k < l.ws.len) {
+                val w:   str   = l.ws.data[k];
+                val len: usize = str_len(w);
+                var eq:  usize = 0;
+                for (eq < len && w[eq] != '=') { eq = eq + 1; }
+                if (eq == 0 || eq + 1 >= len) { ret refused(?l, BAD_MEMBER, w); }
+                val field: res[str, StrError] = str_copy_slice(a, w, 0, eq);
+                if (sel field.err) { ret refused(?l, diag.MEMORY, nil); }
+                var bits: str               = nil;
+                val read: err[diag.Refusal] = pattern(a, ?l, ?w[eq + 1], len - eq - 1, ?bits);
+                if (sel read.err)                                                       { ret res[Operands, diag.Refusal].err{read.err}; }
+                if (!fits(vector.push[Fixed](?fs, Fixed{field: field.ok, bits: bits}))) { ret refused(?l, diag.MEMORY, nil); }
+                k = k + 1;
+            }
+            val prior: opt[*vector.Vector[Fixed]] = map.get[str, vector.Vector[Fixed]](?out.fixed, ?name);
+            if (sel prior.some)                                                         { ret refused(?l, TWICE, name); }
+            if (!inserted(map.insert[str, vector.Vector[Fixed]](?out.fixed, name, fs))) { ret refused(?l, diag.MEMORY, nil); }
+        }
+        or (topic.is(?l, "withheld", 2)) {
+            val name: str = l.key.data[1];
+            if (found(map.get[str, u32](?out.withheld, ?name)))                             { ret refused(?l, TWICE, name); }
+            if (!inserted(map.insert[str, u32](?out.withheld, name, out.reasons.len::u32))) { ret refused(?l, diag.MEMORY, nil); }
+            if (!fits(vector.push[*topic.Fact](?out.reasons, l.fact)))                      { ret refused(?l, diag.MEMORY, nil); }
+        }
+        or (topic.is(?l, "role", 2)) {
+            var r:  Roles;
+            val ok: err[diag.Refusal] = roles_of(a, ?l, ?r);
+            if (sel ok.err)                                                                            { ret res[Operands, diag.Refusal].err{ok.err}; }
+            if (found(map.get[str, u32](?out.instructions, ?r.instruction)))                           { ret refused(?l, TWICE, r.instruction); }
+            if (!inserted(map.insert[str, u32](?out.instructions, r.instruction, out.roles.len::u32))) { ret refused(?l, diag.MEMORY, nil); }
+            if (!fits(vector.push[Roles](?out.roles, r)))                                              { ret refused(?l, diag.MEMORY, nil); }
         }
         or {
             var f:  Fact;
             val ok: err[diag.Refusal] = fact_of(a, ?l, ?f);
             if (sel ok.err)                                                              { ret res[Operands, diag.Refusal].err{ok.err}; }
-            if (found(map.get[str, u32](?out.rules, ?f.rule)))                           { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, TWICE, f.rule)}; }
-            if (!inserted(map.insert[str, u32](?out.rules, f.rule, out.facts.len::u32))) { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
-            if (!fits(vector.push[Fact](?out.facts, f)))                                 { ret res[Operands, diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+            if (found(map.get[str, u32](?out.rules, ?f.rule)))                           { ret refused(?l, TWICE, f.rule); }
+            if (!inserted(map.insert[str, u32](?out.rules, f.rule, out.facts.len::u32))) { ret refused(?l, diag.MEMORY, nil); }
+            if (!fits(vector.push[Fact](?out.facts, f)))                                 { ret refused(?l, diag.MEMORY, nil); }
         }
         i = i + 1;
     }
@@ -332,4 +689,29 @@ pub fun element(o: *Operands, name: str) opt[*Element] {
     val at: opt[*u32] = map.get[str, u32](?o.specifiers, ?name);
     if (sel at.none) { ret opt[*Element].none{}; }
     ret opt[*Element].some{?o.elements.data[@at.some]};
+}
+
+# the role line of `instruction` for rule `rule`, UNSTATED when none states it
+pub fun role(o: *Operands, instruction: str, rule: str) Role {
+    val at: opt[*u32] = map.get[str, u32](?o.instructions, ?instruction);
+    if (sel at.none) { ret UNSTATED; }
+    val r: *Roles = ?o.roles.data[@at.some];
+    var i: usize  = 0;
+    for (i < r.roles.len) {
+        if (str_equals(r.roles.data[i].rule, rule)) { ret r.roles.data[i].role; }
+        i = i + 1;
+    }
+    ret UNSTATED;
+}
+
+# the withheld line of instruction `name`, none when it is not withheld
+pub fun withheld(o: *Operands, name: str) opt[*topic.Fact] {
+    val at: opt[*u32] = map.get[str, u32](?o.withheld, ?name);
+    if (sel at.none) { ret opt[*topic.Fact].none{}; }
+    ret opt[*topic.Fact].some{o.reasons.data[@at.some]};
+}
+
+# the fields instruction `name`'s fixed line fixes, none when it has none
+pub fun fixed(o: *Operands, name: str) opt[*vector.Vector[Fixed]] {
+    ret map.get[str, vector.Vector[Fixed]](?o.fixed, ?name);
 }
