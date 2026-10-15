@@ -23,10 +23,8 @@
 # operand the text may leave out names its default member by the empty name, as the add shift's `lsl #12`
 # or nothing. the syntax places the commas and the `#`
 #
-# not covered here: the floating-point 8-bit immediate of fmov (an operand.FLOAT a row's kind narrows),
-# the sve and sme immediates particular to one instruction family (index, shifts by element size, the
-# `mul vl` offsets), the predicate qualifiers `/z` and `/m`, whose bit differs by family, and the sme2
-# multi-vector groups. each is a row's layout of the catalog that states it
+# the sve and sme immediates particular to one instruction family, the predicate qualifiers `/z` and
+# `/m` and the sme2 multi-vector groups are each a row's slices of the catalog that states it
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -63,8 +61,10 @@ use masc.core.state;
 use aarch64:          masc.isa.aarch64.extension;
 use aarch64_register: masc.isa.aarch64.register;
 
-pub val UNIT_KIND:    u16 = 0;
-pub val BITMASK_KIND: u16 = 1;
+pub val UNIT_KIND:     u16 = 0;
+pub val BITMASK_KIND:  u16 = 1;
+pub val FLOAT8_KIND:   u16 = 2;
+pub val MULTIPLE_KIND: u16 = 3;
 
 pub val NO_BITMASK: str = "value is not a bitmask immediate";
 pub val RESERVED:   str = "reserved bitmask immediate encoding";
@@ -206,10 +206,162 @@ fun bitmask_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
 # the logical immediate: the field operand's value as its N:immr:imms code, the rest of the unit fixed bits and slices
 pub val BITMASK: field.Kind = field.Kind{name: "bitmask", admit: bitmask_admit, encode: bitmask_encode, decode: bitmask_decode, finish: nil, complete: nil, check: nil};
 
-val KINDS: [2]*field.Kind = [2]*field.Kind{?field.UNIT, ?BITMASK};
+# the exponent bits of an ieee 754 binary float of `width` bits, 0 for a width aarch64 has no 8-bit immediate of
+fun exponent_bits(width: u32) u32 {
+    if (width == 16) { ret 5; }
+    if (width == 32) { ret 8; }
+    if (width == 64) { ret 11; }
+    ret 0;
+}
+
+# the 8-bit immediate a:b:c:d:e:f:g:h of the `width`-bit float `v`, as VFPExpandImm reads it back: the sign a, an
+# exponent of NOT(b), b repeated and c:d, and a fraction of e:f:g:h and zeros. none for a value it cannot hold
+pub fun encode_float8(v: u64, width: u32) opt[u64] {
+    val e: u32 = exponent_bits(width);
+    if (e == 0) { ret opt[u64].none{}; }
+    val f:    u32 = width - e - 1;
+    val sign: u64 = (v >> (width - 1)::u64) & 1;
+    val exp:  u64 = (v >> f::u64) & field.ones(e::u8);
+    val frac: u64 = v & field.ones(f::u8);
+    if ((frac & field.ones((f - 4)::u8)) != 0) { ret opt[u64].none{}; }
+    val b:    u64 = (exp >> (e - 2)::u64) & 1;
+    val top:  u64 = (exp >> (e - 1)::u64) & 1;
+    val reps: u64 = (exp >> 2) & field.ones((e - 3)::u8);
+    if (top == b)                                                             { ret opt[u64].none{}; }
+    if ((b == 1 && reps != field.ones((e - 3)::u8)) || (b == 0 && reps != 0)) { ret opt[u64].none{}; }
+    ret opt[u64].some{(sign << 7) | (b << 6) | ((exp & 3) << 4) | (frac >> (f - 4)::u64)};
+}
+
+# the `width`-bit float the 8-bit immediate `imm8` expands to, VFPExpandImm
+pub fun decode_float8(imm8: u64, width: u32) u64 {
+    val e:    u32 = exponent_bits(width);
+    val f:    u32 = width - e - 1;
+    val sign: u64 = (imm8 >> 7) & 1;
+    val b:    u64 = (imm8 >> 6) & 1;
+    var exp:  u64 = ((b ^ 1) << (e - 1)::u64) | ((imm8 >> 4) & 3);
+    if (b == 1) { exp = exp | (field.ones((e - 3)::u8) << 2); }
+    ret (sign << (width - 1)::u64) | (exp << f::u64) | ((imm8 & 0xF) << (f - 4)::u64);
+}
+
+# part NUMBER of the field operand set to `bits` while the field's unit is packed, and put
+fun put_number(enc: *field.Encoder, f: *field.Field, bits: u64) err[field.Refusal] {
+    val p:    *field.Parts = ?enc.parts[f.operand];
+    val kept: u64          = p.bits[field.NUMBER];
+    p.bits[field.NUMBER] = bits;
+    val unit: res[u64, field.Refusal] = field.pack(enc, f);
+    p.bits[field.NUMBER] = kept;
+    if (sel unit.err) { ret err[field.Refusal].err{unit.err}; }
+    ret field.put(enc, unit.ok, f.width / 8);
+}
+
+# the unit of the field read and its slices deposited, its offset into `at`
+fun got_unit(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    if (f.operand::u32 >= dec.count) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, dec.at)}; }
+    val at:   usize                   = dec.at;
+    val unit: res[u64, field.Refusal] = field.get(dec, f.width / 8);
+    if (sel unit.err) { ret err[field.Refusal].err{unit.err}; }
+    ret field.unpack(dec, f, unit.ok, at);
+}
+
+pub val NO_FLOAT8: str = "value is not a floating-point number of an 8-bit immediate";
+
+fun float8_code(enc: *field.Encoder, f: *field.Field, at: usize) res[u64, field.Refusal] {
+    if (f.operand::u32 >= enc.count) { ret res[u64, field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    val code: opt[u64] = encode_float8(enc.parts[f.operand].bits[field.NUMBER], f.param::u32);
+    if (sel code.none) { ret res[u64, field.Refusal].err{field.refusal(NO_FLOAT8, f.operand, at)}; }
+    ret res[u64, field.Refusal].ok{code.some};
+}
+
+fun float8_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val code: res[u64, field.Refusal] = float8_code(enc, f, 0);
+    if (sel code.err) { ret err[field.Refusal].err{code.err}; }
+    ret err[field.Refusal].ok{};
+}
+
+fun float8_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val code: res[u64, field.Refusal] = float8_code(enc, f, enc.out.len);
+    if (sel code.err) { ret err[field.Refusal].err{code.err}; }
+    ret put_number(enc, f, code.ok);
+}
+
+fun float8_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val got: err[field.Refusal] = got_unit(dec, f);
+    if (sel got.err) { ret got; }
+    field.replace(dec, f.operand, field.NUMBER, decode_float8(dec.parts[f.operand].bits[field.NUMBER] & 0xFF, f.param::u32));
+    ret err[field.Refusal].ok{};
+}
+
+# fmov's floating-point immediate: the field operand's value, a float of the param's width, as the 8-bit immediate its
+# slices place
+pub val FLOAT8: field.Kind = field.Kind{name: "float8", admit: float8_admit, encode: float8_encode, decode: float8_decode, finish: nil, complete: nil, check: nil};
+
+# a multiple field's param: the odd multiplier in bits 0 to 7, the bits of the multiplied number in bits 8 to 15, and
+# whether it is signed in bit 16
+pub fun multiple_param(by: u8, bits: u8, signed: bool) u64 {
+    var s: u64 = 0;
+    if (signed) { s = 1; }
+    ret by::u64 | (bits::u64 << 8) | (s << 16);
+}
+
+# `raw`'s low `bits` bits as a number, two's complement when `signed`
+fun extend_bits(raw: u64, bits: u32, signed: bool) i64 {
+    var v: u64 = raw & field.ones(bits::u8);
+    if (signed && bits > 0 && bits < 64 && ((v >> (bits - 1)::u64) & 1) != 0) { v = v | ~field.ones(bits::u8); }
+    ret v:~i64;
+}
+
+# the bits of the field operand's immediate, the width its encoded number is masked to
+fun operand_bits(operands: *operand.Operand, op: u8) u32 {
+    val shape: *operand.Shape = ?operands[op].shape;
+    if (sel shape.immediate) { ret shape.immediate.bits::u32 - shape.immediate.scale::u32; }
+    ret 64;
+}
+
+pub val NOT_MULTIPLE: str = "value is not a multiple of its field's multiplier within its bits";
+
+fun multiple_number(enc: *field.Encoder, f: *field.Field, at: usize) res[u64, field.Refusal] {
+    if (f.operand::u32 >= enc.count) { ret res[u64, field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    val by:     i64  = (f.param & 0xFF):~i64;
+    val bits:   u32  = ((f.param >> 8) & 0xFF)::u32;
+    val signed: bool = ((f.param >> 16) & 1) != 0;
+    val d:      i64  = extend_bits(enc.parts[f.operand].bits[field.NUMBER], operand_bits(enc.operands, f.operand), signed);
+    if (by == 0 || d % by != 0) { ret res[u64, field.Refusal].err{field.refusal(NOT_MULTIPLE, f.operand, at)}; }
+    val n: i64 = d / by;
+    if (extend_bits(n:~u64, bits, signed) != n) { ret res[u64, field.Refusal].err{field.refusal(NOT_MULTIPLE, f.operand, at)}; }
+    ret res[u64, field.Refusal].ok{n:~u64 & field.ones(bits::u8)};
+}
+
+fun multiple_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val n: res[u64, field.Refusal] = multiple_number(enc, f, 0);
+    if (sel n.err) { ret err[field.Refusal].err{n.err}; }
+    ret err[field.Refusal].ok{};
+}
+
+fun multiple_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val n: res[u64, field.Refusal] = multiple_number(enc, f, enc.out.len);
+    if (sel n.err) { ret err[field.Refusal].err{n.err}; }
+    ret put_number(enc, f, n.ok);
+}
+
+fun multiple_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val got: err[field.Refusal] = got_unit(dec, f);
+    if (sel got.err) { ret got; }
+    val by:     i64  = (f.param & 0xFF):~i64;
+    val bits:   u32  = ((f.param >> 8) & 0xFF)::u32;
+    val signed: bool = ((f.param >> 16) & 1) != 0;
+    val n:      i64  = extend_bits(dec.parts[f.operand].bits[field.NUMBER], bits, signed);
+    field.replace(dec, f.operand, field.NUMBER, (n * by):~u64 & field.ones(operand_bits(dec.operands, f.operand)::u8));
+    ret err[field.Refusal].ok{};
+}
+
+# an immediate an odd number times a number of its bits, as ld3's `#-24, mul vl` three times imm4: the field operand's
+# encoded number divided by the multiplier its slices place
+pub val MULTIPLE: field.Kind = field.Kind{name: "multiple", admit: multiple_admit, encode: multiple_encode, decode: multiple_decode, finish: nil, complete: nil, check: nil};
+
+val KINDS: [4]*field.Kind = [4]*field.Kind{?field.UNIT, ?BITMASK, ?FLOAT8, ?MULTIPLE};
 
 # the aarch64 field table, its units little-endian
-pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 2, order: field.LITTLE};
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 4, order: field.LITTLE};
 
 # the value a bitmask field's operand holds: the register's bits for a64, the element's for sve
 pub val BITMASK_32: operand.Immediate = operand.Immediate{bits: 32, sign: operand.UNSIGNED, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS};
