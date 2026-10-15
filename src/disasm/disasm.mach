@@ -356,6 +356,8 @@ val PAIR:      Attempt = 2;
 # mapping:    the mapping symbols the text's assembler writes, none when the dialect's writes none
 # marks:      the object's mapping symbols, in place order
 # mi:         the next mapping symbol to read
+# modes:      the assembler modes the text written so far ends under
+# pushed:     the modes the push of the scope in force saved, which its pop restores
 # copies:     per section, the copy of its bytes the set's stream recalled a relocation into, nil for none
 rec Disasm {
     a:          *A.Allocator;
@@ -365,6 +367,7 @@ rec Disasm {
     dialect:    *dialect.Dialect;
     naming:     *contract.Naming;
     modes:      mode.State;
+    pushed:     mode.State;
     o:          *mink_object.Object;
     out:        *vector.Vector[u8];
     labels:     vector.Vector[Label];
@@ -1227,7 +1230,9 @@ fun span_at(d: *Disasm, at: u64, first: usize, end: usize) opt[*core_fixup.Span]
         var i: usize = first_bound(d, r.kind);
         for (i < d.bound.len && d.bound.data[i].kind == r.kind) {
             val sp: opt[*core_fixup.Span] = core_fixup.span_of(d.s.spans, d.bound.data[i].fixup);
-            if (sel sp.some) { ret sp; }
+            if (sel sp.some) {
+                if (sp.some.count > 1) { ret sp; }
+            }
             i = i + 1;
         }
     }
@@ -1283,7 +1288,7 @@ fun statement(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, limit: u
     val start: usize = d.out.len;
     put_char(d, '\t');
     val text:    usize              = d.out.len;
-    var w:       core_syntax.Writer = core_syntax.Writer{out: d.out, codec: d.s.codec, ctx: d.v, syntax: d.syntax, modes: ?d.modes, symbols: ?d.symbols, context: nil, row: nil};
+    var w:       core_syntax.Writer = core_syntax.Writer{out: d.out, codec: d.s.codec, ctx: d.v, syntax: d.syntax, modes: ?d.modes, symbols: ?d.symbols, context: nil, row: nil, dot: false, values: nil};
     var printed: bool               = false;
     if (sel sp.some) {
         var aimed: opt[Aimed] = opt[Aimed].none{};
@@ -1767,7 +1772,10 @@ fun enter(d: *Disasm, to: usize) {
     val pop:  opt[*source.Directive] = source.pop_of(ds);
     if (to != d.now) {
         if (from.mask != 0) {
-            if (sel pop.some) { put_line(d, pop.some); }
+            if (sel pop.some) {
+                put_line(d, pop.some);
+                d.modes = d.pushed;
+            }
             or {
                 var n: u32 = 0;
                 for (n < ds.len) {
@@ -1780,7 +1788,10 @@ fun enter(d: *Disasm, to: usize) {
             }
         }
         if (into.mask != 0) {
-            if (sel push.some) { put_line(d, push.some); }
+            if (sel push.some) {
+                put_line(d, push.some);
+                d.pushed = d.modes;
+            }
             var n: u32 = 0;
             for (n < ds.len) {
                 if ((into.mask & source.bit(n)) != 0) { put_line(d, ?ds.at[n]); }
@@ -1805,25 +1816,75 @@ fun tried(d: *Disasm, k: usize) usize {
     ret k;
 }
 
-# `what` at `at` written under the first scope it reads back under, after the directives that move to it, answering
-# how many bytes it takes, 0 when it reads back under none, with the output as it was
-fun scoped(d: *Disasm, what: Attempt, section: u32, data: *u8, len: usize, at: u64, limit: u64) res[u64, Refusal] {
-    val start: usize             = d.out.len;
-    var took:  res[u64, Refusal] = res[u64, Refusal].ok{0};
-    var k:     usize             = 0;
+# the directive of the dialect that sets mode `m` to value `v`, none when it has none
+fun mode_directive(d: *Disasm, m: *mode.Mode, v: *mode.Value) opt[*source.Directive] {
+    val ds: source.Directives = d.s.source.directives;
+    var i:  u32               = 0;
+    for (i < ds.len) {
+        val e: source.Edit = ds.at[i].edit;
+        if (sel e.mode && (e.mode.mode == m && e.mode.value == v)) { ret opt[*source.Directive].some{?ds.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*source.Directive].none{};
+}
+
+# `what` at `at` written under the first scope it reads back under, after the directives that move to it and, when
+# `dir` is some, the dialect's directive `dir` of the mode setting `to`, answering how many bytes it takes, 0 when it
+# reads back under none, with the output and the modes as they were
+fun under_scopes(d: *Disasm, what: Attempt, section: u32, data: *u8, len: usize, at: u64, limit: u64, dir: opt[*source.Directive], to: mode.Setting) res[u64, Refusal] {
+    val start:  usize             = d.out.len;
+    val modes:  mode.State        = d.modes;
+    val pushed: mode.State        = d.pushed;
+    var took:   res[u64, Refusal] = res[u64, Refusal].ok{0};
+    var k:      usize             = 0;
     for (k < d.scopes.len) {
-        val to: usize = tried(d, k);
+        val into: usize = tried(d, k);
         k = k + 1;
-        enter(d, to);
+        enter(d, into);
+        if (sel dir.some) {
+            put_line(d, dir.some);
+            mode.change(?d.modes, to);
+        }
         if (what == REALIGN) { took = realign(d, section, data, at, limit); }
         or (what == PAIR)    { took = pair(d, section, data, len, at, limit); }
         or                   { took = statement(d, section, data, len, at, limit); }
         if (sel took.err)    { brk; }
         if (took.ok > 0) {
-            d.now = to;
+            d.now = into;
             brk;
         }
         d.out.len = start;
+        d.modes   = modes;
+        d.pushed  = pushed;
+    }
+    ret took;
+}
+
+# whether an attempt took nothing and refused nothing
+fun unread(took: *res[u64, Refusal]) bool {
+    if (sel took.ok) { ret took.ok == 0; }
+    ret false;
+}
+
+# `what` at `at` written under the first scope it reads back under, answering how many bytes it takes, 0 when it reads
+# back under none, with the output as it was: under the modes in force, or else with one mode at another value set by
+# the dialect's directive of it, as a relaxed object's call reads back only after `.option relax`
+fun scoped(d: *Disasm, what: Attempt, section: u32, data: *u8, len: usize, at: u64, limit: u64) res[u64, Refusal] {
+    val none: mode.Setting      = mode.Setting{mode: nil, value: nil};
+    var took: res[u64, Refusal] = under_scopes(d, what, section, data, len, at, limit, opt[*source.Directive].none{}, none);
+    val held: mode.State        = d.modes;
+    var i:    u32               = 0;
+    for (i < held.modes.len && i < mode.MAX_MODES && unread(?took)) {
+        val m: *mode.Mode = held.modes.at[i];
+        var v: u32        = 0;
+        for (v < m.values.len && unread(?took)) {
+            val value: *mode.Value = m.values.at[v];
+            v = v + 1;
+            if (value == held.values[i]) { cnt; }
+            val dir: opt[*source.Directive] = mode_directive(d, m, value);
+            if (sel dir.some) { took = under_scopes(d, what, section, data, len, at, limit, dir, mode.Setting{mode: m, value: value}); }
+        }
+        i = i + 1;
     }
     d.v     = d.scopes.data[d.now].v;
     d.fills = ?d.scopes.data[d.now].fills;
@@ -2818,6 +2879,7 @@ pub fun disassemble(a: *A.Allocator, s: *set.Set, object: *state.Context, option
         dialect:    options.dialect,
         naming:     options.naming,
         modes:      mode.initial(?s.assembly),
+        pushed:     mode.initial(?s.assembly),
         o:          o,
         out:        out,
         labels:     vector.init[Label](a),
@@ -3530,18 +3592,46 @@ test disassemble__a_full_length_compressible_instruction_is_stated_under_its_nar
     var t: T;
     if (!t_make(?t, "rv64ic")) { ret 1; }
     val a:    *A.Allocator      = testing.allocator_of(?t.t);
-    val text: str               = "\t.option push\n\t.option norvc\n\taddi sp, sp, -16\n\tbeq a0, zero, 8\n\tcall f\n\t.balign 16\n\t.option pop\n\taddi sp, sp, -16\n";
+    val text: str               = "\t.option relax\n\t.option push\n\t.option norvc\n\taddi sp, sp, -16\n\tbeq a0, zero, 8\n\tcall f\n\t.balign 16\n\t.option pop\n\taddi sp, sp, -16\n";
     var want: vector.Vector[u8] = vector.init[u8](a);
     var got:  vector.Vector[u8] = vector.init[u8](a);
     if (!t_text(?t, text, str_len(text), ?want) || want.len != 30)                    { ret 2; }
     if (!t_disassemble(?t, text))                                                     { ret 3; }
     if (!t_holds(?t, "\n\t.option push\n\t.option norvc\n\taddi sp, sp, -16\n\tbeq")) { ret 4; }
     # the realigned padding is the narrowing's, its worst case the boundary less a four-byte nop
-    if (!t_holds(?t, "\n\tcall f\n\t.balign 16\n\t.option pop\n\t"))          { ret 5; }
-    if (!t_text(?t, t.out.data, t.out.len - 1, ?got) || !t_same(?want, ?got)) { ret 6; }
+    # the call reads back only relaxed, which the text states where it is first needed
+    if (!t_holds(?t, "\n\t.option relax\n\tcall f\n\t.balign 16\n\t.option pop\n\t")) { ret 5; }
+    if (!t_text(?t, t.out.data, t.out.len - 1, ?got) || !t_same(?want, ?got))         { ret 6; }
     vector.dnit[u8](?want);
     vector.dnit[u8](?got);
     if (!t_done(?t)) { ret 7; }
+    ret 0;
+}
+
+# a relaxed lla, la and pc-relative pair, each relocated with a relax marker beside its two relocations as llvm-mc's
+# +relax writes them, read back only under `.option relax`, to the same object
+test disassemble__relaxed_pc_relative_pairs_read_back_under_the_relax_mode {
+    var t: T;
+    if (!t_make(?t, "rv64i")) { ret 1; }
+    val a:       *A.Allocator                           = testing.allocator_of(?t.t);
+    val text:    str                                    = "\t.option relax\n\tlla a0, g\n\tla a1, g\nhi:\n\tauipc a2, %pcrel_hi(x)\n\taddi a2, a2, %pcrel_lo(hi)\nx:\n\tnop\n";
+    val options: model.Options                          = model.Options{arch: ?arch_riscv.RISCV64, formats: ?t.formats, syntax: 0, abi: trait.t_abi(?arch_riscv.RISCV64, "lp64d"), dialect: ?dialect.ELF, layers: model.NO_LAYERS};
+    var got:     res[mink_object.Object, model.Refusal] = asm.assemble(a, ?riscv_set.SET, ?t.ctx, options, text, str_len(text), diagnostic.START);
+    if (sel got.err) { ret 2; }
+    var o: mink_object.Object = got.ok;
+    # each pair is a hi20, a lo12 and a relax marker beside each
+    if (o.relocs.count != 12) { ret 3; }
+    t.out.len = 0;
+    val done: err[Refusal] = disassemble(a, ?riscv_set.SET, ?t.ctx, Options{syntax: 0, spelling: t.spelling, dialect: t.dialect, naming: t.naming}, ?o, ?t.out);
+    if (sel done.err)                      { ret 4; }
+    if (!held(vector.push[u8](?t.out, 0))) { ret 5; }
+    if (!t_holds(?t, "\t.option relax\n")) { ret 6; }
+    var again: res[mink_object.Object, model.Refusal] = asm.assemble(a, ?riscv_set.SET, ?t.ctx, options, t.out.data, t.out.len - 1, diagnostic.START);
+    if (sel again.err)                 { ret 7; }
+    if (!t_same_object(?o, ?again.ok)) { ret 8; }
+    mink_object.release(?o);
+    mink_object.release(?again.ok);
+    if (!t_done(?t)) { ret 9; }
     ret 0;
 }
 

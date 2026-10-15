@@ -13,6 +13,12 @@
 #
 # a set adds what its operands mean beyond their kind through its hook, by
 # offering further values for one operand, as risc-v offers every named csr.
+#
+# an alias's vectors are generated over the alias's own operands, as it
+# writes them, and each is the base row's instruction the reader takes it
+# back to, kept when the alias admits its values, none excluded, and the base
+# row admits what they come to. so an alias that is only read, which no base
+# value prints as, has vectors too.
 # a set of a typed stream states the edges of the values its kinds cannot
 # choose alone, an id the stream must define or a literal its type sizes,
 # through its edges hook, at every level a value is chosen: an operand, a
@@ -40,6 +46,8 @@ use masc.core.operand;
 use masc.core.register;
 use masc.core.row;
 use masc.core.state;
+use masc.core.syntax;
+use masc.syntax.alias;
 
 # the base vectors tried before a row is found to admit none, each spreading its registers and choosing its values
 # one step further along their edges
@@ -75,9 +83,12 @@ pub def Provide: fun(ptr, *Need) err[str];
 # codec:   the set's codec
 # ctx:     the context the vectors are generated under, whose stream holds every need provided so far
 # row:     the row
+# alias:   the alias of the row whose operands the vectors are generated over, nil for the row's own
+# count:   how many operands they are generated over, the alias's or the row's
 # edges:   each operand's edges, the values its vectors move it to
 # base:    the base vector's values
-# out:     the vectors, appended in order
+# out:     the vectors, appended in order, each an instruction of the row
+# spelled: for an alias, each vector's values as the alias writes them, at the vector's place in `out`, nil otherwise
 # failed:  whether the allocator refused, or a need could not be provided, after which nothing more is generated
 # chooses: the set's edges hook, nil for a set whose values its kinds choose alone
 # needs:   the needs provided so far, nil for a set of no stream
@@ -88,9 +99,12 @@ pub rec Generation {
     codec:   *dispatch.Codec;
     ctx:     *state.Context;
     row:     *row.Row;
+    alias:   *syntax.Alias;
+    count:   u32;
     edges:   [row.MAX_OPERANDS]vector.Vector[operand.Value];
     base:    [row.MAX_OPERANDS]operand.Value;
     out:     *vector.Vector[inst.Inst];
+    spelled: *vector.Vector[inst.Inst];
     failed:  bool;
     chooses: Edges;
     needs:   *vector.Vector[Need];
@@ -150,7 +164,10 @@ pub fun make(a: *A.Allocator, codec: *dispatch.Codec, ctx: *state.Context, r: *r
     g.codec   = codec;
     g.ctx     = ctx;
     g.row     = r;
+    g.alias   = nil;
+    g.count   = r.operands.len;
     g.out     = out;
+    g.spelled = nil;
     g.failed  = false;
     g.chooses = nil;
     g.needs   = nil;
@@ -162,6 +179,89 @@ pub fun make(a: *A.Allocator, codec: *dispatch.Codec, ctx: *state.Context, r: *r
         k          = k + 1;
     }
     ret g;
+}
+
+# a generation of the vectors of alias `a` of `r` over the alias's operands, into `out` as instructions of `r` and
+# into `spelled` as the alias's values, under `ctx`, its values allocated from `a`
+pub fun make_alias(alloc: *A.Allocator, codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, a: *syntax.Alias, out: *vector.Vector[inst.Inst], spelled: *vector.Vector[inst.Inst]) Generation {
+    var g: Generation = make(alloc, codec, ctx, r, out);
+    g.alias   = a;
+    g.count   = a.count::u32;
+    g.spelled = spelled;
+    ret g;
+}
+
+# operand `k` of what the vectors are generated over, the alias's or the row's
+pub fun operand_at(g: *Generation, k: u32) *operand.Operand {
+    if (g.alias != nil) { ret syntax.alias_operand(g.alias, g.row, k::u8); }
+    ret ?g.row.operands.at[k];
+}
+
+# the operand of what the vectors are generated over that row operand `j` takes its value from as it is, none when it
+# takes it from none, as an alias's fixed register or computed value
+pub fun from_row(g: *Generation, j: u32) opt[u32] {
+    if (g.alias == nil)                                    { ret opt[u32].some{j}; }
+    if (g.alias.derive != nil || j >= g.alias.sources.len) { ret opt[u32].none{}; }
+    val src: syntax.Source = g.alias.sources.at[j];
+    if (sel src.operand) { ret opt[u32].some{src.operand::u32}; }
+    ret opt[u32].none{};
+}
+
+# the register the row fixes operand `k` of what the vectors are generated over to, none when it fixes none
+fun fixed_at(g: *Generation, k: u32) opt[register.Id] {
+    var j: u32 = 0;
+    for (j < g.row.operands.len) {
+        val at: opt[u32] = from_row(g, j);
+        if (sel at.some && at.some == k) { ret walk.fixed(g.codec, g.row, j::u8); }
+        j = j + 1;
+    }
+    ret opt[register.Id].none{};
+}
+
+# the row's values `held` comes to into `base`, held itself for the row's own vectors
+fun resolved(g: *Generation, held: *operand.Value, base: *operand.Value) bool {
+    if (g.alias == nil) {
+        var i: u32 = 0;
+        for (i < g.count) {
+            base[i] = held[i];
+            i       = i + 1;
+        }
+        ret true;
+    }
+    if (alias.excluded(g.alias, held) != field.NO_OPERAND) { ret false; }
+    ret alias.resolve(g.codec, g.alias, held, base);
+}
+
+# whether the row admits what `held` comes to under the context
+fun admits(g: *Generation, held: *operand.Value) bool {
+    var base: [row.MAX_OPERANDS]operand.Value;
+    if (!resolved(g, held, ?base[0])) { ret false; }
+    val ins: inst.Inst          = inst.Inst{row: g.row, values: ?base[0], count: g.row.operands.len};
+    val ok:  err[field.Refusal] = walk.admits(g.codec, g.ctx, ?ins);
+    ret sel ok.ok;
+}
+
+# `held` appended: the row's instruction it comes to, and its own values for an alias
+fun push(g: *Generation, held: *operand.Value) {
+    val n:  u32            = g.row.operands.len;
+    val at: *operand.Value = values(g, n);
+    if (n > 0 && at == nil)     { ret; }
+    if (!resolved(g, held, at)) { ret; }
+    val pushed: res[usize, A.Error] = vector.push[inst.Inst](g.out, inst.Inst{row: g.row, values: at, count: n});
+    if (sel pushed.err) {
+        g.failed = true;
+        ret;
+    }
+    if (g.spelled == nil) { ret; }
+    val own: *operand.Value = values(g, g.count);
+    if (g.count > 0 && own == nil) { ret; }
+    var i: u32 = 0;
+    for (i < g.count) {
+        own[i] = held[i];
+        i      = i + 1;
+    }
+    val kept: res[usize, A.Error] = vector.push[inst.Inst](g.spelled, inst.Inst{row: g.row, values: own, count: g.count});
+    if (sel kept.err) { g.failed = true; }
 }
 
 # the edge storage given back
@@ -548,8 +648,8 @@ fun shape_edges(g: *Generation, desc: *operand.Operand, k: u32, out: *vector.Vec
 # and of two for a variadic operand, and with no value for an optional one
 fun operand_edges(g: *Generation, k: u32) {
     val out:  *vector.Vector[operand.Value] = ?g.edges[k];
-    val desc: *operand.Operand              = ?g.row.operands.at[k];
-    val held: opt[register.Id]              = walk.fixed(g.codec, g.row, k::u8);
+    val desc: *operand.Operand              = operand_at(g, k);
+    val held: opt[register.Id]              = fixed_at(g, k);
     if (sel held.some) {
         add(g, out, operand.Value.register{held.some});
         ret;
@@ -581,8 +681,8 @@ fun operand_edges(g: *Generation, k: u32) {
 
 # operand `k`'s value in base try `t`: its register spread from the others', or its `t`th edge
 fun base_value(g: *Generation, k: u32, t: u32) opt[operand.Value] {
-    val desc: *operand.Operand = ?g.row.operands.at[k];
-    val held: opt[register.Id] = walk.fixed(g.codec, g.row, k::u8);
+    val desc: *operand.Operand = operand_at(g, k);
+    val held: opt[register.Id] = fixed_at(g, k);
     if (sel held.none && desc.quantity == operand.ONE) {
         if (sel desc.shape.register) {
             val reg: register.Id = register_default(g, ?desc.shape.register, k, t);
@@ -595,29 +695,17 @@ fun base_value(g: *Generation, k: u32, t: u32) opt[operand.Value] {
     ret opt[operand.Value].some{edges.data[t::usize % edges.len]};
 }
 
-# the instruction of the row over `held`, its values copied into storage of its own, appended when the row admits it
+# the instruction of the row `held` comes to, its values copied into storage of its own, appended when the row admits it
 fun keep(g: *Generation, held: *operand.Value) {
-    val n:   u32                = g.row.operands.len;
-    val ins: inst.Inst          = inst.Inst{row: g.row, values: held, count: n};
-    val ok:  err[field.Refusal] = walk.admits(g.codec, g.ctx, ?ins);
-    if (sel ok.err) { ret; }
-    val at: *operand.Value = values(g, n);
-    if (n > 0 && at == nil) { ret; }
-    var i: u32 = 0;
-    for (i < n) {
-        at[i] = held[i];
-        i     = i + 1;
-    }
-    val pushed: res[usize, A.Error] = vector.push[inst.Inst](g.out, inst.Inst{row: g.row, values: at, count: n});
-    if (sel pushed.err) { g.failed = true; }
+    if (admits(g, held)) { push(g, held); }
 }
 
 # the base vector with operand `k` holding `value`, appended when the row admits it. a set's hook offers each value
 # once per operand, and a value equal to the base's or to one of the operand's edges is already a vector, so it is not
 # offered again
 pub fun offer(g: *Generation, k: u32, value: operand.Value) {
-    if (k >= g.row.operands.len || g.failed) { ret; }
-    if (operand.equal(?g.base[k], ?value))   { ret; }
+    if (k >= g.count || g.failed)          { ret; }
+    if (operand.equal(?g.base[k], ?value)) { ret; }
     val edges: *vector.Vector[operand.Value] = ?g.edges[k];
     var i:     usize                         = 0;
     for (i < edges.len) {
@@ -629,11 +717,33 @@ pub fun offer(g: *Generation, k: u32, value: operand.Value) {
     keep(g, ?held[0]);
 }
 
-# the row's vectors appended: the base, then each operand at each of its edges, then what the hook offers
+# the base vector with operand `k` holding `value`, appended when the row refuses it under the context, as a register
+# the e base lacks: a vector every tool must refuse too, which agrees when they all do
+pub fun refusal(g: *Generation, k: u32, value: operand.Value) {
+    if (g.alias != nil || k >= g.row.operands.len || g.failed) { ret; }
+    var held: [row.MAX_OPERANDS]operand.Value = g.base;
+    held[k] = value;
+    val n:   u32                = g.row.operands.len;
+    val ins: inst.Inst          = inst.Inst{row: g.row, values: ?held[0], count: n};
+    val ok:  err[field.Refusal] = walk.admits(g.codec, g.ctx, ?ins);
+    if (sel ok.ok) { ret; }
+    val at: *operand.Value = values(g, n);
+    if (at == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        at[i] = held[i];
+        i     = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[inst.Inst](g.out, inst.Inst{row: g.row, values: at, count: n});
+    if (sel pushed.err) { g.failed = true; }
+}
+
+# the row's vectors appended: the base, then each operand at each of its edges, then what the hook offers, which is
+# asked of the row's own operands alone
 # ---
 # ret: whether the row admits a base vector, so that it has any
 pub fun generate(g: *Generation, hook: Hook) bool {
-    val n: u32 = g.row.operands.len;
+    val n: u32 = g.count;
     var k: u32 = 0;
     for (k < n) {
         operand_edges(g, k);
@@ -650,11 +760,7 @@ pub fun generate(g: *Generation, hook: Hook) bool {
             or              { complete = false; }
             k = k + 1;
         }
-        if (complete) {
-            val ins: inst.Inst          = inst.Inst{row: g.row, values: ?g.base[0], count: n};
-            val ok:  err[field.Refusal] = walk.admits(g.codec, g.ctx, ?ins);
-            found = sel ok.ok;
-        }
+        if (complete) { found = admits(g, ?g.base[0]); }
         t = t + 1;
     }
     if (!found) { ret false; }
@@ -673,6 +779,6 @@ pub fun generate(g: *Generation, hook: Hook) bool {
         }
         k = k + 1;
     }
-    hook(g);
+    if (g.alias == nil) { hook(g); }
     ret true;
 }
