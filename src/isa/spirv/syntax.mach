@@ -14,6 +14,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -46,7 +47,6 @@ use masc.core.relax;
 use masc.core.requirement;
 #[testing]
 use masc.core.row;
-#[testing]
 use masc.core.state;
 use core_syntax: masc.core.syntax;
 use masc.syntax.expr;
@@ -73,7 +73,13 @@ pub val UNNAMED:    str = "an id is named only within a module's stream";
 pub val NO_BINDING: str = "expected `=` after the result id";
 pub val UNCLOSED:   str = "string not closed";
 pub val NO_STRING:  str = "expected a string between double quotes";
-pub val TYPED:      str = "a literal typed by another operand is not spelled";
+pub val TYPED:      str = "a literal of no type, which spir-v spells only as a string or by its type";
+pub val UNTYPED:    str = "a typed literal whose type is no scalar type the stream holds";
+pub val FLOATED:    str = "a float literal, which masc reads and writes once mach-std converts float text";
+pub val WIDE:       str = "a typed literal wider than 64 bits";
+pub val NEGATIVE:   str = "a negative number in an unsigned literal";
+pub val UNFIT:      str = "an integer that does not fit its type";
+pub val EXTENDED:   str = "a literal whose words do not extend its type's bits as its type does";
 
 # whether `c` continues an id's name or number
 fun name_byte(c: u8) bool {
@@ -190,17 +196,148 @@ fun string_print(w: *core_syntax.Writer, bytes: operand.Bytes) err[field.Refusal
     ret write.text(w, "\"");
 }
 
+# the scalar type of the literal of `desc` among `values`, the type its width names, none when the literal states no
+# such type or the stream holds none
+fun typed_of(ctx: *state.Context, desc: *operand.Literal, values: *operand.Value) opt[spirv_stream.Scalar] {
+    if (desc.width_of == 0 || values == nil || ctx == nil || ctx.stream == nil) { ret opt[spirv_stream.Scalar].none{}; }
+    val by: operand.Value = values[desc.width_of - 1];
+    if (!sel by.id) { ret opt[spirv_stream.Scalar].none{}; }
+    ret spirv_stream.scalar(ctx.stream, by.id);
+}
+
+# the value of digit `c` in `base`, none for a byte that is no digit of it
+fun digit_of(c: u8, base: u64) opt[u64] {
+    var d: u64 = 99;
+    if (c >= '0' && c <= '9') { d = (c - '0')::u64; }
+    or (c >= 'a' && c <= 'f') { d = (c - 'a')::u64 + 10; }
+    or (c >= 'A' && c <= 'F') { d = (c - 'A')::u64 + 10; }
+    if (d >= base)            { ret opt[u64].none{}; }
+    ret opt[u64].some{d};
+}
+
+# an integer of scalar type `t` read as spirv-as reads it, its words little endian into the reader's bytes: a sign, then
+# 0x and hex digits, 0 and octal digits or decimal digits. a hex number of a signed type is its bit pattern, any other
+# its value, and a signed type's words sign-extend its bits and an unsigned type's zero-extend them
+fun integer_parse(r: *core_syntax.Reader, t: spirv_stream.Scalar, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val at:  usize = r.at;
+    var end: usize = at;
+    if (end < r.end && (r.text[end] == '-' || r.text[end] == '+')) { end = end + 1; }
+    for (end < r.end && read.word(r.text[end])) { end = end + 1; }
+    val len: usize = end - at;
+    if (t.bits == 0 || t.bits > 64) { ret err[diagnostic.Diagnostic].err{read.refuse(r, WIDE, at, len)}; }
+    var i:        usize = at;
+    var negative: bool  = false;
+    if (i < at + len && (r.text[i] == '-' || r.text[i] == '+')) {
+        negative = r.text[i] == '-';
+        i        = i + 1;
+    }
+    var base: u64 = 10;
+    if (i + 1 < at + len && r.text[i] == '0' && (r.text[i + 1] == 'x' || r.text[i + 1] == 'X')) {
+        base = 16;
+        i    = i + 2;
+    }
+    or (i + 1 < at + len && r.text[i] == '0') {
+        base = 8;
+        i    = i + 1;
+    }
+    if (i == at + len) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    var magnitude: u64 = 0;
+    for (i < at + len) {
+        val d: opt[u64] = digit_of(r.text[i], base);
+        if (sel d.none)                            { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+        if (magnitude > (~0::u64 - d.some) / base) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNFIT, at, len)}; }
+        magnitude = magnitude * base + d.some;
+        i         = i + 1;
+    }
+    val signed: bool = t.class == spirv_stream.SIGNED;
+    var all:    u64  = ~0::u64;
+    if (t.bits < 64) { all = (1::u64 << t.bits::u64) - 1; }
+    val half:    u64 = all / 2 + 1;
+    var pattern: u64 = magnitude;
+    if (negative) {
+        if (!signed)          { ret err[diagnostic.Diagnostic].err{read.refuse(r, NEGATIVE, at, len)}; }
+        if (magnitude > half) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNFIT, at, len)}; }
+        pattern = (~magnitude + 1) & all;
+    }
+    or (signed && base != 16 && magnitude >= half) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNFIT, at, len)}; }
+    or (magnitude > all)                           { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNFIT, at, len)}; }
+    var words: u64 = pattern;
+    if (signed && t.bits < 64 && (pattern & half) != 0) { words = pattern | ~all; }
+    var n: u32 = 4;
+    if (t.bits > 32) { n = 8; }
+    val room: res[*u8, diagnostic.Diagnostic] = read.reserve(r, n);
+    if (sel room.err) { ret err[diagnostic.Diagnostic].err{room.err}; }
+    var k: u32 = 0;
+    for (k < n) {
+        room.ok[k] = ((words >> (k * 8)::u64) & 0xFF)::u8;
+        k          = k + 1;
+    }
+    @out = operand.Value.literal{operand.Bytes{at: room.ok, len: n}};
+    r.at = at + len;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
 fun literal_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
     if (!sel desc.shape.literal)                      { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
     if (desc.shape.literal.content == operand.STRING) { ret string_parse(r, out); }
-    ret err[diagnostic.Diagnostic].err{read.refuse(r, TYPED, r.at, read.token(r, r.at))};
+    if (desc.shape.literal.width_of == 0)             { ret err[diagnostic.Diagnostic].err{read.refuse(r, TYPED, r.at, read.token(r, r.at))}; }
+    val t: opt[spirv_stream.Scalar] = typed_of(r.ctx, ?desc.shape.literal, r.values);
+    if (sel t.none)                         { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNTYPED, r.at, read.token(r, r.at))}; }
+    if (t.some.class == spirv_stream.FLOAT) { ret err[diagnostic.Diagnostic].err{read.refuse(r, FLOATED, r.at, read.token(r, r.at))}; }
+    ret integer_parse(r, t.some, out);
+}
+
+# `value` written in decimal, no sign
+fun unsigned_write(w: *core_syntax.Writer, value: u64) err[field.Refusal] {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var m:      u64   = value;
+    for {
+        digits[19 - count] = '0' + (m % 10)::u8;
+        count              = count + 1;
+        m                  = m / 10;
+        if (m == 0) { brk; }
+    }
+    ret write.bytes(w, ?digits[20 - count], count);
+}
+
+# the integer the words `bytes` hold of scalar type `t`, in decimal as spirv-dis writes it, negative for a signed type,
+# refused where the words do not extend the type's bits as the type does
+fun integer_print(w: *core_syntax.Writer, t: spirv_stream.Scalar, bytes: operand.Bytes) err[field.Refusal] {
+    if (t.bits == 0 || t.bits > 64)        { ret write.refuse(w, WIDE, field.NO_OPERAND); }
+    if (bytes.len != 4 && bytes.len != 8)  { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    if ((bytes.len == 8) != (t.bits > 32)) { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    var words: u64 = 0;
+    var k:     u32 = 0;
+    for (k < bytes.len) {
+        words = words | (bytes.at[k]::u64 << (k * 8)::u64);
+        k     = k + 1;
+    }
+    var all: u64 = ~0::u64;
+    if (t.bits < 64) { all = (1::u64 << t.bits::u64) - 1; }
+    var whole: u64 = 0xFFFF_FFFF;
+    if (bytes.len == 8) { whole = ~0::u64; }
+    val pattern:  u64  = words & all;
+    val half:     u64  = all / 2 + 1;
+    val negative: bool = t.class == spirv_stream.SIGNED && (pattern & half) != 0;
+    var extended: u64  = pattern;
+    if (negative)          { extended = (pattern | ~all) & whole; }
+    if (extended != words) { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    if (!negative)         { ret unsigned_write(w, pattern); }
+    val minus: err[field.Refusal] = write.text(w, "-");
+    if (sel minus.err) { ret minus; }
+    ret unsigned_write(w, ((~pattern + 1) & all));
 }
 
 fun literal_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
-    if (!sel desc.shape.literal || !sel value.literal)                          { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
-    if (sel desc.shape.literal && desc.shape.literal.content != operand.STRING) { ret write.refuse(w, TYPED, field.NO_OPERAND); }
-    if (sel value.literal)                                                      { ret string_print(w, value.literal); }
-    ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND);
+    if (!sel desc.shape.literal)                      { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (!sel value.literal)                           { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    if (desc.shape.literal.content == operand.STRING) { ret string_print(w, value.literal); }
+    if (desc.shape.literal.width_of == 0)             { ret write.refuse(w, TYPED, field.NO_OPERAND); }
+    val t: opt[spirv_stream.Scalar] = typed_of(w.ctx, ?desc.shape.literal, w.values);
+    if (sel t.none)                         { ret write.refuse(w, UNTYPED, field.NO_OPERAND); }
+    if (t.some.class == spirv_stream.FLOAT) { ret write.refuse(w, FLOATED, field.NO_OPERAND); }
+    ret integer_print(w, t.some, value.literal);
 }
 
 val LITERAL: core_syntax.Hook = core_syntax.Hook{parse: literal_parse, print: literal_print};
@@ -410,5 +547,56 @@ test text__an_extended_instruction_resolves_through_its_set {
     val unimported: err[diagnostic.Diagnostic] = t_read(?t, "%11 = OpExtInst %1 %8 Sqrt %7");
     if (!sel unimported.err) { ret 9; }
     if (!t_release(?t))      { ret 10; }
+    ret 0;
+}
+
+# whether the typed literal of the test's instruction, operand `op`, holds the words `want`
+#[testing]
+fun t_literal(t: *T, op: u32, want: *u32, n: u32) bool {
+    val v: operand.Value = t.ins.values[op];
+    if (!sel v.literal)         { ret false; }
+    if (v.literal.len != n * 4) { ret false; }
+    var k: u32 = 0;
+    for (k < n * 4) {
+        if (v.literal.at[k] != ((want[k / 4] >> ((k % 4) * 8)) & 0xFF)::u8) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_refused(t: *T, text: str, message: str) bool {
+    val got: err[diagnostic.Diagnostic] = t_read(t, text);
+    if (!sel got.err) { ret false; }
+    ret got.err.message == message;
+}
+
+# a typed literal takes the words of its type's width, a signed type's sign-extended and a hex one its bit pattern, and
+# prints in decimal, as spirv-as and spirv-dis read and write them (SPIRV-Tools v2026.4: -2 of a signed 16-bit type is
+# 0xfffffffe, 0xffff of it reads as -1, 32768 does not fit it, and -9223372036854775808 of a signed 64-bit type is the
+# words 0 and 0x80000000). a float literal is refused until mach-std converts float text
+test text__a_typed_literal_takes_its_types_width_and_sign {
+    var t: T;
+    if (!t_make(?t, "spv1.0,Int16,Int64"))                                                                     { ret 1; }
+    if (!t_reads_as(?t, "%5 = OpTypeInt 32 0", gen_row.OPTYPEINT, "%5 = OpTypeInt 32 0") || !t_define(?t))     { ret 2; }
+    if (!t_reads_as(?t, "%6 = OpConstant %5 0x10", gen_row.OPCONSTANT, "%6 = OpConstant %5 16"))               { ret 3; }
+    if (!t_reads_as(?t, "%6 = OpConstant %5 4294967295", gen_row.OPCONSTANT, "%6 = OpConstant %5 4294967295")) { ret 4; }
+    if (!t_refused(?t, "%6 = OpConstant %5 -1", NEGATIVE))                                                     { ret 5; }
+    if (!t_refused(?t, "%6 = OpConstant %5 4294967296", UNFIT))                                                { ret 6; }
+    if (!t_reads_as(?t, "%7 = OpTypeInt 16 1", gen_row.OPTYPEINT, "%7 = OpTypeInt 16 1") || !t_define(?t))     { ret 7; }
+    if (!t_reads_as(?t, "%8 = OpConstant %7 -2", gen_row.OPCONSTANT, "%8 = OpConstant %7 -2"))                 { ret 8; }
+    val minus_two: [1]u32 = [1]u32{0xFFFF_FFFE};
+    if (!t_literal(?t, 2, ?minus_two[0], 1) || !t_define(?t))                                                                          { ret 9; }
+    if (!t_reads_as(?t, "%9 = OpConstant %7 0xffff", gen_row.OPCONSTANT, "%9 = OpConstant %7 -1"))                                     { ret 10; }
+    if (!t_refused(?t, "%9 = OpConstant %7 32768", UNFIT))                                                                             { ret 11; }
+    if (!t_reads_as(?t, "%10 = OpTypeInt 64 1", gen_row.OPTYPEINT, "%10 = OpTypeInt 64 1") || !t_define(?t))                           { ret 12; }
+    if (!t_reads_as(?t, "%11 = OpConstant %10 -9223372036854775808", gen_row.OPCONSTANT, "%11 = OpConstant %10 -9223372036854775808")) { ret 13; }
+    val least: [2]u32 = [2]u32{0, 0x8000_0000};
+    if (!t_literal(?t, 2, ?least[0], 2)) { ret 14; }
+    # a case literal takes the width of the selector's type
+    if (!t_reads_as(?t, "OpSwitch %8 %12 7 %13 -1 %14", gen_row.OPSWITCH, "OpSwitch %8 %12 7 %13 -1 %14"))     { ret 15; }
+    if (!t_reads_as(?t, "%15 = OpTypeFloat 32", gen_row.OPTYPEFLOAT, "%15 = OpTypeFloat 32") || !t_define(?t)) { ret 16; }
+    if (!t_refused(?t, "%16 = OpConstant %15 1.5", FLOATED))                                                   { ret 17; }
+    if (!t_release(?t))                                                                                        { ret 18; }
     ret 0;
 }
