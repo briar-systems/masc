@@ -1,0 +1,337 @@
+# a wasm function body's instructions, read from their text and encoded in the stream's order
+#
+# a body is instructions in the plain form, its immediates after its mnemonic up to the next instruction, or folded,
+# `(` an instruction and its operands `)` (WebAssembly Specification release 3.0, tag wg-3.0, 6.3-text.instructions,
+# Tfoldedinstr). a folded plain instruction's operands are folded instructions, encoded before it. a folded block,
+# loop or try_table is its head, its body and an `end`, and a folded if its conditions, its head, `(then ...)` and an
+# optional `(else ...)`, each arm's instructions in turn, and an `end`. a plain `end` or `else` may repeat the label
+# its block took, which must be the innermost.
+#
+# each instruction is read by the set's syntax over its own text, encoded by the codec and observed by the stream,
+# so a label's name resolves to its depth, a local to its index and a type use to its type. the reader owns the order:
+# what the text folds is encoded in the order the stream holds it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.codec.walk;
+use masc.core.diagnostic;
+use masc.core.dispatch;
+use masc.core.field;
+use masc.core.form;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.state;
+use core_syntax: masc.core.syntax;
+use masc.syntax.parse;
+
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_stream: masc.isa.wasm.stream;
+use wasm_syntax: masc.isa.wasm.syntax;
+use wasm_text:   masc.isa.wasm.text;
+
+use masc.isa.wasm.gen_row;
+
+pub val NOT_AN_INSTRUCTION: str = "expected an instruction";
+pub val NO_THEN:            str = "folded if without its then arm";
+pub val NOT_CLOSED:         str = "expected `)`";
+pub val UNCLOSED_BLOCK:     str = "block not closed by the end of its function";
+pub val OTHER_LABEL:        str = "label is not the innermost block's";
+pub val BROKEN_TEXT:        str = "malformed text";
+
+# what a body reads with: the text, its codec, the context whose stream holds the module, and storage for each
+# instruction's values
+# ---
+# text:   the module's text
+# origin: the position its first byte is at
+# codec:  the set's codec
+# ctx:    the context, its stream the module's
+# modes:  the assembler modes, none for wasm
+# pool:   each instruction's values and their members, grown to what its text may hold
+# fixups: what the codec appends, which no wasm field makes
+pub rec Reader {
+    text:   *u8;
+    origin: diagnostic.Position;
+    codec:  *dispatch.Codec;
+    ctx:    *state.Context;
+    modes:  mode.State;
+    pool:   vector.Vector[operand.Value];
+    fixups: vector.Vector[field.Fixup];
+}
+
+pub fun make(a: *A.Allocator, text: *u8, origin: diagnostic.Position, codec: *dispatch.Codec, ctx: *state.Context) Reader {
+    ret Reader{text: text, origin: origin, codec: codec, ctx: ctx, modes: mode.initial(?mode.NO_MODES), pool: vector.init[operand.Value](a), fixups: vector.init[field.Fixup](a)};
+}
+
+pub fun release(b: *Reader) {
+    vector.dnit[operand.Value](?b.pool);
+    vector.dnit[field.Fixup](?b.fixups);
+}
+
+fun refuse(b: *Reader, message: str, at: usize, len: usize) err[diagnostic.Diagnostic] {
+    ret err[diagnostic.Diagnostic].err{diagnostic.refusal(message, b.origin, b.text, at, len)};
+}
+
+fun at_token(b: *Reader, message: str, t: wasm_text.Token) err[diagnostic.Diagnostic] {
+    if (t.kind == wasm_text.BROKEN) { ret refuse(b, t.why, t.at, t.len); }
+    ret refuse(b, message, t.at, t.len);
+}
+
+# the first row the syntax's index has spelled by the atom `t`, none when no instruction is
+fun row_of(b: *Reader, t: wasm_text.Token) opt[u32] {
+    if (t.kind != wasm_text.ATOM) { ret opt[u32].none{}; }
+    val s:   *core_syntax.Syntax = ?wasm_syntax.SYNTAX;
+    val key: View                = View{data: ?b.text[t.at], len: t.len};
+    var lo:  u32                 = 0;
+    var hi:  u32                 = s.index.len;
+    for (lo < hi) {
+        val mid: u32                = lo + (hi - lo) / 2;
+        val e:   *core_syntax.Entry = ?s.index.at[mid];
+        val c:   i64                = core_syntax.compare(s, View{data: e.key, len: str_len(e.key)}, key);
+        if (c == 0) { ret opt[u32].some{s.index.candidates[e.first].row}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[u32].none{};
+}
+
+# whether `t` is an instruction's mnemonic
+fun mnemonic(b: *Reader, t: wasm_text.Token) bool {
+    val r: opt[u32] = row_of(b, t);
+    ret sel r.some;
+}
+
+# whether the token after `(` at the lexer starts a folded instruction or an if's arm, the end of an operand's text
+fun folds(b: *Reader, l: *wasm_text.Lexer) bool {
+    var copy: wasm_text.Lexer = @l;
+    if (wasm_text.next(?copy).kind != wasm_text.OPEN) { ret false; }
+    val t: wasm_text.Token = wasm_text.next(?copy);
+    ret mnemonic(b, t) || wasm_text.is(l, t, "then") || wasm_text.is(l, t, "else");
+}
+
+# the lexer past an instruction's immediates, which end at the next instruction, a folded one or an arm, or at the
+# `)` around them, the offset just past the last
+fun immediates(b: *Reader, l: *wasm_text.Lexer, from: usize) res[usize, diagnostic.Diagnostic] {
+    var end: usize = from;
+    for {
+        val t: wasm_text.Token = wasm_text.ahead(l);
+        if (t.kind == wasm_text.END || t.kind == wasm_text.CLOSE) { brk; }
+        if (t.kind == wasm_text.BROKEN)                           { ret res[usize, diagnostic.Diagnostic].err{diagnostic.refusal(t.why, b.origin, b.text, t.at, t.len)}; }
+        if (mnemonic(b, t))                                       { brk; }
+        if (t.kind == wasm_text.OPEN) {
+            if (folds(b, l)) { brk; }
+            val opened: wasm_text.Token = wasm_text.next(l);
+            if (!wasm_text.skip(l)) { ret res[usize, diagnostic.Diagnostic].err{diagnostic.refusal(NOT_CLOSED, b.origin, b.text, opened.at, 1)}; }
+            end = l.at;
+            cnt;
+        }
+        val taken: wasm_text.Token = wasm_text.next(l);
+        end = taken.at + taken.len;
+    }
+    ret res[usize, diagnostic.Diagnostic].ok{end};
+}
+
+fun observed(b: *Reader, ins: *inst.Inst, at: usize, len: usize) err[diagnostic.Diagnostic] {
+    val seen: err[field.Refusal] = wasm_stream.HOOKS.observe(b.ctx.stream, ins);
+    if (sel seen.err) { ret refuse(b, seen.err.message, at, len); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the instruction of no operands at row `r`, as a folded block's `end` and an if's `else`, encoded onto `out`
+fun bare(b: *Reader, r: *row.Row, at: usize, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    var ins:  inst.Inst                 = inst.Inst{row: r, values: nil, count: 0, form: form.PREFERRED};
+    val done: res[usize, field.Refusal] = walk.encode(b.codec, b.ctx, ?ins, out, ?b.fixups);
+    if (sel done.err) { ret refuse(b, done.err.message, at, 1); }
+    ret observed(b, ?ins, at, 1);
+}
+
+fun no_symbol(context: ptr, name: View) res[core_syntax.Resolved, str] {
+    ret res[core_syntax.Resolved, str].err{wasm_syntax.UNKNOWN};
+}
+
+fun no_name(context: ptr, handle: u32) View {
+    ret View{data: nil, len: 0};
+}
+
+val SYMBOLS: core_syntax.Symbols = core_syntax.Symbols{context: nil, resolve: no_symbol, name: no_name};
+
+# the instruction of the text `[at, end)`, read in wat, encoded onto `out` and observed
+fun one(b: *Reader, at: usize, end: usize, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    # a value per byte of text, and its operands, is more than any instruction's text holds
+    val cap:   usize               = end - at + row.MAX_OPERANDS::usize;
+    val grown: res[usize, A.Error] = vector.reserve[operand.Value](?b.pool, cap);
+    if (sel grown.err) { ret refuse(b, field.MEMORY, at, end - at); }
+    var bytes: [32]u8;
+    var noted: [8]requirement.Alternative;
+    var rd:    core_syntax.Reader = core_syntax.Reader{
+        text:    b.text,
+        start:   at,
+        at:      at,
+        end:     end,
+        origin:  diagnostic.advance(b.origin, b.text, at),
+        codec:   b.codec,
+        ctx:     b.ctx,
+        syntax:  ?wasm_syntax.SYNTAX,
+        modes:   ?b.modes,
+        symbols: ?SYMBOLS,
+        context: nil,
+        row:     nil,
+        pool:    b.pool.data,
+        cap:     cap::u32,
+        used:    0,
+        bytes:   ?bytes[0],
+        room:    32,
+        taken:   0,
+        refused: field.Admissions{at: ?noted[0], cap: 8, used: 0},
+    };
+    val got: res[inst.Inst, diagnostic.Diagnostic] = parse.instruction(?rd);
+    if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
+    var ins:  inst.Inst                 = got.ok;
+    val done: res[usize, field.Refusal] = walk.encode(b.codec, b.ctx, ?ins, out, ?b.fixups);
+    if (sel done.err) { ret refuse(b, done.err.message, at, end - at); }
+    ret observed(b, ?ins, at, end - at);
+}
+
+# a plain instruction at the lexer, its mnemonic `m` read, and the label a plain `end` or `else` repeats checked
+fun plain(b: *Reader, l: *wasm_text.Lexer, m: wasm_text.Token, r: u32, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val structure: u8 = gen_row.STRUCTURES[r];
+    if (structure == wasm_kind.ELSE || structure == wasm_kind.CLOSE) {
+        val label: wasm_text.Token = wasm_text.ahead(l);
+        if (wasm_text.identifier(l, label)) {
+            val named: str = wasm_stream.label_name(b.ctx.stream, 0);
+            if (!same(b, label, named)) { ret refuse(b, OTHER_LABEL, label.at, label.len); }
+            val passed: wasm_text.Token = wasm_text.next(l);
+            ret one(b, m.at, m.at + m.len, out);
+        }
+    }
+    val end: res[usize, diagnostic.Diagnostic] = immediates(b, l, m.at + m.len);
+    if (sel end.err) { ret err[diagnostic.Diagnostic].err{end.err}; }
+    ret one(b, m.at, end.ok, out);
+}
+
+# whether identifier `t` less its `$` spells `name`
+fun same(b: *Reader, t: wasm_text.Token, name: str) bool {
+    if (name == nil || str_len(name) != t.len - 1) { ret false; }
+    var i: usize = 0;
+    for (i < t.len - 1) {
+        if (b.text[t.at + 1 + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun closed(b: *Reader, l: *wasm_text.Lexer) err[diagnostic.Diagnostic] {
+    val t: wasm_text.Token = wasm_text.next(l);
+    if (t.kind != wasm_text.CLOSE) { ret at_token(b, NOT_CLOSED, t); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a folded instruction at the lexer, its `(` and mnemonic `m` read
+fun folded(b: *Reader, l: *wasm_text.Lexer, m: wasm_text.Token, r: u32, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val head: res[usize, diagnostic.Diagnostic] = immediates(b, l, m.at + m.len);
+    if (sel head.err) { ret err[diagnostic.Diagnostic].err{head.err}; }
+    val structure: u8 = gen_row.STRUCTURES[r];
+    if (structure != wasm_kind.OPEN) {
+        val operands: err[diagnostic.Diagnostic] = foldeds(b, l, out);
+        if (sel operands.err) { ret operands; }
+        val wrote: err[diagnostic.Diagnostic] = one(b, m.at, head.ok, out);
+        if (sel wrote.err) { ret wrote; }
+        ret closed(b, l);
+    }
+    if (?gen_row.ROWS[r] != gen_row.IF) {
+        val opened: err[diagnostic.Diagnostic] = one(b, m.at, head.ok, out);
+        if (sel opened.err) { ret opened; }
+        val inner: err[diagnostic.Diagnostic] = sequence(b, l, out);
+        if (sel inner.err) { ret inner; }
+        val shut:  wasm_text.Token            = wasm_text.ahead(l);
+        val ended: err[diagnostic.Diagnostic] = bare(b, gen_row.END, shut.at, out);
+        if (sel ended.err) { ret ended; }
+        ret closed(b, l);
+    }
+    val conditions: err[diagnostic.Diagnostic] = foldeds(b, l, out);
+    if (sel conditions.err) { ret conditions; }
+    val opened: err[diagnostic.Diagnostic] = one(b, m.at, head.ok, out);
+    if (sel opened.err)              { ret opened; }
+    if (!wasm_text.opens(l, "then")) { ret refuse(b, NO_THEN, m.at, m.len); }
+    val then: err[diagnostic.Diagnostic] = sequence(b, l, out);
+    if (sel then.err) { ret then; }
+    val then_shut: err[diagnostic.Diagnostic] = closed(b, l);
+    if (sel then_shut.err) { ret then_shut; }
+    val arm: wasm_text.Token = wasm_text.ahead(l);
+    if (wasm_text.opens(l, "else")) {
+        val turned: err[diagnostic.Diagnostic] = bare(b, gen_row.ELSE, arm.at, out);
+        if (sel turned.err) { ret turned; }
+        val other: err[diagnostic.Diagnostic] = sequence(b, l, out);
+        if (sel other.err) { ret other; }
+        val else_shut: err[diagnostic.Diagnostic] = closed(b, l);
+        if (sel else_shut.err) { ret else_shut; }
+    }
+    val shut:  wasm_text.Token            = wasm_text.ahead(l);
+    val ended: err[diagnostic.Diagnostic] = bare(b, gen_row.END, shut.at, out);
+    if (sel ended.err) { ret ended; }
+    ret closed(b, l);
+}
+
+# the folded instructions at the lexer, up to the first token that starts none
+fun foldeds(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    for {
+        var copy: wasm_text.Lexer = @l;
+        if (wasm_text.next(?copy).kind != wasm_text.OPEN) { brk; }
+        val m: wasm_text.Token = wasm_text.next(?copy);
+        val r: opt[u32]        = row_of(b, m);
+        if (sel r.none) { brk; }
+        @l = copy;
+        val got: err[diagnostic.Diagnostic] = folded(b, l, m, r.some, out);
+        if (sel got.err) { ret got; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the instructions at the lexer, plain and folded, up to the `)` around them, which is left for the caller
+pub fun sequence(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    for {
+        val t: wasm_text.Token = wasm_text.ahead(l);
+        if (t.kind == wasm_text.CLOSE || t.kind == wasm_text.END) { brk; }
+        if (t.kind == wasm_text.OPEN) {
+            var copy:   wasm_text.Lexer = @l;
+            val opened: wasm_text.Token = wasm_text.next(?copy);
+            val m:      wasm_text.Token = wasm_text.next(?copy);
+            val r:      opt[u32]        = row_of(b, m);
+            if (sel r.none) { ret at_token(b, NOT_AN_INSTRUCTION, m); }
+            @l = copy;
+            val got: err[diagnostic.Diagnostic] = folded(b, l, m, r.some, out);
+            if (sel got.err) { ret got; }
+            cnt;
+        }
+        val r: opt[u32] = row_of(b, t);
+        if (sel r.none) { ret at_token(b, NOT_AN_INSTRUCTION, t); }
+        val m:   wasm_text.Token            = wasm_text.next(l);
+        val got: err[diagnostic.Diagnostic] = plain(b, l, m, r.some, out);
+        if (sel got.err) { ret got; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a function's instructions at the lexer, up to the `)` that closes the function, which is left for the caller, and
+# the `end` its body takes, every block it opened closed
+pub fun function(b: *Reader, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val got: err[diagnostic.Diagnostic] = sequence(b, l, out);
+    if (sel got.err) { ret got; }
+    val shut: wasm_text.Token = wasm_text.ahead(l);
+    if (wasm_stream.count(b.ctx.stream, wasm_kind.LABELS) != 1) { ret refuse(b, UNCLOSED_BLOCK, shut.at, 1); }
+    ret bare(b, gen_row.END, shut.at, out);
+}
