@@ -1,0 +1,382 @@
+# wasm's float constants, read from text and written back
+#
+# the text spells a float as a decimal, a hexadecimal float `0x1.8p+3`, `inf`, `nan` for the canonical nan or
+# `nan:0x` and its payload, each signed, with `_` between digits (WebAssembly Specification release 3.0, tag wg-3.0,
+# 6.1-text.values.spectec, Tfloat). a hexadecimal float is read exactly and rounded once to the nearest, ties to even,
+# and a decimal by std's correctly rounded f64 reader, an f32 then rounded from that f64. the f64 is the decimal's
+# nearest, so rounding it again is the decimal's own rounding but where the f64 lies exactly between two f32s: such a
+# decimal is refused, its value then to be spelled in hexadecimal (limit). a float is written as the hexadecimal float
+# of its bits, as wabt's wasm2wat writes it, so it reads back to them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.collections.vector;
+use std.text.parse;
+
+pub val MALFORMED: str = "malformed float constant";
+pub val RANGE:     str = "float constant out of range";
+pub val TIE:       str = "decimal f32 constant lies between two f32s at an f64's precision, spell it in hexadecimal";
+pub val PAYLOAD:   str = "nan payload is 0 or wider than the float's fraction";
+pub val LONG:      str = "float constant longer than 1024 bytes";
+
+# the longest float constant read, its `_` removed (limit): an f64's exact decimal is at most 767 significant digits
+pub val MAX_TEXT: usize = 1024;
+
+# a float format's fraction bits and exponent bias
+rec Format {
+    fraction: u32;
+    bias:     i64;
+    exponent: u32;
+}
+
+fun format_of(bits: u32) Format {
+    if (bits == 32) { ret Format{fraction: 23, bias: 127, exponent: 8}; }
+    ret Format{fraction: 52, bias: 1023, exponent: 11};
+}
+
+# the highest set bit of `m`, which is not 0
+fun top(m: u64) i64 {
+    var h: i64 = 63;
+    for (h > 0 && ((m >> h::u64) & 1) == 0) { h = h - 1; }
+    ret h;
+}
+
+# a rounding: the bits it gives, or why it gives none
+rec Rounded {
+    bits: u64;
+    tie:  bool;
+}
+
+# `m` times 2^`e`, `sticky` set when bits below `m` were dropped, rounded to the nearest of format `f`, ties to even,
+# its bits without the sign. none past the format's largest finite value
+fun round(f: Format, m: u64, e: i64, sticky: bool) opt[Rounded] {
+    if (m == 0) { ret opt[Rounded].some{Rounded{bits: 0, tie: false}}; }
+    val h:      i64  = top(m);
+    val big:    i64  = h + e;
+    val lowest: i64  = 1 - f.bias;
+    var normal: bool = true;
+    var shift:  i64  = h - f.fraction::i64;
+    if (big < lowest) {
+        normal = false;
+        shift  = shift + (lowest - big);
+    }
+    var q:   u64  = 0;
+    var tie: bool = false;
+    if (shift <= 0) { q = m << (0 - shift)::u64; }
+    or (shift > 64) { q = 0; }
+    or {
+        var rem:  u64 = m;
+        var half: u64 = 0;
+        if (shift == 64) {
+            q    = 0;
+            half = 1::u64 << 63;
+        }
+        or {
+            q    = m >> shift::u64;
+            rem  = m & ((1::u64 << shift::u64) - 1);
+            half = 1::u64 << (shift - 1)::u64;
+        }
+        if (rem == half && !sticky)                                  { tie = true; }
+        if (rem > half || (rem == half && (sticky || (q & 1) == 1))) { q = q + 1; }
+    }
+    var biased: i64 = 0;
+    if (normal) { biased = big + f.bias; }
+    var out: u64 = (biased::u64 << f.fraction::u64) + q;
+    if (normal) { out = out - (1::u64 << f.fraction::u64); }
+    val inf: u64 = ((1::u64 << f.exponent::u64) - 1) << f.fraction::u64;
+    if (out >= inf) { ret opt[Rounded].none{}; }
+    ret opt[Rounded].some{Rounded{bits: out, tie: tie}};
+}
+
+fun hex(c: u8) i64 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i64 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i64 + 10; }
+    ret -1;
+}
+
+# `text` less its `_` between digits, each `_` between two digits, into `out` and a nul, its length
+fun plain(text: *u8, len: usize, out: *u8) opt[usize] {
+    var i: usize = 0;
+    var n: usize = 0;
+    for (i < len) {
+        if (text[i] == '_') {
+            if (i == 0 || i + 1 >= len || hex(text[i - 1]) < 0 || hex(text[i + 1]) < 0) { ret opt[usize].none{}; }
+        }
+        or {
+            out[n] = text[i];
+            n      = n + 1;
+        }
+        i = i + 1;
+    }
+    out[n] = 0;
+    ret opt[usize].some{n};
+}
+
+# the hexadecimal float at `s` after its `0x`, rounded to `f`
+fun hexadecimal(f: Format, s: *u8) res[u64, str] {
+    var m:      u64   = 0;
+    var e:      i64   = 0;
+    var sticky: bool  = false;
+    var digits: u32   = 0;
+    var seen:   bool  = false;
+    var point:  bool  = false;
+    var i:      usize = 0;
+    for (s[i] != 0 && s[i] != 'p' && s[i] != 'P') {
+        val c: u8 = s[i];
+        if (c == '.') {
+            if (point) { ret res[u64, str].err{MALFORMED}; }
+            point = true;
+        }
+        or {
+            val d: i64 = hex(c);
+            if (d < 0) { ret res[u64, str].err{MALFORMED}; }
+            seen = true;
+            if (m == 0 && d == 0) {
+                if (point) { e = e - 4; }
+            }
+            or (digits < 15) {
+                m      = m * 16 + d::u64;
+                digits = digits + 1;
+                if (point) { e = e - 4; }
+            }
+            or {
+                if (d != 0) { sticky = true; }
+                if (!point) { e = e + 4; }
+            }
+        }
+        i = i + 1;
+    }
+    if (!seen) { ret res[u64, str].err{MALFORMED}; }
+    if (s[i] == 'p' || s[i] == 'P') {
+        i = i + 1;
+        var negative: bool = false;
+        if (s[i] == '+' || s[i] == '-') {
+            negative = s[i] == '-';
+            i        = i + 1;
+        }
+        if (s[i] == 0) { ret res[u64, str].err{MALFORMED}; }
+        var x: i64 = 0;
+        for (s[i] != 0) {
+            if (s[i] < '0' || s[i] > '9') { ret res[u64, str].err{MALFORMED}; }
+            if (x < 100000)               { x = x * 10 + (s[i] - '0')::i64; }
+            i = i + 1;
+        }
+        if (negative) { x = 0 - x; }
+        e = e + x;
+    }
+    val r: opt[Rounded] = round(f, m, e, sticky);
+    if (sel r.none) { ret res[u64, str].err{RANGE}; }
+    ret res[u64, str].ok{r.some.bits};
+}
+
+# the decimal at `s`, `len` bytes, rounded to `f` through std's f64 reader
+fun decimal(f: Format, bits: u32, s: *u8, len: usize) res[u64, str] {
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = s[i];
+        if (!((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')) { ret res[u64, str].err{MALFORMED}; }
+        i = i + 1;
+    }
+    val got: res[f64, parse.ParseError] = parse.parse_f64_len(s, len);
+    if (sel got.err) { ret res[u64, str].err{MALFORMED}; }
+    val d: u64 = got.ok:~u64;
+    if (((d >> 52) & 0x7FF) == 0x7FF) { ret res[u64, str].err{RANGE}; }
+    if (bits == 64)                   { ret res[u64, str].ok{d & 0x7FFF_FFFF_FFFF_FFFF}; }
+    val exp:  u64 = (d >> 52) & 0x7FF;
+    var mant: u64 = d & 0xF_FFFF_FFFF_FFFF;
+    var e:    i64 = 0;
+    if (exp == 0) { e = 1 - 1023 - 52; }
+    or {
+        mant = mant | (1::u64 << 52);
+        e    = exp::i64 - 1023 - 52;
+    }
+    val r: opt[Rounded] = round(f, mant, e, false);
+    if (sel r.none) { ret res[u64, str].err{RANGE}; }
+    if (r.some.tie) { ret res[u64, str].err{TIE}; }
+    ret res[u64, str].ok{r.some.bits};
+}
+
+fun same(s: *u8, word: str) bool {
+    var i: usize = 0;
+    for (word[i] != 0) {
+        if (s[i] != word[i]) { ret false; }
+        i = i + 1;
+    }
+    ret s[i] == 0;
+}
+
+# the bits of the float of `bits` the `len` bytes of `text` spell
+pub fun read(text: *u8, len: usize, bits: u32) res[u64, str] {
+    if (len > MAX_TEXT) { ret res[u64, str].err{LONG}; }
+    val f:    Format     = format_of(bits);
+    var buf:  [1025]u8;
+    val kept: opt[usize] = plain(text, len, ?buf[0]);
+    if (sel kept.none) { ret res[u64, str].err{MALFORMED}; }
+    var s:    *u8   = ?buf[0];
+    var n:    usize = kept.some;
+    var sign: u64   = 0;
+    if (s[0] == '+' || s[0] == '-') {
+        if (s[0] == '-') { sign = 1::u64 << (bits - 1)::u64; }
+        s = ?s[1];
+        n = n - 1;
+    }
+    val inf:   u64           = ((1::u64 << f.exponent::u64) - 1) << f.fraction::u64;
+    var value: res[u64, str] = res[u64, str].err{MALFORMED};
+    if (same(s, "inf")) { value = res[u64, str].ok{inf}; }
+    or (same(s, "nan")) { value = res[u64, str].ok{inf | (1::u64 << (f.fraction - 1)::u64)}; }
+    or (n > 6 && s[0] == 'n' && s[1] == 'a' && s[2] == 'n' && s[3] == ':' && s[4] == '0' && s[5] == 'x') {
+        var payload: u64   = 0;
+        var i:       usize = 6;
+        for (i < n) {
+            val d: i64 = hex(s[i]);
+            if (d < 0 || payload >= (1::u64 << f.fraction::u64)) { ret res[u64, str].err{MALFORMED}; }
+            payload = payload * 16 + d::u64;
+            i       = i + 1;
+        }
+        if (payload == 0 || payload >= (1::u64 << f.fraction::u64)) { ret res[u64, str].err{PAYLOAD}; }
+        value = res[u64, str].ok{inf | payload};
+    }
+    or (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { value = hexadecimal(f, ?s[2]); }
+    or (n > 0)                                                { value = decimal(f, bits, s, n); }
+    if (sel value.err)                                        { ret value; }
+    ret res[u64, str].ok{value.ok | sign};
+}
+
+fun put(out: *vector.Vector[u8], s: str) {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        vector.push[u8](out, s[i]);
+        i = i + 1;
+    }
+}
+
+fun put_hex(out: *vector.Vector[u8], v: u64) {
+    val digits: str = "0123456789abcdef";
+    var shift:  i64 = 60;
+    for (shift > 0 && ((v >> shift::u64) & 0xF) == 0) { shift = shift - 4; }
+    for (shift >= 0) {
+        vector.push[u8](out, digits[(v >> shift::u64) & 0xF]);
+        shift = shift - 4;
+    }
+}
+
+fun put_decimal(out: *vector.Vector[u8], v: i64) {
+    var n: u64 = v::u64;
+    if (v < 0) {
+        vector.push[u8](out, '-');
+        n = (0 - v)::u64;
+    }
+    or { vector.push[u8](out, '+'); }
+    var rev: [24]u8;
+    var len: usize = 0;
+    for {
+        rev[len] = '0' + (n % 10)::u8;
+        len      = len + 1;
+        n        = n / 10;
+        if (n == 0) { brk; }
+    }
+    for (len > 0) {
+        len = len - 1;
+        vector.push[u8](out, rev[len]);
+    }
+}
+
+# the float of `bits` whose bits are `v` written onto `out`, as a hexadecimal float, `inf` or a nan
+pub fun write(out: *vector.Vector[u8], v: u64, bits: u32) {
+    val f:        Format = format_of(bits);
+    val sign:     bool   = ((v >> (bits - 1)::u64) & 1) == 1;
+    val exp:      u64    = (v >> f.fraction::u64) & ((1::u64 << f.exponent::u64) - 1);
+    var fraction: u64    = v & ((1::u64 << f.fraction::u64) - 1);
+    if (sign) { vector.push[u8](out, '-'); }
+    if (exp == (1::u64 << f.exponent::u64) - 1) {
+        if (fraction == 0) {
+            put(out, "inf");
+            ret;
+        }
+        put(out, "nan");
+        if (fraction != (1::u64 << (f.fraction - 1)::u64)) {
+            put(out, ":0x");
+            put_hex(out, fraction);
+        }
+        ret;
+    }
+    if (exp == 0 && fraction == 0) {
+        put(out, "0x0p+0");
+        ret;
+    }
+    var e: i64 = exp::i64 - f.bias;
+    if (exp == 0) {
+        # a subnormal written normalized
+        val h: i64 = top(fraction);
+        e        = 1 - f.bias - (f.fraction::i64 - h);
+        fraction = (fraction << (f.fraction::i64 - h)::u64) & ((1::u64 << f.fraction::u64) - 1);
+    }
+    put(out, "0x1");
+    if (fraction != 0) {
+        # the fraction left aligned to whole hex digits, its trailing zero digits dropped
+        val pad:   u32 = (4 - f.fraction % 4) % 4;
+        var bits_: u64 = fraction << pad::u64;
+        var width: u32 = (f.fraction + pad) / 4;
+        for (width > 0 && (bits_ & 0xF) == 0) {
+            bits_ = bits_ >> 4;
+            width = width - 1;
+        }
+        vector.push[u8](out, '.');
+        val digits: str = "0123456789abcdef";
+        var k:      i64 = width::i64 - 1;
+        for (k >= 0) {
+            vector.push[u8](out, digits[(bits_ >> (k * 4)::u64) & 0xF]);
+            k = k - 1;
+        }
+    }
+    vector.push[u8](out, 'p');
+    put_decimal(out, e);
+}
+
+#[testing]
+fun t_reads(text: str, bits: u32, want: u64) bool {
+    var n: usize = 0;
+    for (text[n] != 0) { n = n + 1; }
+    val got: res[u64, str] = read(text, n, bits);
+    ret sel got.ok && got.ok == want;
+}
+
+#[testing]
+fun t_writes(a: *A.Allocator, v: u64, bits: u32, want: str) bool {
+    var out: vector.Vector[u8] = vector.init[u8](a);
+    write(?out, v, bits);
+    vector.push[u8](?out, 0);
+    ret str_equals(out.data, want);
+}
+
+# decimals, hexadecimal floats, infinities and nans read to their bits and write back as hexadecimal floats
+test float__constants_read_to_their_bits_and_write_back {
+    var t: testing.Testing;
+    testing.make(?t);
+    val a: *A.Allocator = testing.allocator_of(?t);
+    if (!t_reads("1", 32, 0x3F80_0000))                                  { ret 1; }
+    if (!t_reads("-1.5", 64, 0xBFF8_0000_0000_0000))                     { ret 2; }
+    if (!t_reads("0x1.8p+1", 32, 0x4040_0000))                           { ret 3; }
+    if (!t_reads("0x1p-149", 32, 1))                                     { ret 4; }
+    if (!t_reads("nan:0x1", 32, 0x7F80_0001))                            { ret 5; }
+    if (!t_reads("-inf", 64, 0xFFF0_0000_0000_0000))                     { ret 6; }
+    if (!t_reads("0.1", 32, 0x3DCC_CCCD))                                { ret 7; }
+    if (!t_reads("1_000", 32, 0x447A_0000))                              { ret 8; }
+    if (!t_writes(a, 0x3F80_0000, 32, "0x1p+0"))                         { ret 9; }
+    if (!t_writes(a, 0x4040_0000, 32, "0x1.8p+1"))                       { ret 10; }
+    if (!t_writes(a, 1, 32, "0x1p-149"))                                 { ret 11; }
+    if (!t_writes(a, 0x7FC0_0000, 32, "nan"))                            { ret 12; }
+    if (!t_writes(a, 0x3FB9_9999_9999_999A, 64, "0x1.999999999999ap-4")) { ret 13; }
+    if (t_reads("0x1p+128", 32, 0))                                      { ret 14; }
+    ret 0;
+}

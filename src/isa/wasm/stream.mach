@@ -1,0 +1,416 @@
+# the state a wasm module's stream keeps across its instructions
+#
+# wasm numbers its definitions in index spaces a module's fields fill, types, functions, tables, memories, globals,
+# tags, data and element segments, and a function's locals after its params, and counts a branch's target by the
+# blocks open around it. the state keeps each space's entries by the code of each one's type: a function's or a tag's
+# type index, a table's or a memory's address type, a global's or a local's value type. it keeps the function types,
+# the names a module's text gives its definitions, the label stack of the function being read and that function's
+# results.
+#
+# whoever reads or writes a module's instructions in order makes and begins the stream, defines its spaces, enters
+# each function body and observes each instruction: block, loop, if and try_table push a label, the name the text
+# gave it pending when they are observed, and end pops one, the function body's last. a name resolves in its own
+# space, a label's to its depth counted from the innermost.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use masc.core.field;
+use masc.core.inst;
+use masc.core.stream;
+
+use wasm_kind: masc.isa.wasm.kind;
+
+use masc.isa.wasm.gen_row;
+
+pub val NAMED_TWICE: str = "name given twice in its index space";
+pub val NOT_OPEN:    str = "end or else with no block open";
+pub val NO_TYPE:     str = "function names a type index the module does not define";
+pub val NO_SPACE:    str = "index space the set does not have";
+
+# the value type codes of the i32 and i64 address types
+pub val I32: u32 = 0x7F;
+pub val I64: u32 = 0x7E;
+
+# a function type, its params and its results by their value type codes
+pub rec FuncType {
+    params:  vector.Vector[u32];
+    results: vector.Vector[u32];
+}
+
+# a label of the function being read, by the name the text gave it, nil for none
+rec Label {
+    name: str;
+}
+
+# the stream's state
+# ---
+# alloc:   what it lives in
+# spaces:  each space's entries, by the code of each one's type
+# names:   each space's names, each owned, by the index it names
+# types:   the function types, by type index
+# labels:  the label stack of the function being read, the innermost last
+# pending: the name the text gave the next block, nil for none
+# results: the results of the function being read
+# used:    the params and results a type use states, as the text reads them
+pub rec State {
+    alloc:   *A.Allocator;
+    spaces:  [10]vector.Vector[u32];
+    names:   [10]map.Map[str, u32];
+    types:   vector.Vector[FuncType];
+    labels:  vector.Vector[Label];
+    pending: str;
+    results: vector.Vector[u32];
+    used:    FuncType;
+}
+
+fun state_of(p: ptr) *State {
+    ret p::*State;
+}
+
+fun memory() err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(field.MEMORY, field.NO_OPERAND, 0)};
+}
+
+fun make(a: *A.Allocator) res[ptr, A.Error] {
+    val got: res[*State, A.Error] = A.allocate[State](a, 1);
+    if (sel got.err) { ret res[ptr, A.Error].err{got.err}; }
+    val s: *State = got.ok;
+    s.alloc = a;
+    var k: u16 = 0;
+    for (k < wasm_kind.SPACES) {
+        s.spaces[k] = vector.init[u32](a);
+        s.names[k]  = map.init[str, u32](a);
+        k           = k + 1;
+    }
+    s.types   = vector.init[FuncType](a);
+    s.labels  = vector.init[Label](a);
+    s.pending = nil;
+    s.results = vector.init[u32](a);
+    s.used    = FuncType{params: vector.init[u32](a), results: vector.init[u32](a)};
+    ret res[ptr, A.Error].ok{s::ptr};
+}
+
+# a copy of `v` with a nul after it, nil when the storage is refused
+fun owned(a: *A.Allocator, v: View) str {
+    val got: res[*u8, A.Error] = A.allocate[u8](a, v.len + 1);
+    if (sel got.err) { ret nil; }
+    var i: usize = 0;
+    for (i < v.len) {
+        got.ok[i] = v.data[i];
+        i         = i + 1;
+    }
+    got.ok[v.len] = 0;
+    ret got.ok;
+}
+
+fun give(a: *A.Allocator, s: str) {
+    if (s == nil) { ret; }
+    val freed: err[A.Error] = A.deallocate[u8](a, s, str_len(s) + 1);
+}
+
+fun forget_names(s: *State, k: u16) {
+    var it:  map.Iter = map.iter[str, u32](?s.names[k]);
+    var one: map.Entry[str, u32];
+    for (map.next[str, u32](?s.names[k], ?it, ?one)) { give(s.alloc, @one.key); }
+    map.clear[str, u32](?s.names[k]);
+}
+
+fun forget_labels(s: *State) {
+    var i: usize = 0;
+    for (i < s.labels.len) {
+        give(s.alloc, s.labels.data[i].name);
+        i = i + 1;
+    }
+    s.labels.len = 0;
+    give(s.alloc, s.pending);
+    s.pending = nil;
+}
+
+fun forget_types(s: *State) {
+    var i: usize = 0;
+    for (i < s.types.len) {
+        vector.dnit[u32](?s.types.data[i].params);
+        vector.dnit[u32](?s.types.data[i].results);
+        i = i + 1;
+    }
+    s.types.len = 0;
+}
+
+fun release(a: *A.Allocator, p: ptr) {
+    val s: *State = state_of(p);
+    forget_labels(s);
+    forget_types(s);
+    var k: u16 = 0;
+    for (k < wasm_kind.SPACES) {
+        forget_names(s, k);
+        vector.dnit[u32](?s.spaces[k]);
+        map.dnit[str, u32](?s.names[k]);
+        k = k + 1;
+    }
+    vector.dnit[FuncType](?s.types);
+    vector.dnit[Label](?s.labels);
+    vector.dnit[u32](?s.results);
+    vector.dnit[u32](?s.used.params);
+    vector.dnit[u32](?s.used.results);
+    val freed: err[A.Error] = A.deallocate[State](a, s, 1);
+}
+
+# the state started on a new module, every space empty
+fun begin(p: ptr) {
+    val s: *State = state_of(p);
+    forget_labels(s);
+    forget_types(s);
+    var k: u16 = 0;
+    for (k < wasm_kind.SPACES) {
+        forget_names(s, k);
+        s.spaces[k].len = 0;
+        k               = k + 1;
+    }
+    s.results.len = 0;
+}
+
+# a block of the function opened, by the name the text gave it
+fun open(s: *State) err[field.Refusal] {
+    val pushed: res[usize, A.Error] = vector.push[Label](?s.labels, Label{name: s.pending});
+    if (sel pushed.err) { ret memory(); }
+    s.pending = nil;
+    ret err[field.Refusal].ok{};
+}
+
+# a block structure the instruction opens or closes added to the state
+fun observe(p: ptr, ins: *inst.Inst) err[field.Refusal] {
+    val s: *State = state_of(p);
+    val r: u32    = ins.row.index;
+    if (r >= gen_row.COUNT) { ret err[field.Refusal].ok{}; }
+    val structure: u8 = gen_row.STRUCTURES[r];
+    if (structure == wasm_kind.OPEN) { ret open(s); }
+    # a name pends only until the next instruction is observed, so a refused block's name names no later one
+    give(s.alloc, s.pending);
+    s.pending = nil;
+    if (structure == wasm_kind.ELSE && s.labels.len == 0) { ret err[field.Refusal].err{field.refusal(NOT_OPEN, field.NO_OPERAND, 0)}; }
+    if (structure == wasm_kind.CLOSE) {
+        if (s.labels.len == 0) { ret err[field.Refusal].err{field.refusal(NOT_OPEN, field.NO_OPERAND, 0)}; }
+        give(s.alloc, s.labels.data[s.labels.len - 1].name);
+        s.labels.len = s.labels.len - 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# wasm types no literal by an id
+fun width(p: ptr, id: u32) opt[u8] {
+    ret opt[u8].none{};
+}
+
+# the code of the entry `index` names in space `at`, none past the space's end
+pub fun space(p: ptr, at: u16, index: u32) opt[u32] {
+    val s: *State = state_of(p);
+    if (at == wasm_kind.LABELS) {
+        if (index::usize >= s.labels.len) { ret opt[u32].none{}; }
+        ret opt[u32].some{0};
+    }
+    if (at >= wasm_kind.SPACES)           { ret opt[u32].none{}; }
+    if (index::usize >= s.spaces[at].len) { ret opt[u32].none{}; }
+    ret opt[u32].some{s.spaces[at].data[index]};
+}
+
+# how many entries space `at` holds
+pub fun count(p: ptr, at: u16) u32 {
+    val s: *State = state_of(p);
+    if (at == wasm_kind.LABELS) { ret s.labels.len::u32; }
+    if (at >= wasm_kind.SPACES) { ret 0; }
+    ret s.spaces[at].len::u32;
+}
+
+# the bits of the address type of memory `index`, none for a memory the stream does not hold
+pub fun address(p: ptr, index: u32) opt[u32] {
+    val got: opt[u32] = space(p, wasm_kind.MEMORIES, index);
+    if (sel got.none)    { ret opt[u32].none{}; }
+    if (got.some == I64) { ret opt[u32].some{64}; }
+    ret opt[u32].some{32};
+}
+
+# a new entry of space `at` of type code `code`, named `name` when it is not empty, its index
+pub fun define(p: ptr, at: u16, code: u32, name: View) res[u32, str] {
+    val s: *State = state_of(p);
+    if (at >= wasm_kind.SPACES || at == wasm_kind.LABELS) { ret res[u32, str].err{NO_SPACE}; }
+    val index: u32 = s.spaces[at].len::u32;
+    if (name.len > 0) {
+        val held: opt[u32] = resolve(p, at, name);
+        if (sel held.some) { ret res[u32, str].err{NAMED_TWICE}; }
+        val text: str = owned(s.alloc, name);
+        if (text == nil) { ret res[u32, str].err{field.MEMORY}; }
+        val put: res[bool, A.Error] = map.insert[str, u32](?s.names[at], text, index);
+        if (sel put.err) { ret res[u32, str].err{field.MEMORY}; }
+    }
+    val pushed: res[usize, A.Error] = vector.push[u32](?s.spaces[at], code);
+    if (sel pushed.err) { ret res[u32, str].err{field.MEMORY}; }
+    ret res[u32, str].ok{index};
+}
+
+# the index `name` names in space `at`, a label's depth from the innermost block, none for a name it does not hold
+pub fun resolve(p: ptr, at: u16, name: View) opt[u32] {
+    val s: *State = state_of(p);
+    if (at == wasm_kind.LABELS) {
+        var depth: usize = 0;
+        for (depth < s.labels.len) {
+            val l: str = s.labels.data[s.labels.len - 1 - depth].name;
+            if (l != nil && same(l, name)) { ret opt[u32].some{depth::u32}; }
+            depth = depth + 1;
+        }
+        ret opt[u32].none{};
+    }
+    if (at >= wasm_kind.SPACES) { ret opt[u32].none{}; }
+    val text: str = owned(s.alloc, name);
+    if (text == nil) { ret opt[u32].none{}; }
+    var key:   str       = text;
+    val found: opt[*u32] = map.get[str, u32](?s.names[at], ?key);
+    give(s.alloc, text);
+    if (sel found.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{@found.some};
+}
+
+fun same(s: str, v: View) bool {
+    if (str_len(s) != v.len) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (s[i] != v.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun copy_codes(into: *vector.Vector[u32], from: *u32, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[u32](into, from[i]);
+        if (sel pushed.err) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun matches(v: *vector.Vector[u32], at: *u32, n: u32) bool {
+    if (v.len != n::usize) { ret false; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (v.data[i] != at[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the first function type of `params` and `results`, none when the module defines none
+pub fun find_type(p: ptr, params: *u32, np: u32, results: *u32, nr: u32) opt[u32] {
+    val s: *State = state_of(p);
+    var i: usize  = 0;
+    for (i < s.types.len) {
+        val t: *FuncType = ?s.types.data[i];
+        if (matches(?t.params, params, np) && matches(?t.results, results, nr)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# a new function type of `params` and `results`, named `name` when it is not empty, its type index
+pub fun add_type(p: ptr, params: *u32, np: u32, results: *u32, nr: u32, name: View) res[u32, str] {
+    val s:  *State        = state_of(p);
+    val at: res[u32, str] = define(p, wasm_kind.TYPES, 0x60, name);
+    if (sel at.err) { ret at; }
+    var t: FuncType = FuncType{params: vector.init[u32](s.alloc), results: vector.init[u32](s.alloc)};
+    if (!copy_codes(?t.params, params, np) || !copy_codes(?t.results, results, nr)) { ret res[u32, str].err{field.MEMORY}; }
+    val pushed: res[usize, A.Error] = vector.push[FuncType](?s.types, t);
+    if (sel pushed.err) { ret res[u32, str].err{field.MEMORY}; }
+    ret at;
+}
+
+# the function type of type index `index`, none for one the module does not define
+pub fun func_type(p: ptr, index: u32) opt[*FuncType] {
+    val s: *State = state_of(p);
+    if (index::usize >= s.types.len) { ret opt[*FuncType].none{}; }
+    ret opt[*FuncType].some{?s.types.data[index]};
+}
+
+# the state entered into the body of a function of type `index`: its params its first locals, its results the
+# function's, and its body the outermost block
+pub fun enter(p: ptr, index: u32) err[str] {
+    val s: *State         = state_of(p);
+    val t: opt[*FuncType] = func_type(p, index);
+    if (sel t.none) { ret err[str].err{NO_TYPE}; }
+    forget_labels(s);
+    forget_names(s, wasm_kind.LOCALS);
+    s.spaces[wasm_kind.LOCALS].len = 0;
+    s.results.len                  = 0;
+    if (!copy_codes(?s.spaces[wasm_kind.LOCALS], t.some.params.data, t.some.params.len::u32)) { ret err[str].err{field.MEMORY}; }
+    if (!copy_codes(?s.results, t.some.results.data, t.some.results.len::u32))                { ret err[str].err{field.MEMORY}; }
+    val pushed: res[usize, A.Error] = vector.push[Label](?s.labels, Label{name: nil});
+    if (sel pushed.err) { ret err[str].err{field.MEMORY}; }
+    ret err[str].ok{};
+}
+
+# the name of local `index` of the function being read, as the text names its params, `name` empty for none
+pub fun name_local(p: ptr, index: u32, name: View) err[str] {
+    val s: *State = state_of(p);
+    if (name.len == 0) { ret err[str].ok{}; }
+    val held: opt[u32] = resolve(p, wasm_kind.LOCALS, name);
+    if (sel held.some) { ret err[str].err{NAMED_TWICE}; }
+    val text: str = owned(s.alloc, name);
+    if (text == nil) { ret err[str].err{field.MEMORY}; }
+    val put: res[bool, A.Error] = map.insert[str, u32](?s.names[wasm_kind.LOCALS], text, index);
+    if (sel put.err) { ret err[str].err{field.MEMORY}; }
+    ret err[str].ok{};
+}
+
+# the name the text gives the next block observed, as `block $l` names its label, empty for a block it names none
+pub fun label(p: ptr, name: View) err[str] {
+    val s: *State = state_of(p);
+    give(s.alloc, s.pending);
+    s.pending = nil;
+    if (name.len == 0) { ret err[str].ok{}; }
+    s.pending = owned(s.alloc, name);
+    if (s.pending == nil) { ret err[str].err{field.MEMORY}; }
+    ret err[str].ok{};
+}
+
+# the name of the label at depth `depth`, nil for an unnamed one or one past the stack
+pub fun label_name(p: ptr, depth: u32) str {
+    val s: *State = state_of(p);
+    if (depth::usize >= s.labels.len) { ret nil; }
+    ret s.labels.data[s.labels.len - 1 - depth::usize].name;
+}
+
+# the params and results of a type use, emptied, for its reader to fill
+pub fun used(p: ptr) *FuncType {
+    val s: *State = state_of(p);
+    s.used.params.len  = 0;
+    s.used.results.len = 0;
+    ret ?s.used;
+}
+
+# the results of the function being read
+pub fun results(p: ptr) *vector.Vector[u32] {
+    ret ?state_of(p).results;
+}
+
+# how a wasm module's stream keeps its state, its stack types spelled by the value types' names
+pub val HOOKS: stream.Hooks = stream.Hooks{
+    types:   stream.Names{at: ?gen_row.TYPE_NAMES[0], len: gen_row.TYPE_NAMES_COUNT},
+    make:    make,
+    release: release,
+    begin:   begin,
+    observe: observe,
+    width:   width,
+    space:   space,
+};
