@@ -10,7 +10,10 @@
 #   memory      `<size> ptr <segment>:[<base> + <scale>*<index> + <displacement>]`, each part absent when the address
 #               has none, the displacement subtracted when negative and dropped when zero beside a register, the size
 #               the operand's width (byte, word, dword, fword, qword, tbyte, xmmword, ymmword, zmmword), none for an
-#               address computed but never accessed, as lea's, and rip as the base of a rip-relative address
+#               address computed but never accessed, as lea's, and rip as the base of a rip-relative address. the
+#               displacement may name a symbol and its addend, as `[rip + ext + 8]`, whose fixup the ModRM kind
+#               chooses: pc-relative from the instruction's end for a rip-relative address, as llvm-mc writes
+#               R_X86_64_PC32 ext-4, else absolute
 # relative targets are the core's expression of their offset. registers are written by name and read without regard
 # to case.
 
@@ -41,6 +44,7 @@ pub val NO_SIZE:    str = "memory operand states no size, or another than the in
 pub val NOT_SCALE:  str = "index scale is none of 1, 2, 4 and 8";
 pub val NO_ADDRESS: str = "memory operand is no address the syntax reads";
 pub val TWO_PARTS:  str = "memory operand names its base, index or displacement twice";
+pub val NEGATED:    str = "memory operand subtracts a symbol";
 
 # a size word and the width it names
 rec Size {
@@ -133,7 +137,17 @@ fun memory_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, v
         if (sel index.err) { ret index; }
         plus = true;
     }
-    if (a.disp != 0 || !plus) {
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        if (plus) {
+            val joined: err[field.Refusal] = write.text(w, " + ");
+            if (sel joined.err) { ret joined; }
+        }
+        var fixup: operand.FixupKind = operand.NO_FIXUP;
+        if (sel desc.shape.memory) { fixup = desc.shape.memory.disp.fixup; }
+        val named: err[field.Refusal] = expr.print_symbol(w, a.symbol, fixup, field.NO_OPERAND);
+        if (sel named.err) { ret named; }
+    }
+    or (a.disp != 0 || !plus) {
         var d: i64 = a.disp;
         if (plus) {
             var joint: str = " + ";
@@ -190,9 +204,32 @@ fun scale_of(n: i64) opt[u8] {
     ret opt[u8].none{};
 }
 
-# a term of the address: a register, a register times a scale, a scale times a register, or a number, added or, for a
-# number, subtracted
-fun term(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *bool) err[diagnostic.Diagnostic] {
+# a displacement term that is no number and no register, as `ext`: the expression's one term, a symbol whose addend
+# the address's numbers add to once it is read, or a constant a name equates to, under the displacement's fixup kind
+fun displacement(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *bool, fixup: operand.FixupKind) err[diagnostic.Diagnostic] {
+    val at: usize                                 = r.at;
+    val e:  res[expr.Expr, diagnostic.Diagnostic] = expr.unary(r, fixup);
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{e.err}; }
+    val got: expr.Expr = e.ok;
+    if (sel got.difference) { ret err[diagnostic.Diagnostic].err{read.refuse(r, expr.DIFFERENCE, at, r.at - at)}; }
+    if (sel got.symbol) {
+        if (negative)                         { ret refused(r, NEGATED, at); }
+        if (a.symbol.id != operand.NO_SYMBOL) { ret refused(r, TWO_PARTS, at); }
+        a.symbol = got.symbol;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (sel got.constant) {
+        if (@seen) { ret refused(r, TWO_PARTS, at); }
+        @seen = true;
+        if (negative) { a.disp = 0 - got.constant; }
+        or            { a.disp = got.constant; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a term of the address: a register, a register times a scale, a scale times a register, a number, or a displacement
+# naming a symbol, added or, for a number or a constant, subtracted
+fun term(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *bool, fixup: operand.FixupKind) err[diagnostic.Diagnostic] {
     val at: usize = r.at;
     val c:  u8    = read.peek(r);
     if (c >= '0' && c <= '9') {
@@ -216,9 +253,12 @@ fun term(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *boo
         or            { a.disp = n.ok; }
         ret err[diagnostic.Diagnostic].ok{};
     }
-    if (negative) { ret refused(r, NO_ADDRESS, at); }
     val reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, true);
-    if (sel reg.err) { ret err[diagnostic.Diagnostic].err{reg.err}; }
+    if (sel reg.err) {
+        r.at = at;
+        ret displacement(r, a, negative, seen, fixup);
+    }
+    if (negative) { ret refused(r, NO_ADDRESS, at); }
     read.skip(r);
     if (read.take(r, "*")) {
         read.skip(r);
@@ -257,6 +297,8 @@ fun memory_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, o
     }
     if (!read.take(r, "[")) { ret refused(r, NO_ADDRESS, r.at); }
     read.skip(r);
+    var fixup: operand.FixupKind = operand.NO_FIXUP;
+    if (sel desc.shape.memory) { fixup = desc.shape.memory.disp.fixup; }
     var seen:     bool = false;
     var negative: bool = false;
     # an address of a displacement alone may be negative, as `[-1]`
@@ -265,7 +307,7 @@ fun memory_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, o
         read.skip(r);
     }
     for {
-        val got: err[diagnostic.Diagnostic] = term(r, ?a, negative, ?seen);
+        val got: err[diagnostic.Diagnostic] = term(r, ?a, negative, ?seen, fixup);
         if (sel got.err) { ret got; }
         read.skip(r);
         if (read.take(r, "]")) { brk; }
@@ -273,6 +315,11 @@ fun memory_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, o
         or (read.take(r, "-")) { negative = true; }
         or                     { ret refused(r, NO_ADDRESS, r.at); }
         read.skip(r);
+    }
+    # a symbolic displacement carries the address's number as its addend
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        a.symbol.addend = a.symbol.addend + a.disp;
+        a.disp          = 0;
     }
     @out = operand.Value.memory{a};
     ret err[diagnostic.Diagnostic].ok{};
