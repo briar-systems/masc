@@ -50,6 +50,10 @@ gen/out/linux-x86_64/debug/bin/gen          # regenerate every table
 gen/out/linux-x86_64/debug/bin/gen --check  # report any drift from them
 ```
 
+gen reads masc through `gen/dep/masc`, a copy `mach dep pull gen` takes, and a
+build never refreshes it. Pull gen again after every change to masc, or gen
+builds against the masc of the last pull.
+
 Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.
 `mach dep pull .` realizes the committed pins and `mach dep update` moves them.
