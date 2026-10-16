@@ -307,6 +307,9 @@ pub rec Result {
 # exceptions: the exception table by row key, each an index into it
 # scopes:     each exception's extensions whose absence it excuses, by its index, none for every selection
 # withs:      each exception's extensions it applies with, by its index, none for every selection
+# needs:      each exception's extension a row it names needs, by its index, none but for an extension's
+# used:       whether each exception, by its index, excused a row, so one of a pattern or an extension that excused
+#             none is stale
 # seen:       the notes so far, so each is kept once
 # modes:      the assembler modes the rows are read under
 # formats:    the format registry masc's and the tools' objects are read and written through
@@ -319,6 +322,8 @@ pub rec Run {
     exceptions: map.Map[str, u32];
     scopes:     vector.Vector[requirement.Ids];
     withs:      vector.Vector[requirement.Ids];
+    needs:      vector.Vector[requirement.Ids];
+    used:       vector.Vector[bool];
     seen:       map.Map[str, u32];
     modes:      mode.State;
     formats:    *registry.Registry;
@@ -1564,6 +1569,10 @@ fun subject_key(a: *A.Allocator, subject: agreement.Subject, variant: str) opt[s
         text.byte(?t, 0x01);
         text.put(?t, subject.rows);
     }
+    if (sel subject.extension) {
+        text.byte(?t, 0x02);
+        text.put(?t, subject.extension);
+    }
     ret text.copy(?t, a);
 }
 
@@ -1582,15 +1591,55 @@ fun globbed(pattern: str, key: str) bool {
     ret globbed(?pattern[1], ?key[1]);
 }
 
-# the exception of the table whose pattern matches row key `key` at the variant named `variant`, empty for every
-# variant, when it applies under `s`, nil for none
-fun patterned(run: *Run, key: str, variant: str, s: *extension.Selection) *agreement.Exception {
+# whether exception `e` is of a pattern or an extension, a family of rows
+fun broad(e: *agreement.Exception) bool {
+    ret sel e.subject.rows || sel e.subject.extension;
+}
+
+# whether row `r` needs every extension of `ids`: every alternative of its requirement holds each
+fun needs(r: *row.Row, ids: requirement.Ids) bool {
+    if (r.requires.len == 0 || ids.len == 0) { ret false; }
+    var a: u32 = 0;
+    for (a < r.requires.len) {
+        val all: requirement.Ids = r.requires.at[a].all;
+        var i:   u32             = 0;
+        for (i < ids.len) {
+            var held: bool = false;
+            var k:    u32  = 0;
+            for (k < all.len) {
+                if (all.at[k] == ids.at[i]) { held = true; }
+                k = k + 1;
+            }
+            if (!held) { ret false; }
+            i = i + 1;
+        }
+        a = a + 1;
+    }
+    ret true;
+}
+
+# the exception of the table of a pattern matching row key `key`, else of an extension the row needs, at the width
+# named `width`, empty for every width, when it applies under `s`, nil for none
+fun family(run: *Run, key: str, width: str, s: *extension.Selection) *agreement.Exception {
     val ex: agreement.Exceptions = run.agreement.exceptions;
     var i:  u32                  = 0;
     for (i < ex.len) {
         val e: *agreement.Exception = ?ex.at[i];
         if (sel e.subject.rows) {
-            if (str_equals(e.variant, variant) && globbed(e.subject.rows, key)) {
+            if (str_equals(e.variant, width) && globbed(e.subject.rows, key)) {
+                val got: *agreement.Exception = applying(run, i, s);
+                if (got != nil) { ret got; }
+            }
+        }
+        i = i + 1;
+    }
+    val known: opt[*row.Row] = walk.row_keyed(run.agreement.set.codec, key);
+    if (sel known.none) { ret nil; }
+    i = 0;
+    for (i < ex.len) {
+        val e: *agreement.Exception = ?ex.at[i];
+        if (sel e.subject.extension) {
+            if (str_equals(e.variant, width) && needs(known.some, run.needs.data[i])) {
                 val got: *agreement.Exception = applying(run, i, s);
                 if (got != nil) { ret got; }
             }
@@ -1615,17 +1664,30 @@ fun indexed(run: *Run, subject: agreement.Subject, variant: str) opt[*u32] {
     ret map.get[str, u32](?run.exceptions, ?key.some);
 }
 
-# the exception that names `subject` at the width named `width`, else the one that names it at every width, when it
-# applies under `s`, nil for none
+# the exception that names `subject` at the width named `width`, else the one that names it at every width, else
+# the family's of its row, or of the row a spelling is of, when it applies under `s`, nil for none
 fun exception_of(run: *Run, subject: agreement.Subject, width: str, s: *extension.Selection) *agreement.Exception {
     val own: opt[*u32] = indexed(run, subject, width);
     if (sel own.some) { ret applying(run, @own.some, s); }
     val every: opt[*u32] = indexed(run, subject, "");
-    if (sel every.some)   { ret applying(run, @every.some, s); }
-    if (!sel subject.row) { ret nil; }
-    val by_own: *agreement.Exception = patterned(run, subject.row, width, s);
+    if (sel every.some) { ret applying(run, @every.some, s); }
+    var key: str = nil;
+    if (sel subject.row)      { key = subject.row; }
+    if (sel subject.spelling) { key = subject.spelling.row; }
+    if (key == nil)           { ret nil; }
+    val by_own: *agreement.Exception = family(run, key, width, s);
     if (by_own != nil) { ret by_own; }
-    ret patterned(run, subject.row, "", s);
+    ret family(run, key, "", s);
+}
+
+# exception `e` marked as having excused a row
+fun used(r: *Run, e: *agreement.Exception) {
+    val ex: agreement.Exceptions = r.agreement.exceptions;
+    var i:  u32                  = 0;
+    for (i < ex.len) {
+        if (?ex.at[i] == e) { r.used.data[i] = true; }
+        i = i + 1;
+    }
 }
 
 # exception `at` of the table when it applies under `s`: `s` holds every extension it applies with and lacks one it
@@ -1882,16 +1944,25 @@ fun width(r: *Run, variant: *agreement.Variant, format: *mink_format.Format) err
                     if (by != nil && (by.checks & agreement.DECODE & failed(r.result, one)) != 0) {
                         one.lent = by;
                         lent     = true;
+                        used(r, by);
                     }
                 }
                 any = any | owed(r.result, one);
                 c   = c + 1;
             }
             var excused: agreement.Checks = 0;
-            if (v.exception != nil)                         { excused = v.exception.checks; }
-            if ((any & ~excused) != 0)                      { v.state = DISAGREE; }
-            or (v.exception != nil && (any & excused) == 0) { v.state = STALE; }
-            or (v.exception != nil || lent)                 { v.state = EXCEPTED; }
+            var wide:    bool             = false;
+            if (v.exception != nil) {
+                excused = v.exception.checks;
+                wide    = broad(v.exception);
+            }
+            if ((any & ~excused) != 0)                               { v.state = DISAGREE; }
+            or (v.exception != nil && (any & excused) == 0 && !wide) { v.state = STALE; }
+            or (v.exception != nil && (any & excused) != 0) {
+                v.state = EXCEPTED;
+                used(r, v.exception);
+            }
+            or (lent) { v.state = EXCEPTED; }
         }
         if (failing(v.state)) { r.result.failures = r.result.failures + 1; }
         k = k + 1;
@@ -2008,6 +2079,16 @@ fun index_exceptions(r: *Run) err[str] {
         if (sel with.err) { ret err[str].err{with.err}; }
         val held: res[usize, A.Error] = vector.push[requirement.Ids](?r.withs, with.ok);
         if (sel held.err) { ret err[str].err{MEMORY}; }
+        var need: requirement.Ids = requirement.NO_IDS;
+        if (sel e.subject.extension) {
+            val named: res[requirement.Ids, str] = scope_of(r, r.agreement.set.extensions, e.subject.extension);
+            if (sel named.err) { ret err[str].err{"an exception names no extension of the set"}; }
+            need = named.ok;
+        }
+        val needed: res[usize, A.Error] = vector.push[requirement.Ids](?r.needs, need);
+        if (sel needed.err) { ret err[str].err{MEMORY}; }
+        val unused: res[usize, A.Error] = vector.push[bool](?r.used, false);
+        if (sel unused.err) { ret err[str].err{MEMORY}; }
         val inserted: res[bool, A.Error] = map.insert[str, u32](?r.exceptions, key.some, i);
         if (sel inserted.err) { ret err[str].err{MEMORY}; }
         i = i + 1;
@@ -2044,6 +2125,7 @@ fun subject_known(r: *Run, subject: agreement.Subject, stated: *map.Map[str, u32
         }
         ret err[str].err{"an exception's pattern names no row of the set"};
     }
+    if (sel subject.extension) { ret err[str].ok{}; }
     if (sel subject.statement) {
         if (map.contains[str, u32](stated, ?subject.statement)) { ret err[str].ok{}; }
     }
@@ -2081,7 +2163,7 @@ pub fun agree(a: *A.Allocator, ag: *agreement.Agreement, options: Options, out: 
     if (sel built.err) { ret err[str].err{"mink's format registry cannot be built"}; }
     var formats: registry.Registry = built.ok;
     fin { registry.release(?formats); }
-    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), withs: vector.init[requirement.Ids](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats};
+    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), withs: vector.init[requirement.Ids](a), needs: vector.init[requirement.Ids](a), used: vector.init[bool](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats};
     val indexed: err[str] = index_exceptions(?r);
     if (sel indexed.err) { ret indexed; }
     val dir: err[fs.FsError] = fs.create_dir_all(a, options.work, 0o755);
@@ -2113,6 +2195,20 @@ pub fun agree(a: *A.Allocator, ag: *agreement.Agreement, options: Options, out: 
             v = v + 1;
         }
         f = f + 1;
+    }
+    # an exception of a family of rows that excused none is stale, as one of a row is
+    var e: u32 = 0;
+    for (e < ag.exceptions.len) {
+        val ex: *agreement.Exception = ?ag.exceptions.at[e];
+        if (broad(ex) && !r.used.data[e]) {
+            var named: str = nil;
+            if (sel ex.subject.rows)      { named = ex.subject.rows; }
+            if (sel ex.subject.extension) { named = ex.subject.extension; }
+            val noted: err[str] = note(?r, "stale exception", named);
+            if (sel noted.err) { ret noted; }
+            out.failures = out.failures + 1;
+        }
+        e = e + 1;
     }
     ret err[str].ok{};
 }
