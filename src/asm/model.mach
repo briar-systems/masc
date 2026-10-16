@@ -77,6 +77,7 @@ use masc.core.state;
 use masc.core.syntax;
 use masc.format.dialect;
 use masc.syntax.expr;
+use spell: masc.syntax.name;
 use masc.syntax.parse;
 use masc.syntax.read;
 
@@ -343,10 +344,10 @@ rec Frame {
     previous: opt[build.Section];
 }
 
-# a section opened apart from others of its name, re-entered by its name, the number it was opened with and the
-# signature of the group it is in
+# a section opened apart from others of its name, re-entered by its name and its keys: the number it was opened with,
+# the signature of the group it is in and the section it is ordered after, the last two the builder's
 # ---
-# unique: the number, none for a section only its group keeps apart
+# unique: the number, none for a section only its group or owner keeps apart
 rec Apart {
     unique:  opt[u64];
     section: build.Section;
@@ -374,11 +375,13 @@ rec Saved {
     syntax: u32;
 }
 
-# the view of the narrowings `active` marks at the state `values`, made the first time they are in force
+# the view of the narrowings `active` marks at the state `values`, made the first time they are in force, at the
+# statement `site` the file being assembled states
 rec Kept {
     active: u64;
     values: state.Settings;
     view:   *narrow.Narrowed;
+    site:   diagnostic.Position;
 }
 
 # a selection the narrowings in force narrow: the object's, or one a restatement states. it is held on the heap, so a
@@ -415,6 +418,7 @@ val ADMISSIONS: u32 = 16;
 # active:     the narrowings in force, one bit per row of the dialect's directives
 # values:     the state in force, the object's until a state directive sets an axis
 # pushed:     the statement states saved by the dialect's push, the last on top
+# site:       where the file being assembled states the statement being read, the start before the first
 # bases:      every selection a statement state has narrowed, the object's first, each with its views, which outlive
 #             the builder
 # index:      every row by name, in ascending order of folded name
@@ -445,6 +449,7 @@ pub rec Assembler {
     active:     u64;
     values:     state.Settings;
     pushed:     vector.Vector[Saved];
+    site:       diagnostic.Position;
     bases:      vector.Vector[*Basis];
     index:      vector.Vector[Entry];
     facts:      vector.Vector[Facts];
@@ -461,12 +466,13 @@ pub rec Assembler {
     admissions: [ADMISSIONS]requirement.Alternative;
 }
 
-fun nowhere(message: str) Refusal {
+# a refusal of `message` at no place of the text
+pub fun nowhere(message: str) Refusal {
     ret Refusal{message: message, span: diagnostic.Span{start: diagnostic.START, len: 0}, site: diagnostic.START, mode: opt[build.Mismatch].none{}, unmet: state.nothing_unmet()};
 }
 
 # the builder's refusal `b`, with the modes it names when it refuses a selection
-fun refused_build(b: build.Refusal) Refusal {
+pub fun refused_build(b: build.Refusal) Refusal {
     var r: Refusal = nowhere(b.message);
     r.mode  = b.mode;
     r.cause = b.object;
@@ -558,6 +564,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, object: *state.Context, options: Opti
         active:   0,
         values:   object.values,
         pushed:   vector.init[Saved](a),
+        site:     diagnostic.START,
         bases:    vector.init[*Basis](a),
         index:    vector.init[Entry](a),
         facts:    vector.init[Facts](a),
@@ -1045,17 +1052,45 @@ pub fun equate(m: *Assembler, l: build.Label, e: expr.Expr, fixed: bool, at: dia
     ret err[str].ok{};
 }
 
-# the section opened apart as `name` with the number `unique` in the group of signature `group`, none when no section
-# was
-fun apart_of(m: *Assembler, name: View, unique: opt[u64], group: opt[View]) opt[build.Section] {
+# what keeps a section apart from the others of its name, each none for a section it does not
+# ---
+# unique: the number it is opened apart with, as elf's `unique, 1`
+# group:  the signature of the comdat group it is in
+# owner:  the section it is ordered after, as an elf link-order section
+pub rec Keys {
+    unique: opt[u64];
+    group:  opt[View];
+    owner:  opt[build.Section];
+}
+
+# keys that keep a section apart by nothing
+pub val NO_KEYS: Keys = Keys{unique: opt[u64].none{}, group: opt[View].none{}, owner: opt[build.Section].none{}};
+
+# whether any of `k` keeps a section apart
+fun keeps(k: Keys) bool {
+    ret sel k.unique.some || sel k.group.some || sel k.owner.some;
+}
+
+# the section opened apart as `name` under keys `k`, none when no section was
+fun apart_of(m: *Assembler, name: View, k: Keys) opt[build.Section] {
     var i: usize = 0;
     for (i < m.apart.len) {
         val a: *Apart = ?m.apart.data[i];
         i = i + 1;
         val o: build.Opened = build.opened(?m.b, a.section);
-        if (same_number(a.unique, unique) && same_name(o.name, opt[View].some{name}) && same_name(build.group_of(?m.b, a.section), group)) { ret opt[build.Section].some{a.section}; }
+        if (!same_number(a.unique, k.unique) || !same_name(o.name, opt[View].some{name})) { cnt; }
+        if (!same_name(build.group_of(?m.b, a.section), k.group))                         { cnt; }
+        if (same_section(build.owner_of(?m.b, a.section), k.owner))                       { ret opt[build.Section].some{a.section}; }
     }
     ret opt[build.Section].none{};
+}
+
+fun same_section(a: opt[build.Section], b: opt[build.Section]) bool {
+    if (sel a.some) {
+        if (sel b.some) { ret a.some.index == b.some.index; }
+        ret false;
+    }
+    ret sel b.none;
 }
 
 fun same_number(a: opt[u64], b: opt[u64]) bool {
@@ -1088,15 +1123,17 @@ fun same_view(a: View, b: View) bool {
 # current with the section before it the previous. with `unique` it is the section of that name opened apart with that
 # number, never the one the name alone enters
 pub fun enter(m: *Assembler, name: View, spec: build.Spec, stated: bool, unique: opt[u64]) err[str] {
-    ret enter_grouped(m, name, spec, stated, unique, opt[View].none{});
+    var k: Keys = NO_KEYS;
+    k.unique = unique;
+    ret enter_kept(m, name, spec, stated, k);
 }
 
-# the section `enter` enters, in the comdat group of signature `group` when it is some: the section of that name and
-# number in that group, never one of another group or none
-pub fun enter_grouped(m: *Assembler, name: View, spec: build.Spec, stated: bool, unique: opt[u64], group: opt[View]) err[str] {
-    val kept:  bool               = sel unique.some || sel group.some;
+# the section `enter` enters under keys `k`: the section of that name, number, comdat group and owner, never one that
+# differs in any of them. a section any key keeps apart is never the one the name alone enters
+pub fun enter_kept(m: *Assembler, name: View, spec: build.Spec, stated: bool, k: Keys) err[str] {
+    val kept:  bool               = keeps(k);
     var found: opt[build.Section] = opt[build.Section].none{};
-    if (kept) { found = apart_of(m, name, unique, group); }
+    if (kept) { found = apart_of(m, name, k); }
     or        { found = build.section_named(?m.b, name); }
     var s: build.Section = build.Section{index: 0};
     if (sel found.some) {
@@ -1113,13 +1150,26 @@ pub fun enter_grouped(m: *Assembler, name: View, spec: build.Spec, stated: bool,
         val opened: res[build.Section, build.Refusal] = build.open(?m.b, named_);
         if (sel opened.err) { ret err[str].err{opened.err.message}; }
         s = opened.ok;
-        if (sel group.some) {
-            val joined: err[build.Refusal] = build.join(?m.b, s, group.some);
+        if (sel k.group.some) {
+            val joined: err[build.Refusal] = build.join(?m.b, s, k.group.some);
             if (sel joined.err) { ret err[str].err{joined.err.message}; }
         }
-        if (kept) { vector.push[Apart](?m.apart, Apart{unique: unique, section: s}); }
+        if (sel k.owner.some) {
+            val ordered: err[build.Refusal] = build.order(?m.b, s, k.owner.some);
+            if (sel ordered.err) { ret err[str].err{ordered.err.message}; }
+        }
+        if (kept) { vector.push[Apart](?m.apart, Apart{unique: k.unique, section: s}); }
     }
     ret switch_to(m, s);
+}
+
+# the section a link-order section names by `name` to be ordered after: the section of the label of that name placed so
+# far, else the first section of that name not kept apart, as the gnu assembler 2.47 reads a symbol before a section's
+# name. none when neither is, which llvm-mc 23.1.1 refuses too, as it reads no symbol placed later
+pub fun linked(m: *Assembler, name: View) opt[build.Section] {
+    val placed: opt[build.Section] = build.placed_in(?m.b, name);
+    if (sel placed.some) { ret placed; }
+    ret build.section_named(?m.b, name);
 }
 
 # section `s` made current, the current one becoming the previous
@@ -1226,7 +1276,7 @@ fun in_force(m: *Assembler, basis: *Basis, active: u64, values: state.Settings) 
             if (!held(vector.reserve[Kept](?basis.kept, 1))) { ret err[str].err{field.MEMORY}; }
             val made: res[*narrow.Narrowed, state.Opened] = narrow.from(m.a, m.object.view.file, ?basis.selection, m.object, values, m.set.source.directives, active);
             if (sel made.err) { ret err[str].err{opened(made.err)}; }
-            vector.push[Kept](?basis.kept, Kept{active: active, values: values, view: made.ok});
+            vector.push[Kept](?basis.kept, Kept{active: active, values: values, view: made.ok, site: m.site});
             found = made.ok;
         }
         v = ?found.context;
@@ -1256,30 +1306,6 @@ fun modes_back(m: *Assembler, saved: *mode.State) err[str] {
         i = i + 1;
     }
     ret err[str].ok{};
-}
-
-# the closure of `s` with extensions `ids` added, the state atoms it states kept, in storage of its own
-fun added(m: *Assembler, s: *extension.Selection, ids: requirement.Ids) res[extension.Selection, extension.Error] {
-    val made: res[extension.Request, extension.Error] = extension.request(m.a, s.catalog, "", diagnostic.START);
-    if (sel made.err) { ret res[extension.Selection, extension.Error].err{made.err}; }
-    var r: extension.Request = made.ok;
-    var i: u32               = 0;
-    for (i < s.catalog.count) {
-        if (extension.has(s, i)) { extension.request_add(?r, i); }
-        i = i + 1;
-    }
-    # the state atoms its spelling states stay stated, as a combination may hold under them
-    i = 0;
-    for (i < s.stated.len) {
-        extension.request_add(?r, s.stated.at[i]);
-        i = i + 1;
-    }
-    i = 0;
-    for (i < ids.len) {
-        extension.request_add(?r, ids.at[i]);
-        i = i + 1;
-    }
-    ret extension.close(r);
 }
 
 # the refusal of a selection that could not be made, at the `len` bytes from `at`
@@ -1316,7 +1342,7 @@ fun edited(m: *Assembler, rd: *syntax.Reader) res[extension.Selection, diagnosti
         }
         if (sign == '+' && !extension.has(?s, id.some)) {
             val one:   [1]requirement.Id                         = [1]requirement.Id{id.some};
-            val grown: res[extension.Selection, extension.Error] = added(m, ?s, requirement.Ids{at: ?one[0], len: 1});
+            val grown: res[extension.Selection, extension.Error] = extension.added(m.a, ?s, requirement.Ids{at: ?one[0], len: 1});
             extension.release(?s);
             if (sel grown.err) { ret res[extension.Selection, diagnostic.Diagnostic].err{unmade(rd, grown.err, at, len)}; }
             s = grown.ok;
@@ -1398,19 +1424,6 @@ fun dialect_row(m: *Assembler, rd: *syntax.Reader, first: u32) res[u32, diagnost
     ret res[u32, diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FORM, at, len)};
 }
 
-# the narrowings `active` over `s`, which holds `ids`, less every one that would take an extension of `ids` away, as a
-# widening lifts them
-fun lifted(m: *Assembler, s: *extension.Selection, active: u64, ids: requirement.Ids) u64 {
-    val ds:   core_source.Directives = m.set.source.directives;
-    var left: u64                    = active;
-    var i:    u32                    = 0;
-    for (i < ds.len) {
-        if ((active & core_source.bit(i)) != 0 && narrow.lifts(m.a, ds, i, s, ids)) { left = left & ~core_source.bit(i); }
-        i = i + 1;
-    }
-    ret left;
-}
-
 # the statement state saved last put back: its selection, narrowings and state in force, its modes and its syntax
 fun popped(m: *Assembler, rd: *syntax.Reader, at: usize, len: usize) err[diagnostic.Diagnostic] {
     if (m.pushed.len == 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NOTHING_PUSHED, at, len)}; }
@@ -1447,14 +1460,14 @@ fun widen(m: *Assembler, rd: *syntax.Reader, ids: requirement.Ids, at: usize, le
         k    = k + 1;
     }
     if (lack) {
-        val grown: res[extension.Selection, extension.Error] = added(m, ?b.selection, ids);
+        val grown: res[extension.Selection, extension.Error] = extension.added(m.a, ?b.selection, ids);
         if (sel grown.err) { ret err[diagnostic.Diagnostic].err{unmade(rd, grown.err, at, len)}; }
         val kept: res[*Basis, str] = based(m, grown.ok, false);
         if (sel kept.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, kept.err, at, len)}; }
         b = kept.ok;
     }
     @basis  = b;
-    @active = lifted(m, ?b.selection, @active, ids);
+    @active = narrow.lifted(m.a, m.set.source.directives, @active, ?b.selection, ids);
     ret err[diagnostic.Diagnostic].ok{};
 }
 
@@ -1777,6 +1790,35 @@ pub fun string(m: *Assembler, rd: *syntax.Reader) res[View, diagnostic.Diagnosti
     ret res[View, diagnostic.Diagnostic].ok{View{data: ?m.strings.data[start], len: m.strings.len - start}};
 }
 
+# the name the `len` bytes between a quoted name's quotes at `text` spell (`masc.syntax.name`), read into the
+# assembler's strings, which grow to hold it. ESCAPE for an escape the name may not hold
+pub fun unquoted(m: *Assembler, text: *u8, len: usize) res[View, str] {
+    if (!held(vector.reserve[u8](?m.strings, len))) { ret res[View, str].err{field.MEMORY}; }
+    val start: usize      = m.strings.len;
+    val n:     opt[usize] = spell.unquote(text, len, ?m.strings.data[start]);
+    if (sel n.none) { ret res[View, str].err{expr.ESCAPE}; }
+    m.strings.len = start + n.some;
+    ret res[View, str].ok{View{data: ?m.strings.data[start], len: n.some}};
+}
+
+# a symbol name read at the reader's position, bare or in quotes (`masc.syntax.name`), a quoted one into the
+# assembler's strings
+pub fun symbol_name(m: *Assembler, rd: *syntax.Reader) res[View, diagnostic.Diagnostic] {
+    val at: usize = rd.at;
+    if (read.peek(rd) == '"') {
+        val len: usize = spell.quoted(rd.text, at, rd.end);
+        if (len == 0) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, expr.UNQUOTED, at, rd.end - at)}; }
+        val v: res[View, str] = unquoted(m, ?rd.text[at + 1], len - 2);
+        if (sel v.err) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, v.err, at, len)}; }
+        rd.at = at + len;
+        ret res[View, diagnostic.Diagnostic].ok{v.ok};
+    }
+    val len: usize = read.name(rd);
+    if (len == 0) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NAME, at, read.token(rd, at))}; }
+    rd.at = at + len;
+    ret res[View, diagnostic.Diagnostic].ok{read.span(rd, at, len)};
+}
+
 fun hexit(c: u8) u32 {
     if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
     if (c >= 'a' && c <= 'f') { ret (c - 'a')::u32 + 10; }
@@ -1886,10 +1928,9 @@ pub fun read_item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, d
 fun item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
     val at: usize = rd.at;
     if (kind == NAME) {
-        val len: usize = read.name(rd);
-        if (len == 0) { ret res[Argument, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_NAME, at, read.token(rd, at))}; }
-        rd.at = at + len;
-        ret res[Argument, diagnostic.Diagnostic].ok{Argument.name{read.span(rd, at, len)}};
+        val v: res[View, diagnostic.Diagnostic] = symbol_name(m, rd);
+        if (sel v.err) { ret res[Argument, diagnostic.Diagnostic].err{v.err}; }
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.name{v.ok}};
     }
     if (kind == EXPRESSION) {
         val e: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
@@ -1974,7 +2015,14 @@ fun stop_at(st: *source.Statement, message: str, t: source.Token) err[diagnostic
 
 # a label statement: a numbered label placed as the next definition of its number, or a named one
 fun label_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnostic] {
-    val name:   View     = source.bytes(st, st.head);
+    var name: View = source.bytes(st, st.head);
+    # a quoted name is the name it spells, never a numbered label
+    if (name.len >= 2 && name.data[0] == '"') {
+        m.strings.len = 0;
+        val v: res[View, str] = unquoted(m, ?name.data[1], name.len - 2);
+        if (sel v.err) { ret stop_at(st, v.err, st.head); }
+        ret placed_label(m, st, v.ok);
+    }
     val number: opt[u64] = number_of(name);
     if (sel number.some) {
         val state: res[*Numbered, str] = numbered_state(m, number.some);
@@ -1993,6 +2041,11 @@ fun label_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnos
         n.next = opt[build.Label].none{};
         ret err[diagnostic.Diagnostic].ok{};
     }
+    ret placed_label(m, st, name);
+}
+
+# the label named `name` placed at the cursor by label statement `st`
+fun placed_label(m: *Assembler, st: *source.Statement, name: View) err[diagnostic.Diagnostic] {
     val l: res[build.Label, str] = label_named(m, name);
     if (sel l.err) { ret stop_at(st, l.err, st.head); }
     val f: Facts = declared(m, l.ok.id);
@@ -2085,6 +2138,7 @@ fun directive_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Dia
 # one statement read and written, its refusal at the place the file being assembled states it, `st.site`
 fun statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnostic] {
     m.names.context = m::ptr;
+    m.site          = st.site;
     if (st.kind == source.LABEL)     { ret label_statement(m, st); }
     if (st.kind == source.DIRECTIVE) { ret directive_statement(m, st); }
     ret instruction_statement(m, st);
@@ -2113,9 +2167,15 @@ fun refused_at(message: str, f: Facts) Refusal {
 # releases before its caller reads the refusal, and refused as `UNMET_FULL` when that is more than an unmet
 # requirement holds
 fun resolved(m: *Assembler, d: diagnostic.Diagnostic, site: diagnostic.Position) Refusal {
+    ret diagnosed(d, site, build.view(?m.b));
+}
+
+# the refusal of `d`, stated at `site`, with what it needed resolved against the context `view`, and refused as
+# `UNMET_FULL` when that is more than an unmet requirement holds
+pub fun diagnosed(d: diagnostic.Diagnostic, site: diagnostic.Position, view: *state.Context) Refusal {
     var r: Refusal = Refusal{message: d.message, span: d.span, site: site, mode: opt[build.Mismatch].none{}, unmet: state.nothing_unmet()};
-    if (d.requires.len == 0)                                  { ret r; }
-    if (!state.unmet(build.view(?m.b), d.requires, ?r.unmet)) { r.message = UNMET_FULL; }
+    if (d.requires.len == 0)                      { ret r; }
+    if (!state.unmet(view, d.requires, ?r.unmet)) { r.message = UNMET_FULL; }
     ret r;
 }
 
@@ -2186,7 +2246,8 @@ fun symbols(m: *Assembler) err[Refusal] {
 }
 
 # what every layer writes at the end, every label made a symbol, and mink's neutral object handed over, which the
-# caller releases. a builder refusal about a label is placed where the source first referred to it
+# caller releases. a builder refusal about a label is placed where the source first referred to it, and one about a
+# view at the statement that first put it in force
 pub fun finish(m: *Assembler) res[mink_object.Object, Refusal] {
     m.names.context = m::ptr;
     var i: usize = 0;
@@ -2201,10 +2262,30 @@ pub fun finish(m: *Assembler) res[mink_object.Object, Refusal] {
     val o: res[mink_object.Object, build.Refusal] = build.finish(?m.b);
     if (sel o.err) {
         var r: Refusal = refused_at(o.err.message, declared(m, o.err.label));
+        if (o.err.view != nil) {
+            val p: diagnostic.Position = entered(m, o.err.view);
+            r.span = diagnostic.Span{start: p, len: 0};
+            r.site = p;
+        }
         r.cause = o.err.object;
         ret res[mink_object.Object, Refusal].err{r};
     }
     ret res[mink_object.Object, Refusal].ok{o.ok};
+}
+
+# where the file being assembled states the statement that first put view `v` in force, the start for the object's own
+fun entered(m: *Assembler, v: *state.Context) diagnostic.Position {
+    var i: usize = 0;
+    for (i < m.bases.len) {
+        val kept: *vector.Vector[Kept] = ?m.bases.data[i].kept;
+        var j:    usize                = 0;
+        for (j < kept.len) {
+            if (?kept.data[j].view.context == v) { ret kept.data[j].site; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret diagnostic.START;
 }
 
 # no operands

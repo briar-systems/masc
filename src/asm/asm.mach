@@ -4,6 +4,15 @@
 # `masc.asm.model` with the core directives of `masc.asm.core`, the set's
 # integer data directives, and any layers the caller adds, into mink's
 # neutral object in memory.
+#
+# a dialect whose text states the one module its format builds
+# (`dialect.Dialect.module`) is read as the disassembler writes it. a module
+# that is one instruction stream (`stream.Module.stream`), as spir-v's, is
+# the builder's one section of that stream, so it is assembled as any other
+# source. a module with text of its own (`stream.Module.printed`), as wasm's
+# fields, is read whole by its set's reader, and the file is the bytes the
+# format writes of the module it reads back to, which no neutral object
+# stands between.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -52,6 +61,7 @@ use masc.core.register;
 use masc.core.set;
 use core_source: masc.core.source;
 use masc.core.state;
+use masc.core.stream;
 use masc.core.trait;
 use masc.format.dialect;
 use masc.syntax.parse;
@@ -111,6 +121,57 @@ pub fun assemble(a: *A.Allocator, s: *set.Set, object: *state.Context, options: 
     val o: res[mink_object.Object, model.Refusal] = model.finish(?m);
     model.release(?m);
     ret o;
+}
+
+# what a source assembles to, as its dialect states an object
+# ---
+# object: mink's neutral object, which the caller writes through the format and releases
+# module: the bytes the format writes of the module the text states, which the caller writes as they are and releases
+pub tag Assembled: u8 {
+    object: mink_object.Object;
+    module: sink.Sink;
+}
+
+# the `len` bytes of `text`, whose first byte is at `origin`, assembled under the object's context `object` as the
+# dialect `options.dialect` states an object: the module of a dialect whose text prints one, read whole by its reader
+# (`printed`), and every other text through the builder (`assemble`)
+pub fun assembled(a: *A.Allocator, s: *set.Set, object: *state.Context, options: model.Options, text: *u8, len: usize, origin: diagnostic.Position) res[Assembled, model.Refusal] {
+    val m: *stream.Module = options.dialect.module;
+    if (m != nil) {
+        if (sel m.printed) { ret printed(a, s, object, options.arch, m.printed, text, len, origin); }
+    }
+    val o: res[mink_object.Object, model.Refusal] = assemble(a, s, object, options, text, len, origin);
+    if (sel o.err) { ret res[Assembled, model.Refusal].err{o.err}; }
+    ret res[Assembled, model.Refusal].ok{Assembled.object{o.ok}};
+}
+
+# the bytes the format writes of the module the `len` bytes of `text`, whose first byte is at `origin`, read back to
+# through `p` under the object's context `object` and a stream of its own, refused, as every object is, for a context
+# that does not enter `arch`
+fun printed(a: *A.Allocator, s: *set.Set, object: *state.Context, arch: *mink_arch.Arch, p: stream.Printed, text: *u8, len: usize, origin: diagnostic.Position) res[Assembled, model.Refusal] {
+    val entered: err[build.Refusal] = build.enters(s, arch, object);
+    if (sel entered.err) { ret res[Assembled, model.Refusal].err{model.refused_build(entered.err)}; }
+    # a typed stream's state is the module's, begun by its reader, as the builder begins an object's
+    var v: state.Context = @object;
+    val h: *stream.Hooks = s.codec.stream;
+    if (h != nil) {
+        if (object.stream != nil) { ret res[Assembled, model.Refusal].err{model.nowhere(build.STREAMED)}; }
+        val made: res[ptr, A.Error] = h.make(a);
+        if (sel made.err) { ret res[Assembled, model.Refusal].err{model.nowhere(field.MEMORY)}; }
+        v.stream = made.ok;
+    }
+    fin {
+        if (h != nil) { h.release(a, v.stream); }
+    }
+    val back: res[sink.Sink, stream.Unread] = p.read(a, text, len, origin, ?v);
+    if (sel back.ok) { ret res[Assembled, model.Refusal].ok{Assembled.module{back.ok}}; }
+    var r: model.Refusal;
+    if (sel back.err.text) { r = model.diagnosed(back.err.text, back.err.text.span.start, ?v); }
+    or (sel back.err.written) {
+        r       = model.nowhere(back.err.written.text);
+        r.cause = opt[fail.Fail].some{back.err.written};
+    }
+    ret res[Assembled, model.Refusal].err{r};
 }
 
 # a test's allocator, selection, register view and context
@@ -1110,6 +1171,35 @@ test asm__an_e_base_selection_assembles_for_riscv64e_and_riscv32e {
     ret 0;
 }
 
+# the ilp32e calling convention must not be used with d (psabi, "ILP32E Calling Convention"), so an rv32e object
+# holding d is refused with the convention's cited reason, where lp64e asks nothing of it, and so is one whose code
+# `.option arch, +d` puts under d partway, at that statement
+test asm__ilp32e_refuses_a_selection_holding_d {
+    if (!t_e_base("rv64ed", 2, ?arch_riscv.RISCV_LP64E, "\taddi a0, a5, 1\n", true)) { ret 1; }
+    val reason: str = riscv_set.SET.conventions.at[0].refusal;
+    var got:    res[mink_object.Object, model.Refusal];
+    if (!t_ilp32e("rv32ed", "\taddi a0, a5, 1\n", ?got))                                          { ret 2; }
+    if (!t_refused(?got, reason, 1, 1))                                                           { ret 3; }
+    if (!t_ilp32e("rv32e", "\taddi a0, a5, 1\n.option arch, +d\n\tfadd.d fa0, fa1, fa2\n", ?got)) { ret 4; }
+    if (!t_refused(?got, reason, 2, 1))                                                           { ret 5; }
+    ret 0;
+}
+
+# `text` assembled for riscv32e under the selection `isa` and the ilp32e abi row into `got`, false when the test's
+# assembler could not be made or released
+#[testing]
+fun t_ilp32e(isa: str, text: str, got: *res[mink_object.Object, model.Refusal]) bool {
+    var t:   T;
+    val row: *set.Arch = ?riscv_set.SET.arches.at[3];
+    if (!t_make_at(?t, isa, row)) { ret false; }
+    var options: model.Options = t_options(?t);
+    options.arch = row.arch;
+    options.abi  = ?arch_riscv.RISCV_ILP32E;
+    @got         = assemble(testing.allocator_of(?t.t), ?riscv_set.SET, ?t.ctx, options, text, str_len(text), diagnostic.START);
+    if (sel got.ok) { ret true; }
+    ret t_release(?t);
+}
+
 test asm__an_unknown_directive_is_refused {
     var t: T;
     if (!t_make(?t, "rv64i")) { ret 1; }
@@ -1491,7 +1581,7 @@ fun t_elf_again(t: *T, o: *mink_object.Object) opt[mink_object.Object] {
     var bytes: sink.Sink                      = written.ok;
     var in:    contract.Input                 = contract.Input{file: "t.o", data: sink.data(?bytes), len: sink.len(?bytes)};
     val read_: res[contract.Model, fail.Fail] = registry.read(?t.formats, a, ?in);
-    var back:  mink_object.Object             = mink_object.make(a, nil);
+    var back:  mink_object.Object             = mink_object.make(a, nil, nil);
     var ok:    bool                           = false;
     if (sel read_.ok) {
         var r:         contract.Model = read_.ok;
