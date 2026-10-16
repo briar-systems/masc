@@ -24,6 +24,27 @@
 # the offset of the instruction that last wrote it, or of the join that
 # merged two, so the states a loop reaches are finite and the worklist over
 # instruction starts reaches a fixed point.
+#
+# code of a typed stream passes its values on an operand stack and in the
+# entries of its index spaces, as wasm's locals and globals, and nests its
+# control in blocks a branch names by depth. the walk first reads such code
+# once in its own order, as the stream's readers do, observing each
+# instruction on the stream the context holds, which the caller has entered
+# into the function the code is the body of. that read resolves through the
+# stream's hooks how many values each type of each signature stands for under
+# the labels open there, and matches each block's opening with its split and
+# its close by the structure the effects state, so a branch to a block goes to
+# its close, or a loop's to its start. secrecy is then held per value of the
+# operand stack, the bottom first, and per index space entry, and follows the
+# signatures and the footprints: a value an instruction pops at a depth its
+# effect names is an address, a count of elements, a condition or what chooses
+# a target, a branch carries the values its label's type names down to its
+# block's height, a block's params pass into it as they are, an entry written
+# through an operand takes what is written, and every value an instruction
+# pushes takes whether anything it reads is secret. control joins only at one
+# height of the stack. a call leaves what it pushes, every entry and every
+# address secret when anything is, and a value pushed as the polymorphic stack
+# ends the code control reaches there.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -45,11 +66,14 @@ use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.field;
 use masc.core.footprint;
+use masc.core.index;
 use masc.core.operand;
+use masc.core.quantity;
 use masc.core.register;
 use masc.core.requirement;
 use masc.core.set;
 use masc.core.state;
+use masc.core.stream;
 
 #[testing]
 use masc.core.diagnostic;
@@ -75,13 +99,24 @@ pub rec Extent {
     length: u64;
 }
 
+# an entry of one of a typed stream's index spaces, as a wasm function's param is a local
+# ---
+# space: the set-local index space (`operand.Typed.space`)
+# index: the entry's index in it
+pub rec Entry {
+    space: u16;
+    index: u32;
+}
+
 # where a secret is when the code starts
 # ---
 # register: a register's value
 # memory:   the bytes of an extent
+# entry:    the value of an index space entry of a typed stream
 pub tag Seed: u8 {
     register: register.Id;
     memory:   Extent;
+    entry:    Entry;
 }
 
 # seeds as a pointer to the caller's rows and a count
@@ -90,7 +125,8 @@ pub rec Secrets {
     len: u32;
 }
 
-# encoded code of one function, the bytes the caller encoded
+# encoded code of one function, the bytes the caller encoded. code of a typed stream is the instructions of the
+# function's body, read under a context whose stream the caller has entered into that function
 # ---
 # set:  the instruction set it is encoded in
 # data: its bytes
@@ -134,12 +170,16 @@ pub tag Verdict: u8 {
     unguaranteed;
 }
 
-pub val UNDECODED:  str = "bytes no row decodes under the context";
-pub val UNDECIDED:  str = "an instruction whose footprint its values and the configuration in force do not decide";
-pub val NOWHERE:    str = "a transfer to where no code is";
-pub val INDIRECT:   str = "a jump to a target a register holds, which the walk cannot follow";
-pub val UNSEEDABLE: str = "a seed names a register the set's file has no row of";
-pub val STACKED:    str = "code whose values pass on a typed stream's operand stack, which the walk does not follow yet (masc#348)";
+pub val UNDECODED:    str = "bytes no row decodes under the context";
+pub val UNDECIDED:    str = "an instruction whose footprint its values and the configuration in force do not decide";
+pub val NOWHERE:      str = "a transfer to where no code is";
+pub val INDIRECT:     str = "a jump to a target a register holds, which the walk cannot follow";
+pub val UNSEEDABLE:   str = "a seed names a register the set's file has no row of, or an entry its stream does not hold";
+pub val UNTYPED:      str = "a stack type of a signature the stream does not resolve to a count of values";
+pub val UNBALANCED:   str = "a value popped past the bottom of the operand stack or its block's, a popped value named past what the instruction pops, or control joining at two heights of the stack";
+pub val UNSTRUCTURED: str = "blocks the code does not close in order, a depth past every block open, or code past its body's block";
+pub val CAUGHT:       str = "a block whose catches take control from any throw in it, which the walk does not follow";
+pub val TIMED:        str = "code of a typed stream whose set classifies its rows' timing, which no class states over the values a row pops";
 
 # the operand values one decoded instruction holds, and the alternatives a refused decode notes
 val VALUES:       u32 = 64;
@@ -147,6 +187,23 @@ val ALTERNATIVES: u32 = 16;
 
 # the version of a register's value on entry
 val ENTRY: u64 = 0;
+
+# the register file of a set that names no register, as a typed stream's
+val NO_FILE: register.File = register.File{
+    quantities:     quantity.NO_QUANTITIES,
+    bindings:       quantity.NO_BINDINGS,
+    slot_count:     0,
+    classes:        nil,
+    class_count:    0,
+    class_names:    index.NO_ENTRIES,
+    registers:      nil,
+    register_count: 0,
+    aliases:        nil,
+    alias_count:    0,
+    names:          index.NO_ENTRIES,
+    columns:        nil,
+    column_count:   0,
+};
 
 # an extent that may hold a secret
 # ---
@@ -168,12 +225,19 @@ rec Held {
 # held:     the extents that may hold a secret
 # anywhere: whether a secret may be at any address
 # config:   the configuration state in force, none when not known
+# stack:    a typed stream's operand stack, the bottom first, whether each value may hold a secret
+# entries:  the keys of the index space entries that may hold a secret, by `key`, ascending, or with `except` the
+#           entries known to hold none
+# except:   whether every entry `entries` does not name may hold a secret, as after a call
 rec Point {
     taint:    vector.Vector[u64];
     versions: vector.Vector[u64];
     held:     vector.Vector[Held];
     anywhere: bool;
     config:   opt[config.State];
+    stack:    vector.Vector[bool];
+    entries:  vector.Vector[u64];
+    except:   bool;
 }
 
 # a memory access of one instruction, placed as the walk names extents
@@ -189,18 +253,66 @@ rec Touch {
     at:      Held;
 }
 
+# what the walk's ordered read of a typed stream found of the instruction starting at one offset
+# ---
+# len:     its bytes
+# counts:  where in `Walk.counts` the counts of its signature's types start, its pops' then its pushes', each how many
+#          values the type stands for, 0 for the polymorphic stack
+# targets: where in `Walk.targets` the blocks its depths name start
+# depths:  how many
+# block:   the block it opens, splits or closes, NO_BLOCK for none
+# stuck:   whether it pushes the polymorphic stack, so control does not go on past it
+rec Shape {
+    len:     usize;
+    counts:  u32;
+    targets: u32;
+    depths:  u32;
+    block:   u32;
+    stuck:   bool;
+}
+
+# a structured block of a typed stream's code
+# ---
+# open:    where the instruction opening it starts, NO_OFFSET for the function's body
+# body:    where its first instruction starts
+# split:   where the instruction splitting it into two arms starts, NO_OFFSET for none
+# close:   where the instruction closing it starts, NO_OFFSET while it is open
+# base:    the height of the operand stack below its params
+# params:  how many values pass into it
+# results: how many values it leaves
+# loops:   whether its label is its start, else its close
+rec Block {
+    open:    usize;
+    body:    usize;
+    split:   usize;
+    close:   usize;
+    base:    u32;
+    params:  u32;
+    results: u32;
+    loops:   bool;
+}
+
 # the walk's storage
 # ---
 # code:    the code walked
 # timed:   whether each row's latency is asked, false for a set whose timing is not guaranteed
 # ctx:     the context it runs under
-# file:    the set's register file
+# file:    the set's register file, NO_FILE for a set that names no register
 # words:   the words a set over the file's rows spans
+# stream:  the set's typed stream hooks, nil for a machine set
 # points:  the state at each instruction start reached, by index into `states`, NO_POINT for none
 # states:  the states
 # work:    the instruction starts whose state changed and are not walked since
 # named:   the rows the operands of the instruction walked name, one bit per row
 # touches: the memory accesses of the instruction walked
+# shaped:  what the ordered read found of each instruction start of a typed stream, by index into `shapes`, NO_POINT
+#          for none
+# shapes:  what it found
+# counts:  the counts of the shapes' signatures
+# targets: the blocks the shapes' depths name, by index into `blocks`
+# blocks:  the blocks of a typed stream's code, the function's body first
+# carried: the values a branch of the instruction walked carries to its label, the deepest first
+# popped:  the values the instruction walked pops, the deepest first
 rec Walk {
     a:       *A.Allocator;
     code:    *Code;
@@ -208,14 +320,24 @@ rec Walk {
     ctx:     *state.Context;
     file:    *register.File;
     words:   usize;
+    stream:  *stream.Hooks;
     points:  vector.Vector[u32];
     states:  vector.Vector[Point];
     work:    vector.Vector[usize];
     named:   vector.Vector[u64];
     touches: vector.Vector[Touch];
+    shaped:  vector.Vector[u32];
+    shapes:  vector.Vector[Shape];
+    counts:  vector.Vector[u32];
+    targets: vector.Vector[u32];
+    blocks:  vector.Vector[Block];
+    carried: vector.Vector[bool];
+    popped:  vector.Vector[bool];
 }
 
-val NO_POINT: u32 = 0xFFFF_FFFF;
+val NO_POINT:  u32   = 0xFFFF_FFFF;
+val NO_BLOCK:  u32   = 0xFFFF_FFFF;
+val NO_OFFSET: usize = 0xFFFF_FFFF_FFFF_FFFF;
 
 fun bit_of(words: *u64, row: u32) bool {
     ret (words[row / 64] & (1::u64 << (row % 64)::u64)) != 0;
@@ -231,7 +353,76 @@ fun failed[T](e: A.Error) res[T, A.Error] {
     ret res[T, A.Error].err{e};
 }
 
-# a point of `w`'s file holding nothing secret, every register at its entry version
+# the key of entry `index` of space `space`, in the order the keys of a point's entries keep
+fun key(space: u16, index: u32) u64 {
+    ret (space::u64 << 32) | index::u64;
+}
+
+# where `k` is in the ascending `keys`, or where it would go
+# ---
+# held: whether it is there
+# at:   its position, or the position it would take
+rec Found {
+    held: bool;
+    at:   usize;
+}
+
+fun find_key(keys: *vector.Vector[u64], k: u64) Found {
+    var lo: usize = 0;
+    var hi: usize = keys.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (keys.data[mid] < k) { lo = mid + 1; }
+        or                      { hi = mid; }
+    }
+    ret Found{held: lo < keys.len && keys.data[lo] == k, at: lo};
+}
+
+# `k` added to the ascending `keys` unless they hold it
+fun insert_key(keys: *vector.Vector[u64], k: u64) err[A.Error] {
+    val f: Found = find_key(keys, k);
+    if (f.held) { ret err[A.Error].ok{}; }
+    val pushed: res[usize, A.Error] = vector.push[u64](keys, k);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    var i: usize = keys.len - 1;
+    for (i > f.at) {
+        keys.data[i] = keys.data[i - 1];
+        i            = i - 1;
+    }
+    keys.data[f.at] = k;
+    ret err[A.Error].ok{};
+}
+
+# `k` taken out of the ascending `keys` when they hold it
+fun remove_key(keys: *vector.Vector[u64], k: u64) {
+    val f: Found = find_key(keys, k);
+    if (!f.held) { ret; }
+    var i: usize = f.at;
+    for (i + 1 < keys.len) {
+        keys.data[i] = keys.data[i + 1];
+        i            = i + 1;
+    }
+    keys.len = keys.len - 1;
+}
+
+# whether entry `k` may hold a secret under `p`
+fun entry_secret(p: *Point, k: u64) bool {
+    ret find_key(?p.entries, k).held != p.except;
+}
+
+# entry `k` made to hold a secret under `p` or none
+fun set_entry(p: *Point, k: u64, secret: bool) err[A.Error] {
+    if (secret != p.except) { ret insert_key(?p.entries, k); }
+    remove_key(?p.entries, k);
+    ret err[A.Error].ok{};
+}
+
+# whether some entry may hold a secret under `p`
+fun any_entry(p: *Point) bool {
+    ret p.except || p.entries.len > 0;
+}
+
+# a point of `w`'s file holding nothing secret, every register at its entry version and the operand stack empty
 fun blank(w: *Walk) res[Point, A.Error] {
     var p: Point = Point{
         taint:    vector.init[u64](w.a),
@@ -239,6 +430,9 @@ fun blank(w: *Walk) res[Point, A.Error] {
         held:     vector.init[Held](w.a),
         anywhere: false,
         config:   opt[config.State].none{},
+        stack:    vector.init[bool](w.a),
+        entries:  vector.init[u64](w.a),
+        except:   false,
     };
     var i: usize = 0;
     for (i < w.words) {
@@ -259,6 +453,8 @@ fun drop(p: *Point) {
     vector.dnit[u64](?p.taint);
     vector.dnit[u64](?p.versions);
     vector.dnit[Held](?p.held);
+    vector.dnit[bool](?p.stack);
+    vector.dnit[u64](?p.entries);
 }
 
 # a copy of `from`
@@ -285,8 +481,27 @@ fun copy(w: *Walk, from: *Point) res[Point, A.Error] {
         }
         i = i + 1;
     }
+    i = 0;
+    for (i < from.stack.len) {
+        val pushed: res[usize, A.Error] = vector.push[bool](?p.stack, from.stack.data[i]);
+        if (sel pushed.err) {
+            drop(?p);
+            ret failed[Point](pushed.err);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < from.entries.len) {
+        val pushed: res[usize, A.Error] = vector.push[u64](?p.entries, from.entries.data[i]);
+        if (sel pushed.err) {
+            drop(?p);
+            ret failed[Point](pushed.err);
+        }
+        i = i + 1;
+    }
     p.anywhere = from.anywhere;
     p.config   = from.config;
+    p.except   = from.except;
     ret res[Point, A.Error].ok{p};
 }
 
@@ -325,10 +540,51 @@ fun secret_at(p: *Point, at: *Held) bool {
     ret false;
 }
 
+# the entries of `from` merged into `into`'s, so the entries either may hold a secret in may in the join
+# ---
+# ret: whether `into`'s changed
+fun merge_entries(w: *Walk, into: *Point, from: *Point) res[bool, A.Error] {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    if (!from.except) {
+        # what from holds secret is secret in the join: added to into's secrets, or taken from what into knows public
+        for (i < from.entries.len) {
+            val k:      u64  = from.entries.data[i];
+            val before: bool = entry_secret(into, k);
+            if (!before) {
+                val set: err[A.Error] = set_entry(into, k, true);
+                if (sel set.err) { ret failed[bool](set.err); }
+                changed = true;
+            }
+            i = i + 1;
+        }
+        ret res[bool, A.Error].ok{changed};
+    }
+    # from holds every entry secret but those it knows public, so the join knows public only what both do
+    var kept: vector.Vector[u64] = vector.init[u64](w.a);
+    for (i < from.entries.len) {
+        val k: u64 = from.entries.data[i];
+        if (!entry_secret(into, k)) {
+            val pushed: res[usize, A.Error] = vector.push[u64](?kept, k);
+            if (sel pushed.err) {
+                vector.dnit[u64](?kept);
+                ret failed[bool](pushed.err);
+            }
+        }
+        i = i + 1;
+    }
+    changed = !into.except || kept.len != into.entries.len;
+    vector.dnit[u64](?into.entries);
+    into.entries = kept;
+    into.except  = true;
+    ret res[bool, A.Error].ok{changed};
+}
+
 # `from` merged into the point at `to`, which is the version of a register the two disagree on
 # ---
-# ret: whether the point at `to` changed
-fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[bool, A.Error] {
+# ret: whether the point at `to` changed, none when the two hold operand stacks of different heights
+fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[opt[bool], A.Error] {
+    if (into.stack.len != from.stack.len) { ret res[opt[bool], A.Error].ok{opt[bool].none{}}; }
     var changed: bool  = false;
     var i:       usize = 0;
     for (i < w.words) {
@@ -350,7 +606,7 @@ fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[bool, A.Error] {
     for (i < from.held.len) {
         val before: usize        = into.held.len;
         val held:   err[A.Error] = hold(into, from.held.data[i]);
-        if (sel held.err)            { ret failed[bool](held.err); }
+        if (sel held.err)            { ret failed[opt[bool]](held.err); }
         if (into.held.len != before) { changed = true; }
         i = i + 1;
     }
@@ -358,6 +614,17 @@ fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[bool, A.Error] {
         into.anywhere = true;
         changed       = true;
     }
+    i = 0;
+    for (i < into.stack.len) {
+        if (from.stack.data[i] && !into.stack.data[i]) {
+            into.stack.data[i] = true;
+            changed            = true;
+        }
+        i = i + 1;
+    }
+    val entries: res[bool, A.Error] = merge_entries(w, into, from);
+    if (sel entries.err) { ret failed[opt[bool]](entries.err); }
+    if (entries.ok)      { changed = true; }
     var keep: bool = true;
     if (sel into.config.some) {
         keep = false;
@@ -367,27 +634,30 @@ fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[bool, A.Error] {
         into.config = opt[config.State].none{};
         changed     = true;
     }
-    ret res[bool, A.Error].ok{changed};
+    ret res[opt[bool], A.Error].ok{opt[bool].some{changed}};
 }
 
 # the state `p` reaching the instruction at `to`: its point made or merged into, and `to` queued when it changed
-fun reach(w: *Walk, p: *Point, to: usize) err[A.Error] {
+# ---
+# ret: false when the point at `to` holds an operand stack of another height than `p`
+fun reach(w: *Walk, p: *Point, to: usize) res[bool, A.Error] {
     val at: u32 = w.points.data[to];
     if (at == NO_POINT) {
         val made: res[Point, A.Error] = copy(w, p);
-        if (sel made.err) { ret err[A.Error].err{made.err}; }
+        if (sel made.err) { ret failed[bool](made.err); }
         w.points.data[to] = w.states.len::u32;
         val kept: res[usize, A.Error] = vector.push[Point](?w.states, made.ok);
-        if (sel kept.err) { ret err[A.Error].err{kept.err}; }
+        if (sel kept.err) { ret failed[bool](kept.err); }
     }
     or {
-        val merged: res[bool, A.Error] = merge(w, ?w.states.data[at], p, to);
-        if (sel merged.err) { ret err[A.Error].err{merged.err}; }
-        if (!merged.ok)     { ret err[A.Error].ok{}; }
+        val merged: res[opt[bool], A.Error] = merge(w, ?w.states.data[at], p, to);
+        if (sel merged.err)     { ret failed[bool](merged.err); }
+        if (sel merged.ok.none) { ret res[bool, A.Error].ok{false}; }
+        if (!merged.ok.some)    { ret res[bool, A.Error].ok{true}; }
     }
     val queued: res[usize, A.Error] = vector.push[usize](?w.work, to);
-    if (sel queued.err) { ret err[A.Error].err{queued.err}; }
-    ret err[A.Error].ok{};
+    if (sel queued.err) { ret failed[bool](queued.err); }
+    ret res[bool, A.Error].ok{true};
 }
 
 fun row_index(w: *Walk, reg: register.Id) opt[u32] {
@@ -463,6 +733,13 @@ fun names_secret(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8) bool {
     ret false;
 }
 
+# whether the value the instruction pops at depth `pop` less one may hold a secret under `p`, which holds the
+# instruction's pops on top of its stack. none for 0, and the ordered read holds every depth to what the instruction pops
+fun popped_secret(p: *Point, pop: u8) bool {
+    if (pop == 0) { ret false; }
+    ret p.stack.data[p.stack.len - pop::usize];
+}
+
 # the bytes access width `width` covers, 0 when the walk does not know them: a width scaling with a quantity, or a
 # count no element fixes
 fun bytes_of(width: *effect.Width) u64 {
@@ -492,12 +769,28 @@ fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, length: u
     if (touch.at.base != effect.NO_ROW) { touch.at.version = p.versions.data[touch.at.base]; }
 }
 
+# the refusal of a secret in what decides an access's count `count` under `p`: the register at its row, its operand or
+# the value it pops, naming the operand when one decides it. none for a count nothing the instruction reads decides
+fun count_secret(w: *Walk, p: *Point, ins: *walk.Decoded, count: effect.Count) opt[ct.Refusal] {
+    var secret: bool = false;
+    var op:     u8   = field.NO_OPERAND;
+    if (sel count.register) { secret = bit_of(p.taint.data, count.register); }
+    or (sel count.operand) {
+        op     = count.operand;
+        secret = names_secret(w, p, ins, op);
+    }
+    or (sel count.popped) { secret = popped_secret(p, count.popped + 1); }
+    if (!secret)          { ret opt[ct.Refusal].none{}; }
+    ret opt[ct.Refusal].some{ct.refusal(ct.MEMORY, op)};
+}
+
 fun found(r: ct.Refusal) res[opt[ct.Refusal], A.Error] {
     ret res[opt[ct.Refusal], A.Error].ok{opt[ct.Refusal].some{r}};
 }
 
 # the memory accesses of `ins` gathered into `w.touches`: each its footprint states, then each memory operand none of
-# them names. a secret in what forms an address is refused
+# them names. a secret in what forms an address or a value popped as one, or in what decides its count of elements, is
+# refused
 fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) res[opt[ct.Refusal], A.Error] {
     w.touches.len = 0;
     val r: *operand.Operand = ins.inst.row.operands.at;
@@ -511,6 +804,9 @@ fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) r
         if (names_secret(w, p, ins, acc.operand))                                      { ret found(ct.refusal(ct.MEMORY, acc.operand)); }
         if (acc.base != effect.NO_ROW && bit_of(p.taint.data, acc.base))               { ret found(ct.refusal(ct.MEMORY, field.NO_OPERAND)); }
         if (acc.governor != field.NO_OPERAND && names_secret(w, p, ins, acc.governor)) { ret found(ct.refusal(ct.MEMORY, acc.governor)); }
+        if (popped_secret(p, acc.pop))                                                 { ret found(ct.refusal(ct.MEMORY, field.NO_OPERAND)); }
+        val counted: opt[ct.Refusal] = count_secret(w, p, ins, acc.width.count);
+        if (sel counted.some) { ret found(counted.some); }
         var k: u32 = 0;
         for (k < ins.inst.count && k < 32) {
             if ((acc.forming & (1::u32 << k)) != 0 && names_secret(w, p, ins, k::u8)) { ret found(ct.refusal(ct.MEMORY, k::u8)); }
@@ -598,13 +894,23 @@ fun first_secret(secret: u32, count: u32) u8 {
 }
 
 # the control refusal of `ins`: a transfer that may fall through decided by a secret, or one to a target formed from
-# one
-fun control(w: *Walk, p: *Point, ins: *walk.Decoded, c: *effect.Control, value: bool, secret: u32) opt[ct.Refusal] {
+# one. `held` is whether what it reads but the values it pops is secret, and `stacked` whether a value it pops is.
+# the values a transfer pops decide it only through the condition and the chooser its effect names, but for a
+# conditional or indirect one that names neither, which every value it reads may decide
+fun control(w: *Walk, p: *Point, ins: *walk.Decoded, c: *effect.Control, held: bool, stacked: bool, secret: u32) opt[ct.Refusal] {
     if (c.transfer == effect.NONE || c.transfer == effect.MERGE) { ret opt[ct.Refusal].none{}; }
-    if (c.conditional && value)                                  { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, first_secret(secret, ins.inst.count))}; }
+    if (c.conditional) {
+        if (c.condition != 0) {
+            if (popped_secret(p, c.condition)) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, field.NO_OPERAND)}; }
+        }
+        or (held || stacked) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, first_secret(secret, ins.inst.count))}; }
+    }
+    if (popped_secret(p, c.chooses)) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, field.NO_OPERAND)}; }
     if (c.target == effect.INDIRECT || (c.target == effect.UNTARGETED && c.transfer == effect.RETURN)) {
         if (c.operand == field.NO_OPERAND) {
-            if (value) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, field.NO_OPERAND)}; }
+            var decided: bool = held;
+            if (c.target == effect.INDIRECT && c.chooses == 0) { decided = held || stacked; }
+            if (decided)                                       { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, field.NO_OPERAND)}; }
             ret opt[ct.Refusal].none{};
         }
         if (names_secret(w, p, ins, c.operand)) { ret opt[ct.Refusal].some{ct.refusal(ct.CONTROL, c.operand)}; }
@@ -616,6 +922,201 @@ fun control(w: *Walk, p: *Point, ins: *walk.Decoded, c: *effect.Control, value: 
         }
     }
     ret opt[ct.Refusal].none{};
+}
+
+# whether `a` and `b` are one type of a signature: one fixed type, one variable or one operand's types
+fun same_ref(a: effect.TypeRef, b: effect.TypeRef) bool {
+    if (sel a.fixed)    { ret sel b.fixed && b.fixed == a.fixed; }
+    if (sel a.variable) { ret sel b.variable && b.variable == a.variable; }
+    if (sel a.operand)  { ret sel b.operand && b.operand == a.operand; }
+    if (sel a.results)  { ret sel b.results; }
+    ret false;
+}
+
+# whether type `ref` of a signature is one it pushes again, of `sig`'s pushes
+fun pushed_again(sig: *effect.Signature, ref: effect.TypeRef) bool {
+    var i: u32 = 0;
+    for (i < sig.pushes.len) {
+        if (same_ref(sig.pushes.at[i], ref)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# how many values the shape `s` of an instruction of signature `sig` pops
+fun pop_count(w: *Walk, s: *Shape, sig: *effect.Signature) usize {
+    var n: usize = 0;
+    var i: u32   = 0;
+    for (i < sig.pops.len) {
+        n = n + w.counts.data[s.counts + i]::usize;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the key of the entry operand `op` of `ins` names, none for an operand holding no id
+fun entry_key(ins: *walk.Decoded, op: u8) opt[u64] {
+    if (op::u32 >= ins.inst.count || op::u32 >= ins.inst.row.operands.len) { ret opt[u64].none{}; }
+    val shape: *operand.Shape = ?ins.inst.row.operands.at[op].shape;
+    val v:     operand.Value  = ins.inst.values[op];
+    if (sel shape.id) {
+        if (sel v.id) { ret opt[u64].some{key(shape.id.space, v.id)}; }
+    }
+    ret opt[u64].none{};
+}
+
+# whether an entry `ins` reads through its operands may hold a secret under `p`. an operand holding no id may name
+# any entry
+fun entries_read(p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) bool {
+    var i: u32 = 0;
+    for (i < fp.entries.len) {
+        val n: *effect.Entry = ?fp.entries.at[i];
+        if ((n.role & operand.READ) != 0) {
+            val k: opt[u64] = entry_key(ins, n.operand);
+            if (sel k.some) {
+                if (entry_secret(p, k.some)) { ret true; }
+            }
+            or (any_entry(p)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the values of the pop of `sig` of type `ref` copied into `w.carried`, the deepest first, from the pops of shape `s`
+# on top of `p`'s stack, none when the instruction pops no value of that type
+fun carry(w: *Walk, p: *Point, s: *Shape, sig: *effect.Signature, ref: effect.TypeRef) err[A.Error] {
+    w.carried.len = 0;
+    var at: usize = p.stack.len - pop_count(w, s, sig);
+    var i:  u32   = 0;
+    for (i < sig.pops.len) {
+        val n: usize = w.counts.data[s.counts + i]::usize;
+        if (same_ref(sig.pops.at[i], ref)) {
+            var k: usize = 0;
+            for (k < n) {
+                val pushed: res[usize, A.Error] = vector.push[bool](?w.carried, p.stack.data[at + k]);
+                if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+                k = k + 1;
+            }
+            ret err[A.Error].ok{};
+        }
+        at = at + n;
+        i  = i + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# what an instruction of a typed stream leaves secret, applied to `p`: the entries it writes take `value`, and its pops
+# are replaced on the stack, by the params an opening instruction passes into its block as they are, else by its
+# pushes, each a value a jump pops of the same type and count as it pushes, as br_if leaves the values its label
+# takes, kept as it was, and every other taking `value`. a call, whose callee the walk does not read, leaves what it
+# pushes, every entry and every address secret when anything is
+fun apply_stream(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, s: *Shape, value: bool) err[A.Error] {
+    var i: u32 = 0;
+    for (i < fp.entries.len) {
+        val n: *effect.Entry = ?fp.entries.at[i];
+        if ((n.role & operand.WRITE) != 0) {
+            val k: opt[u64] = entry_key(ins, n.operand);
+            if (sel k.some) {
+                val set: err[A.Error] = set_entry(p, k.some, value);
+                if (sel set.err) { ret set; }
+            }
+            # a write through an operand holding no id may reach any entry
+            or (value) {
+                p.except      = true;
+                p.entries.len = 0;
+            }
+        }
+        i = i + 1;
+    }
+    val sig:    *effect.Signature = ?fp.signature;
+    val bottom: usize             = p.stack.len - pop_count(w, s, sig);
+    w.popped.len = 0;
+    var k: usize = bottom;
+    for (k < p.stack.len) {
+        val pushed: res[usize, A.Error] = vector.push[bool](?w.popped, p.stack.data[k]);
+        if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        k = k + 1;
+    }
+    p.stack.len = bottom;
+    if (effect.opens(fp.structure)) {
+        var at: usize = 0;
+        i = 0;
+        for (i < sig.pops.len) {
+            val n: usize = w.counts.data[s.counts + i]::usize;
+            if (pushed_again(sig, sig.pops.at[i])) {
+                k = 0;
+                for (k < n) {
+                    val pushed: res[usize, A.Error] = vector.push[bool](?p.stack, w.popped.data[at + k]);
+                    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+                    k = k + 1;
+                }
+            }
+            at = at + n;
+            i  = i + 1;
+        }
+        ret err[A.Error].ok{};
+    }
+    i = 0;
+    for (i < sig.pushes.len) {
+        val n:    usize          = w.counts.data[s.counts + sig.pops.len + i]::usize;
+        val ref:  effect.TypeRef = sig.pushes.at[i];
+        var from: usize          = NO_OFFSET;
+        if (fp.control.transfer == effect.JUMP) {
+            var at: usize = 0;
+            var j:  u32   = 0;
+            for (j < sig.pops.len) {
+                val m: usize = w.counts.data[s.counts + j]::usize;
+                if (same_ref(sig.pops.at[j], ref) && m == n) { from = at; }
+                at = at + m;
+                j  = j + 1;
+            }
+        }
+        k = 0;
+        for (k < n) {
+            var held: bool = value;
+            if (from != NO_OFFSET) { held = w.popped.data[from + k]; }
+            val pushed: res[usize, A.Error] = vector.push[bool](?p.stack, held);
+            if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (fp.control.transfer == effect.CALL) {
+        var secret: bool = value || p.anywhere || p.held.len > 0 || any_entry(p);
+        k = 0;
+        for (k < p.stack.len) {
+            if (p.stack.data[k]) { secret = true; }
+            k = k + 1;
+        }
+        var word: usize = 0;
+        for (word < w.words) {
+            if (p.taint.data[word] != 0) { secret = true; }
+            word = word + 1;
+        }
+        if (secret) {
+            k = p.stack.len - push_count(w, s, sig);
+            for (k < p.stack.len) {
+                p.stack.data[k] = true;
+                k               = k + 1;
+            }
+            p.except      = true;
+            p.entries.len = 0;
+            p.anywhere    = true;
+        }
+    }
+    ret err[A.Error].ok{};
+}
+
+# how many values the shape `s` of an instruction of signature `sig` pushes
+fun push_count(w: *Walk, s: *Shape, sig: *effect.Signature) usize {
+    var n: usize = 0;
+    var i: u32   = 0;
+    for (i < sig.pushes.len) {
+        n = n + w.counts.data[s.counts + sig.pops.len + i]::usize;
+        i = i + 1;
+    }
+    ret n;
 }
 
 # what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, a write leaving part
@@ -681,13 +1182,76 @@ fun refused(r: ct.Refusal, at: usize) opt[Verdict] {
     ret opt[Verdict].some{Verdict.refused{Finding{offset: at::u64, refusal: r}}};
 }
 
-# the instruction starts control reaches from `ins` at `at`, each reached with `p`
+fun stays(at: usize) res[opt[Verdict], A.Error] {
+    ret res[opt[Verdict], A.Error].ok{unread(UNBALANCED, at)};
+}
+
+# `p` reaching `to` from the instruction at `at`, unread when control joins there at another height of the stack
+fun goes(w: *Walk, p: *Point, at: usize, to: usize) res[opt[Verdict], A.Error] {
+    val reached: res[bool, A.Error] = reach(w, p, to);
+    if (sel reached.err) { ret failed[opt[Verdict]](reached.err); }
+    if (!reached.ok)     { ret stays(at); }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+# where a branch to block `b` goes: a loop's start, else its close
+fun label_of(b: *Block) usize {
+    if (b.loops) { ret b.body; }
+    ret b.close;
+}
+
+# the blocks the depths of the instruction of shape `s` at `at` name, each reached with `p` cut to its block's height
+# and the values `w.carried` holds on top
+fun branches(w: *Walk, p: *Point, at: usize, s: *Shape) res[opt[Verdict], A.Error] {
+    var i: u32 = 0;
+    for (i < s.depths) {
+        val b: *Block = ?w.blocks.data[w.targets.data[s.targets + i]];
+        if (p.stack.len < b.base::usize) { ret stays(at); }
+        val made: res[Point, A.Error] = copy(w, p);
+        if (sel made.err) { ret failed[opt[Verdict]](made.err); }
+        var edge: Point = made.ok;
+        edge.stack.len = b.base::usize;
+        var k: usize = 0;
+        for (k < w.carried.len) {
+            val pushed: res[usize, A.Error] = vector.push[bool](?edge.stack, w.carried.data[k]);
+            if (sel pushed.err) {
+                drop(?edge);
+                ret failed[opt[Verdict]](pushed.err);
+            }
+            k = k + 1;
+        }
+        val went: res[opt[Verdict], A.Error] = goes(w, ?edge, at, label_of(b));
+        drop(?edge);
+        if (sel went.err)     { ret went; }
+        if (sel went.ok.some) { ret went; }
+        i = i + 1;
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+# the instruction starts control reaches from `ins` at `at`, each reached with `p`: a typed stream's branch to the
+# blocks its depths name or where the block it opens or splits goes on, a jump to its relative target, and the next
+# instruction unless it jumps or returns unconditionally or leaves the stack polymorphic
 # ---
 # ret: none when every one is in the code, else why the walk cannot follow it
-fun successors(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, c: *effect.Control) res[opt[Verdict], A.Error] {
+fun successors(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, c: *effect.Control, s: *Shape) res[opt[Verdict], A.Error] {
     val next:  usize = at + ins.len;
     var falls: bool  = (c.transfer != effect.JUMP && c.transfer != effect.RETURN) || c.conditional;
-    if (c.transfer == effect.JUMP) {
+    if (s != nil && s.stuck) { falls = false; }
+    if (c.transfer == effect.JUMP && c.target == effect.DEPTH && s != nil) {
+        val went: res[opt[Verdict], A.Error] = branches(w, p, at, s);
+        if (sel went.err)     { ret went; }
+        if (sel went.ok.some) { ret went; }
+    }
+    or (c.transfer == effect.JUMP && c.target == effect.STRUCTURED && s != nil && s.block != NO_BLOCK) {
+        val b:  *Block = ?w.blocks.data[s.block];
+        var to: usize  = b.close;
+        if (effect.opens(ins.inst.row.effect.structure) && b.split != NO_OFFSET) { to = b.split + w.shapes.data[w.shaped.data[b.split]].len; }
+        val went: res[opt[Verdict], A.Error] = goes(w, p, at, to);
+        if (sel went.err)     { ret went; }
+        if (sel went.ok.some) { ret went; }
+    }
+    or (c.transfer == effect.JUMP) {
         if (c.target != effect.DIRECT || c.operand == field.NO_OPERAND || c.operand::u32 >= ins.inst.count) { ret res[opt[Verdict], A.Error].ok{unread(INDIRECT, at)}; }
         val v: operand.Value = ins.inst.values[c.operand];
         if (!sel v.relative) { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
@@ -695,14 +1259,13 @@ fun successors(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, c: *effect.Co
         val shape: operand.Shape = ins.inst.row.operands.at[c.operand].shape;
         if (sel shape.relative && shape.relative.anchor == operand.END) { from = next::i64; }
         val to: i64 = from + v.relative;
-        if (to < 0 || to >= w.code.len::i64) { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
-        val reached: err[A.Error] = reach(w, p, to::usize);
-        if (sel reached.err) { ret failed[opt[Verdict]](reached.err); }
+        if (to < 0 || to >= w.code.len::i64)                  { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
+        if (s != nil && w.shaped.data[to::usize] == NO_POINT) { ret res[opt[Verdict], A.Error].ok{unread(NOWHERE, at)}; }
+        val went: res[opt[Verdict], A.Error] = goes(w, p, at, to::usize);
+        if (sel went.err)     { ret went; }
+        if (sel went.ok.some) { ret went; }
     }
-    if (falls && next < w.code.len) {
-        val reached: err[A.Error] = reach(w, p, next);
-        if (sel reached.err) { ret failed[opt[Verdict]](reached.err); }
-    }
+    if (falls && next < w.code.len) { ret goes(w, p, at, next); }
     ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
 }
 
@@ -722,6 +1285,18 @@ fun step(w: *Walk, at: usize, store: *operand.Value, alts: *field.Admissions, fp
     val foot:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(fp, ins.inst.row, values, w.ctx, cfg);
     if (sel foot.err)          { ret failed[opt[Verdict]](foot.err); }
     if (sel foot.ok.undecided) { ret res[opt[Verdict], A.Error].ok{unread(UNDECIDED, at)}; }
+    var shape:   *Shape = nil;
+    var stacked: bool   = false;
+    if (w.stream != nil) {
+        shape = ?w.shapes.data[w.shaped.data[at]];
+        val popped: usize = pop_count(w, shape, ?fp.signature);
+        if (p.stack.len < popped) { ret stays(at); }
+        var k: usize = p.stack.len - popped;
+        for (k < p.stack.len) {
+            if (p.stack.data[k]) { stacked = true; }
+            k = k + 1;
+        }
+    }
     var k: usize = 0;
     for (k < w.words) {
         w.named.data[k] = 0;
@@ -736,30 +1311,39 @@ fun step(w: *Walk, at: usize, store: *operand.Value, alts: *field.Admissions, fp
     val address: res[opt[ct.Refusal], A.Error] = touches(w, ?p, ?ins, fp);
     if (sel address.err)     { ret failed[opt[Verdict]](address.err); }
     if (sel address.ok.some) { ret res[opt[Verdict], A.Error].ok{refused(address.ok.some, at)}; }
-    var value: bool = false;
+    var read: bool = entries_read(?p, ?ins, fp);
     k = 0;
     for (k < w.words) {
-        if ((fp.reads.data[k] & p.taint.data[k]) != 0) { value = true; }
+        if ((fp.reads.data[k] & p.taint.data[k]) != 0) { read = true; }
         k = k + 1;
     }
     k = 0;
     for (k < w.touches.len) {
-        if (w.touches.data[k].reads && secret_at(?p, ?w.touches.data[k].at)) { value = true; }
+        if (w.touches.data[k].reads && secret_at(?p, ?w.touches.data[k].at)) { read = true; }
         k = k + 1;
     }
     var c:        effect.Control  = fp.control;
-    val transfer: opt[ct.Refusal] = control(w, ?p, ?ins, ?c, value, secret);
+    val transfer: opt[ct.Refusal] = control(w, ?p, ?ins, ?c, read, stacked, secret);
     if (sel transfer.some) { ret res[opt[Verdict], A.Error].ok{refused(transfer.some, at)}; }
     if (w.timed) {
         val timing: opt[ct.Refusal] = latency(w, ?p, ?ins, fp, secret);
         if (sel timing.some) { ret res[opt[Verdict], A.Error].ok{refused(timing.some, at)}; }
     }
+    val value: bool = read || stacked;
+    if (shape != nil && c.target == effect.DEPTH) {
+        val kept: err[A.Error] = carry(w, ?p, shape, ?fp.signature, effect.TypeRef.operand{c.operand});
+        if (sel kept.err) { ret failed[opt[Verdict]](kept.err); }
+    }
     val applied: err[A.Error] = apply(w, ?p, at, ?ins, fp, value);
     if (sel applied.err) { ret failed[opt[Verdict]](applied.err); }
-    ret successors(w, ?p, at, ?ins, ?c);
+    if (shape != nil) {
+        val streamed: err[A.Error] = apply_stream(w, ?p, ?ins, fp, shape, value);
+        if (sel streamed.err) { ret failed[opt[Verdict]](streamed.err); }
+    }
+    ret successors(w, ?p, at, ?ins, ?c, shape);
 }
 
-# the entry state the seeds make, refused naming a register the file has no row of
+# the entry state the seeds make, refused naming a register the file has no row of or an entry the stream does not hold
 fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
     var i: u32 = 0;
     for (i < secrets.len) {
@@ -779,8 +1363,198 @@ fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
             val held: err[A.Error] = hold(p, h);
             if (sel held.err) { ret failed[opt[Verdict]](held.err); }
         }
+        if (sel s.entry) {
+            if (w.stream == nil) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+            val there: opt[u32] = w.stream.space(w.ctx.stream, s.entry.space, s.entry.index);
+            if (sel there.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+            val set: err[A.Error] = set_entry(p, key(s.entry.space, s.entry.index), true);
+            if (sel set.err) { ret failed[opt[Verdict]](set.err); }
+        }
         i = i + 1;
     }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+# the height `height` of the operand stack less `n` values, none when that passes below `base`, its block's, and
+# `base` in code no control reaches past a polymorphic stack, whose pops take values that are never there
+fun lowered(height: u32, n: u32, base: u32, dead: bool) opt[u32] {
+    if (height >= base + n) { ret opt[u32].some{height - n}; }
+    if (dead)               { ret opt[u32].some{base}; }
+    ret opt[u32].none{};
+}
+
+# whether every popped value the effect `e` and the control `c` name by depth is one of the `popped` an instruction pops
+fun names_popped(e: *effect.Effect, c: *effect.Control, popped: u32) bool {
+    if (c.condition::u32 > popped || c.chooses::u32 > popped) { ret false; }
+    var i: u32 = 0;
+    for (i < e.memory.len) {
+        val a: *effect.Access = ?e.memory.at[i];
+        if (a.pop::u32 > popped) { ret false; }
+        val count: effect.Count = a.width.count;
+        if (sel count.popped) {
+            if (count.popped::u32 >= popped) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the counts of each type of signature `sig` of `ins` pushed onto `w.counts`, its pops' then its pushes', as the
+# stream resolves each, 0 for the polymorphic stack
+# ---
+# ret: how many values it pops and pushes, none for a type the stream does not resolve
+rec Counted {
+    pops:   u32;
+    pushes: u32;
+}
+
+fun counted(w: *Walk, ins: *walk.Decoded, sig: *effect.Signature) res[opt[Counted], A.Error] {
+    var c: Counted = Counted{pops: 0, pushes: 0};
+    var i: u32     = 0;
+    for (i < sig.pops.len + sig.pushes.len) {
+        var ref:    effect.TypeRef = effect.TypeRef.polymorphic{};
+        var pushed: bool           = i >= sig.pops.len;
+        if (pushed) { ref = sig.pushes.at[i - sig.pops.len]; }
+        or          { ref = sig.pops.at[i]; }
+        var n: u32 = 0;
+        if (!sel ref.polymorphic) {
+            val got: opt[u32] = w.stream.arity(w.ctx.stream, ?ins.inst, ref, pushed);
+            if (sel got.none) { ret res[opt[Counted], A.Error].ok{opt[Counted].none{}}; }
+            n = got.some;
+        }
+        val kept: res[usize, A.Error] = vector.push[u32](?w.counts, n);
+        if (sel kept.err) { ret failed[opt[Counted]](kept.err); }
+        if (pushed)       { c.pushes = c.pushes + n; }
+        or                { c.pops = c.pops + n; }
+        i = i + 1;
+    }
+    ret res[opt[Counted], A.Error].ok{opt[Counted].some{c}};
+}
+
+# the blocks the depths of control `c` of `ins` name added to `w.targets`, by the blocks `open` holds open, innermost
+# last
+# ---
+# ret: how many, none for a depth past every block open or an operand holding no depth
+fun depths(w: *Walk, ins: *walk.Decoded, c: *effect.Control, open: *vector.Vector[u32]) res[opt[u32], A.Error] {
+    if (c.target != effect.DEPTH)                                          { ret res[opt[u32], A.Error].ok{opt[u32].some{0}}; }
+    if (c.operand == field.NO_OPERAND || c.operand::u32 >= ins.inst.count) { ret res[opt[u32], A.Error].ok{opt[u32].none{}}; }
+    val v:    operand.Value  = ins.inst.values[c.operand];
+    var one:  [1]operand.Value;
+    var list: operand.Values = operand.Values{at: ?one[0], len: 1};
+    one[0] = v;
+    if (sel v.list) { list = v.list; }
+    var i: u32 = 0;
+    for (i < list.len) {
+        val d: operand.Value = list.at[i];
+        if (!sel d.id)               { ret res[opt[u32], A.Error].ok{opt[u32].none{}}; }
+        if (d.id::usize >= open.len) { ret res[opt[u32], A.Error].ok{opt[u32].none{}}; }
+        val pushed: res[usize, A.Error] = vector.push[u32](?w.targets, open.data[open.len - 1 - d.id::usize]);
+        if (sel pushed.err) { ret failed[opt[u32]](pushed.err); }
+        i = i + 1;
+    }
+    ret res[opt[u32], A.Error].ok{opt[u32].some{list.len}};
+}
+
+# how many values of the pops of signature `sig`, whose counts start at `first` in `w.counts`, a block takes as its
+# params: those of each type the instruction opening it pushes again
+fun params_of(w: *Walk, sig: *effect.Signature, first: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < sig.pops.len) {
+        if (pushed_again(sig, sig.pops.at[i])) { n = n + w.counts.data[first + i]; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the code of a typed stream read once in its own order, each instruction observed on the context's stream after it is
+# read: how many values each type of its signature stands for, the blocks it opens, splits and closes, matched by
+# their structure, the height of the operand stack below each block's params, and the blocks its depths name
+# ---
+# ret: none when every instruction reads and every block opened closes in order, else why the code cannot be followed
+fun scan(w: *Walk, store: *operand.Value, alts: *field.Admissions) res[opt[Verdict], A.Error] {
+    var open: vector.Vector[u32] = vector.init[u32](w.a);
+    fin { vector.dnit[u32](?open); }
+    val root: res[usize, A.Error] = vector.push[Block](?w.blocks, Block{open: NO_OFFSET, body: 0, split: NO_OFFSET, close: NO_OFFSET, base: 0, params: 0, results: 0, loops: false});
+    if (sel root.err) { ret failed[opt[Verdict]](root.err); }
+    val outer: res[usize, A.Error] = vector.push[u32](?open, 0);
+    if (sel outer.err) { ret failed[opt[Verdict]](outer.err); }
+    var height: u32   = 0;
+    var dead:   bool  = false;
+    var at:     usize = 0;
+    for (at < w.code.len) {
+        if (open.len == 0) { ret res[opt[Verdict], A.Error].ok{unread(UNSTRUCTURED, at)}; }
+        val got: res[walk.Decoded, field.Refusal] = walk.decode(w.code.set.codec, w.ctx, w.code.data, w.code.len, at, store, VALUES, alts);
+        if (sel got.err) { ret res[opt[Verdict], A.Error].ok{unread(UNDECODED, at)}; }
+        var ins:    walk.Decoded                  = got.ok;
+        val e:      *effect.Effect                = ins.inst.row.effect;
+        val values: operand.Values                = operand.Values{at: ins.inst.values, len: ins.inst.count};
+        val ctl:    effect.Answer[effect.Control] = effect.control(w.file, ins.inst.row.operands.at, e, values);
+        if (sel ctl.undecided)             { ret res[opt[Verdict], A.Error].ok{unread(UNDECIDED, at)}; }
+        if (e.structure == effect.CATCHES) { ret res[opt[Verdict], A.Error].ok{unread(CAUGHT, at)}; }
+        var c:     effect.Control             = ctl.decided;
+        var shape: Shape                      = Shape{len: ins.len, counts: w.counts.len::u32, targets: w.targets.len::u32, depths: 0, block: NO_BLOCK, stuck: false};
+        val sized: res[opt[Counted], A.Error] = counted(w, ?ins, ?e.signature);
+        if (sel sized.err)     { ret failed[opt[Verdict]](sized.err); }
+        if (sel sized.ok.none) { ret res[opt[Verdict], A.Error].ok{unread(UNTYPED, at)}; }
+        val n: Counted = sized.ok.some;
+        if (!names_popped(e, ?c, n.pops)) { ret res[opt[Verdict], A.Error].ok{unread(UNBALANCED, at)}; }
+        var i: u32 = 0;
+        for (i < e.signature.pushes.len) {
+            if (sel e.signature.pushes.at[i].polymorphic) { shape.stuck = true; }
+            i = i + 1;
+        }
+        val named: res[opt[u32], A.Error] = depths(w, ?ins, ?c, ?open);
+        if (sel named.err)     { ret failed[opt[Verdict]](named.err); }
+        if (sel named.ok.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSTRUCTURED, at)}; }
+        shape.depths = named.ok.some;
+        val top: u32              = open.data[open.len - 1];
+        val s:   effect.Structure = e.structure;
+        if (effect.opens(s)) {
+            val params: u32      = params_of(w, ?e.signature, shape.counts);
+            val below:  opt[u32] = lowered(height, n.pops, w.blocks.data[top].base, dead);
+            if (sel below.none) { ret res[opt[Verdict], A.Error].ok{unread(UNBALANCED, at)}; }
+            shape.block = w.blocks.len::u32;
+            val opened: res[usize, A.Error] = vector.push[Block](?w.blocks, Block{open: at, body: at + ins.len, split: NO_OFFSET, close: NO_OFFSET, base: below.some, params: params, results: n.pushes, loops: s == effect.LOOPS});
+            if (sel opened.err) { ret failed[opt[Verdict]](opened.err); }
+            val nested: res[usize, A.Error] = vector.push[u32](?open, shape.block);
+            if (sel nested.err) { ret failed[opt[Verdict]](nested.err); }
+            height = below.some + params;
+            dead   = false;
+        }
+        or (s == effect.SPLITS) {
+            val b: *Block = ?w.blocks.data[top];
+            if (b.open == NO_OFFSET || b.loops || b.split != NO_OFFSET) { ret res[opt[Verdict], A.Error].ok{unread(UNSTRUCTURED, at)}; }
+            b.split     = at;
+            shape.block = top;
+            height      = b.base + b.params;
+            dead        = false;
+        }
+        or (s == effect.CLOSES) {
+            val b: *Block = ?w.blocks.data[top];
+            b.close     = at;
+            shape.block = top;
+            open.len    = open.len - 1;
+            height      = b.base + b.results;
+            dead        = false;
+        }
+        or {
+            val below: opt[u32] = lowered(height, n.pops, w.blocks.data[top].base, dead);
+            if (sel below.none) { ret res[opt[Verdict], A.Error].ok{unread(UNBALANCED, at)}; }
+            height = below.some + n.pushes;
+            if (shape.stuck) {
+                height = w.blocks.data[top].base;
+                dead   = true;
+            }
+        }
+        w.shaped.data[at] = w.shapes.len::u32;
+        val kept: res[usize, A.Error] = vector.push[Shape](?w.shapes, shape);
+        if (sel kept.err) { ret failed[opt[Verdict]](kept.err); }
+        val seen: err[field.Refusal] = w.stream.observe(w.ctx.stream, ?ins.inst);
+        if (sel seen.err) { ret res[opt[Verdict], A.Error].ok{unread(seen.err.message, at)}; }
+        at = at + ins.len;
+    }
+    if (open.len != 0) { ret res[opt[Verdict], A.Error].ok{unread(UNSTRUCTURED, at)}; }
     ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
 }
 
@@ -795,6 +1569,13 @@ fun release(w: *Walk) {
     vector.dnit[usize](?w.work);
     vector.dnit[u64](?w.named);
     vector.dnit[Touch](?w.touches);
+    vector.dnit[u32](?w.shaped);
+    vector.dnit[Shape](?w.shapes);
+    vector.dnit[u32](?w.counts);
+    vector.dnit[u32](?w.targets);
+    vector.dnit[Block](?w.blocks);
+    vector.dnit[bool](?w.carried);
+    vector.dnit[bool](?w.popped);
 }
 
 fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
@@ -802,6 +1583,10 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     for (i < w.code.len) {
         val pushed: res[usize, A.Error] = vector.push[u32](?w.points, NO_POINT);
         if (sel pushed.err) { ret failed[Verdict](pushed.err); }
+        if (w.stream != nil) {
+            val shaped: res[usize, A.Error] = vector.push[u32](?w.shaped, NO_POINT);
+            if (sel shaped.err) { ret failed[Verdict](shaped.err); }
+        }
         i = i + 1;
     }
     i = 0;
@@ -810,7 +1595,10 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
         if (sel pushed.err) { ret failed[Verdict](pushed.err); }
         i = i + 1;
     }
-    val made: res[Point, A.Error] = blank(w);
+    var store: [VALUES]operand.Value;
+    var noted: [ALTERNATIVES]requirement.Alternative;
+    var alts:  field.Admissions    = field.Admissions{at: ?noted[0], cap: ALTERNATIVES, used: 0};
+    val made:  res[Point, A.Error] = blank(w);
     if (sel made.err) { ret failed[Verdict](made.err); }
     var entry: Point = made.ok;
     fin { drop(?entry); }
@@ -818,15 +1606,17 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     if (sel seeded.err)     { ret failed[Verdict](seeded.err); }
     if (sel seeded.ok.some) { ret res[Verdict, A.Error].ok{seeded.ok.some}; }
     if (w.code.len == 0)    { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
-    val reached: err[A.Error] = reach(w, ?entry, 0);
+    if (w.stream != nil) {
+        val read: res[opt[Verdict], A.Error] = scan(w, ?store[0], ?alts);
+        if (sel read.err)     { ret failed[Verdict](read.err); }
+        if (sel read.ok.some) { ret res[Verdict, A.Error].ok{read.ok.some}; }
+    }
+    val reached: res[bool, A.Error] = reach(w, ?entry, 0);
     if (sel reached.err) { ret failed[Verdict](reached.err); }
     val made_fp: res[footprint.Footprint, A.Error] = footprint.make(w.a, w.file);
     if (sel made_fp.err) { ret failed[Verdict](made_fp.err); }
     var fp: footprint.Footprint = made_fp.ok;
     fin { footprint.release(?fp); }
-    var store: [VALUES]operand.Value;
-    var noted: [ALTERNATIVES]requirement.Alternative;
-    var alts:  field.Admissions = field.Admissions{at: ?noted[0], cap: ALTERNATIVES, used: 0};
     for {
         val next: opt[usize] = vector.pop[usize](?w.work);
         if (sel next.none) { brk; }
@@ -839,27 +1629,37 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
 
 # the constant-time walk of `code` under the context the function runs under, from the secrets the caller seeds. a
 # set whose timing is `none` is refused before any walk, worded UNCLASSIFIED, and one whose timing is not guaranteed
-# is walked asking no row's latency, code it clears answered unguaranteed. code of a typed stream, whose values pass
-# on its operand stack, is answered unread before the walk reads the register file, which such a set has none of
+# is walked asking no row's latency, code it clears answered unguaranteed. code of a typed stream is read once in its
+# own order first, observed on the context's stream, which it leaves as reading the function's body leaves it, and is
+# answered unread when its set classifies its rows' timing, as no class states inputs among the values a row pops
 # ---
 # ret: the verdict, or the allocator's refusal of the walk's storage
 pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secrets) res[Verdict, A.Error] {
     val answer: ct.Required = ct.required(code.set.ct);
-    if (sel answer.refused)           { ret res[Verdict, A.Error].ok{Verdict.refused{Finding{offset: 0, refusal: answer.refused}}}; }
-    if (code.set.codec.stream != nil) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: STACKED, offset: 0}}}; }
-    val file: *register.File = code.set.codec.registers;
-    var w:    Walk           = Walk{
+    if (sel answer.refused)                              { ret res[Verdict, A.Error].ok{Verdict.refused{Finding{offset: 0, refusal: answer.refused}}}; }
+    if (code.set.codec.stream != nil && sel answer.held) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: TIMED, offset: 0}}}; }
+    var file: *register.File = code.set.codec.registers;
+    if (file == nil) { file = ?NO_FILE; }
+    var w: Walk = Walk{
         a:       a,
         code:    code,
         timed:   sel answer.held,
         ctx:     ctx,
         file:    file,
         words:   effect.words(file)::usize,
+        stream:  code.set.codec.stream,
         points:  vector.init[u32](a),
         states:  vector.init[Point](a),
         work:    vector.init[usize](a),
         named:   vector.init[u64](a),
         touches: vector.init[Touch](a),
+        shaped:  vector.init[u32](a),
+        shapes:  vector.init[Shape](a),
+        counts:  vector.init[u32](a),
+        targets: vector.init[u32](a),
+        blocks:  vector.init[Block](a),
+        carried: vector.init[bool](a),
+        popped:  vector.init[bool](a),
     };
     val verdict: res[Verdict, A.Error] = walked(?w, secrets);
     release(?w);
@@ -1070,5 +1870,32 @@ test check__under_zvkt_a_secret_gather_index_is_refused {
     }
     val data: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_GATHER[0], 12, ?T_V2[0], 1);
     if (!sel data.clear) { ret 3; }
+    ret 0;
+}
+
+# vsetvli t0, a0, e8, m1, ta, ma; vle8.v v1, (a1); ret
+#[testing]
+val T_COUNTED: [12]u8 = [12]u8{0xd7, 0x72, 0x05, 0x0c, 0x87, 0x80, 0x05, 0x02, 0x67, 0x80, 0x00, 0x00};
+
+# vsetvli t0, a0, e8, m1, ta, ma; vlm.v v1, (a1); ret
+#[testing]
+val T_MASK_COUNTED: [12]u8 = [12]u8{0xd7, 0x72, 0x05, 0x0c, 0x87, 0x80, 0xb5, 0x02, 0x67, 0x80, 0x00, 0x00};
+
+# a vector access covers what vl decides, so a vl set from a secret is refused as the access's length, a mask access's
+# bytes as well. it is walked on a set whose timing is not guaranteed, which asks no latency, since where timing is
+# guaranteed vsetvli's own latency refuses the secret first. a public vl walks clean
+test check__a_vector_access_counted_by_a_secret_vl_is_refused {
+    var t: testing.Testing;
+    testing.make(?t);
+    var s: set.Set = riscv_set.SET;
+    s.ct = ct.Timing.unguaranteed{};
+    val counted: Verdict = t_walk_as(?t, ?s, "rv64iv", ?T_COUNTED[0], 12, ?T_A0[0], 1);
+    if (!t_refuses(counted, 4, ct.MEMORY)) { ret 1; }
+    if (sel counted.refused) {
+        if (counted.refused.refusal.operand != field.NO_OPERAND) { ret 2; }
+    }
+    if (!t_refuses(t_walk_as(?t, ?s, "rv64iv", ?T_MASK_COUNTED[0], 12, ?T_A0[0], 1), 4, ct.MEMORY)) { ret 3; }
+    val public: Verdict = t_walk(?t, "rv64iv_zvkt", ?T_COUNTED[0], 12, nil, 0);
+    if (!sel public.clear) { ret 4; }
     ret 0;
 }
