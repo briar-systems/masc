@@ -7,9 +7,10 @@
 # `observe` adds what each instruction defines, refusing an id defined twice, and a module's reader asks `width`, `space`
 # and the scalar of an id.
 #
-# a source spells an id `%n` by its number or `%name` by a name. a name takes one past the highest id the stream has
-# seen, at its first sight, and a later number naming that id is refused, so a source's numbers keep their ids and
-# its names take ids none of them has.
+# a source spells an id `%n` by its number or `%name` by a name, as spirv-as reads it with --preserve-numeric-ids: a
+# number is its id, and a name, at its first sight, takes the lowest id no number of the text spells and no name took.
+# the stream sees every statement of its text before it reads one (`ahead`), so it knows every number the text spells,
+# and a number naming an id a name took is refused only in a text read without its statements seen ahead.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -44,6 +45,7 @@ use masc.core.inst;
 use masc.core.operand;
 use masc.core.state;
 use masc.core.stream;
+use masc.syntax.read;
 
 use masc.isa.spirv.gen_operand;
 use masc.isa.spirv.gen_row;
@@ -94,6 +96,8 @@ pub fun float_format(bits: u32, encoding: *operand.Value) opt[ieee.Format] {
 # imports: the import code of every set an id imports, by the id
 # names:   the id of every name the source spelled, each name owned
 # named:   the ids names took
+# spelled: the ids the text's numbers spell, every statement's seen ahead and every one read
+# next:    the lowest id a name may take next, every id below it spelled or taken
 # top:     the highest id the stream has seen
 # linkage: whether an OpCapability declared Linkage, which makes the module an object a link takes
 pub rec State {
@@ -103,6 +107,8 @@ pub rec State {
     imports: map.Map[u32, u32];
     names:   map.Map[str, u32];
     named:   map.Map[u32, bool];
+    spelled: map.Map[u32, bool];
+    next:    u32;
     top:     u32;
     linkage: bool;
 }
@@ -114,7 +120,7 @@ fun state_of(p: ptr) *State {
 fun make(a: *A.Allocator) res[ptr, A.Error] {
     val got: res[*State, A.Error] = A.allocate[State](a, 1);
     if (sel got.err) { ret res[ptr, A.Error].err{got.err}; }
-    @got.ok = State{alloc: a, defined: map.init[u32, u32](a), scalars: map.init[u32, Scalar](a), imports: map.init[u32, u32](a), names: map.init[str, u32](a), named: map.init[u32, bool](a), top: 0, linkage: false};
+    @got.ok = State{alloc: a, defined: map.init[u32, u32](a), scalars: map.init[u32, Scalar](a), imports: map.init[u32, u32](a), names: map.init[str, u32](a), named: map.init[u32, bool](a), spelled: map.init[u32, bool](a), next: 1, top: 0, linkage: false};
     ret res[ptr, A.Error].ok{got.ok::ptr};
 }
 
@@ -137,6 +143,7 @@ fun release(a: *A.Allocator, p: ptr) {
     map.dnit[u32, u32](?s.imports);
     map.dnit[str, u32](?s.names);
     map.dnit[u32, bool](?s.named);
+    map.dnit[u32, bool](?s.spelled);
     val freed: err[A.Error] = A.deallocate[State](a, s, 1);
 }
 
@@ -147,6 +154,8 @@ fun begin(p: ptr) {
     map.clear[u32, Scalar](?s.scalars);
     map.clear[u32, u32](?s.imports);
     map.clear[u32, bool](?s.named);
+    map.clear[u32, bool](?s.spelled);
+    s.next    = 1;
     s.top     = 0;
     s.linkage = false;
 }
@@ -272,11 +281,13 @@ pub fun numbered(p: ptr, n: u32) res[u32, str] {
     var key:   u32        = n;
     val taken: opt[*bool] = map.get[u32, bool](?s.named, ?key);
     if (sel taken.some) { ret res[u32, str].err{NAMED_ID}; }
+    val put: res[bool, A.Error] = map.insert[u32, bool](?s.spelled, n, true);
+    if (sel put.err) { ret res[u32, str].err{field.MEMORY}; }
     seen(s, n);
     ret res[u32, str].ok{n};
 }
 
-# the id the source's `%` and `name` spells, one past the highest id the stream has seen at its first sight
+# the id the source's `%` and `name` spells, at its first sight the lowest id no number spells and no name took
 pub fun named(p: ptr, name: View) res[u32, str] {
     val s:    *State            = state_of(p);
     val text: res[*u8, A.Error] = A.allocate[u8](s.alloc, name.len + 1);
@@ -293,13 +304,60 @@ pub fun named(p: ptr, name: View) res[u32, str] {
         val freed: err[A.Error] = A.deallocate[u8](s.alloc, text.ok, name.len + 1);
         ret res[u32, str].ok{@known.some};
     }
-    if (s.top == 0xFFFF_FFFF) { ret res[u32, str].err{field.OUT_OF_RANGE}; }
-    val id:   u32                = s.top + 1;
+    var id: u32 = s.next;
+    for (id != 0 && spelled(s, id)) { id = id + 1; }
+    if (id == 0) {
+        val freed: err[A.Error] = A.deallocate[u8](s.alloc, text.ok, name.len + 1);
+        ret res[u32, str].err{field.OUT_OF_RANGE};
+    }
     val put:  res[bool, A.Error] = map.insert[str, u32](?s.names, text.ok, id);
     val took: res[bool, A.Error] = map.insert[u32, bool](?s.named, id, true);
     if (sel put.err || sel took.err) { ret res[u32, str].err{field.MEMORY}; }
-    s.top = id;
+    s.next = id + 1;
+    seen(s, id);
     ret res[u32, str].ok{id};
+}
+
+# whether a number of the text spells `id`
+fun spelled(s: *State, id: u32) bool {
+    var key: u32        = id;
+    val got: opt[*bool] = map.get[u32, bool](?s.spelled, ?key);
+    ret sel got.some;
+}
+
+# the ids the numbers of statement `text` spell, seen before the stream reads it: every `%` and digits outside a string
+fun ahead(p: ptr, text: View) err[str] {
+    val s: *State = state_of(p);
+    var i: usize  = 0;
+    for (i < text.len) {
+        val c: u8 = text.data[i];
+        if (c == '"') {
+            i = i + 1;
+            for (i < text.len && text.data[i] != '"') {
+                if (text.data[i] == '\\') { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+            cnt;
+        }
+        i = i + 1;
+        if (c != '%') { cnt; }
+        var end:      usize = i;
+        var numbered: bool  = true;
+        var n:        u64   = 0;
+        for (end < text.len && read.word(text.data[end])) {
+            val d: u8 = text.data[end];
+            if (d < '0' || d > '9') { numbered = false; }
+            or (n <= 0xFFFF_FFFF)   { n = n * 10 + (d - '0')::u64; }
+            end = end + 1;
+        }
+        if (numbered && end > i && n != 0 && n <= 0xFFFF_FFFF) {
+            val put: res[bool, A.Error] = map.insert[u32, bool](?s.spelled, n::u32, true);
+            if (sel put.err) { ret err[str].err{field.MEMORY}; }
+        }
+        i = end;
+    }
+    ret err[str].ok{};
 }
 
 # the facts mink's conversion reads of the module the object holds: the id space, an entry for every id from 1 to the
@@ -322,4 +380,4 @@ fun record(p: ptr, v: *state.Context, o: *Object) err[Fail] {
 }
 
 # how a spir-v module's stream keeps its state. spir-v has no operand stack, so it names no stack types
-pub val HOOKS: stream.Hooks = stream.Hooks{types: stream.Names{at: nil, len: 0}, make: make, release: release, begin: begin, observe: observe, width: width, space: space, record: record};
+pub val HOOKS: stream.Hooks = stream.Hooks{types: stream.Names{at: nil, len: 0}, make: make, release: release, begin: begin, observe: observe, width: width, space: space, record: record, ahead: ahead};
