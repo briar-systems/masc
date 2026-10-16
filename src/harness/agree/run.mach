@@ -80,6 +80,7 @@ use masc.asm.model;
 use masc.codec.walk;
 use masc.core.diagnostic;
 use masc.core.dispatch;
+use masc.core.effect;
 use masc.core.extension;
 use masc.core.field;
 use masc.core.form;
@@ -608,6 +609,101 @@ fun enumerated(r: *Run, row_: *row.Row, s: *extension.Selection) err[str] {
     ret err[str].ok{};
 }
 
+# the first alternative's extensions of the first register `r` admits that `v` does not hold, none when it holds one
+# of them or none of those it lacks has a requirement
+fun operand_needs(v: *register.Available, r: *operand.Register) opt[requirement.Ids] {
+    val file: *register.File       = v.file;
+    var need: opt[requirement.Ids] = opt[requirement.Ids].none{};
+    var c:    u32                  = 0;
+    for (c < r.classes.len) {
+        val class: u16 = r.classes.at[c];
+        if (class::u32 < file.class_count) {
+            val span: u32 = operand.span(r, register.count_most(file, class)::u32);
+            var i:    u32 = 0;
+            for (i < span) {
+                val n: u32 = r.first + i;
+                if (!operand.excludes_number(r, n)) {
+                    val held: err[register.Absent] = register.admitted(v, register.make(class, n::u16));
+                    if (sel held.ok) { ret opt[requirement.Ids].none{}; }
+                    if (sel held.err) {
+                        val why: register.Absent = held.err;
+                        if (sel why.unavailable) {
+                            if (sel need.none && why.unavailable.requires.len > 0) { need = opt[requirement.Ids].some{why.unavailable.requires.at[0].all}; }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        c = c + 1;
+    }
+    ret need;
+}
+
+# the first alternative's extensions of the first register of `set` that `v` does not hold, none when it holds each
+fun touched_needs(v: *register.Available, set: effect.Set) opt[requirement.Ids] {
+    val file: *register.File = v.file;
+    var w:    u32            = 0;
+    for (w < set.len) {
+        var b: u32 = 0;
+        for (b < 64) {
+            val at: u32 = w * 64 + b;
+            if (((set.words[w] >> b::u64) & 1) != 0 && at < file.register_count) {
+                val reg:  *register.Register   = ?file.registers[at];
+                val held: err[register.Absent] = register.admitted(v, register.make(reg.class, reg.number));
+                if (sel held.err && reg.requires.len > 0) { ret opt[requirement.Ids].some{reg.requires.at[0].all}; }
+            }
+            b = b + 1;
+        }
+        w = w + 1;
+    }
+    ret opt[requirement.Ids].none{};
+}
+
+# `s` widened by what the registers of `row_` need where the selection lacks them, as a user selects them: the first
+# alternative of the requirement of a register operand's registers where it holds none of them, as cvtps2pi's mm needs
+# mmx, and of each register the row surely touches, as fxsave's x87 control words need x87
+fun registered(r: *Run, variant: *agreement.Variant, row_: *row.Row, s: *extension.Selection) err[str] {
+    val set_: *set.Set = r.agreement.set;
+    if (set_.codec == nil || set_.codec.registers == nil) { ret err[str].ok{}; }
+    val arch: opt[*set.Arch] = set.arch_of(set_, variant.arch);
+    if (sel arch.none) { ret err[str].ok{}; }
+    var round: u32 = 0;
+    for (round < 8) {
+        var view:   register.Available;
+        val opened: res[state.Context, state.Opened] = set.open(r.scratch, set_, arch.some, s, ?view);
+        if (sel opened.err) { ret err[str].ok{}; }
+        var need: opt[requirement.Ids] = opt[requirement.Ids].none{};
+        var k:    u32                  = 0;
+        for (k < row_.operands.len && sel need.none) {
+            val shape: *operand.Shape = ?row_.operands.at[k].shape;
+            if (sel shape.register) { need = operand_needs(?view, ?shape.register); }
+            k = k + 1;
+        }
+        val touched: effect.Touched       = effect.must(row_.effect);
+        val read:    opt[requirement.Ids] = touched_needs(?view, touched.read);
+        val written: opt[requirement.Ids] = touched_needs(?view, touched.written);
+        var found:   bool                 = sel need.some;
+        if (!found && sel read.some) {
+            need  = read;
+            found = true;
+        }
+        if (!found && sel written.some) { need = written; }
+        val released: err[A.Error] = register.release(?view);
+        if (sel released.err) { ret err[str].err{MEMORY}; }
+        if (sel need.none)    { ret err[str].ok{}; }
+        val grown: err[str] = widen_by(r, s, need.some);
+        if (sel grown.err) { ret grown; }
+        var i: u32 = 0;
+        for (i < need.some.len) {
+            if (!extension.has(s, need.some.at[i])) { ret err[str].ok{}; }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    ret err[str].ok{};
+}
+
 # the selection `r` is checked under at `variant`, none when no alternative of its requirement closes with the base
 fun choose(r: *Run, variant: *agreement.Variant, row_: *row.Row) res[opt[extension.Selection], str] {
     val none:     requirement.Alternative  = requirement.Alternative{all: requirement.NO_IDS, none: requirement.NO_IDS};
@@ -629,7 +725,9 @@ fun choose(r: *Run, variant: *agreement.Variant, row_: *row.Row) res[opt[extensi
     if (sel chosen.none) { ret res[opt[extension.Selection], str].ok{chosen}; }
     var s:      extension.Selection = chosen.some;
     val needed: err[str]            = enumerated(r, row_, ?s);
-    if (sel needed.err)         { ret res[opt[extension.Selection], str].err{needed.err}; }
+    if (sel needed.err) { ret res[opt[extension.Selection], str].err{needed.err}; }
+    val held: err[str] = registered(r, variant, row_, ?s);
+    if (sel held.err)           { ret res[opt[extension.Selection], str].err{held.err}; }
     if (!r.result.options.full) { ret res[opt[extension.Selection], str].ok{opt[extension.Selection].some{s}}; }
     val widened: err[str] = widen(r, variant, ?s, excluded);
     if (sel widened.err) { ret res[opt[extension.Selection], str].err{widened.err}; }
