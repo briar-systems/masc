@@ -5,8 +5,16 @@
 # operand written only when present, a mask's members joined by `|`, an enumerant's params after it, an operation of
 # OpSpecConstantOp after its result type and an extended instruction after its set. what is written here is how its
 # values are spelled: an id `%` and its number or a name, a string between double quotes, which a backslash escapes
-# within, and an integer in decimal, after 0x or after a leading 0 in octal, with no expressions, so `7 %5` is two
-# operands. mnemonics and names read with their case.
+# within, an integer in decimal, after 0x or after a leading 0 in octal, and a float in decimal or as a hex float with
+# its `p` exponent, with no expressions, so `7 %5` is two operands. mnemonics and names read with their case.
+#
+# a float literal is rounded once to its type's ieee 754 format by `masc.asm.model.float_bits`, the one rounding every
+# float text of masc takes, a typed one's format the one its OpTypeFloat states and a LiteralFloat immediate binary32.
+# spirv-as spells infinity and nan only as hex floats whose exponent is one past the format's largest, its field all
+# ones and the fraction the hex digits', so a decimal that rounds past the largest finite value is refused, as are
+# `inf` and `nan`. floats print as spirv-dis prints them: a zero or a normal binary32 or binary64 by `%.9g` and `%.17g`
+# of `std.format`, which read back to their bits, and every other, binary16 always, as SPIRV-Tools' hex float, a
+# subnormal normalized and the fraction's trailing zero digits left out.
 #
 # a source names an id by its number or by a name, which the stream gives the id past the highest it has seen. the
 # printer writes every id by its number, as spirv-dis --raw-id does, so its text reads back to the same ids.
@@ -25,6 +33,11 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view.View;
 
+use std.format;
+use std.io.writer;
+use std.math.ieee;
+use number: std.text.parse;
+
 #[testing]
 use A: std.allocator;
 #[testing]
@@ -32,6 +45,7 @@ use std.allocator.testing;
 #[testing]
 use std.collections.vector;
 
+use masc.asm.model;
 use masc.core.diagnostic;
 #[testing]
 use masc.core.extension;
@@ -75,7 +89,8 @@ pub val UNCLOSED:   str = "string not closed";
 pub val NO_STRING:  str = "expected a string between double quotes";
 pub val TYPED:      str = "a literal of no type, which spir-v spells only as a string or by its type";
 pub val UNTYPED:    str = "a typed literal whose type is no scalar type the stream holds";
-pub val FLOATED:    str = "a float literal, which masc reads and writes once mach-std converts float text";
+pub val UNROUNDED:  str = "a float literal of a type of no ieee 754 binary16, binary32 or binary64 format";
+pub val OVERFLOWED: str = "a decimal float past its type's largest finite value, which spir-v spells only as a hex float";
 pub val WIDE:       str = "a typed literal wider than 64 bits";
 pub val NEGATIVE:   str = "a negative number in an unsigned literal";
 pub val UNFIT:      str = "an integer that does not fit its type";
@@ -286,13 +301,68 @@ fun integer_parse(r: *core_syntax.Reader, t: spirv_stream.Scalar, out: *operand.
     ret err[diagnostic.Diagnostic].ok{};
 }
 
+# the bits of a float in format `f` read at the reader's position, the reader advanced past it: a decimal or a hex
+# float with its `p` exponent as `masc.asm.model.float_literal` reads one, rounded once by `masc.asm.model.float_bits`.
+# a hex float whose exponent is one past the format's largest finite one is the field of all ones, an infinity or a nan
+# with the hex digits' fraction, as spirv-as reads it, and a decimal that rounds to infinity is refused
+fun float_read(r: *core_syntax.Reader, f: opt[ieee.Format], out: *u64) err[diagnostic.Diagnostic] {
+    val at:  usize = r.at;
+    val len: usize = read.token(r, at);
+    if (sel f.none) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNROUNDED, at, len)}; }
+    var end: usize             = at;
+    val got: opt[model.Float] = model.float_literal(r, at, ?end);
+    if (sel got.none)                                                  { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    if (sel got.some.form.infinity || sel got.some.form.nan)           { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    if (got.some.text.len != end - at)                                 { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    if (end < r.end && (read.word(r.text[end]) || r.text[end] == '.')) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    val fmt:  ieee.Format                  = f.some;
+    var bits: res[u128, number.ParseError] = model.float_bits(got.some, fmt);
+    if (sel got.some.form.hex) {
+        # the format one exponent bit wider holds the binade past the largest exactly where the narrow one holds its own
+        val wide:  ieee.Format                  = ieee.Format{mant_bits: fmt.mant_bits, exp_bits: fmt.exp_bits + 1, bias: fmt.bias * 2 + 1};
+        val wider: res[u128, number.ParseError] = model.float_bits(got.some, wide);
+        if (sel wider.ok) {
+            val p: ieee.Fields = ieee.fields(wide, wider.ok);
+            if (p.field == ieee.exp_field_max(fmt) - fmt.bias + wide.bias) {
+                var sign: u128 = 0;
+                if (p.neg) { sign = ieee.sign_bit(fmt); }
+                bits = res[u128, number.ParseError].ok{sign | ieee.inf_bits(fmt) | p.frac};
+            }
+        }
+    }
+    if (sel bits.err) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
+    if (sel got.some.form.decimal && ieee.fields(fmt, bits.ok).field == ieee.exp_field_max(fmt)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, OVERFLOWED, at, len)}; }
+    @out = bits.ok::u64;
+    r.at = end;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a float of float type `t` read as `float_read` reads it, its bits zero-extended to whole words little endian into the
+# reader's bytes
+fun float_parse(r: *core_syntax.Reader, t: spirv_stream.Scalar, out: *operand.Value) err[diagnostic.Diagnostic] {
+    var bits: u64                        = 0;
+    val got:  err[diagnostic.Diagnostic] = float_read(r, t.format, ?bits);
+    if (sel got.err) { ret got; }
+    var n: u32 = 4;
+    if (t.bits > 32) { n = 8; }
+    val room: res[*u8, diagnostic.Diagnostic] = read.reserve(r, n);
+    if (sel room.err) { ret err[diagnostic.Diagnostic].err{room.err}; }
+    var k: u32 = 0;
+    for (k < n) {
+        room.ok[k] = ((bits >> (k * 8)::u64) & 0xFF)::u8;
+        k          = k + 1;
+    }
+    @out = operand.Value.literal{operand.Bytes{at: room.ok, len: n}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
 fun literal_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
     if (!sel desc.shape.literal)                      { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
     if (desc.shape.literal.content == operand.STRING) { ret string_parse(r, out); }
     if (desc.shape.literal.width_of == 0)             { ret err[diagnostic.Diagnostic].err{read.refuse(r, TYPED, r.at, read.token(r, r.at))}; }
     val t: opt[spirv_stream.Scalar] = typed_of(r.ctx, ?desc.shape.literal, r.values);
     if (sel t.none)                         { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNTYPED, r.at, read.token(r, r.at))}; }
-    if (t.some.class == spirv_stream.FLOAT) { ret err[diagnostic.Diagnostic].err{read.refuse(r, FLOATED, r.at, read.token(r, r.at))}; }
+    if (t.some.class == spirv_stream.FLOAT) { ret float_parse(r, t.some, out); }
     ret integer_parse(r, t.some, out);
 }
 
@@ -338,6 +408,106 @@ fun integer_print(w: *core_syntax.Writer, t: spirv_stream.Scalar, bytes: operand
     ret unsigned_write(w, ((~pattern + 1) & all));
 }
 
+# the significant digits spirv-dis writes a zero or a normal of format `f` to, a binary32's 9 and a binary64's 17, which
+# read back to their bits, none for a format it writes only as a hex float, as binary16
+fun precision_of(f: ieee.Format) opt[usize] {
+    if (f.mant_bits == ieee.F32.mant_bits && f.exp_bits == ieee.F32.exp_bits) { ret opt[usize].some{9}; }
+    if (f.mant_bits == ieee.F64.mant_bits && f.exp_bits == ieee.F64.exp_bits) { ret opt[usize].some{17}; }
+    ret opt[usize].none{};
+}
+
+# the hex float of `bits` in format `f` as SPIRV-Tools writes one: a sign, `0x`, a leading 1, or 0 for a zero, the
+# fraction's hex digits after a point with their trailing zero digits left out, and the exponent after `p` in decimal,
+# signed `+` when it is not negative. the fraction is padded to whole digits at its low end, a subnormal's is normalized
+# past its leading one, and the field of all ones is written as the exponent one past the largest
+fun hex_print(w: *core_syntax.Writer, f: ieee.Format, bits: u64) err[field.Refusal] {
+    val p:        ieee.Fields = ieee.fields(f, bits::u128);
+    val nibbles:  u32         = (f.mant_bits + 3) / 4;
+    val all:      u128        = (1::u128 << (nibbles * 4)::u128) - 1;
+    var fraction: u128        = p.frac << (nibbles * 4 - f.mant_bits)::u128;
+    val zero:     bool        = p.field == 0 && p.frac == 0;
+    var exponent: i64         = p.field - f.bias;
+    if (zero) { exponent = 0; }
+    if (p.field == 0 && !zero) {
+        val top: u128 = 1::u128 << (nibbles * 4 - 1)::u128;
+        for ((fraction & top) == 0) {
+            fraction = fraction << 1;
+            exponent = exponent - 1;
+        }
+        fraction = (fraction << 1) & all;
+    }
+    var digits: u32 = nibbles;
+    for (digits > 0 && (fraction & 0xF) == 0) {
+        fraction = fraction >> 4;
+        digits   = digits - 1;
+    }
+    var line: [40]u8;
+    var n:    usize = 0;
+    if (p.neg) {
+        line[n] = '-';
+        n       = n + 1;
+    }
+    line[n]     = '0';
+    line[n + 1] = 'x';
+    line[n + 2] = '1';
+    if (zero) { line[n + 2] = '0'; }
+    n = n + 3;
+    if (digits > 0) {
+        line[n] = '.';
+        n       = n + 1;
+        var j: u32 = digits;
+        for (j > 0) {
+            j = j - 1;
+            val d: u8 = ((fraction >> (j * 4)::u128) & 0xF)::u8;
+            if (d < 10) { line[n] = '0' + d; }
+            or          { line[n] = 'a' + d - 10; }
+            n = n + 1;
+        }
+    }
+    line[n] = 'p';
+    n       = n + 1;
+    if (exponent >= 0) {
+        line[n] = '+';
+        n       = n + 1;
+    }
+    val head: err[field.Refusal] = write.bytes(w, ?line[0], n);
+    if (sel head.err) { ret head; }
+    ret write.decimal(w, exponent);
+}
+
+# the float of bits `bits` in format `f` as spirv-dis writes it: a zero or a normal to its format's precision by
+# `std.format.write_float_g`, every other as a hex float
+fun float_print(w: *core_syntax.Writer, f: opt[ieee.Format], bits: u64) err[field.Refusal] {
+    if (sel f.none) { ret write.refuse(w, UNROUNDED, field.NO_OPERAND); }
+    val fmt:       ieee.Format = f.some;
+    val p:         ieee.Fields = ieee.fields(fmt, bits::u128);
+    val precision: opt[usize]  = precision_of(fmt);
+    if (sel precision.none)                                              { ret hex_print(w, fmt, bits); }
+    if (p.field == ieee.exp_field_max(fmt) || (p.field == 0 && p.frac != 0)) { ret hex_print(w, fmt, bits); }
+    var buf:     [48]u8;
+    var m:       writer.Memory                   = writer.Memory{alloc: nil, buf: nil, cap: 0, len: 0, limit: opt[usize].none{}};
+    var out:     writer.Writer                   = writer.memory(?m, ?buf[0], 48);
+    val written: res[usize, writer.WriteError] = format.write_float_g(?out, fmt, bits::u128, precision.some);
+    if (sel written.err) { ret write.refuse(w, field.MEMORY, field.NO_OPERAND); }
+    ret write.bytes(w, ?buf[0], m.len);
+}
+
+# the float the words `bytes` hold of float type `t`, as `float_print` writes it, refused where the words hold bits past
+# the type's own
+fun float_literal_print(w: *core_syntax.Writer, t: spirv_stream.Scalar, bytes: operand.Bytes) err[field.Refusal] {
+    if (sel t.format.none)                 { ret write.refuse(w, UNROUNDED, field.NO_OPERAND); }
+    if (bytes.len != 4 && bytes.len != 8)  { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    if ((bytes.len == 8) != (t.bits > 32)) { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    var words: u64 = 0;
+    var k:     u32 = 0;
+    for (k < bytes.len) {
+        words = words | (bytes.at[k]::u64 << (k * 8)::u64);
+        k     = k + 1;
+    }
+    if (t.bits < 64 && (words >> t.bits::u64) != 0) { ret write.refuse(w, EXTENDED, field.NO_OPERAND); }
+    ret float_print(w, t.format, words);
+}
+
 fun literal_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
     if (!sel desc.shape.literal)                      { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
     if (!sel value.literal)                           { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
@@ -345,7 +515,7 @@ fun literal_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, 
     if (desc.shape.literal.width_of == 0)             { ret write.refuse(w, TYPED, field.NO_OPERAND); }
     val t: opt[spirv_stream.Scalar] = typed_of(w.ctx, ?desc.shape.literal, w.values);
     if (sel t.none)                         { ret write.refuse(w, UNTYPED, field.NO_OPERAND); }
-    if (t.some.class == spirv_stream.FLOAT) { ret write.refuse(w, FLOATED, field.NO_OPERAND); }
+    if (t.some.class == spirv_stream.FLOAT) { ret float_literal_print(w, t.some, value.literal); }
     ret integer_print(w, t.some, value.literal);
 }
 
@@ -358,24 +528,31 @@ fun scalar_of(imm: *operand.Immediate) spirv_stream.Scalar {
     ret spirv_stream.Scalar{bits: imm.bits::u32, class: class};
 }
 
-# an immediate, a literal number its grammar types itself, read as a literal of its bits and sign, a float one refused
-# as a typed float literal is. spir-v's text has no expressions, so `%` after it is the next operand's id, never a
-# remainder
+# the ieee 754 format a float immediate of `bits` bits is, a LiteralFloat's binary32
+fun immediate_format(bits: u8) opt[ieee.Format] {
+    var none: operand.Value = operand.Value.none{};
+    ret spirv_stream.float_format(bits::u32, ?none);
+}
+
+# an immediate, a literal number its grammar types itself, read as a literal of its bits and sign, a float one as a
+# float literal of its bits' format. spir-v's text has no expressions, so `%` after it is the next operand's id, never
+# a remainder
 fun immediate_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
-    if (!sel desc.shape.immediate)                    { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
-    if (desc.shape.immediate.format == operand.FLOAT) { ret err[diagnostic.Diagnostic].err{read.refuse(r, FLOATED, r.at, read.token(r, r.at))}; }
+    if (!sel desc.shape.immediate) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
     var words: u64                        = 0;
-    val got:   err[diagnostic.Diagnostic] = integer_read(r, scalar_of(?desc.shape.immediate), ?words);
+    var got:   err[diagnostic.Diagnostic] = err[diagnostic.Diagnostic].ok{};
+    if (desc.shape.immediate.format == operand.FLOAT) { got = float_read(r, immediate_format(desc.shape.immediate.bits), ?words); }
+    or                                                { got = integer_read(r, scalar_of(?desc.shape.immediate), ?words); }
     if (sel got.err) { ret got; }
     @out = operand.Value.immediate{words:~i64};
     ret err[diagnostic.Diagnostic].ok{};
 }
 
-# an immediate in decimal, negative for a signed one below zero
+# an immediate in decimal, negative for a signed one below zero, a float one as a float of its bits' format
 fun immediate_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
     if (!sel desc.shape.immediate)                    { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
     if (!sel value.immediate)                         { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
-    if (desc.shape.immediate.format == operand.FLOAT) { ret write.refuse(w, FLOATED, field.NO_OPERAND); }
+    if (desc.shape.immediate.format == operand.FLOAT) { ret float_print(w, immediate_format(desc.shape.immediate.bits), value.immediate:~u64); }
     val v: i64 = value.immediate;
     if (desc.shape.immediate.sign != operand.SIGNED || v >= 0) { ret unsigned_write(w, v:~u64); }
     val minus: err[field.Refusal] = write.text(w, "-");
@@ -617,9 +794,12 @@ fun t_refused(t: *T, text: str, message: str) bool {
 # a typed literal takes the words of its type's width, a signed type's sign-extended and a hex one its bit pattern, and
 # prints in decimal, as spirv-as and spirv-dis read and write them (SPIRV-Tools v2026.4: -2 of a signed 16-bit type is
 # 0xfffffffe, 0xffff of it reads as -1, 32768 does not fit it, and -9223372036854775808 of a signed 64-bit type is the
-# words 0 and 0x80000000). a float literal is refused until mach-std converts float text
+# words 0 and 0x80000000). a float literal rounds once to its type's format and prints as spirv-dis prints it (1.5 of
+# binary16 is 0x3e00 and prints 0x1.8p+0, 0.1 of binary32 prints 0.100000001 and of binary64 0.10000000000000001, a
+# subnormal and a nan print as hex floats, and -0x1.8p+128 is the nan 0xffc00000), and a decimal past the largest
+# finite value, `inf` and `nan` are refused
 # an immediate is a number, never an expression, so the `%` after it starts the next operand's id, and a float one is
-# refused
+# a binary32 literal
 test text__an_immediate_reads_as_a_number_before_an_id {
     var t: T;
     if (!t_make(?t, "spv1.0"))                                                                           { ret 1; }
@@ -629,10 +809,11 @@ test text__an_immediate_reads_as_a_number_before_an_id {
     if (version.immediate != 450)                     { ret 3; }
     if (!t_refused(?t, "OpSource GLSL -1", NEGATIVE)) { ret 4; }
     if (!t_release(?t))                               { ret 5; }
-    # a float immediate, as a decoration's max error, is refused as a typed float literal is
-    if (!t_make(?t, "spv1.0,FPMaxErrorINTEL"))                                { ret 6; }
-    if (!t_refused(?t, "OpDecorate %1 FPMaxErrorDecorationINTEL 1", FLOATED)) { ret 7; }
-    if (!t_release(?t))                                                       { ret 8; }
+    # a float immediate, as a decoration's max error, is a binary32 literal
+    if (!t_make(?t, "spv1.0,FPMaxErrorINTEL"))                                                                                                     { ret 6; }
+    if (!t_reads_as(?t, "OpDecorate %1 FPMaxErrorDecorationINTEL 1.5", gen_row.OPDECORATE, "OpDecorate %1 FPMaxErrorDecorationINTEL 1.5"))         { ret 7; }
+    if (!t_reads_as(?t, "OpDecorate %1 FPMaxErrorDecorationINTEL 0x1p+128", gen_row.OPDECORATE, "OpDecorate %1 FPMaxErrorDecorationINTEL 0x1p+128")) { ret 8; }
+    if (!t_release(?t))                                                                                                                            { ret 9; }
     ret 0;
 }
 
@@ -657,7 +838,22 @@ test text__a_typed_literal_takes_its_types_width_and_sign {
     # a case literal takes the width of the selector's type
     if (!t_reads_as(?t, "OpSwitch %8 %12 7 %13 -1 %14", gen_row.OPSWITCH, "OpSwitch %8 %12 7 %13 -1 %14"))     { ret 15; }
     if (!t_reads_as(?t, "%15 = OpTypeFloat 32", gen_row.OPTYPEFLOAT, "%15 = OpTypeFloat 32") || !t_define(?t)) { ret 16; }
-    if (!t_refused(?t, "%16 = OpConstant %15 1.5", FLOATED))                                                   { ret 17; }
-    if (!t_release(?t))                                                                                        { ret 18; }
+    if (!t_reads_as(?t, "%16 = OpConstant %15 0.1", gen_row.OPCONSTANT, "%16 = OpConstant %15 0.100000001"))   { ret 17; }
+    if (!t_reads_as(?t, "%16 = OpConstant %15 -0", gen_row.OPCONSTANT, "%16 = OpConstant %15 -0"))             { ret 18; }
+    if (!t_reads_as(?t, "%16 = OpConstant %15 0x1p-149", gen_row.OPCONSTANT, "%16 = OpConstant %15 0x1p-149")) { ret 19; }
+    if (!t_reads_as(?t, "%16 = OpConstant %15 -0x1.8p+128", gen_row.OPCONSTANT, "%16 = OpConstant %15 -0x1.8p+128")) { ret 20; }
+    val nan: [1]u32 = [1]u32{0xFFC0_0000};
+    if (!t_literal(?t, 2, ?nan[0], 1))                                                                         { ret 21; }
+    if (!t_refused(?t, "%16 = OpConstant %15 1e39", OVERFLOWED))                                               { ret 22; }
+    if (!t_refused(?t, "%16 = OpConstant %15 inf", read.MALFORMED))                                            { ret 23; }
+    if (!t_reads_as(?t, "%17 = OpTypeFloat 16", gen_row.OPTYPEFLOAT, "%17 = OpTypeFloat 16") || !t_define(?t)) { ret 24; }
+    if (!t_reads_as(?t, "%18 = OpConstant %17 1.5", gen_row.OPCONSTANT, "%18 = OpConstant %17 0x1.8p+0"))      { ret 25; }
+    val half: [1]u32 = [1]u32{0x3E00};
+    if (!t_literal(?t, 2, ?half[0], 1))                                                                        { ret 26; }
+    if (!t_reads_as(?t, "%19 = OpTypeFloat 64", gen_row.OPTYPEFLOAT, "%19 = OpTypeFloat 64") || !t_define(?t)) { ret 27; }
+    if (!t_reads_as(?t, "%20 = OpConstant %19 0.1", gen_row.OPCONSTANT, "%20 = OpConstant %19 0.10000000000000001")) { ret 28; }
+    val tenth: [2]u32 = [2]u32{0x9999_999A, 0x3FB9_9999};
+    if (!t_literal(?t, 2, ?tenth[0], 2)) { ret 29; }
+    if (!t_release(?t))                  { ret 30; }
     ret 0;
 }
