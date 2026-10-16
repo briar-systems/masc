@@ -1,0 +1,671 @@
+# the wasm agreement: every row against wat2wasm, decoded against wasm2wat
+#
+# wasm is a typed stream, so a job's vectors are one module whose prelude defines what they need: the memories a
+# memarg's offset takes its address type from, a function type of a param a block type names by index, and a data
+# segment, without which wasm2wat reads no data index. each vector is the body of a function of its own, in an `if`
+# that gives an `else` or an `end` a block to close and that the frame after the vector closes: an `end` after a
+# vector that opens a block closes it too, and a `nop` after an `else` keeps its arm, which an empty one would not.
+# the frame is no part of the vector: its bytes are the function's body between the `if` and the frame after it, and
+# its listing the lines between them. both tools are told the selection's features alone
+# (`masc.harness.agree.wasm_tools`) and asked not to validate, since a vector is one instruction, not a valid module,
+# so a vector names an index of a space the prelude does not fill as freely as one it does. wasm-validate is not
+# asked, the testsuite sweep's to run (`masc.harness.wast.sweep`).
+#
+# the edges hook chooses what the kinds cannot: a memarg's memory is 0 and, under multimemory, 1, its offset the ends
+# of the address type memory 0 takes, an i64 under memory64, and its alignment every power of two up to the natural
+# one. a block type is each value type, a reference to a heap type, and a type index of the prelude, a select's value
+# types each value type, a heap type each abstract one and the edges of a type index, a catch clause each kind at its
+# first tag and label and a catch at the last, and a float each class of its bits: zeros, the smallest subnormal,
+# the largest finite, infinities and nans quiet and signalling.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use fs: std.filesystem;
+
+use mink.catalog.arch.wasm;
+use mink_format: mink.catalog.format;
+
+use masc.core.effect;
+use masc.core.extension;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.row;
+
+use wasm_extension: masc.isa.wasm.extension;
+use wasm_field:     masc.isa.wasm.field;
+use wasm_kind:      masc.isa.wasm.kind;
+use wasm_leb:       masc.isa.wasm.leb;
+use wasm_set:       masc.isa.wasm.set;
+use wasm_stream:    masc.isa.wasm.stream;
+use wasm_syntax:    masc.isa.wasm.syntax;
+
+use masc.isa.wasm.gen_row;
+
+use masc.harness.agree.agreement;
+use masc.harness.agree.object;
+use masc.harness.agree.vectors;
+use masc.harness.agree.wasm_tools;
+use masc.tool.text;
+
+val MEMORY: str = "out of memory";
+
+# the code of the prelude's function type of one i32 param and no result, a type a block type names by index that
+# wat2wasm writes as the index: one of no params and at most one result it writes as that result's value type
+val PARAMED: u32 = 1;
+
+# the id of the code section, and the bytes a module's header and a function body's frame take
+val CODE:   u8    = 10;
+val HEADER: usize = 8;
+
+# the bytes a body opens with: no locals, and the frame's `if` of the empty block type
+val OPENING: [3]u8 = [3]u8{0x00, 0x04, 0x40};
+
+val WASM64_BASE: [1]requirement.Id = [1]requirement.Id{wasm_extension.id.MEMORY64};
+
+val VARIANTS: [2]agreement.Variant = [2]agreement.Variant{
+    agreement.Variant{name: "wasm32", arch: ?wasm.WASM32, base: requirement.NO_IDS, abi: nil, excludes: requirement.NO_IDS},
+    agreement.Variant{name: "wasm64", arch: ?wasm.WASM64, base: requirement.Ids{at: ?WASM64_BASE[0], len: 1}, abi: nil, excludes: requirement.NO_IDS},
+};
+
+fun wat2wasm(job: *agreement.Job, args: *agreement.Args) {
+    wasm_tools.selected(args, job.selection);
+    agreement.arg(args, "--no-check");
+    agreement.arg(args, job.source);
+    agreement.arg(args, "-o");
+    agreement.arg(args, job.object);
+}
+
+fun wasm2wat(job: *agreement.Job, args: *agreement.Args) {
+    wasm_tools.selected(args, job.selection);
+    agreement.arg(args, "--no-check");
+    agreement.arg(args, job.object);
+}
+
+# how a row of `r` stands to the block the stream holds open, as the frame must close it
+fun structure(r: *row.Row) effect.Structure {
+    ret r.effect.structure;
+}
+
+# the lines of the frame after a vector of structure `s`, each indented and ending a line
+fun after_text(s: effect.Structure) str {
+    if (effect.opens(s))    { ret "    end\n    end\n"; }
+    if (s == effect.SPLITS) { ret "    nop\n    end\n"; }
+    if (s == effect.CLOSES) { ret ""; }
+    ret "    end\n";
+}
+
+# how many lines the frame after a vector of structure `s` takes in a listing
+fun after_lines(s: effect.Structure) usize {
+    if (effect.opens(s) || s == effect.SPLITS) { ret 2; }
+    if (s == effect.CLOSES)                    { ret 0; }
+    ret 1;
+}
+
+val AFTER_NONE: [1]u8 = [1]u8{0x0B};
+val AFTER_OPEN: [2]u8 = [2]u8{0x0B, 0x0B};
+val AFTER_ELSE: [2]u8 = [2]u8{0x01, 0x0B};
+
+# the bytes of the frame after a vector of structure `s`, before the body's own `end`
+fun after_bytes(s: effect.Structure) operand.Bytes {
+    if (effect.opens(s))    { ret operand.Bytes{at: ?AFTER_OPEN[0], len: 2}; }
+    if (s == effect.SPLITS) { ret operand.Bytes{at: ?AFTER_ELSE[0], len: 2}; }
+    if (s == effect.CLOSES) { ret operand.Bytes{at: nil, len: 0}; }
+    ret operand.Bytes{at: ?AFTER_NONE[0], len: 1};
+}
+
+# the field that defines what `need` names
+fun define(t: *text.Text, n: *vectors.Need) {
+    if (n.space == wasm_kind.MEMORIES) {
+        if (n.code == wasm_stream.I64) { text.put(t, "  (memory i64 1)\n"); }
+        or                             { text.put(t, "  (memory 1)\n"); }
+        ret;
+    }
+    if (n.space == wasm_kind.TYPES) {
+        text.put(t, "  (type (func (param i32)))\n");
+        ret;
+    }
+    text.put(t, "  (data \"\")\n");
+}
+
+fun prelude(job: *agreement.Job, t: *text.Text) {
+    text.put(t, "(module\n");
+    var i: u32 = 0;
+    for (i < job.needs.len) {
+        define(t, ?job.needs.at[i]);
+        i = i + 1;
+    }
+}
+
+fun function_of(job: *agreement.Job, ins: *inst.Inst, line: str, t: *text.Text) {
+    text.put(t, "  (func\n    if\n    ");
+    text.put(t, line);
+    text.byte(t, '\n');
+    text.put(t, after_text(structure(ins.row)));
+    text.put(t, "  )\n");
+}
+
+fun closing(job: *agreement.Job, t: *text.Text) {
+    text.put(t, ")\n");
+}
+
+# a function body of a module's code section, by its offsets in the file
+rec Body {
+    at:  usize;
+    end: usize;
+}
+
+fun leb(file: operand.Bytes, at: usize, value: *u64) res[usize, str] {
+    val got: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(file.at, file.len::usize, at, 32, field.NO_OPERAND);
+    if (sel got.err) { ret res[usize, str].err{"wat2wasm wrote a LEB128 the module does not hold whole"}; }
+    @value = got.ok.value;
+    ret res[usize, str].ok{at + got.ok.len};
+}
+
+# the function bodies of the module `file`, in the order of its code section, onto `out`
+fun bodies(file: operand.Bytes, out: *vector.Vector[Body]) err[str] {
+    val len: usize = file.len::usize;
+    if (len < HEADER || file.at[0] != 0 || file.at[1] != 'a' || file.at[2] != 's' || file.at[3] != 'm') { ret err[str].err{"wat2wasm wrote no wasm module"}; }
+    var at: usize = HEADER;
+    for (at < len) {
+        val id:   u8              = file.at[at];
+        var size: u64             = 0;
+        val past: res[usize, str] = leb(file, at + 1, ?size);
+        if (sel past.err) { ret err[str].err{past.err}; }
+        val end: usize = past.ok + size::usize;
+        if (end > len) { ret err[str].err{"wat2wasm wrote a section the module does not hold whole"}; }
+        if (id == CODE) {
+            var count: u64             = 0;
+            val first: res[usize, str] = leb(file, past.ok, ?count);
+            if (sel first.err) { ret err[str].err{first.err}; }
+            var pos: usize = first.ok;
+            var k:   u64   = 0;
+            for (k < count) {
+                var n:     u64             = 0;
+                val size_: res[usize, str] = leb(file, pos, ?n);
+                if (sel size_.err)             { ret err[str].err{size_.err}; }
+                if (size_.ok + n::usize > end) { ret err[str].err{"wat2wasm wrote a function body its section does not hold whole"}; }
+                val pushed: res[usize, A.Error] = vector.push[Body](out, Body{at: size_.ok, end: size_.ok + n::usize});
+                if (sel pushed.err) { ret err[str].err{MEMORY}; }
+                pos = size_.ok + n::usize;
+                k   = k + 1;
+            }
+        }
+        at = end;
+    }
+    ret err[str].ok{};
+}
+
+# each vector's bytes out of its function's body, its frame left out
+fun split(sp: *agreement.Split, file: operand.Bytes, out: *vector.Vector[operand.Bytes]) err[str] {
+    var found: vector.Vector[Body] = vector.init[Body](sp.a);
+    fin { vector.dnit[Body](?found); }
+    val read: err[str] = bodies(file, ?found);
+    if (sel read.err)                 { ret read; }
+    if (found.len != sp.count::usize) { ret err[str].err{"wat2wasm wrote another count of functions than the module's vectors"}; }
+    var k: usize = 0;
+    for (k < found.len) {
+        val b:    Body          = found.data[k];
+        val tail: operand.Bytes = after_bytes(structure(sp.vectors[k].row));
+        val n:    usize         = b.end - b.at;
+        if (n < 3 + tail.len::usize + 1) { ret err[str].err{"wat2wasm wrote a function body shorter than its frame"}; }
+        var i: usize = 0;
+        for (i < 3) {
+            if (file.at[b.at + i] != OPENING[i]) { ret err[str].err{"wat2wasm wrote a function body that does not open with its frame"}; }
+            i = i + 1;
+        }
+        val from: usize = b.at + 3;
+        val to:   usize = b.end - 1 - tail.len::usize;
+        i = 0;
+        for (i < tail.len::usize) {
+            if (file.at[to + i] != tail.at[i]) { ret err[str].err{"wat2wasm wrote a function body that does not close with its frame"}; }
+            i = i + 1;
+        }
+        if (file.at[b.end - 1] != 0x0B) { ret err[str].err{"wat2wasm wrote a function body with no end"}; }
+        val owned: opt[operand.Bytes] = object.own(sp.a, ?file.at[from], to - from);
+        if (sel owned.none) { ret err[str].err{MEMORY}; }
+        val pushed: res[usize, A.Error] = vector.push[operand.Bytes](out, owned.some);
+        if (sel pushed.err) { ret err[str].err{MEMORY}; }
+        k = k + 1;
+    }
+    ret err[str].ok{};
+}
+
+val LAYOUT: agreement.Layout = agreement.Layout{open: prelude, vector: function_of, close: closing, split: split};
+
+val ASSEMBLERS: [1]agreement.Assembler = [1]agreement.Assembler{
+    agreement.Assembler{tool: ?wasm_tools.WAT2WASM, spell: wat2wasm, layout: ?LAYOUT},
+};
+
+# a line of a listing, by its offsets in it
+rec Line {
+    at:  usize;
+    end: usize;
+}
+
+# line `l` of `out` with its comments left out, `;;` to its end and `(;` to `;)`, and the `)` past those it opens,
+# which close the function or the module it ends, onto `t`
+fun cleaned(out: str, l: Line, t: *text.Text) {
+    var opened: usize = 0;
+    var closed: usize = 0;
+    var from:   usize = t.out.len;
+    var i:      usize = l.at;
+    for (i < l.end && (out[i] == ' ' || out[i] == '\t')) { i = i + 1; }
+    for (i < l.end) {
+        val c: u8 = out[i];
+        if (c == ';' && i + 1 < l.end && out[i + 1] == ';') { brk; }
+        if (c == '(' && i + 1 < l.end && out[i + 1] == ';') {
+            var depth: usize = 0;
+            for (i < l.end) {
+                if (out[i] == '(' && i + 1 < l.end && out[i + 1] == ';') {
+                    depth = depth + 1;
+                    i     = i + 2;
+                }
+                or (out[i] == ';' && i + 1 < l.end && out[i + 1] == ')') {
+                    depth = depth - 1;
+                    i     = i + 2;
+                    if (depth == 0) { brk; }
+                }
+                or { i = i + 1; }
+            }
+            cnt;
+        }
+        if (c == '(') { opened = opened + 1; }
+        if (c == ')') { closed = closed + 1; }
+        text.byte(t, c);
+        i = i + 1;
+    }
+    # the `)` that close what the line does not open are the function's and the module's
+    for (closed > opened && t.out.len > from) {
+        var last: usize = t.out.len - 1;
+        for (last > from && (t.out.data[last] == ' ' || t.out.data[last] == '\t')) { last = last - 1; }
+        if (t.out.data[last] != ')') { brk; }
+        t.out.len = last;
+        closed    = closed - 1;
+    }
+    for (t.out.len > from && (t.out.data[t.out.len - 1] == ' ' || t.out.data[t.out.len - 1] == '\t')) { t.out.len = t.out.len - 1; }
+}
+
+# the structure of the instruction whose listing starts at line `l`, by its mnemonic
+fun listed_structure(out: str, l: Line) effect.Structure {
+    var i: usize = l.at;
+    for (i < l.end && (out[i] == ' ' || out[i] == '\t')) { i = i + 1; }
+    var j: usize = i;
+    for (j < l.end && out[j] != ' ' && out[j] != '\t' && out[j] != ')') { j = j + 1; }
+    val r: opt[u32] = wasm_syntax.row_named(View{data: ?out[i], len: j - i});
+    if (sel r.none) { ret effect.FLAT; }
+    ret gen_row.ROWS[r.some].effect.structure;
+}
+
+# whether line `l` of `out` opens a module field, `  (` at the field's indentation
+fun field_line(out: str, l: Line) bool {
+    ret l.end - l.at >= 3 && out[l.at] == ' ' && out[l.at + 1] == ' ' && out[l.at + 2] == '(';
+}
+
+fun func_line(out: str, l: Line) bool {
+    val head: str = "  (func";
+    if (l.end - l.at < str_len(head)) { ret false; }
+    var i: usize = 0;
+    for (i < str_len(head)) {
+        if (out[l.at + i] != head[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# each function's listing by wasm2wat, the lines of its body between the frame's `if` and the frame after the vector,
+# joined, its comments and its closing parentheses left out
+fun listed(job: *agreement.Job, out: str, count: u32, texts: *vector.Vector[str]) err[str] {
+    var lines: vector.Vector[Line] = vector.init[Line](texts.a);
+    fin { vector.dnit[Line](?lines); }
+    var at: usize = 0;
+    for (out[at] != 0) {
+        var end: usize = at;
+        for (out[end] != 0 && out[end] != '\n') { end = end + 1; }
+        val pushed: res[usize, A.Error] = vector.push[Line](?lines, Line{at: at, end: end});
+        if (sel pushed.err) { ret err[str].err{MEMORY}; }
+        at = end;
+        if (out[at] == '\n') { at = at + 1; }
+    }
+    var i: usize = 0;
+    for (i < lines.len) {
+        if (!func_line(out, lines.data[i])) {
+            i = i + 1;
+            cnt;
+        }
+        var j: usize = i + 1;
+        for (j < lines.len && !field_line(out, lines.data[j])) { j = j + 1; }
+        # the frame's `if`, the vector and the frame after it
+        if (j - i < 3) { ret err[str].err{"wasm2wat listed a function without its frame"}; }
+        val first: usize = i + 2;
+        var last:  usize = j - after_lines(listed_structure(out, lines.data[first]));
+        if (last <= first) { last = first + 1; }
+        var t: text.Text = text.make(texts.a);
+        var k: usize     = first;
+        for (k < last) {
+            if (k > first) { text.byte(?t, ' '); }
+            cleaned(out, lines.data[k], ?t);
+            k = k + 1;
+        }
+        val kept: opt[str] = text.copy(?t, texts.a);
+        if (sel kept.none) { ret err[str].err{MEMORY}; }
+        val pushed: res[usize, A.Error] = vector.push[str](texts, kept.some);
+        if (sel pushed.err) { ret err[str].err{MEMORY}; }
+        i = j;
+    }
+    if (texts.len != count::usize) { ret err[str].err{"wasm2wat listed another count of functions than the module's vectors"}; }
+    ret err[str].ok{};
+}
+
+# the vector a failed wasm2wat run names: its error is at a byte offset of the module, `0000xx: error: ...`, in the
+# body of the vector's function
+fun named(job: *agreement.Job, said: str, count: u32) opt[u32] {
+    var offset: usize = 0;
+    var i:      usize = 0;
+    for {
+        val c: u8  = said[i];
+        var d: i32 = -1;
+        if (c >= '0' && c <= '9') { d = (c - '0')::i32; }
+        or (c >= 'a' && c <= 'f') { d = (c - 'a')::i32 + 10; }
+        if (d < 0)                { brk; }
+        offset = offset * 16 + d::usize;
+        i      = i + 1;
+    }
+    if (i == 0 || said[i] != ':') { ret opt[u32].none{}; }
+    var a: A.Allocator;
+    page.make(?a);
+    val loaded: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?a, job.object);
+    if (sel loaded.err) { ret opt[u32].none{}; }
+    var file: vector.Vector[u8] = loaded.ok;
+    fin { vector.dnit[u8](?file); }
+    var found: vector.Vector[Body] = vector.init[Body](?a);
+    fin { vector.dnit[Body](?found); }
+    val read: err[str] = bodies(operand.Bytes{at: file.data, len: file.len::u32}, ?found);
+    if (sel read.err) { ret opt[u32].none{}; }
+    var k: usize = 0;
+    for (k < found.len && k < count::usize) {
+        if (offset >= found.data[k].at && offset < found.data[k].end) { ret opt[u32].some{k::u32}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# a need added to the stream `state`: a memory of the need's address type, the function type of one i32 param or a
+# data segment, each at the index the need names
+fun provide(state: ptr, n: *vectors.Need) err[str] {
+    var got: res[u32, str] = res[u32, str].err{"a need of a space the agreement defines nothing in"};
+    if (n.space == wasm_kind.MEMORIES) { got = wasm_stream.define(state, wasm_kind.MEMORIES, n.code, View{data: nil, len: 0}); }
+    or (n.space == wasm_kind.DATAS)    { got = wasm_stream.define(state, wasm_kind.DATAS, 0, View{data: nil, len: 0}); }
+    or (n.space == wasm_kind.TYPES && n.code == PARAMED) {
+        val param: [1]u32 = [1]u32{wasm_stream.I32};
+        got = wasm_stream.add_type(state, ?param[0], 1, nil, 0, View{data: nil, len: 0});
+    }
+    if (sel got.err)       { ret err[str].err{got.err}; }
+    if (got.ok != n.index) { ret err[str].err{"a need of an entry past the next its space defines"}; }
+    ret err[str].ok{};
+}
+
+# a wasm vector takes nothing of its slot
+fun place(ins: *inst.Inst, slot: u32) {}
+
+val STREAM: agreement.Stream = agreement.Stream{provide: provide, place: place};
+
+# the field of `r` that encodes operand `k`, a memarg's for each of its three, nil for none
+fun field_of(r: *row.Row, k: u32) *field.Field {
+    var j: u32 = 0;
+    for (j < r.encoding.len) {
+        val f: *field.Field = ?r.encoding.at[j];
+        if (f.operand != field.NO_OPERAND) {
+            val op: u32 = f.operand::u32;
+            if (op == k || (f.kind == wasm_kind.MEMARG && k > op && k <= op + 2)) { ret f; }
+        }
+        j = j + 1;
+    }
+    ret nil;
+}
+
+fun push(g: *vectors.Generation, out: *vector.Vector[operand.Value], v: operand.Value) {
+    val pushed: res[usize, A.Error] = vector.push[operand.Value](out, v);
+    if (sel pushed.err) { g.failed = true; }
+}
+
+# the address type code memory 0 of the generation's selection takes, an i64 under memory64
+fun first_address(g: *vectors.Generation) u32 {
+    if (extension.has(g.ctx.selection, wasm_extension.id.MEMORY64)) { ret wasm_stream.I64; }
+    ret wasm_stream.I32;
+}
+
+# a memory index's edges: memory 0, left out, and under multimemory memories 0 and 1 by index, which wabt reads in
+# the text only under multi-memory, where the specification reads a memory index under every feature
+fun memory_edges(g: *vectors.Generation, out: *vector.Vector[operand.Value]) {
+    if (!vectors.need(g, vectors.Need{space: wasm_kind.MEMORIES, index: 0, code: first_address(g)})) { ret; }
+    if (!extension.has(g.ctx.selection, wasm_extension.id.MULTIMEMORY)) {
+        push(g, out, operand.Value.none{});
+        ret;
+    }
+    if (!vectors.need(g, vectors.Need{space: wasm_kind.MEMORIES, index: 1, code: wasm_stream.I32})) { ret; }
+    push(g, out, operand.Value.id{0});
+    push(g, out, operand.Value.id{1});
+}
+
+# a memarg's edges: its memory's, the offsets at the ends of memory 0's address type, and the alignments up to the
+# natural one
+fun memarg_edges(g: *vectors.Generation, f: *field.Field, k: u32, out: *vector.Vector[operand.Value]) {
+    val op:   u32 = f.operand::u32;
+    val wide: u32 = first_address(g);
+    if (k == op) {
+        memory_edges(g, out);
+        ret;
+    }
+    if (k == op + 1) {
+        push(g, out, operand.Value.immediate{1});
+        push(g, out, operand.Value.immediate{0xFFFF_FFFF});
+        if (wide == wasm_stream.I64) {
+            push(g, out, operand.Value.immediate{0x1_0000_0000});
+            push(g, out, operand.Value.immediate{-1});
+        }
+        ret;
+    }
+    var align: i64 = 1;
+    for (align <= (1::i64 << f.param::i64)) {
+        push(g, out, operand.Value.immediate{align});
+        align = align * 2;
+    }
+}
+
+# value type `v` onto `out` where the generation's selection admits it
+fun value_type(g: *vectors.Generation, out: *vector.Vector[operand.Value], v: i64) {
+    val held: err[field.Refusal] = wasm_field.valtype_admit(g.ctx, v, field.NO_OPERAND, 0);
+    if (sel held.ok) { push(g, out, operand.Value.immediate{v}); }
+}
+
+# the value types a vector holds, each the selection admits: each the set names, a nullable and a non-null reference
+# to type 0, and a non-null reference to func
+fun value_types(g: *vectors.Generation, out: *vector.Vector[operand.Value]) {
+    var i: u32 = 0;
+    for (i < gen_row.TYPE_NAMES_COUNT) {
+        value_type(g, out, gen_row.TYPE_NAMES[i].code::i64);
+        i = i + 1;
+    }
+    value_type(g, out, 0x63);
+    value_type(g, out, 0x64);
+    value_type(g, out, ((0x70 - 0x80) << 8) | 0x64);
+}
+
+# `n` values allocated for a group, nil when the allocator refuses
+fun members(g: *vectors.Generation, n: usize) *operand.Value {
+    val got: res[*operand.Value, A.Error] = A.allocate[operand.Value](g.a, n);
+    if (sel got.err) {
+        g.failed = true;
+        ret nil;
+    }
+    ret got.ok;
+}
+
+# a block type of value type `type`, or of type index `index` when `type` is none
+fun blocktype(g: *vectors.Generation, out: *vector.Vector[operand.Value], type: operand.Value, index: operand.Value) {
+    val at: *operand.Value = members(g, 2);
+    if (at == nil) { ret; }
+    at[0] = type;
+    at[1] = index;
+    push(g, out, operand.Value.group{operand.Values{at: at, len: 2}});
+}
+
+fun blocktype_edges(g: *vectors.Generation, out: *vector.Vector[operand.Value]) {
+    var types: vector.Vector[operand.Value] = vector.init[operand.Value](g.a);
+    fin { vector.dnit[operand.Value](?types); }
+    value_types(g, ?types);
+    var i: usize = 0;
+    for (i < types.len) {
+        blocktype(g, out, types.data[i], operand.Value.none{});
+        i = i + 1;
+    }
+    if (!vectors.need(g, vectors.Need{space: wasm_kind.TYPES, index: 0, code: PARAMED})) { ret; }
+    blocktype(g, out, operand.Value.none{}, operand.Value.id{0});
+}
+
+# a catch clause of kind `kind`, its tag where the kind names one, and its label
+fun clause(g: *vectors.Generation, out: *vector.Vector[operand.Value], kind: u32, tag: u32, label: u32) {
+    val at: *operand.Value = members(g, 3);
+    if (at == nil) { ret; }
+    at[0] = operand.enumerant(kind);
+    at[1] = operand.Value.none{};
+    if (wasm_kind.tagged(kind)) { at[1] = operand.Value.id{tag}; }
+    at[2] = operand.Value.id{label};
+    push(g, out, operand.Value.group{operand.Values{at: at, len: 3}});
+}
+
+fun catch_edges(g: *vectors.Generation, out: *vector.Vector[operand.Value]) {
+    var kind: u32 = 0;
+    for (kind < wasm_kind.CATCH_KINDS.count) {
+        clause(g, out, wasm_kind.CATCH_KINDS.members[kind].value, 0, 0);
+        kind = kind + 1;
+    }
+    clause(g, out, wasm_kind.CATCH, 0xFFFF_FFFF, 0xFFFF_FFFF);
+}
+
+# heap type `heap` onto `out` where the generation's selection admits it
+fun heap_type(g: *vectors.Generation, out: *vector.Vector[operand.Value], heap: i64) {
+    val held: err[field.Refusal] = wasm_field.heap_admit(g.ctx, heap, field.NO_OPERAND, 0);
+    if (sel held.ok) { push(g, out, operand.Value.immediate{heap}); }
+}
+
+# the heap types the selection admits: the abstract ones, as the s33 of each, and the edges of a type index
+fun heap_edges(g: *vectors.Generation, out: *vector.Vector[operand.Value]) {
+    var i: u32 = 0;
+    for (i < gen_row.HEAP_NAMES_COUNT) {
+        heap_type(g, out, gen_row.HEAP_NAMES[i].code::i64 - 0x80);
+        i = i + 1;
+    }
+    heap_type(g, out, 0);
+    heap_type(g, out, 1);
+    heap_type(g, out, 0xFFFF_FFFF);
+}
+
+val F32_EDGES: [10]u64 = [10]u64{0, 0x8000_0000, 1, 0x7F7F_FFFF, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0x7FA0_0000, 0xFFFF_FFFF, 0x3F80_0000};
+val F64_EDGES: [10]u64 = [10]u64{0, 0x8000_0000_0000_0000, 1, 0x7FEF_FFFF_FFFF_FFFF, 0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000, 0x7FF8_0000_0000_0000, 0x7FF4_0000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF, 0x3FF0_0000_0000_0000};
+
+fun float_edges(g: *vectors.Generation, bits: u8, out: *vector.Vector[operand.Value]) {
+    var i: usize = 0;
+    for (i < 10) {
+        if (bits == 32) { push(g, out, operand.Value.immediate{F32_EDGES[i]:~i64}); }
+        or              { push(g, out, operand.Value.immediate{F64_EDGES[i]:~i64}); }
+        i = i + 1;
+    }
+}
+
+# the edges of one value of `desc`, operand `k`'s or a member of it, as the agreement's header says
+fun edges(g: *vectors.Generation, k: u32, desc: *operand.Operand, out: *vector.Vector[operand.Value]) bool {
+    val r:     *row.Row       = g.row;
+    val shape: *operand.Shape = ?desc.shape;
+    var f:     *field.Field   = nil;
+    if (k < r.operands.len) { f = field_of(r, k); }
+    if (f == nil)           { ret false; }
+    if (f.kind == wasm_kind.MEMARG) {
+        memarg_edges(g, f, k, out);
+        ret true;
+    }
+    if (f.kind == wasm_kind.BLOCKTYPE && sel shape.group) {
+        blocktype_edges(g, out);
+        ret true;
+    }
+    if (f.kind == wasm_kind.CATCHES && sel shape.group) {
+        catch_edges(g, out);
+        ret true;
+    }
+    if (f.kind == wasm_kind.VALTYPES && sel shape.immediate) {
+        value_types(g, out);
+        ret true;
+    }
+    if (f.kind == wasm_kind.HEAPTYPE && sel shape.immediate) {
+        heap_edges(g, out);
+        ret true;
+    }
+    if (sel shape.immediate) {
+        if (shape.immediate.format == operand.FLOAT) {
+            float_edges(g, shape.immediate.bits, out);
+            ret true;
+        }
+    }
+    if (sel shape.id) {
+        if (shape.id.space == wasm_kind.MEMORIES) {
+            memory_edges(g, out);
+            ret true;
+        }
+        # a table index wabt reads in the text only under reference types, which a table other than 0 needs
+        if (shape.id.space == wasm_kind.TABLES && !extension.has(g.ctx.selection, wasm_extension.id.REFERENCE_TYPES)) {
+            if (desc.quantity == operand.OPTIONAL) { push(g, out, operand.Value.none{}); }
+            or                                     { push(g, out, operand.Value.id{0}); }
+            ret true;
+        }
+        if (shape.id.space == wasm_kind.DATAS) { vectors.need(g, vectors.Need{space: wasm_kind.DATAS, index: 0, code: 0}); }
+    }
+    ret false;
+}
+
+val SUBNORMAL:      str = "wasm2wat 1.0.42 writes a float whose significand is its lowest bit alone, the smallest subnormal, with an empty fraction after the point, as f32's `0x1.p-149` and f64's `0x1.p-1074`, where masc writes `0x1p-149` and `0x1p-1074`: both read as one value (6.1 Thexfloat, a hexfrac after the point optional)";
+val TABLE_INDEX:    str = "wat2wasm 1.0.42 writes table.get's, table.set's, table.grow's, table.size's and table.fill's table index as a signed LEB128, 4294967295 as `7f`, where an index is an unsigned one (5.1 Bu32, 5.3 Binstr/table), and wasm2wat reads it as written, and lists a table index 0 the text leaves out (6.3 Tplaininstr_/table, x?:Ttableidx_ defaulting to 0)";
+val TRY_TABLE_TYPE: str = "wat2wasm 1.0.42 writes a try_table's block type given by a type use alone, `(type x)` with no param or result after it, as the empty block type 0x40, where it writes block's, loop's and if's as the index x (6.3 Tblocktype_, Ttypeuse_)";
+
+pub val EXCEPTIONS_COUNT: u32 = 8;
+
+val EXCEPTIONS: [EXCEPTIONS_COUNT]agreement.Exception = [EXCEPTIONS_COUNT]agreement.Exception{
+    agreement.Exception{subject: agreement.Subject.row{"F32Const"}, variant: "", checks: agreement.DECODE, unless: "", when: "", reason: SUBNORMAL},
+    agreement.Exception{subject: agreement.Subject.row{"F64Const"}, variant: "", checks: agreement.DECODE, unless: "", when: "", reason: SUBNORMAL},
+    agreement.Exception{subject: agreement.Subject.row{"TableFill"}, variant: "", checks: agreement.BYTES | agreement.DECODE, unless: "", when: "reference-types", reason: TABLE_INDEX},
+    agreement.Exception{subject: agreement.Subject.row{"TableGet"}, variant: "", checks: agreement.BYTES | agreement.DECODE, unless: "", when: "reference-types", reason: TABLE_INDEX},
+    agreement.Exception{subject: agreement.Subject.row{"TableGrow"}, variant: "", checks: agreement.BYTES | agreement.DECODE, unless: "", when: "reference-types", reason: TABLE_INDEX},
+    agreement.Exception{subject: agreement.Subject.row{"TableSet"}, variant: "", checks: agreement.BYTES | agreement.DECODE, unless: "", when: "reference-types", reason: TABLE_INDEX},
+    agreement.Exception{subject: agreement.Subject.row{"TableSize"}, variant: "", checks: agreement.BYTES | agreement.DECODE, unless: "", when: "reference-types", reason: TABLE_INDEX},
+    agreement.Exception{subject: agreement.Subject.row{"TryTable"}, variant: "", checks: agreement.BYTES, unless: "", when: "", reason: TRY_TABLE_TYPE},
+};
+
+# the wasm agreement
+pub val AGREEMENT: agreement.Agreement = agreement.Agreement{
+    name:         "wasm",
+    set:          ?wasm_set.SET,
+    syntax:       0,
+    format:       ?mink_format.WASM,
+    variants:     agreement.Variants{at: ?VARIANTS[0], len: 2},
+    assemblers:   agreement.Assemblers{at: ?ASSEMBLERS[0], len: 1},
+    disassembler: agreement.Disassembler{tool: ?wasm_tools.WASM2WAT, spell: wasm2wat, comment: nil, aliased: false, listed: listed, named: named},
+    statements:   agreement.NO_STATEMENTS,
+    exceptions:   agreement.Exceptions{at: ?EXCEPTIONS[0], len: EXCEPTIONS_COUNT},
+    hook:         vectors.no_hook,
+    targets:      agreement.NUMBER,
+    edges:        edges,
+    stream:       ?STREAM,
+};
