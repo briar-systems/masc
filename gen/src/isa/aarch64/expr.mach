@@ -1,0 +1,465 @@
+# the expressions of the operands topic, as the A64 ISA XML states an operand's value by its fields
+#
+# an expression is decimal numbers, `UInt(...)` and `SInt(...)` of fields, field slices `F[hi:lo]` or `F[b]` and
+# quoted bits joined by `:`, and `+`, `-` and `*` with the usual precedence and parentheses. over one row it is an
+# affine function of the bits the row leaves free: a constant plus a weight for each free bit, every bit the row fixes
+# folded into the constant. a product needs one side constant over the row, so the function stays affine.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use gen.isa.aarch64.instructions;
+
+pub val BAD_EXPR:   str = "expression is not numbers, UInt and SInt of fields and bits, +, - and *";
+pub val NO_FIELD:   str = "expression names a field the encoding does not have";
+pub val WIDE_SLICE: str = "expression slices bits past its field's width";
+pub val NOT_LINEAR: str = "expression multiplies two values its row leaves free";
+pub val MEMORY:     str = "out of memory";
+
+# one piece of a concatenation, from its high bit
+# ---
+# field: the field, nil for quoted bits
+# hi:    the slice's high bit within the field, -1 for the whole field
+# lo:    the slice's low bit
+# bits:  the quoted bits, nil for a field's
+pub rec Piece {
+    field: str;
+    hi:    i32;
+    lo:    i32;
+    bits:  str;
+}
+
+# pieces of one concatenation, as a run of an expression's pieces
+pub rec Run {
+    first: u32;
+    len:   u32;
+}
+
+# two operand nodes, by index
+pub rec Pair {
+    a: u32;
+    b: u32;
+}
+
+# a node of an expression, each referring to nodes before it
+pub tag Node: u8 {
+    number:     i64;
+    unsigned:   Run;
+    signed:     Run;
+    sum:        Pair;
+    difference: Pair;
+    product:    Pair;
+}
+
+# an expression
+# ---
+# nodes:  its nodes, its root last
+# pieces: the pieces of its concatenations
+pub rec Expr {
+    nodes:  vector.Vector[Node];
+    pieces: vector.Vector[Piece];
+}
+
+# a free bit's weight in an affine function
+# ---
+# at:     the instruction bit
+# weight: what it adds when set
+pub rec Term {
+    at:     u8;
+    weight: i64;
+}
+
+# a constant plus the weight of each free bit, no bit twice
+pub rec Affine {
+    constant: i64;
+    terms:    vector.Vector[Term];
+}
+
+rec Parser {
+    alloc:  *A.Allocator;
+    text:   str;
+    at:     usize;
+    out:    *Expr;
+    failed: bool;
+    why:    str;
+}
+
+fun refuse(p: *Parser, why: str) u32 {
+    if (!p.failed) {
+        p.failed = true;
+        p.why    = why;
+    }
+    ret 0;
+}
+
+fun node(p: *Parser, n: Node) u32 {
+    val got: res[usize, A.Error] = vector.push[Node](?p.out.nodes, n);
+    if (sel got.err) { ret refuse(p, MEMORY); }
+    ret (p.out.nodes.len - 1)::u32;
+}
+
+fun peek(p: *Parser) u8 {
+    ret p.text[p.at];
+}
+
+fun digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+fun letter(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+fun natural(p: *Parser) i64 {
+    var v: i64 = 0;
+    if (!digit(peek(p))) {
+        refuse(p, BAD_EXPR);
+        ret 0;
+    }
+    for (digit(peek(p))) {
+        v    = v * 10 + (peek(p) - '0')::i64;
+        p.at = p.at + 1;
+    }
+    ret v;
+}
+
+fun take(p: *Parser, c: u8) bool {
+    if (peek(p) != c) { ret false; }
+    p.at = p.at + 1;
+    ret true;
+}
+
+fun word(p: *Parser) str {
+    val from: usize = p.at;
+    for (letter(peek(p)) || digit(peek(p))) { p.at = p.at + 1; }
+    val got: res[str, StrError] = str_copy_slice(p.alloc, p.text, from, p.at - from);
+    if (sel got.err) {
+        refuse(p, MEMORY);
+        ret "";
+    }
+    ret got.ok;
+}
+
+fun piece(p: *Parser) {
+    if (take(p, '\'')) {
+        val from: usize = p.at;
+        for (peek(p) == '0' || peek(p) == '1') { p.at = p.at + 1; }
+        if (p.at == from || !take(p, '\'')) {
+            refuse(p, BAD_EXPR);
+            ret;
+        }
+        val got: res[str, StrError] = str_copy_slice(p.alloc, p.text, from, p.at - 1 - from);
+        if (sel got.err) {
+            refuse(p, MEMORY);
+            ret;
+        }
+        val pushed: res[usize, A.Error] = vector.push[Piece](?p.out.pieces, Piece{field: nil, hi: -1, lo: 0, bits: got.ok});
+        if (sel pushed.err) { refuse(p, MEMORY); }
+        ret;
+    }
+    if (!letter(peek(p))) {
+        refuse(p, BAD_EXPR);
+        ret;
+    }
+    val name: str = word(p);
+    var hi:   i32 = -1;
+    var lo:   i32 = 0;
+    if (take(p, '[')) {
+        hi = natural(p)::i32;
+        lo = hi;
+        if (take(p, ':')) { lo = natural(p)::i32; }
+        if (!take(p, ']') || lo > hi) {
+            refuse(p, BAD_EXPR);
+            ret;
+        }
+    }
+    val pushed: res[usize, A.Error] = vector.push[Piece](?p.out.pieces, Piece{field: name, hi: hi, lo: lo, bits: nil});
+    if (sel pushed.err) { refuse(p, MEMORY); }
+}
+
+fun concatenation(p: *Parser) Run {
+    val first: u32 = p.out.pieces.len::u32;
+    piece(p);
+    for (!p.failed && take(p, ':')) { piece(p); }
+    ret Run{first: first, len: p.out.pieces.len::u32 - first};
+}
+
+fun factor(p: *Parser) u32 {
+    if (p.failed)       { ret 0; }
+    if (digit(peek(p))) { ret node(p, Node.number{natural(p)}); }
+    if (take(p, '(')) {
+        val inner: u32 = sum(p);
+        if (!take(p, ')')) { ret refuse(p, BAD_EXPR); }
+        ret inner;
+    }
+    if (!letter(peek(p))) { ret refuse(p, BAD_EXPR); }
+    val name: str = word(p);
+    if (!take(p, '(')) { ret refuse(p, BAD_EXPR); }
+    val r: Run = concatenation(p);
+    if (!take(p, ')'))            { ret refuse(p, BAD_EXPR); }
+    if (str_equals(name, "UInt")) { ret node(p, Node.unsigned{r}); }
+    if (str_equals(name, "SInt")) { ret node(p, Node.signed{r}); }
+    ret refuse(p, BAD_EXPR);
+}
+
+fun product(p: *Parser) u32 {
+    var a: u32 = factor(p);
+    for (!p.failed && take(p, '*')) {
+        val b: u32 = factor(p);
+        a = node(p, Node.product{Pair{a: a, b: b}});
+    }
+    ret a;
+}
+
+fun sum(p: *Parser) u32 {
+    var a: u32 = 0;
+    if (take(p, '-')) {
+        val zero: u32 = node(p, Node.number{0});
+        val b:    u32 = product(p);
+        a = node(p, Node.difference{Pair{a: zero, b: b}});
+    }
+    or { a = product(p); }
+    for (!p.failed) {
+        if (take(p, '+')) {
+            val b: u32 = product(p);
+            a = node(p, Node.sum{Pair{a: a, b: b}});
+        }
+        or (take(p, '-')) {
+            val b: u32 = product(p);
+            a = node(p, Node.difference{Pair{a: a, b: b}});
+        }
+        or { brk; }
+    }
+    ret a;
+}
+
+# the expression `text`, or the reason it is refused
+pub fun parse(a: *A.Allocator, text: str) res[Expr, str] {
+    var e: Expr   = Expr{nodes: vector.init[Node](a), pieces: vector.init[Piece](a)};
+    var p: Parser = Parser{alloc: a, text: text, at: 0, out: ?e, failed: false, why: nil};
+    sum(?p);
+    if (!p.failed && p.at != str_len(text)) { refuse(?p, BAD_EXPR); }
+    if (p.failed)                           { ret res[Expr, str].err{p.why}; }
+    ret res[Expr, str].ok{e};
+}
+
+# the expression `UInt(f0:f1:...)` of fields `fields`, or `SInt(...)` when `signed` holds
+pub fun of_fields(a: *A.Allocator, fields: *vector.Vector[str], signed: bool) res[Expr, str] {
+    var e: Expr  = Expr{nodes: vector.init[Node](a), pieces: vector.init[Piece](a)};
+    var i: usize = 0;
+    for (i < fields.len) {
+        val got: res[usize, A.Error] = vector.push[Piece](?e.pieces, Piece{field: fields.data[i], hi: -1, lo: 0, bits: nil});
+        if (sel got.err) { ret res[Expr, str].err{MEMORY}; }
+        i = i + 1;
+    }
+    var n: Node = Node.unsigned{Run{first: 0, len: fields.len::u32}};
+    if (signed) { n = Node.signed{Run{first: 0, len: fields.len::u32}}; }
+    val got: res[usize, A.Error] = vector.push[Node](?e.nodes, n);
+    if (sel got.err) { ret res[Expr, str].err{MEMORY}; }
+    ret res[Expr, str].ok{e};
+}
+
+# the instruction bits of `field` of `ins` from its high bit
+pub fun places(ins: *instructions.Instruction, field: str, out: *vector.Vector[u8]) bool {
+    ret places_in(?ins.bits, field, out);
+}
+
+# the bit positions of field `field` among `fields`, from its high bit, false when none is named so
+pub fun places_in(fields: *vector.Vector[instructions.Bits], field: str, out: *vector.Vector[u8]) bool {
+    var found: bool  = false;
+    var k:     usize = 0;
+    for (k < fields.len) {
+        val b: *instructions.Bits = ?fields.data[k];
+        if (b.name != nil && str_equals(b.name, field)) {
+            found = true;
+            var p: u8 = b.width;
+            for (p > 0) {
+                p = p - 1;
+                val got: res[usize, A.Error] = vector.push[u8](out, b.start + p);
+                if (sel got.err) { ret false; }
+            }
+        }
+        k = k + 1;
+    }
+    ret found;
+}
+
+# the bits of concatenation `r` of `e` as instruction bits from the high bit, 0xFF for a quoted 0 and 0xFE for a 1
+pub fun bits(e: *Expr, r: Run, ins: *instructions.Instruction, out: *vector.Vector[u8]) err[str] {
+    var i: u32 = 0;
+    for (i < r.len) {
+        val pc: *Piece = ?e.pieces.data[(r.first + i)::usize];
+        if (pc.field == nil) {
+            var k: usize = 0;
+            for (pc.bits[k] != 0) {
+                var b: u8 = 0xFF;
+                if (pc.bits[k] == '1') { b = 0xFE; }
+                val got: res[usize, A.Error] = vector.push[u8](out, b);
+                if (sel got.err) { ret err[str].err{MEMORY}; }
+                k = k + 1;
+            }
+        }
+        or {
+            var all: vector.Vector[u8] = vector.init[u8](out.a);
+            if (!places(ins, pc.field, ?all)) { ret err[str].err{NO_FIELD}; }
+            val width: i32 = all.len::i32;
+            var hi:    i32 = width - 1;
+            var lo:    i32 = 0;
+            if (pc.hi >= 0) {
+                hi = pc.hi;
+                lo = pc.lo;
+            }
+            if (hi >= width) { ret err[str].err{WIDE_SLICE}; }
+            var b: i32 = hi;
+            for (b >= lo) {
+                val got: res[usize, A.Error] = vector.push[u8](out, all.data[(width - 1 - b)::usize]);
+                if (sel got.err) { ret err[str].err{MEMORY}; }
+                b = b - 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
+fun add_term(out: *Affine, at: u8, weight: i64) err[str] {
+    var i: usize = 0;
+    for (i < out.terms.len) {
+        if (out.terms.data[i].at == at) {
+            out.terms.data[i].weight = out.terms.data[i].weight + weight;
+            ret err[str].ok{};
+        }
+        i = i + 1;
+    }
+    val got: res[usize, A.Error] = vector.push[Term](?out.terms, Term{at: at, weight: weight});
+    if (sel got.err) { ret err[str].err{MEMORY}; }
+    ret err[str].ok{};
+}
+
+fun combine(a: *A.Allocator, x: *Affine, y: *Affine, sign: i64) res[Affine, str] {
+    var out: Affine = Affine{constant: x.constant + sign * y.constant, terms: vector.init[Term](a)};
+    var i:   usize  = 0;
+    for (i < x.terms.len) {
+        val got: err[str] = add_term(?out, x.terms.data[i].at, x.terms.data[i].weight);
+        if (sel got.err) { ret res[Affine, str].err{got.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < y.terms.len) {
+        val got: err[str] = add_term(?out, y.terms.data[i].at, sign * y.terms.data[i].weight);
+        if (sel got.err) { ret res[Affine, str].err{got.err}; }
+        i = i + 1;
+    }
+    ret res[Affine, str].ok{out};
+}
+
+fun scaled(a: *A.Allocator, x: *Affine, k: i64) res[Affine, str] {
+    var out: Affine = Affine{constant: x.constant * k, terms: vector.init[Term](a)};
+    var i:   usize  = 0;
+    for (i < x.terms.len) {
+        val got: res[usize, A.Error] = vector.push[Term](?out.terms, Term{at: x.terms.data[i].at, weight: x.terms.data[i].weight * k});
+        if (sel got.err) { ret res[Affine, str].err{MEMORY}; }
+        i = i + 1;
+    }
+    ret res[Affine, str].ok{out};
+}
+
+fun at_node(a: *A.Allocator, e: *Expr, n: u32, ins: *instructions.Instruction, fixed: u64, mask: u64) res[Affine, str] {
+    val nd: Node = e.nodes.data[n::usize];
+    if (sel nd.number) { ret res[Affine, str].ok{Affine{constant: nd.number, terms: vector.init[Term](a)}}; }
+    if (sel nd.unsigned || sel nd.signed) {
+        var r: Run = Run{first: 0, len: 0};
+        if (sel nd.unsigned) { r = nd.unsigned; }
+        or (sel nd.signed)   { r = nd.signed; }
+        var bs:  vector.Vector[u8] = vector.init[u8](a);
+        val got: err[str]          = bits(e, r, ins, ?bs);
+        if (sel got.err) { ret res[Affine, str].err{got.err}; }
+        var out: Affine = Affine{constant: 0, terms: vector.init[Term](a)};
+        val n:   usize  = bs.len;
+        var i:   usize  = 0;
+        for (i < n) {
+            var w: i64 = 1::i64 << (n - 1 - i)::i64;
+            if (i == 0 && sel nd.signed) { w = -w; }
+            val b: u8 = bs.data[i];
+            if (b == 0xFE) { out.constant = out.constant + w; }
+            or (b != 0xFF && ((mask >> b::u64) & 1) != 0) {
+                if (((fixed >> b::u64) & 1) != 0) { out.constant = out.constant + w; }
+            }
+            or (b != 0xFF) {
+                val put: err[str] = add_term(?out, b, w);
+                if (sel put.err) { ret res[Affine, str].err{put.err}; }
+            }
+            i = i + 1;
+        }
+        ret res[Affine, str].ok{out};
+    }
+    var pr: Pair = Pair{a: 0, b: 0};
+    if (sel nd.sum)        { pr = nd.sum; }
+    or (sel nd.difference) { pr = nd.difference; }
+    or (sel nd.product)    { pr = nd.product; }
+    val x: res[Affine, str] = at_node(a, e, pr.a, ins, fixed, mask);
+    if (sel x.err) { ret x; }
+    val y: res[Affine, str] = at_node(a, e, pr.b, ins, fixed, mask);
+    if (sel y.err) { ret y; }
+    var xa: Affine = x.ok;
+    var ya: Affine = y.ok;
+    if (sel nd.sum)        { ret combine(a, ?xa, ?ya, 1); }
+    if (sel nd.difference) { ret combine(a, ?xa, ?ya, -1); }
+    if (xa.terms.len == 0) { ret scaled(a, ?ya, xa.constant); }
+    if (ya.terms.len == 0) { ret scaled(a, ?xa, ya.constant); }
+    ret res[Affine, str].err{NOT_LINEAR};
+}
+
+# `e` over the bits of `ins` a row leaves free, the bits `mask` sets fixed to those of `fixed`
+pub fun affine(a: *A.Allocator, e: *Expr, ins: *instructions.Instruction, fixed: u64, mask: u64) res[Affine, str] {
+    if (e.nodes.len == 0) { ret res[Affine, str].err{BAD_EXPR}; }
+    val got: res[Affine, str] = at_node(a, e, (e.nodes.len - 1)::u32, ins, fixed, mask);
+    if (sel got.err) { ret got; }
+    # a bit whose weights cancel holds nothing
+    var out:  Affine = got.ok;
+    var kept: usize  = 0;
+    var i:    usize  = 0;
+    for (i < out.terms.len) {
+        if (out.terms.data[i].weight != 0) {
+            out.terms.data[kept] = out.terms.data[i];
+            kept                 = kept + 1;
+        }
+        i = i + 1;
+    }
+    out.terms.len = kept;
+    ret res[Affine, str].ok{out};
+}
+
+# every field `e` names, each once, in order
+pub fun fields(e: *Expr, out: *vector.Vector[str]) bool {
+    var i: usize = 0;
+    for (i < e.pieces.len) {
+        val f: str = e.pieces.data[i].field;
+        if (f != nil) {
+            var seen: bool  = false;
+            var k:    usize = 0;
+            for (k < out.len) {
+                if (str_equals(out.data[k], f)) { seen = true; }
+                k = k + 1;
+            }
+            if (!seen) {
+                val got: res[usize, A.Error] = vector.push[str](out, f);
+                if (sel got.err) { ret false; }
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}

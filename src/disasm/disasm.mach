@@ -162,6 +162,7 @@ use masc.core.row;
 use masc.core.set;
 use masc.core.source;
 use masc.core.state;
+use masc.core.stating;
 use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use masc.core.trait;
@@ -182,19 +183,11 @@ use spirv_extension: masc.isa.spirv.extension;
 #[testing]
 use spirv_set:       masc.isa.spirv.set;
 #[testing]
-use wasm_codec:      masc.isa.wasm.codec;
-#[testing]
 use wasm_extension:  masc.isa.wasm.extension;
-#[testing]
-use wasm_module:     masc.isa.wasm.module;
 #[testing]
 use wasm_set:        masc.isa.wasm.set;
 #[testing]
 use arch_spirv:      mink.catalog.arch.spirv;
-#[testing]
-use wasm_model:      mink.format.wasm.model;
-#[testing]
-use wasm_write:      mink.format.wasm.write;
 
 pub val ARCH:      str = "the set does not serve the object's architecture";
 pub val NO_SYNTAX: str = "no syntax of the set at this index";
@@ -304,15 +297,6 @@ pub rec Refusal {
     offset:  u64;
 }
 
-# operand values a decoded instruction holds, its list members included
-val STORE: u32 = 32;
-
-# alternatives a refused decode notes
-val ALTERNATIVES: u32 = 16;
-
-# literal bytes the parser cannot borrow from the text
-val LITERALS: u32 = 64;
-
 # bytes of raw data on one line
 val PER_LINE: usize = 16;
 
@@ -366,12 +350,12 @@ rec Aimed {
 # ---
 # at:     its offset in the section
 # len:    its length
-# values: its operand values, then its list members
+# values: its operand values, then its list members, grown to what the instruction holds
 rec Step {
     at:     u64;
     len:    usize;
     ins:    inst.Inst;
-    values: [STORE]operand.Value;
+    values: vector.Vector[operand.Value];
 }
 
 # the most scopes a disassembly tries, the object's included, and the most of the dialect's narrowings it combines
@@ -512,9 +496,7 @@ rec Disasm {
     names:      u32;
     scratch:    [core_syntax.MAX_ANONYMOUS + 10]u8;
     steps:      [relax.MAX_STEPS]Step;
-    pool:       [STORE]operand.Value;
-    room:       [ALTERNATIVES]requirement.Alternative;
-    lits:       [LITERALS]u8;
+    stores:     core_syntax.Stores;
 }
 
 fun refusal(message: str, section: u32, offset: u64) err[Refusal] {
@@ -1041,10 +1023,10 @@ fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
             # a marker operand takes the relocation of its kind at the instruction's start, as a marked row's does
             val desc: *operand.Operand = ?st.ins.row.operands.at[k];
             if (sel desc.shape.marker) {
-                if (off == 0 && sel st.values[k].none && binds(d, r.kind, desc.shape.marker)) {
+                if (off == 0 && sel st.values.data[k].none && binds(d, r.kind, desc.shape.marker)) {
                     if (!note(d, aimed.ok.some.handle)) { ret res[bool, Refusal].ok{false}; }
-                    st.values[k] = operand.Value.symbol{operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: desc.shape.marker}};
-                    given        = true;
+                    st.values.data[k] = operand.Value.symbol{operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: desc.shape.marker}};
+                    given             = true;
                 }
                 k = k + 1;
                 cnt;
@@ -1052,20 +1034,20 @@ fun take(d: *Disasm, st: *Step, first: usize, end: usize) res[bool, Refusal] {
             val at: opt[usize] = probe(d, ?st.ins, k);
             if (sel at.some && at.some == off) {
                 val f: operand.FixupKind = fixup_for(d, r.kind, operand.default_fixup(?st.ins.row.operands.at[k]));
-                if (f == operand.NO_FIXUP || holds_symbol(?st.values[k])) {
+                if (f == operand.NO_FIXUP || holds_symbol(?st.values.data[k])) {
                     # the operand takes no relocation of the kind, which a statement that may leaves to `.reloc`
                     if (d.stating == NONE_STATED) { ret res[bool, Refusal].ok{false}; }
                     k = k + 1;
                     cnt;
                 }
                 if (!note(d, aimed.ok.some.handle)) { ret res[bool, Refusal].ok{false}; }
-                var named: operand.Value = symbolic(st.values[k], operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: f});
+                var named: operand.Value = symbolic(st.values.data[k], operand.Symbol{id: aimed.ok.some.handle, addend: aimed.ok.some.addend, fixup: f});
                 val kept_: err[Refusal]  = unfolded(d, site, r, ?st.ins.row.operands.at[k], ?named, st.at);
                 # a relocation the reassembly would fold is kept only by a `.reloc`, the operand left its number
                 if (sel kept_.err) {
                     if (d.stating == NONE_STATED) { ret res[bool, Refusal].ok{false}; }
                 }
-                or { st.values[k] = named; }
+                or { st.values.data[k] = named; }
                 given = true;
             }
             k = k + 1;
@@ -1335,43 +1317,47 @@ fun stated_datum(d: *Disasm, why: Refusal) res[u64, Refusal] {
     ret res[u64, Refusal].ok{0};
 }
 
-# the text from `start` to the output's end parsed as the assembler parses a statement, into `ex`
+# the text from `start` to the output's end parsed as the assembler parses a statement, into `ex`, its stores grown
+# and the parse retried while they hold less than the statement takes, a store that failed to grow noted
 fun reparse(d: *Disasm, start: usize, ex: *relax.Expansion) bool {
-    var rd: core_syntax.Reader = core_syntax.Reader{
-        text:    d.out.data,
-        start:   start,
-        at:      start,
-        end:     d.out.len,
-        origin:  diagnostic.START,
-        codec:   d.s.codec,
-        ctx:     d.v,
-        syntax:  d.syntax,
-        modes:   ?d.modes,
-        symbols: ?d.symbols,
-        context: nil,
-        row:     nil,
-        pool:    ?d.pool[0],
-        cap:     STORE,
-        used:    0,
-        bytes:   ?d.lits[0],
-        room:    LITERALS,
-        taken:   0,
-        refused: field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0},
-    };
-    val got: err[diagnostic.Diagnostic] = parse.statement(?rd, ex);
-    ret sel got.ok;
+    for {
+        var rd: core_syntax.Reader = core_syntax.Reader{
+            text:    d.out.data,
+            start:   start,
+            at:      start,
+            end:     d.out.len,
+            origin:  diagnostic.START,
+            codec:   d.s.codec,
+            ctx:     d.v,
+            syntax:  d.syntax,
+            modes:   ?d.modes,
+            symbols: ?d.symbols,
+            context: nil,
+            row:     nil,
+        };
+        core_syntax.over(?rd, ?d.stores);
+        val got:   err[diagnostic.Diagnostic] = parse.statement(?rd, ex);
+        val again: res[bool, A.Error]         = core_syntax.regrown(?rd, ?d.stores);
+        if (sel again.err) {
+            d.full = true;
+            ret false;
+        }
+        if (!again.ok) { ret sel got.ok; }
+    }
 }
 
-# step `i` decoded at `at` of the `len` bytes at `data`, ending by `limit`
+# step `i` decoded at `at` of the `len` bytes at `data`, ending by `limit`, a store that failed to grow noted
 fun decode_step(d: *Disasm, i: u32, data: *u8, len: usize, at: u64, limit: u64) bool {
-    val st:   *Step                            = ?d.steps[i];
-    var alts: field.Admissions                 = field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0};
-    val got:  res[walk.Decoded, field.Refusal] = walk.decode(d.s.codec, d.v, data, len, at::usize, ?st.values[0], STORE, ?alts);
-    if (sel got.err)                  { ret false; }
+    val st:  *Step                            = ?d.steps[i];
+    val got: res[walk.Decoded, field.Refusal] = walk.decode_grown(d.s.codec, d.v, data, len, at::usize, ?st.values, ?d.stores.refused);
+    if (sel got.err) {
+        if (sel got.err.cause.memory) { d.full = true; }
+        ret false;
+    }
     if (at + got.ok.len::u64 > limit) { ret false; }
     st.at  = at;
     st.len = got.ok.len;
-    st.ins = inst.Inst{row: got.ok.inst.row, values: ?st.values[0], count: got.ok.inst.count};
+    st.ins = inst.Inst{row: got.ok.inst.row, values: st.values.data, count: got.ok.inst.count};
     ret true;
 }
 
@@ -1415,7 +1401,7 @@ fun spanned(d: *Disasm, q: *core_syntax.Sequence, sp: *core_fixup.Span, aimed: A
         val held_: *operand.Value = ?values[i * row.MAX_OPERANDS::u32];
         var k:     u32            = 0;
         for (k < st.ins.count) {
-            held_[k] = st.values[k];
+            held_[k] = st.values.data[k];
             k        = k + 1;
         }
         k = 0;
@@ -1565,19 +1551,26 @@ fun rows_of(d: *Disasm, at: u64, end: usize, rows: **row.Row) u32 {
     ret n;
 }
 
-# the step at the cursor made an instruction of row `r` from the values `base` decoded, its markers none and its other
-# operands taking the decoded values in order
-fun as_row(d: *Disasm, base: *Step, r: *row.Row) {
-    d.steps[0]            = @base;
-    d.steps[0].ins.values = ?d.steps[0].values[0];
-    if (r == base.ins.row) { ret; }
-    var k: u32 = 0;
+# the step at the cursor made an instruction of row `r` from the operand values `held` that `base` decoded, its markers
+# none and its other operands taking the decoded values in order. the step shares its store with `base`, whose list
+# members stay as decoded
+fun as_row(d: *Disasm, base: *Step, held: *operand.Value, r: *row.Row) {
+    d.steps[0] = @base;
+    val values: *operand.Value = d.steps[0].values.data;
+    var k:      u32            = 0;
+    if (r == base.ins.row) {
+        for (k < base.ins.count) {
+            values[k] = held[k];
+            k         = k + 1;
+        }
+        ret;
+    }
     var p: u32 = 0;
     for (k < r.operands.len) {
-        if (sel r.operands.at[k].shape.marker) { d.steps[0].values[k] = operand.Value.none{}; }
+        if (sel r.operands.at[k].shape.marker) { values[k] = operand.Value.none{}; }
         or {
-            d.steps[0].values[k] = base.values[p];
-            p                    = p + 1;
+            values[k] = held[p];
+            p         = p + 1;
         }
         k = k + 1;
     }
@@ -1593,7 +1586,7 @@ fun labelled(d: *Disasm, section: u32) bool {
     var k:   u32   = 0;
     for (k < st.ins.count) {
         val desc: *operand.Operand = ?st.ins.row.operands.at[k];
-        val v:    operand.Value    = st.values[k];
+        val v:    operand.Value    = st.values.data[k];
         var to:   opt[u64]         = opt[u64].none{};
         if (sel desc.shape.relative) {
             if (sel v.relative) { to = target_of(st.at, st.len, desc, v.relative); }
@@ -1602,8 +1595,8 @@ fun labelled(d: *Disasm, section: u32) bool {
             val got: opt[u32] = local_label_at(d, section, to.some);
             if (sel got.some) {
                 if (note(d, got.some)) {
-                    st.values[k] = operand.Value.symbol{operand.Symbol{id: got.some, addend: 0, fixup: operand.NO_FIXUP}};
-                    any          = true;
+                    st.values.data[k] = operand.Value.symbol{operand.Symbol{id: got.some, addend: 0, fixup: operand.NO_FIXUP}};
+                    any               = true;
                 }
             }
         }
@@ -1649,13 +1642,19 @@ fun target_of(at: u64, len: usize, desc: *operand.Operand, offset: i64) opt[u64]
 # where a marker spells one. answering whether one does, with the output from `text` taken back when none does
 fun single(d: *Disasm, section: u32, data: *u8, len: usize, at: u64, stop: u64, end: usize, text: usize, w: *core_syntax.Writer) res[bool, Refusal] {
     var base: Step = d.steps[0];
+    var held: [row.MAX_OPERANDS]operand.Value;
+    var h:    u32  = 0;
+    for (h < base.ins.count) {
+        held[h] = base.values.data[h];
+        h       = h + 1;
+    }
     var rows: [MARKED_TRIED + 1]*row.Row;
-    val n:    u32  = rows_of(d, at, end, ?rows[0]);
-    var r:    u32  = 0;
+    val n:    u32 = rows_of(d, at, end, ?rows[0]);
+    var r:    u32 = 0;
     for (r < n) {
         var labels: u32 = 0;
         for (labels < 2) {
-            as_row(d, ?base, rows[r]);
+            as_row(d, ?base, ?held[0], rows[r]);
             d.names = 0;
             val tried: u32 = labels;
             labels = labels + 1;
@@ -2796,14 +2795,15 @@ fun declared(d: *Disasm, i: u32, name: View) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
-# the traits of object `o` that its text does not state, which the caller gives the assembler again, as the abi row
-# and the trait rows `build.traits` and `build.state` take. the row is the first of the object's architecture whose
-# every setting the object holds, none when no row's are, and every trait the object states that is neither that row's
-# nor of an axis the text states is appended to `out`: the text states a derived axis by the code it writes and the
-# architecture row a fixed one. a text the object holds is borrowed from its store
+# the traits of object `o` that its text in set `s` does not state, which the caller gives the assembler again, as the
+# abi row and the trait rows `build.traits` and `build.state` take. the row is the first of the object's architecture
+# whose every setting the object holds, none when no row's are, and every trait the object states that is neither that
+# row's nor of an axis the text states is appended to `out`: the text states a derived axis by the code it writes, an
+# axis an instruction of the set states by that instruction (`stating`), as spir-v's OpMemoryModel its addressing and
+# memory models, and the architecture row a fixed one. a text the object holds is borrowed from its store
 # ---
 # ret: the abi row, or MEMORY with `out` as it was
-pub fun unwritten(o: *mink_object.Object, out: *vector.Vector[mink_trait.Trait]) res[opt[*mink_arch.Abi], Refusal] {
+pub fun unwritten(s: *set.Set, o: *mink_object.Object, out: *vector.Vector[mink_trait.Trait]) res[opt[*mink_arch.Abi], Refusal] {
     val abi:   opt[*mink_arch.Abi] = conventions_of(o);
     val start: usize               = out.len;
     var i:     usize               = 0;
@@ -2811,6 +2811,7 @@ pub fun unwritten(o: *mink_object.Object, out: *vector.Vector[mink_trait.Trait])
         val t: *mink_trait.Trait = ?o.traits.items[i];
         i = i + 1;
         if (sel t.axis.owner.derived || sel t.axis.owner.fixed) { cnt; }
+        if (stating.states_axis(s.statings, t.axis))            { cnt; }
         if (sel abi.some) {
             val stated: opt[mink_trait.Setting] = trait.convention(abi.some, t.axis);
             if (sel stated.some) { cnt; }
@@ -3387,8 +3388,8 @@ fun branch_targets(d: *Disasm) err[Refusal] {
                 for (k < st.ins.count) {
                     val desc: *operand.Operand = ?st.ins.row.operands.at[k];
                     if (sel desc.shape.relative) {
-                        if (sel st.values[k].relative) {
-                            val to: opt[u64] = target_of(at, st.len, desc, st.values[k].relative);
+                        if (sel st.values.data[k].relative) {
+                            val to: opt[u64] = target_of(at, st.len, desc, st.values.data[k].relative);
                             if (sel to.some) {
                                 if (to.some <= size && !held(vector.push[u64](?targets, to.some))) { done = whole(MEMORY); }
                             }
@@ -3446,6 +3447,12 @@ fun released(d: *Disasm) {
     vector.dnit[Basis](?d.bases);
     vector.dnit[u8](?d.bytes);
     vector.dnit[field.Fixup](?d.fixups);
+    core_syntax.release(?d.stores);
+    var k: u32 = 0;
+    for (k < relax.MAX_STEPS) {
+        vector.dnit[operand.Value](?d.steps[k].values);
+        k = k + 1;
+    }
 }
 
 fun written(d: *Disasm) err[Refusal] {
@@ -3601,7 +3608,13 @@ fun sectioned(a: *A.Allocator, s: *set.Set, v: *state.Context, options: Options,
         full:       false,
         forms:      options.spelling == FORMS,
         names:      0,
+        stores:     core_syntax.stores(a),
     };
+    var k: u32 = 0;
+    for (k < relax.MAX_STEPS) {
+        d.steps[k].values = vector.init[operand.Value](a);
+        k                 = k + 1;
+    }
     d.symbols = core_syntax.Symbols{context: (?d)::ptr, resolve: resolved, name: named};
     val done: err[Refusal] = written(?d);
     released(?d);
@@ -3649,10 +3662,13 @@ fun printed(a: *A.Allocator, v: *state.Context, model: *contract.Model, p: strea
     if (sel wrote.err) { ret whole(wrote.err); }
     val want: res[sink.Sink, fail.Fail] = contract.write(model);
     if (sel want.err) { ret whole(want.err.text); }
-    var w:    sink.Sink           = want.ok;
-    val back: res[sink.Sink, str] = p.read(a, ?out.data[start], out.len - start, v);
-    var done: err[Refusal]        = err[Refusal].ok{};
-    if (sel back.err) { done = whole(back.err); }
+    var w:    sink.Sink                     = want.ok;
+    val back: res[sink.Sink, stream.Unread] = p.read(a, ?out.data[start], out.len - start, diagnostic.START, v);
+    var done: err[Refusal]                  = err[Refusal].ok{};
+    if (sel back.err) {
+        if (sel back.err.text)    { done = whole(back.err.text.message); }
+        or (sel back.err.written) { done = whole(back.err.written.text); }
+    }
     or (sel back.ok) {
         var b:    sink.Sink = back.ok;
         val diff: opt[u64]  = differs(?w, ?b);
@@ -4575,7 +4591,7 @@ test disassemble__the_traits_the_text_does_not_state_are_reported_as_the_rows_gi
     if (sel got.err) { ret 2; }
     var o:    mink_object.Object                = got.ok;
     var rows: vector.Vector[mink_trait.Trait]   = vector.init[mink_trait.Trait](a);
-    val left: res[opt[*mink_arch.Abi], Refusal] = unwritten(?o, ?rows);
+    val left: res[opt[*mink_arch.Abi], Refusal] = unwritten(t.of, ?o, ?rows);
     val ok:   bool                              = t_left(?left, ?rows);
     vector.dnit[mink_trait.Trait](?rows);
     mink_object.release(?o);
@@ -4848,7 +4864,8 @@ val T_COMPUTE_WORDS: [51]u32 = [51]u32{
 };
 
 # a spir-v module read through mink, of a section per module-scope instruction and per function, disassembles as the
-# one instruction stream of the module mink builds of it, with no section directive, and its text assembles to that
+# one instruction stream of the module mink builds of it from its sections, facts and traits, with no section
+# directive, its version the one trait left for the caller to give, and its text assembles to that
 # module again, the words spirv-as writes but for the generator, which names the tool that wrote the module. it is
 # read under spv1.0, which its OpCapability Shader widens, so its GLCompute entry point and its SpecId decoration,
 # which need Shader, read back as the assembler reads them
@@ -4869,7 +4886,13 @@ test disassemble__a_spirv_module_read_through_mink_reads_back_to_its_module {
     if (!t_through_mink(?t, ?bytes[0], 204, ?o)) { ret 2; }
     if (o.sections.count < 2)                    { ret 3; }
     val done: err[Refusal] = t_written(?t, ?o);
+    # its OpMemoryModel states the addressing and memory models, so the version alone is the caller's to give again
+    var rows:  vector.Vector[mink_trait.Trait]   = vector.init[mink_trait.Trait](a);
+    val left:  res[opt[*mink_arch.Abi], Refusal] = unwritten(t.of, ?o, ?rows);
+    val alone: bool                              = sel left.ok && rows.len == 1 && rows.data[0].axis == ?arch_spirv.SPIRV_VERSION;
+    vector.dnit[mink_trait.Trait](?rows);
     mink_object.release(?o);
+    if (!alone)                                                                { ret 11; }
     if (sel done.err)                                                          { ret 4; }
     if (!t_holds(?t, "%5 = OpSpecConstant %4 7\n") || t_holds(?t, ".section")) { ret 5; }
     val options: model.Options                          = model.Options{arch: ?arch_spirv.SPIRV, formats: ?t.formats, syntax: 0, abi: nil, dialect: ?dialect.SPIRV, layers: model.NO_LAYERS};
@@ -4888,6 +4911,80 @@ test disassemble__a_spirv_module_read_through_mink_reads_back_to_its_module {
     sink.release(?w);
     if (!same)       { ret 9; }
     if (!t_done(?t)) { ret 10; }
+    ret 0;
+}
+
+# the words of a compute module whose one function selects among 40 cases by an OpSwitch of %5, a 32-bit OpConstant 0,
+# its default and merge block %7 and case `i` branching from %(8 + i) to it, onto `out`
+#[testing]
+fun t_switch_words(out: *vector.Vector[u32], n: u32) {
+    val head: [27]u32 = [27]u32{
+        0x07230203, 0x00010000, 0x00070000, 0, 0, 0x00020011, 1, 0x0003000e, 0, 1, 0x0005000f, 5, 1, 0x6e69616d, 0,
+        0x00060010, 1, 0x11, 1, 1, 1, 0x00020013, 2, 0x00030021, 3, 2, 0x00040015,
+    };
+    val body: [16]u32 = [16]u32{4, 32, 0, 0x0004002b, 4, 5, 0, 0x00050036, 2, 1, 0, 3, 0x000200f8, 6, 0x000300f7, 7};
+    var i:    u32     = 0;
+    for (i < 27) {
+        vector.push[u32](out, head[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        vector.push[u32](out, body[i]);
+        i = i + 1;
+    }
+    vector.push[u32](out, 0);
+    vector.push[u32](out, ((3 + 2 * n) << 16) | 0xFB);
+    vector.push[u32](out, 5);
+    vector.push[u32](out, 7);
+    i = 0;
+    for (i < n) {
+        vector.push[u32](out, i);
+        vector.push[u32](out, 8 + i);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        vector.push[u32](out, 0x000200f8);
+        vector.push[u32](out, 8 + i);
+        vector.push[u32](out, 0x000200f9);
+        vector.push[u32](out, 7);
+        i = i + 1;
+    }
+    vector.push[u32](out, 0x000200f8);
+    vector.push[u32](out, 7);
+    vector.push[u32](out, 0x000100fd);
+    vector.push[u32](out, 0x00010038);
+    out.data[3] = 8 + n;
+}
+
+# an OpSwitch of 40 cases, more operand values than any fixed store held, disassembles as the one statement that reads
+# back to its words
+test disassemble__a_spirv_switch_of_forty_cases_reads_back {
+    var t: T;
+    if (!t_make_for(?t, ?spirv_set.SET, ?spirv_extension.CATALOG, "spv1.0", ?dialect.SPIRV)) { ret 1; }
+    val a:     *A.Allocator       = testing.allocator_of(?t.t);
+    var words: vector.Vector[u32] = vector.init[u32](a);
+    t_switch_words(?words, 40);
+    var bytes: vector.Vector[u8] = vector.init[u8](a);
+    var i:     usize             = 0;
+    for (i < words.len) {
+        vector.push[u8](?bytes, (words.data[i] & 0xFF)::u8);
+        vector.push[u8](?bytes, ((words.data[i] >> 8) & 0xFF)::u8);
+        vector.push[u8](?bytes, ((words.data[i] >> 16) & 0xFF)::u8);
+        vector.push[u8](?bytes, ((words.data[i] >> 24) & 0xFF)::u8);
+        i = i + 1;
+    }
+    vector.dnit[u32](?words);
+    var o:    mink_object.Object;
+    val read: bool = t_through_mink(?t, bytes.data, bytes.len, ?o);
+    vector.dnit[u8](?bytes);
+    if (!read) { ret 2; }
+    val done: err[Refusal] = t_written(?t, ?o);
+    mink_object.release(?o);
+    if (sel done.err)                                                           { ret 3; }
+    if (!t_holds(?t, "OpSwitch %5 %7 0 %8 1 %9 ") || !t_holds(?t, " 39 %47\n")) { ret 4; }
+    if (!t_done(?t))                                                            { ret 5; }
     ret 0;
 }
 
@@ -4913,7 +5010,8 @@ val T_ADD_CUSTOM: [79]u8 = [79]u8{
 };
 
 # a wasm module read through mink, of a section per function body and per data segment, disassembles as the text of
-# the module mink builds of it, which reads back to the bytes wat2wasm writes. a custom section, which the text cannot
+# the module mink builds of it, which the assembler reads back through the dialect to the bytes wat2wasm writes. a
+# custom section, which the text cannot
 # state, reads back to another module, refused at the first byte the two differ at
 test disassemble__a_wasm_module_read_through_mink_reads_back_to_its_module_or_is_refused {
     var t: T;
@@ -4926,24 +5024,15 @@ test disassemble__a_wasm_module_read_through_mink_reads_back_to_its_module_or_is
     mink_object.release(?o);
     if (sel done.err)                                             { ret 4; }
     if (!t_holds(?t, "(module") || !t_holds(?t, "funcref (item")) { ret 5; }
-    val h:    *stream.Hooks     = t.of.codec.stream;
-    val made: res[ptr, A.Error] = h.make(a);
-    if (sel made.err) { ret 6; }
-    var ctx: state.Context = t.ctx;
-    ctx.stream = made.ok;
-    var m:     wasm_model.Module;
-    val read_: err[diagnostic.Diagnostic] = wasm_module.read(a, t.out.data, t.out.len - 1, diagnostic.START, ?wasm_codec.CODEC, ?ctx, ?m);
-    var same:  bool                       = false;
-    if (sel read_.ok) {
-        val wrote: res[sink.Sink, fail.Fail] = wasm_write.write(a, ?m);
-        if (sel wrote.ok) {
-            var w: sink.Sink = wrote.ok;
-            same = t_sink_is(?w, ?T_ADD[0], 73, 0, 0);
-            sink.release(?w);
+    val options: model.Options                     = model.Options{arch: t.of.arches.at[0].arch, formats: ?t.formats, syntax: 0, abi: nil, dialect: ?dialect.WASM, layers: model.NO_LAYERS};
+    var again:   res[asm.Assembled, model.Refusal] = asm.assembled(a, t.of, ?t.ctx, options, t.out.data, t.out.len - 1, diagnostic.START);
+    var same:    bool                              = false;
+    if (sel again.ok) {
+        if (sel again.ok.module) {
+            same = t_sink_is(?again.ok.module, ?T_ADD[0], 73, 0, 0);
+            sink.release(?again.ok.module);
         }
     }
-    wasm_model.release(?m);
-    h.release(a, made.ok);
     if (!same) { ret 6; }
     var c: mink_object.Object;
     if (!t_through_mink(?t, ?T_ADD_CUSTOM[0], 79, ?c)) { ret 7; }

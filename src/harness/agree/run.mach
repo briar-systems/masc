@@ -327,6 +327,19 @@ pub rec Run {
     seen:       map.Map[str, u32];
     modes:      mode.State;
     formats:    *registry.Registry;
+    widened:    vector.Vector[Widened];
+}
+
+# a selection `widen` grew, kept so a later row of the same selection and exclusions takes it without growing it again,
+# since growing closes the selection once per extension of the catalog
+# ---
+# from:     the selection before
+# excluded: what it was kept from holding
+# to:       the selection after
+rec Widened {
+    from:     extension.Selection;
+    excluded: requirement.Ids;
+    to:       extension.Selection;
 }
 
 val MEMORY:   str = "out of memory";
@@ -334,13 +347,6 @@ val UNSERVED: str = "the set serves no architecture of the variant";
 
 # the section masc assembles a statement in a comdat group in, named as the tools' source names its vector's section
 val VECTOR_ZERO: str = ".text.0";
-
-# the store a decode walk holds operand values in, and the alternatives it notes
-val STORE:        u32 = 64;
-val ALTERNATIVES: u32 = 8;
-
-# the values a vector's reading holds its list members in
-val POOL: u32 = 256;
 
 fun no_symbol(context: ptr, name: View) res[core_syntax.Resolved, str] {
     ret res[core_syntax.Resolved, str].err{"a vector names no symbol"};
@@ -511,6 +517,52 @@ fun attempt(r: *Run, variant: *agreement.Variant, alternative: requirement.Alter
 # names, as a row a later version removes is checked without that version, nor anything `variant`'s abi row does not
 # admit
 fun widen(r: *Run, variant: *agreement.Variant, s: *extension.Selection, excluded: requirement.Ids) err[str] {
+    var c: usize = 0;
+    for (c < r.widened.len) {
+        val w: *Widened = ?r.widened.data[c];
+        if (same_selection(?w.from, s) && same_ids(w.excluded, excluded)) {
+            val got: res[extension.Selection, A.Error] = extension.copy(r.a, ?w.to);
+            if (sel got.err) { ret err[str].err{MEMORY}; }
+            extension.release(s);
+            @s = got.ok;
+            ret err[str].ok{};
+        }
+        c = c + 1;
+    }
+    val from: res[extension.Selection, A.Error] = extension.copy(r.a, s);
+    if (sel from.err) { ret err[str].err{MEMORY}; }
+    val grown: err[str] = grow_each(r, variant, s, excluded);
+    if (sel grown.err) { ret grown; }
+    val to: res[extension.Selection, A.Error] = extension.copy(r.a, s);
+    if (sel to.err) { ret err[str].err{MEMORY}; }
+    val kept: res[usize, A.Error] = vector.push[Widened](?r.widened, Widened{from: from.ok, excluded: excluded, to: to.ok});
+    if (sel kept.err) { ret err[str].err{MEMORY}; }
+    ret err[str].ok{};
+}
+
+# whether `a` and `b` hold the same members and state the same atoms
+fun same_selection(a: *extension.Selection, b: *extension.Selection) bool {
+    if (!extension.within(a, b) || !extension.within(b, a) || a.stated.len != b.stated.len) { ret false; }
+    var i: u32 = 0;
+    for (i < a.stated.len) {
+        if (a.stated.at[i] != b.stated.at[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun same_ids(a: requirement.Ids, b: requirement.Ids) bool {
+    if (a.len != b.len) { ret false; }
+    var i: u32 = 0;
+    for (i < a.len) {
+        if (a.at[i] != b.at[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `s` grown by each extension of its catalog in turn, as `widen` states
+fun grow_each(r: *Run, variant: *agreement.Variant, s: *extension.Selection, excluded: requirement.Ids) err[str] {
     val catalog: *extension.Catalog = s.catalog;
     var x:       u32                = 0;
     for (x < catalog.count) {
@@ -695,17 +747,22 @@ fun refused_by(r: *Run, head: str, message: str) Outcome {
 # typed stream reads one line of a source whose earlier lines defined what the group's vectors need, into the run's
 # storage
 fun encoded(r: *Run, g: *Group, source: str) Outcome {
-    val s:    *set.Set                     = r.agreement.set;
-    val len:  usize                        = str_len(source);
-    val pool: res[*operand.Value, A.Error] = A.allocate[operand.Value](r.scratch, POOL::usize);
-    val lits: res[*u8, A.Error]            = A.allocate[u8](r.scratch, len + 1);
-    if (sel pool.err) { ret Outcome.refused{MEMORY}; }
-    if (sel lits.err) { ret Outcome.refused{MEMORY}; }
-    var room: [ALTERNATIVES]requirement.Alternative;
-    var ex:   relax.Expansion;
-    var rd:   core_syntax.Reader         = core_syntax.Reader{text: source, start: 0, at: 0, end: len, origin: diagnostic.START, codec: s.codec, ctx: ?g.context, syntax: ?s.syntaxes.at[r.agreement.syntax], modes: ?r.modes, symbols: ?NO_SYMBOLS, context: nil, row: nil, pool: pool.ok, cap: POOL, used: 0, bytes: lits.ok, room: (len + 1)::u32, taken: 0, refused: field.Admissions{at: ?room[0], cap: ALTERNATIVES, used: 0}};
-    val read: err[diagnostic.Diagnostic] = parse.statement(?rd, ?ex);
-    if (sel read.err) { ret refused_by(r, "masc cannot read it: ", read.err.message); }
+    val s:      *set.Set           = r.agreement.set;
+    val len:    usize              = str_len(source);
+    var stores: core_syntax.Stores = core_syntax.stores(r.scratch);
+    fin { core_syntax.release(?stores); }
+    var ex: relax.Expansion;
+    # read again into stores grown to what the read found them short of, which reads the stream's ids and types alike
+    for {
+        var rd: core_syntax.Reader = core_syntax.Reader{text: source, start: 0, at: 0, end: len, origin: diagnostic.START, codec: s.codec, ctx: ?g.context, syntax: ?s.syntaxes.at[r.agreement.syntax], modes: ?r.modes, symbols: ?NO_SYMBOLS, context: nil, row: nil};
+        core_syntax.over(?rd, ?stores);
+        val read:  err[diagnostic.Diagnostic] = parse.statement(?rd, ?ex);
+        val again: res[bool, A.Error]         = core_syntax.regrown(?rd, ?stores);
+        if (sel again.err) { ret Outcome.refused{MEMORY}; }
+        if (again.ok)      { cnt; }
+        if (sel read.err)  { ret refused_by(r, "masc cannot read it: ", read.err.message); }
+        brk;
+    }
     var out:    vector.Vector[u8]          = vector.init[u8](r.scratch);
     var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](r.scratch);
     var i:      u32                        = 0;
@@ -734,7 +791,7 @@ fun assembled(r: *Run, w: *Width, g: *Group, source: str, group: str) Outcome {
 fun from_start(ins: *inst.Inst, len: usize, bytes: u8, room: *operand.Value) inst.Inst {
     var out: inst.Inst = @ins;
     var k:   u32       = 0;
-    for (k < ins.count && k < STORE) {
+    for (k < ins.count) {
         room[k] = ins.values[k];
         val desc: *operand.Operand = ?ins.row.operands.at[k];
         val v:    *operand.Value   = ?room[k];
@@ -762,16 +819,19 @@ fun from_start(ins: *inst.Inst, len: usize, bytes: u8, room: *operand.Value) ins
 # one instruction they are, nil when they are more or none
 fun decode(r: *Run, g: *Group, bytes: operand.Bytes, listed: bool, dot: bool, address: u8, read: **row.Row) Printed {
     @read = nil;
-    val s:     *set.Set           = r.agreement.set;
-    var store: [STORE]operand.Value;
-    var room:  [ALTERNATIVES]requirement.Alternative;
-    var alts:  field.Admissions   = field.Admissions{at: ?room[0], cap: ALTERNATIVES, used: 0};
-    var out:   vector.Vector[u8]  = vector.init[u8](r.scratch);
-    var w:     core_syntax.Writer = writer(r, g, ?out);
-    var at:    usize              = 0;
+    val s:     *set.Set                               = r.agreement.set;
+    var store: vector.Vector[operand.Value]           = vector.init[operand.Value](r.scratch);
+    var alts:  vector.Vector[requirement.Alternative] = vector.init[requirement.Alternative](r.scratch);
+    fin {
+        vector.dnit[operand.Value](?store);
+        vector.dnit[requirement.Alternative](?alts);
+    }
+    var out: vector.Vector[u8]  = vector.init[u8](r.scratch);
+    var w:   core_syntax.Writer = writer(r, g, ?out);
+    var at:  usize              = 0;
     w.dot = dot;
     for (at < bytes.len::usize) {
-        val got: res[walk.Decoded, field.Refusal] = walk.decode(s.codec, ?g.context, bytes.at, bytes.len::usize, at, ?store[0], STORE, ?alts);
+        val got: res[walk.Decoded, field.Refusal] = walk.decode_grown(s.codec, ?g.context, bytes.at, bytes.len::usize, at, ?store, ?alts);
         if (sel got.err) {
             var t: text.Text = text.make(r.a);
             text.put(?t, "masc cannot decode it: ");
@@ -791,7 +851,7 @@ fun decode(r: *Run, g: *Group, bytes: operand.Bytes, listed: bool, dot: bool, ad
         }
         var printed: err[field.Refusal] = err[field.Refusal].ok{};
         if (listed) {
-            var started: [STORE]operand.Value;
+            var started: [row.MAX_OPERANDS]operand.Value;
             val shown:   inst.Inst = from_start(?ins, got.ok.len, address, ?started[0]);
             if (r.agreement.disassembler.aliased) { printed = print.instruction(?w, ?shown); }
             or                                    { printed = print.form(?w, ?shown); }
@@ -880,18 +940,18 @@ fun labelled(desc: *operand.Operand, v: operand.Value, len: i64) operand.Value {
 # case `c`, vector `n` of `g`, printed by its row's form or its alias with each relative target the vector's label
 # plus the offset from the vector's start masc's `len` bytes reach, none when masc cannot print it so
 fun labelled_text(r: *Run, g: *Group, c: *Case, n: u32, len: i64) res[opt[str], str] {
-    var room: [STORE]operand.Value;
-    var own:  [STORE]operand.Value;
+    var room: [row.MAX_OPERANDS]operand.Value;
+    var own:  [row.MAX_OPERANDS]operand.Value;
     var ins:  inst.Inst = c.inst;
     var k:    u32       = 0;
-    for (k < ins.count && k < STORE) {
+    for (k < ins.count) {
         room[k] = labelled(?ins.row.operands.at[k], ins.values[k], len);
         k       = k + 1;
     }
     ins.values = ?room[0];
     if (c.alias != nil) {
         k = 0;
-        for (k < c.alias.count::u32 && k < STORE) {
+        for (k < c.alias.count::u32 && k < row.MAX_OPERANDS) {
             own[k] = labelled(core_syntax.alias_operand(c.alias, c.inst.row, k::u8), c.spelled[k], len);
             k      = k + 1;
         }
@@ -1190,7 +1250,8 @@ fun by_layout(r: *Run, w: *Width, g: *Group, j: usize, pending: *vector.Vector[u
 }
 
 # the cases of `g` assembler `j` assembles, its outcome given each. the cases are assembled in batches, the first of
-# them all: a batch the tool refuses vectors of at their lines is run again without them, and one it fails naming no
+# them all: a batch the tool refuses vectors of at their lines is run again without them, and each of those alone, as a
+# refusal may come of the statement before it as llvm-mc's after a movprfx does, and one it fails naming no
 # line, as a fixup no line holds, is run again as its two halves, so one vector never hides another's bytes. each
 # batch the reference assembles is one of the group's reference objects
 fun by_tool(r: *Run, w: *Width, g: *Group, j: usize) err[str] {
@@ -1285,6 +1346,13 @@ fun by_tool(r: *Run, w: *Width, g: *Group, j: usize) err[str] {
                     removed.data[at]                        = true;
                     g.cases.data[pending.data[at]].tools[j] = refused(r, l.message);
                     any                                     = true;
+                    if (pending.len > 1) {
+                        var alone: vector.Vector[u32]  = vector.init[u32](r.a);
+                        val one:   res[usize, A.Error] = vector.push[u32](?alone, pending.data[at]);
+                        if (sel one.err) { ret err[str].err{MEMORY}; }
+                        val again: res[usize, A.Error] = vector.push[vector.Vector[u32]](?batches, alone);
+                        if (sel again.err) { ret err[str].err{MEMORY}; }
+                    }
                 }
             }
             k = k + 1;
@@ -1474,7 +1542,7 @@ fun by_disassembler(r: *Run, w: *Width, g: *Group) err[str] {
                 val pointer: opt[mink_arch.Pointer] = w.variant.arch.pointer;
                 if (sel pointer.none && why == nil) { why = "the architecture states no pointer width"; }
                 if (sel pointer.some) {
-                    val read: err[str] = listing.read(r.a, r.scratch, ran.ok.out, pointer.some.bytes, r.agreement.disassembler.comment, ?listed);
+                    val read: err[str] = listing.read(r.a, r.scratch, ran.ok.out, pointer.some.bytes, r.agreement.disassembler.comment, r.agreement.disassembler.target, r.agreement.disassembler.immediate, ?listed);
                     if (sel read.err) {
                         if (why == nil) { why = read.err; }
                     }
@@ -1537,11 +1605,19 @@ fun judged(r: *Run, w: *Width, g: *Group, why: str, listed: *vector.Vector[listi
     ret err[str].ok{};
 }
 
-# the group of `w` whose selection spells as `s` does, made when there is none, `s` given back when there is
+# the group of `w` whose selection spells as `s` does, its stated atoms after its extensions, made when there is none,
+# `s` given back when there is. a set's spelling names extensions alone, so the atoms keep apart the selections that
+# differ only in state, as aarch64's rows of streaming mode from those outside it
 fun group_of(r: *Run, w: *Width, groups: *map.Map[str, u32], s: extension.Selection) res[*Group, str] {
     var held:    extension.Selection = s;
     var spelled: vector.Vector[u8]   = vector.init[u8](r.a);
-    val wrote:   err[A.Error]        = held.catalog.syntax.spell(?held, ?spelled);
+    var wrote:   err[A.Error]        = held.catalog.syntax.spell(?held, ?spelled);
+    var k:       u32                 = 0;
+    for (!(sel wrote.err) && k < held.stated.len) {
+        wrote = extension.append(?spelled, "+");
+        if (!(sel wrote.err)) { wrote = state.spell_atom(held.catalog, ?r.agreement.set.states, held.stated.at[k], ?spelled); }
+        k = k + 1;
+    }
     if (sel wrote.err) { ret res[*Group, str].err{MEMORY}; }
     val key: opt[str] = owned(r.a, ?spelled);
     if (sel key.none) { ret res[*Group, str].err{MEMORY}; }
@@ -2080,7 +2156,7 @@ pub fun agree(a: *A.Allocator, ag: *agreement.Agreement, options: Options, out: 
     if (sel built.err) { ret err[str].err{"mink's format registry cannot be built"}; }
     var formats: registry.Registry = built.ok;
     fin { registry.release(?formats); }
-    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), withs: vector.init[requirement.Ids](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats};
+    var r:       Run      = Run{a: a, scratch: ?scratch, area: ?area, agreement: ag, result: out, exceptions: map.init[str, u32](a), scopes: vector.init[requirement.Ids](a), withs: vector.init[requirement.Ids](a), seen: map.init[str, u32](a), modes: mode.initial(?ag.set.assembly), formats: ?formats, widened: vector.init[Widened](a)};
     val indexed: err[str] = index_exceptions(?r);
     if (sel indexed.err) { ret indexed; }
     val dir: err[fs.FsError] = fs.create_dir_all(a, options.work, 0o755);
