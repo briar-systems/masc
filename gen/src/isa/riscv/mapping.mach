@@ -95,6 +95,8 @@ pub val NO_LIST:        str = "listed row's argument not in the row or not an en
 pub val UNSAVED:        str = "list member whose registers the overlay does not state";
 pub val LIST_AND_RULE:  str = "row a list and a register rule of the overlay both state";
 pub val NO_NF:          str = "riscv-opcodes names no nf argument, whose place a segment's fields are read from";
+pub val NO_LENGTH:      str = "vector access in a register file of no single length register";
+pub val NO_COUNT_LIST:  str = "access of list registers in a row no listed line names";
 
 # one extension alternative: the ids it names and its closure under the catalog
 pub rec Alternative {
@@ -160,7 +162,7 @@ pub rec Operand {
 # base:     the register row holding the address when no operand does, effect.NO_ROW otherwise
 # forming:  the further operands forming the address
 # element:  the bits of each element
-# one:      whether it covers one element, its count otherwise unstated
+# count:    how many elements it covers
 # governor: the operand deciding which elements it touches, field.NO_OPERAND when none
 pub rec Access {
     role:     operand.Role;
@@ -168,7 +170,7 @@ pub rec Access {
     base:     u32;
     forming:  operand.Positions;
     element:  quantity.Scaled;
-    one:      bool;
+    count:    effect.Count;
     governor: u8;
 }
 
@@ -382,6 +384,7 @@ rec Mapper {
     constraints: *constraints.Constraints;
     nf_lo:       u64;
     nf_known:    bool;
+    length:      opt[u32];
 
     required: map.Map[str, *Requirement];
     standard: map.Map[str, u32];
@@ -1479,13 +1482,33 @@ fun digits(name: str, at: usize, value: *u32) usize {
     ret i;
 }
 
-# a vector access's element, and whether it is one element: a whole register
-# move of n registers is one element of n vector lengths, a unit stride or
-# strided access of eew N is N bits, a mask access is bytes, and an indexed
-# access's data element is the selected element width, which no operand states
-fun vector_element(m: *Mapper, name: str, element: *quantity.Scaled, one: *bool) err[diag.Refusal] {
-    @one     = false;
+# the row of the register of `file` that counts a vector instruction's elements, flagged LENGTH, none when no one
+# register is
+fun length_row(file: *register.File) opt[u32] {
+    var found: u32 = 0;
+    var seen:  u32 = 0;
+    var row:   u32 = 0;
+    for (row < file.register_count) {
+        if ((file.registers[row].flags & register.LENGTH) != 0) {
+            found = row;
+            seen  = seen + 1;
+        }
+        row = row + 1;
+    }
+    if (seen != 1) { ret opt[u32].none{}; }
+    ret opt[u32].some{found};
+}
+
+# a vector access's element and count: a whole register move of n registers is
+# one element of n vector lengths, which vl does not decide, and every other
+# access covers what vl decides, a unit stride or strided access of eew N in N
+# bit elements, a mask access in bytes, and an indexed access in elements of the
+# selected element width, which no operand states
+fun vector_element(m: *Mapper, row: *Row, element: *quantity.Scaled, count: *effect.Count) err[diag.Refusal] {
+    val name: str = row.mnemonic;
     @element = quantity.Scaled{fixed: 0, per: 0, scale: 0};
+    if (sel m.length.none) { ret refuse(row.record, NO_LENGTH, name); }
+    @count = effect.Count.register{m.length.some};
     if (str_starts_with(name, "vlm.") || str_starts_with(name, "vsm.")) {
         element.fixed = 8;
         ret err[diag.Refusal].ok{};
@@ -1497,7 +1520,7 @@ fun vector_element(m: *Mapper, name: str, element: *quantity.Scaled, one: *bool)
         if (sel vl.none)      { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNKNOWN_CLASS, name)}; }
         if (name[end] != 'r') { ret err[diag.Refusal].err{diag.refusal(nil, 0, UNKNOWN_CLASS, name)}; }
         @element = quantity.Scaled{fixed: 0, per: 32 * n, scale: vl.some};
-        @one     = true;
+        @count   = effect.Count.one{};
         ret err[diag.Refusal].ok{};
     }
     var i: usize = 0;
@@ -1531,6 +1554,17 @@ fun bit(op: u8) operand.Positions {
     ret 1::u32 << op::u32;
 }
 
+# the list operand of `row` a listed line names, whose registers its accesses move, field.NO_OPERAND when none does
+fun list_of(m: *Mapper, row: *Row) u8 {
+    var i: usize = 0;
+    for (i < m.effects.listed.len) {
+        val l: *effects.Listed = ?m.effects.listed.data[i];
+        if (overlay.matches(l.mnemonic, row.mnemonic)) { ret operand_of(row, l.arg); }
+        i = i + 1;
+    }
+    ret field.NO_OPERAND;
+}
+
 # the memory accesses of `row`
 fun accesses(m: *Mapper, row: *Row) err[diag.Refusal] {
     var i: u32 = 0;
@@ -1540,21 +1574,23 @@ fun accesses(m: *Mapper, row: *Row) err[diag.Refusal] {
             val major:    u64  = row.match & 0x7F;
             val vectored: bool = str_starts_with(mem.mnemonic, "vl") || str_starts_with(mem.mnemonic, "vs");
             if (vectored && !((major == m.constraints.load_fp && mem.role == operand.READ) || (major == m.constraints.store_fp && mem.role == operand.WRITE))) { ret err[diag.Refusal].ok{}; }
-            var a: Access = Access{role: mem.role, address: address_of(m, row), base: effect.NO_ROW, forming: operand.NO_POSITIONS, element: quantity.Scaled{fixed: mem.bits, per: 0, scale: 0}, one: true, governor: field.NO_OPERAND};
+            var a: Access = Access{role: mem.role, address: address_of(m, row), base: effect.NO_ROW, forming: operand.NO_POSITIONS, element: quantity.Scaled{fixed: mem.bits, per: 0, scale: 0}, count: effect.Count.one{}, governor: field.NO_OPERAND};
             if (mem.element == effects.SUFFIX) { a.element.fixed = suffix_bits(row.mnemonic); }
-            if (mem.element == effects.BLOCK)  { a.one = false; }
+            if (mem.element == effects.BLOCK)  { a.count = effect.Count.unstated{}; }
             if (mem.element == effects.XLEN) {
                 val x: opt[u8] = scale_index(m.file, "xlen");
                 if (sel x.none) { ret refuse(row.record, UNKNOWN_CLASS, "xlen"); }
                 a.element = quantity.Scaled{fixed: 0, per: 32, scale: x.some};
-                a.one     = false;
+                val list: u8 = list_of(m, row);
+                if (list == field.NO_OPERAND) { ret refuse(row.record, NO_COUNT_LIST, row.mnemonic); }
+                a.count   = effect.Count.operand{list};
                 a.address = field.NO_OPERAND;
                 val sp: opt[u32] = register_row(m.file, m.effects.stack_pointer);
                 if (sel sp.none) { ret refuse(row.record, UNKNOWN_NAME, m.effects.stack_pointer); }
                 a.base = sp.some;
             }
             if (vectored) {
-                val got: err[diag.Refusal] = vector_element(m, row.mnemonic, ?a.element, ?a.one);
+                val got: err[diag.Refusal] = vector_element(m, row, ?a.element, ?a.count);
                 if (sel got.err) { ret got; }
                 a.forming  = bit(operand_of(row, "rs2")) | bit(operand_of(row, "vs2"));
                 a.governor = operand_of(row, "vm");
@@ -2461,7 +2497,7 @@ pub fun build(a: *A.Allocator, s: *read.Source, x: *facts.Facts, file: *register
     out.rows        = vector.init[*Row](a);
     out.respellings = vector.init[Respelling](a);
     out.idle        = vector.init[str](a);
-    var m:  Mapper   = Mapper{alloc: a, source: s, catalog: ?x.catalog, axes: ?x.axes, file: file, o: ?x.overlay, kinds: Kinds{unit: 0, stack: 0, sregs: 0, push: nil, pop: nil}, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), hints: map.init[str, *vector.Vector[Space]](a), out: out, transferred: vector.init[bool](a), restating: vector.init[bool](a), effects: ?x.effects, constraints: ?x.constraints, nf_lo: 0, nf_known: false};
+    var m:  Mapper   = Mapper{alloc: a, source: s, catalog: ?x.catalog, axes: ?x.axes, file: file, o: ?x.overlay, kinds: Kinds{unit: 0, stack: 0, sregs: 0, push: nil, pop: nil}, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), hints: map.init[str, *vector.Vector[Space]](a), out: out, transferred: vector.init[bool](a), restating: vector.init[bool](a), effects: ?x.effects, constraints: ?x.constraints, nf_lo: 0, nf_known: false, length: length_row(file)};
     val nf: opt[u64] = arg_lo(s, "nf");
     if (sel nf.some) {
         m.nf_lo    = nf.some;
