@@ -221,6 +221,8 @@ pub val FRAME_OPEN:        str = "frame begun inside another, or a rule or end w
 pub val FRAME_SPLIT:       str = "frame that ends in another section than it begins, or is never ended";
 pub val FRAME_SYMBOL:      str = "frame of a function, personality or language data whose label is no symbol of the object";
 pub val NO_FRAME:          str = "frame of an architecture the set states no starting frame for";
+pub val NOT_REMEMBERED:    str = "frame state restored where none is remembered";
+pub val CFA_SCALES:        str = "canonical frame address register or offset changed alone while its offset scales";
 pub val STARTED:           str = "starting section named twice, or opened apart";
 pub val NOT_THREAD:        str = "symbol a thread-local relocation names, stated as a type other than thread-local";
 pub val STREAMED:          str = "object context already in a stream";
@@ -778,6 +780,8 @@ rec Entry {
 # cts:       the ranges marked as built to run in constant time, the last open while `ct_end` is awaited
 # frames:    the frames of the functions stated, the last open while `cfi_end` is awaited
 # rules:     the rules of every frame, each at the statement it precedes
+# kept:      the canonical frame addresses the open frame remembered, the last remembered last
+# defined:   the label placed last, which `placed_here` answers while nothing is written after it
 # mapping:   the mapping symbols written, the set's source dialect's where the format's assembler writes them
 #            (`dialect.Dialect.mapping`), else none
 # modes:     the assembler modes the next statement is read under, each at its initial value until changed
@@ -835,6 +839,8 @@ pub rec Builder {
     cts:       vector.Vector[Ct];
     frames:    vector.Vector[Framed];
     rules:     vector.Vector[Ruled];
+    kept:      vector.Vector[Cfa];
+    defined:   opt[Label];
     mapping:   core_source.Mapping;
     modes:     mode.State;
     states:    vector.Vector[mode.State];
@@ -936,6 +942,8 @@ rec Ct {
 # lsda:        the label of its language specific data
 # signal:      whether it is a signal handler's
 # open:        whether `cfi_end` is awaited
+# cfa:         the canonical frame address its rules leave at the cursor
+# depth:       how many states its rules remember that none restores yet
 rec Framed {
     function:    Label;
     section:     u32;
@@ -947,6 +955,21 @@ rec Framed {
     lsda:        opt[Label];
     signal:      bool;
     open:        bool;
+    cfa:         Cfa;
+    depth:       u32;
+}
+
+# the canonical frame address an open frame's rules leave, as a register plus an offset that may scale, in dwarf numbers
+# ---
+# reg:      the register it is from
+# fixed:    the bytes of the offset that do not scale
+# scale:    the multiple of the value of `quantity` the offset adds, 0 when it does not scale
+# quantity: the register whose value scales the offset, read only when `scale` is nonzero
+pub rec Cfa {
+    reg:      u16;
+    fixed:    i64;
+    scale:    i64;
+    quantity: u16;
 }
 
 # a frame rule at the statement it takes effect before, an expression's bytes in the builder's texts
@@ -1093,6 +1116,8 @@ pub fun make(a: *A.Allocator, formats: *registry.Registry, s: *set.Set, object: 
         cts:      vector.init[Ct](a),
         frames:   vector.init[Framed](a),
         rules:    vector.init[Ruled](a),
+        kept:     vector.init[Cfa](a),
+        defined:  opt[Label].none{},
         mapping:  mapping_of(s, arch, format),
         modes:    mode.initial(?s.assembly),
         states:   vector.init[mode.State](a),
@@ -1243,6 +1268,7 @@ pub fun release(b: *Builder) {
     vector.dnit[Ct](?b.cts);
     vector.dnit[Framed](?b.frames);
     vector.dnit[Ruled](?b.rules);
+    vector.dnit[Cfa](?b.kept);
     vector.dnit[mode.State](?b.states);
     vector.dnit[Versioned](?b.versions);
     vector.dnit[Direct](?b.direct);
@@ -1765,7 +1791,19 @@ pub fun define(b: *Builder, l: Label) err[Refusal] {
     m.some.defined  = true;
     m.some.section  = at.ok::u32;
     m.some.fragment = b.areas.data[at.ok].fragments.len::u32;
+    b.defined       = opt[Label].some{l};
     ret err[Refusal].ok{};
+}
+
+# the label placed last when it is at the cursor of the current section, nothing written after it, as a function's
+# label is where `.cfi_startproc` begins its frame. none when no label is there
+pub fun placed_here(b: *Builder) opt[Label] {
+    if (sel b.defined.none) { ret opt[Label].none{}; }
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err) { ret opt[Label].none{}; }
+    val m: *Mark = ?b.labels.data[b.defined.some.id::usize - 1];
+    if (m.section != at.ok::u32 || m.fragment != b.areas.data[at.ok].fragments.len::u32) { ret opt[Label].none{}; }
+    ret b.defined;
 }
 
 # whether `l` is placed or given a value
@@ -2670,8 +2708,63 @@ pub fun cfi_start(b: *Builder, function: Label) err[Refusal] {
     if (sel here.err) { ret err[Refusal].err{here.err}; }
     val known: opt[*Mark] = mark_of(b, function);
     if (sel known.none) { ret refused(NO_SUCH); }
-    val f: Framed = Framed{function: function, section: here.ok.section, start: here.ok.start, end: 0, rules: b.rules.len, count: 0, personality: opt[Label].none{}, lsda: opt[Label].none{}, signal: false, open: true};
+    val start: *set.Frame = row.some.frame;
+    val cfa:   opt[u32]   = core_state.debug_number(b.object.view.file, start.cfa_register, register.DWARF, b.object);
+    if (sel cfa.none) { ret refused(NO_FRAME); }
+    val f: Framed = Framed{
+        function:    function,
+        section:     here.ok.section,
+        start:       here.ok.start,
+        end:         0,
+        rules:       b.rules.len,
+        count:       0,
+        personality: opt[Label].none{},
+        lsda:        opt[Label].none{},
+        signal:      false,
+        open:        true,
+        cfa:         Cfa{reg: cfa.some::u16, fixed: start.cfa_offset, scale: 0, quantity: 0},
+        depth:       0,
+    };
     if (!held(vector.push[Framed](?b.frames, f))) { ret err[Refusal].err{memory()}; }
+    b.kept.len = 0;
+    ret err[Refusal].ok{};
+}
+
+# the canonical frame address the open frame's rules leave at the cursor, none when no frame is open
+pub fun cfa(b: *Builder) opt[Cfa] {
+    val open: opt[*Framed] = open_frame(b);
+    if (sel open.none) { ret opt[Cfa].none{}; }
+    ret opt[Cfa].some{open.some.cfa};
+}
+
+# the canonical frame address and remembered states of frame `f` after rule `rule`, refused with both as they were when
+# the rule restores a state none remembers or changes the register or offset alone of an address whose offset scales
+fun follow(b: *Builder, f: *Framed, rule: frame.Rule) err[Refusal] {
+    if (sel rule.def_cfa) {
+        f.cfa = Cfa{reg: rule.def_cfa.reg, fixed: rule.def_cfa.offset, scale: 0, quantity: 0};
+    }
+    or (sel rule.def_cfa_scaled) {
+        val d: frame.Scaled = rule.def_cfa_scaled;
+        f.cfa = Cfa{reg: d.reg, fixed: d.fixed, scale: d.scale, quantity: d.quantity};
+    }
+    or (sel rule.cfa_offset) {
+        if (f.cfa.scale != 0) { ret refused(CFA_SCALES); }
+        f.cfa.fixed = rule.cfa_offset;
+    }
+    or (sel rule.cfa_register) {
+        if (f.cfa.scale != 0) { ret refused(CFA_SCALES); }
+        f.cfa.reg = rule.cfa_register;
+    }
+    or (sel rule.remember) {
+        if (!held(vector.push[Cfa](?b.kept, f.cfa))) { ret err[Refusal].err{memory()}; }
+        f.depth = f.depth + 1;
+    }
+    or (sel rule.restore_state) {
+        if (f.depth == 0 || b.kept.len == 0) { ret refused(NOT_REMEMBERED); }
+        b.kept.len = b.kept.len - 1;
+        f.cfa      = b.kept.data[b.kept.len];
+        f.depth    = f.depth - 1;
+    }
     ret err[Refusal].ok{};
 }
 
@@ -2691,7 +2784,10 @@ pub fun cfi(b: *Builder, rule: frame.Rule) err[Refusal] {
         if (sel kept.err) { ret err[Refusal].err{kept.err}; }
         r.expression = kept.ok;
     }
-    if (!held(vector.push[Ruled](?b.rules, r))) { ret err[Refusal].err{memory()}; }
+    if (!held(vector.reserve[Ruled](?b.rules, 1))) { ret err[Refusal].err{memory()}; }
+    val followed: err[Refusal] = follow(b, open.some, rule);
+    if (sel followed.err) { ret followed; }
+    vector.push[Ruled](?b.rules, r);
     open.some.count = open.some.count + 1;
     ret err[Refusal].ok{};
 }
@@ -4842,11 +4938,12 @@ pub fun source_at(b: *Builder, i: usize) View {
     ret intern.bytes_of(?b.names, b.sources.data[i]);
 }
 
-# whether a writer states records on the object, facts that are no statement of a section
-pub fun records(b: *Builder) bool {
+# whether a writer states records on the object, facts that are no statement of a section, but the writer whose context
+# is `besides`, nil for none, whose records the caller states itself
+pub fun records(b: *Builder, besides: ptr) bool {
     var i: usize = 0;
     for (i < b.writers.len) {
-        if (b.writers.data[i].record != nil) { ret true; }
+        if (b.writers.data[i].record != nil && b.writers.data[i].context != besides) { ret true; }
         i = i + 1;
     }
     ret false;

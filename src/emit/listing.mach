@@ -43,6 +43,12 @@
 # same traits. the traits the caller states, and its abi row, are the
 # caller's to give the assembler again, as they were the caller's to give the
 # builder. constant-time ranges are in memory only and are not restated.
+#
+# the line facts the caller attached to the builder (`masc.emit.line`), when
+# it names them, are restated as the `.file` lines of their table before the
+# sections and a `.loc` before each instruction a location starts at, so the
+# text assembled with the line directives reads back to the same records. a
+# location the text cannot state, as one with an end column, is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -99,6 +105,7 @@ use masc.core.state;
 use core_syntax: masc.core.syntax;
 use masc.core.trait;
 use masc.emit.emit;
+use masc.emit.line;
 use masc.format.dialect;
 use masc.syntax.parse;
 use masc.syntax.print;
@@ -168,9 +175,12 @@ pub val NO_SECTION: u32 = 0xFFFF_FFFF;
 # dialect: the assembly dialect of the format the object is written in (`masc.format.dialect`), which states the names the
 #          assembler reading the listing keeps out of the symbol table, as elf's `.L`, and how a section is kept apart
 #          from another of its name
+# lines:   the line facts attached to the builder, which the listing restates, nil for none. a builder whose line facts
+#          the caller does not name is refused as one whose writer states records
 pub rec Options {
     syntax:  u32;
     dialect: *dialect.Dialect;
+    lines:   *line.Lines;
 }
 
 # why the builder's record was not listed
@@ -238,6 +248,9 @@ rec Held {
 # apart:   the unique numbers given so far, the last of them the latest
 # full:    whether the output or a store failed to grow
 # stores:  what a statement is read back into, grown to what the largest takes
+# lines:   the line facts restated, nil for none
+# locs:    per label, less one, the index of the location it places, plus one, 0 for a label that places none
+# spoken:  what the `.loc` lines written so far leave
 rec Lister {
     a:       *A.Allocator;
     b:       *build.Builder;
@@ -258,6 +271,9 @@ rec Lister {
     byte:    str;
     apart:   u64;
     full:    bool;
+    lines:   *line.Lines;
+    locs:    vector.Vector[u32];
+    spoken:  line.Spoken;
     held:    [relax.MAX_STEPS]Held;
     steps:   [relax.MAX_STEPS]inst.Inst;
     markers: [relax.MAX_STEPS]operand.FixupKind;
@@ -557,6 +573,36 @@ fun directive(l: *Lister, name: str, id: u32) {
     put_view(l, name_of(l, id));
 }
 
+# the line facts' file table as its `.file` lines, and per label the location it places
+fun files(l: *Lister) err[Refusal] {
+    if (l.lines == nil)                                              { ret err[Refusal].ok{}; }
+    if (l.lines.builder != nil && l.lines.builder != l.b)            { ret whole(RECORDS); }
+    if (!held(vector.reserve[u32](?l.locs, build.label_count(l.b)))) { ret whole(MEMORY); }
+    var id: usize = 0;
+    for (id < build.label_count(l.b)) {
+        vector.push[u32](?l.locs, 0);
+        id = id + 1;
+    }
+    var k: usize = 0;
+    for (k < line.mark_count(l.lines)) {
+        val at: u32 = line.mark_at(l.lines, k).at.id;
+        if (at == 0 || at::usize > l.locs.len) { ret whole(RECORDS); }
+        l.locs.data[at::usize - 1] = (k + 1)::u32;
+        k                          = k + 1;
+    }
+    var i: u32 = 0;
+    for (i < line.file_count(l.lines)) {
+        val start: usize    = l.out.len;
+        val wrote: err[str] = line.put_file(l.out, i, line.file_at(l.lines, i));
+        if (sel wrote.err) {
+            l.out.len = start;
+            ret whole(wrote.err);
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
 # the source files the object names
 fun sources(l: *Lister) err[Refusal] {
     var i: usize = 0;
@@ -589,6 +635,7 @@ fun spells_difference(l: *Lister, d: build.Difference) bool {
 
 # the declarations of label `id`: what makes it a symbol, and the value it is given in place of a place
 fun declare(l: *Lister, id: u32) err[Refusal] {
+    if (locates(l, id)) { ret err[Refusal].ok{}; }
     val lb:    build.Label         = build.Label{id: id};
     val shown: opt[build.Exposure] = build.exposure_of(l.b, lb);
     val value: opt[build.Value]    = build.value_of(l.b, lb);
@@ -957,13 +1004,35 @@ fun label_line(l: *Lister, id: u32, s: u32, at: u64) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
+# whether label `id` places a location, which is written as its `.loc` and is no label of the text
+fun locates(l: *Lister, id: u32) bool {
+    ret id::usize <= l.locs.len && l.locs.data[id::usize - 1] != 0;
+}
+
+# the location placed by label `id` written as its `.loc`
+fun loc_line(l: *Lister, k: u32, s: u32, at: u64) err[Refusal] {
+    val m:     *line.Mark = line.mark_at(l.lines, k::usize);
+    val start: usize      = l.out.len;
+    val wrote: err[str]   = line.put_loc(l.out, m.loc, ?l.spoken);
+    if (sel wrote.err) {
+        l.out.len = start;
+        ret refusal(wrote.err, s, at);
+    }
+    ret err[Refusal].ok{};
+}
+
 # the labels placed before statement `j` of section `s`, at `at`, but label `skip`, which the statement there binds
-# itself, operand.NO_SYMBOL for none
+# itself, operand.NO_SYMBOL for none, a label that places a location written as its `.loc`
 fun labels_at(l: *Lister, s: u32, j: u32, at: u64, skip: u32) err[Refusal] {
     for (l.pi < l.places.len && l.places.data[l.pi].section == s && l.places.data[l.pi].statement == j) {
         val id: u32 = l.places.data[l.pi].id;
         l.pi = l.pi + 1;
         if (id == skip) { cnt; }
+        if (locates(l, id)) {
+            val located: err[Refusal] = loc_line(l, l.locs.data[id::usize - 1] - 1, s, at);
+            if (sel located.err) { ret located; }
+            cnt;
+        }
         val wrote: err[Refusal] = label_line(l, id, s, at);
         if (sel wrote.err) { ret wrote; }
     }
@@ -1523,8 +1592,10 @@ fun run(l: *Lister) err[Refusal] {
     if (sel places.err) { ret places; }
     val used: err[Refusal] = count_uses(l);
     if (sel used.err) { ret used; }
-    val files: err[Refusal] = sources(l);
-    if (sel files.err) { ret files; }
+    val named: err[Refusal] = sources(l);
+    if (sel named.err) { ret named; }
+    val tabled: err[Refusal] = files(l);
+    if (sel tabled.err) { ret tabled; }
     var id: usize = 1;
     for (id <= build.label_count(l.b)) {
         val declared: err[Refusal] = declare(l, id::u32);
@@ -1552,7 +1623,7 @@ fun run(l: *Lister) err[Refusal] {
 pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[Refusal] {
     if (options.syntax >= b.set.syntaxes.len) { ret whole(NO_SYNTAX); }
     if (!build.handed_over(b))                { ret whole(UNFINISHED); }
-    if (build.records(b))                     { ret whole(RECORDS); }
+    if (build.records(b, options.lines::ptr)) { ret whole(RECORDS); }
     if (build.framed(b))                      { ret whole(FRAMES); }
     var l: Lister = Lister{
         a:       out.a,
@@ -1573,6 +1644,9 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
         byte:    nil,
         apart:   0,
         full:    false,
+        lines:   options.lines,
+        locs:    vector.init[u32](out.a),
+        spoken:  line.UNSPOKEN,
         stores:  core_syntax.stores(out.a),
     };
     l.symbols = core_syntax.Symbols{context: (?l)::ptr, resolve: resolved, name: named};
@@ -1591,6 +1665,7 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
     vector.dnit[Placed](?l.places);
     vector.dnit[u32](?l.uses);
     vector.dnit[Scope](?l.scopes);
+    vector.dnit[u32](?l.locs);
     core_syntax.release(?l.stores);
     if (sel done.err) { out.len = start; }
     ret done;

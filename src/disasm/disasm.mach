@@ -132,6 +132,7 @@ use mink.format.contract;
 use riscv_kinds: mink.format.elf.reloc.riscv.kinds;
 use mink.format.registry;
 use mink_group:   mink.model.group;
+use mink_line:    mink.model.line;
 use mink_object:  mink.model.object;
 use mink_reloc:   mink.model.reloc;
 use mink_section: mink.model.section;
@@ -166,6 +167,7 @@ use masc.core.stating;
 use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use masc.core.trait;
+use lines: masc.emit.line;
 use masc.format.dialect;
 use spell: masc.syntax.name;
 use masc.syntax.parse;
@@ -199,8 +201,9 @@ pub val MEMORY:    str = "out of memory";
 pub val REREAD:    str = "text that reads back to another module than the format builds from the object";
 # the facts no directive the assembler reads states, each refused for its reason (#181), the source dialect's directives
 # being those `masc.asm.core` reads:
-# - line tables: the assembler reads `.file` and `.loc` (`masc.asm.line`), but writing a line program back as them is
-#   not built, a fact outside #181's
+# - line tables the line directives do not state (`masc.asm.line`): a section's rows run from a sequence's first row to
+#   its section's end, one sequence per section, each row's `.loc` before the instruction it starts at, so a sequence
+#   of another extent, a row where no instruction starts and a row with an end column are refused
 # - link-order owners no name reads back to: a link-order section is stated by its `.section` order flag `o` and the
 #   name of the section it orders after (gas manual, ".section", elf version), which only a named section written
 #   before it that its name alone enters has. a comdat group is stated by its sections' `.section` group flag `G`,
@@ -218,7 +221,8 @@ pub val REREAD:    str = "text that reads back to another module than the format
 # the unique binding, comdat groups, symbol versions and marker relocations are no longer among them: `.type` with
 # `gnu_unique_object`, `.section` with `G`, `.symver` and `.reloc` state them (#353), and link-order sections are
 # stated by `.section` with `o` (#382)
-pub val LINES:          str = "the object states line tables, which disassembly does not write";
+pub val SEQUENCE:       str = "line sequence no .loc states: a second in its section, one with no row at its start, or one that ends before its section";
+pub val ROW:            str = "line row at a place no instruction starts at";
 pub val NOTES:          str = "the object states note records apart from any section, which no section the text writes holds";
 pub val ENTRIES:        str = "the object states index entries, which disassembly does not write";
 pub val LIBRARY:        str = "the object describes a shared library, which has no source";
@@ -497,6 +501,18 @@ rec Disasm {
     scratch:    [core_syntax.MAX_ANONYMOUS + 10]u8;
     steps:      [relax.MAX_STEPS]Step;
     stores:     core_syntax.Stores;
+    rows:       vector.Vector[Located];
+    xi:         usize;
+    spoken:     lines.Spoken;
+    pending:    bool;
+}
+
+# a line row at its place, `order` its place among the object's rows, which keeps rows at one offset in their order
+rec Located {
+    section: u32;
+    offset:  u64;
+    order:   usize;
+    loc:     lines.Location;
 }
 
 fun refusal(message: str, section: u32, offset: u64) err[Refusal] {
@@ -1905,6 +1921,104 @@ fun label_line(d: *Disasm, h: u32) {
     put(d, ":\n");
 }
 
+fun by_row(x: *Located, y: *Located) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.offset != y.offset) {
+        if (x.offset < y.offset) { ret -1; }
+        ret 1;
+    }
+    if (x.order < y.order) { ret -1; }
+    if (x.order > y.order) { ret 1; }
+    ret 0;
+}
+
+# the rows of sequence `i` taken, refused when it is a second of its section, has no row at its start or ends before
+# its section. `seen` marks the sections taken, and `n` counts the rows taken so far
+fun take_sequence(d: *Disasm, i: usize, seen: *vector.Vector[bool], n: *usize) err[Refusal] {
+    val q:    *mink_object.Sequence = ?d.o.sequences.items[i];
+    val sec:  u32                   = q.start.section.index;
+    val rows: usize                 = q.rows.count;
+    for (seen.len <= sec::usize) {
+        if (!held(vector.push[bool](seen, false))) { ret whole(MEMORY); }
+    }
+    if (seen.data[sec::usize] || rows == 0 || q.end != size_of(d, sec)) { ret refusal(SEQUENCE, sec, q.start.offset); }
+    if (q.rows.items[0].at != q.start.offset)                           { ret refusal(SEQUENCE, sec, q.start.offset); }
+    seen.data[sec::usize] = true;
+    if (!held(vector.reserve[Located](?d.rows, rows))) { ret whole(MEMORY); }
+    var k: usize = 0;
+    for (k < rows) {
+        val r: *mink_line.Row = ?q.rows.items[k];
+        vector.push[Located](?d.rows, Located{
+            section: sec,
+            offset:  r.at,
+            order:   @n,
+            loc:     lines.Location{file: r.file.index, line: r.line, column: r.column, end_column: r.end_column, flags: r.flags, isa: r.isa, discriminator: r.discriminator},
+        });
+        @n = @n + 1;
+        k  = k + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# every row of the object's line sequences in place order, refused for a sequence the line directives do not state
+fun line_rows(d: *Disasm) err[Refusal] {
+    var seen: vector.Vector[bool] = vector.init[bool](d.a);
+    var n:    usize               = 0;
+    var i:    usize               = 0;
+    for (i < d.o.sequences.count) {
+        val took: err[Refusal] = take_sequence(d, i, ?seen, ?n);
+        if (sel took.err) {
+            vector.dnit[bool](?seen);
+            ret took;
+        }
+        i = i + 1;
+    }
+    vector.dnit[bool](?seen);
+    sort.sort_by[Located](d.rows.data, d.rows.len, by_row);
+    ret err[Refusal].ok{};
+}
+
+# the object's file table as the `.file` lines of the line directives
+fun files(d: *Disasm) err[Refusal] {
+    var i: usize = 0;
+    for (i < d.o.files.count) {
+        val f:   *mink_line.File = ?d.o.files.items[i];
+        var dir: View            = View{data: "", len: 0};
+        if (sel f.directory.some) { dir = name_of(d, f.directory.some); }
+        val wrote: err[str] = lines.put_file(d.out, i::u32, lines.Source{directory: dir, name: name_of(d, f.name), md5: f.md5});
+        if (sel wrote.err) { ret whole(wrote.err); }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the rows of `section` at `at` written as their `.loc` lines, which the instruction at `at` must follow
+fun rows_at(d: *Disasm, section: u32, at: u64) err[Refusal] {
+    for (d.xi < d.rows.len && d.rows.data[d.xi].section == section && d.rows.data[d.xi].offset == at) {
+        val wrote: err[str] = lines.put_loc(d.out, d.rows.data[d.xi].loc, ?d.spoken);
+        if (sel wrote.err) { ret refusal(wrote.err, section, at); }
+        d.xi      = d.xi + 1;
+        d.pending = true;
+    }
+    if (d.xi < d.rows.len && d.rows.data[d.xi].section == section && d.rows.data[d.xi].offset < at) { ret refusal(ROW, section, d.rows.data[d.xi].offset); }
+    ret err[Refusal].ok{};
+}
+
+# the offset of the next row of `section`, `none` when it has no more before it
+fun next_row(d: *Disasm, section: u32, none: u64) u64 {
+    if (d.xi < d.rows.len && d.rows.data[d.xi].section == section && d.rows.data[d.xi].offset < none) { ret d.rows.data[d.xi].offset; }
+    ret none;
+}
+
+# what is written at `at` of `section` is no instruction, refused when a row written there awaits one
+fun unrowed(d: *Disasm, section: u32, at: u64) err[Refusal] {
+    if (d.pending) { ret refusal(ROW, section, at); }
+    ret err[Refusal].ok{};
+}
+
 # the offset of the next label of `section`, `none` when it has no more
 fun next_label(d: *Disasm, section: u32, none: u64) u64 {
     if (d.li < d.labels.len && d.labels.data[d.li].section == section && d.labels.data[d.li].offset < none) { ret d.labels.data[d.li].offset; }
@@ -2578,19 +2692,24 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
         var here: u32 = operand.NO_SYMBOL;
         if (code && sel sec.contents.held) { here = pair_label(d, i, at); }
         labels_at(d, i, at, here);
-        val limit: u64 = next_mark(d, i, next_label(d, i, size));
+        val located: err[Refusal] = rows_at(d, i, at);
+        if (sel located.err) { ret located; }
+        val limit: u64 = next_row(d, i, next_mark(d, i, next_label(d, i, size)));
         if (here != operand.NO_SYMBOL) {
             d.here = here;
             val bound: res[u64, Refusal] = scoped(d, PAIR, i, data, len, at, limit);
             if (sel bound.err) { ret err[Refusal].err{bound.err}; }
             if (bound.ok > 0) {
-                at = at + bound.ok;
+                d.pending = false;
+                at        = at + bound.ok;
                 cnt;
             }
             # no sequence binds it, so it is written where it is placed
             label_line(d, here);
         }
         if (sel sec.contents.zero) {
+            val zeroed: err[Refusal] = unrowed(d, i, at);
+            if (sel zeroed.err)                 { ret zeroed; }
             if (next_site(d, i, limit) < limit) { ret refusal(ZEROS, i, next_site(d, i, limit)); }
             put(d, "\t.zero ");
             put_unsigned(d, limit - at);
@@ -2603,6 +2722,8 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
             if (sel padded.err) { ret err[Refusal].err{padded.err}; }
             # a marker no alignment writes is a relocation the statement there leaves to `.reloc`
             if (padded.ok > 0) {
+                val aligned: err[Refusal] = unrowed(d, i, at);
+                if (sel aligned.err) { ret aligned; }
                 at = at + padded.ok;
                 cnt;
             }
@@ -2611,9 +2732,12 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
             val took: res[u64, Refusal] = scoped(d, STATEMENT, i, data, len, at, limit);
             if (sel took.err) { ret err[Refusal].err{took.err}; }
             if (took.ok > 0) {
-                at = at + took.ok;
+                d.pending = false;
+                at        = at + took.ok;
                 cnt;
             }
+            val raw_: err[Refusal] = unrowed(d, i, at);
+            if (sel raw_.err) { ret raw_; }
             var unit: u64 = d.s.parcel(data, len, at::usize)::u64;
             if (at + unit > limit) { unit = limit - at; }
             val next: u64 = next_site(d, i, limit);
@@ -2623,11 +2747,14 @@ fun section(d: *Disasm, i: u32) err[Refusal] {
             at = at + run.ok;
             cnt;
         }
+        val unrun: err[Refusal] = unrowed(d, i, at);
+        if (sel unrun.err) { ret unrun; }
         val run: res[u64, Refusal] = data_run(d, i, data, len, at, limit, limit);
         if (sel run.err) { ret err[Refusal].err{run.err}; }
         at = at + run.ok;
     }
     labels_at(d, i, size, operand.NO_SYMBOL);
+    if (d.xi < d.rows.len && d.rows.data[d.xi].section == i) { ret refusal(ROW, i, d.rows.data[d.xi].offset); }
     code = marked_at(d, i, size, code);
     leave(d);
     if (d.li < d.labels.len && d.labels.data[d.li].section == i) { ret refusal(PAST, i, d.labels.data[d.li].offset); }
@@ -2857,10 +2984,9 @@ fun borrowed_setting(o: *mink_object.Object, s: mink_trait.Setting) mink_trait.S
 
 # the facts of the object no text of its sections states, refused
 fun stated(o: *mink_object.Object) err[Refusal] {
-    if (o.sequences.count > 0 || o.files.count > 0) { ret whole(LINES); }
-    if (o.notes.count > 0)                          { ret whole(NOTES); }
-    if (o.entries.count > 0)                        { ret whole(ENTRIES); }
-    if (sel o.library.some)                         { ret whole(LIBRARY); }
+    if (o.notes.count > 0)   { ret whole(NOTES); }
+    if (o.entries.count > 0) { ret whole(ENTRIES); }
+    if (sel o.library.some)  { ret whole(LIBRARY); }
     ret err[Refusal].ok{};
 }
 
@@ -3420,6 +3546,7 @@ fun branch_targets(d: *Disasm) err[Refusal] {
 }
 
 fun released(d: *Disasm) {
+    vector.dnit[Located](?d.rows);
     vector.dnit[Label](?d.labels);
     vector.dnit[Site](?d.sites);
     vector.dnit[Label](?d.anchors);
@@ -3463,12 +3590,16 @@ fun written(d: *Disasm) err[Refusal] {
     # the scopes the code marks name are made since, so the scope in force is taken from where they now are
     d.v     = d.scopes.data[0].v;
     d.fills = ?d.scopes.data[0].fills;
+    val rowed: err[Refusal] = line_rows(d);
+    if (sel rowed.err) { ret rowed; }
     var i: u32 = 0;
     for (i < d.count) {
         val declared: err[Refusal] = declare(d, i);
         if (sel declared.err) { ret declared; }
         i = i + 1;
     }
+    val filed: err[Refusal] = files(d);
+    if (sel filed.err) { ret filed; }
     i = 0;
     for (i < d.o.sections.count::u32) {
         var done: err[Refusal] = err[Refusal].ok{};
@@ -3609,6 +3740,10 @@ fun sectioned(a: *A.Allocator, s: *set.Set, v: *state.Context, options: Options,
         forms:      options.spelling == FORMS,
         names:      0,
         stores:     core_syntax.stores(a),
+        rows:       vector.init[Located](a),
+        xi:         0,
+        spoken:     lines.UNSPOKEN,
+        pending:    false,
     };
     var k: u32 = 0;
     for (k < relax.MAX_STEPS) {
