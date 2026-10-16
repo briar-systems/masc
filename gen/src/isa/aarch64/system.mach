@@ -1,0 +1,385 @@
+# the reader of Arm's system register model, AARCHMRS Registers.json
+#
+# a register of the A64 state names the encodings an MRS reads it by and an MSR writes it by, each an accessor of
+# its own, A64.MRS and A64.MSRregister: the five fields op0, op1, CRn, CRm and op2 and the name the encoding is
+# written by. a register array states one accessor for every index of its index variable, its fields and its name
+# stating the index as a slice of it or a group of literal bits and slices. the reader keeps every named encoding
+# with the storage it accesses, the register or the element of an array, so the accessors of one register share it.
+# the model also states the implementation defined space as a register named by the generic spelling
+# S3_<op1>_C<Cn>_C<Cm>_<op2>, which names no one encoding, and the reader leaves it to the syntax's register hook
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.format;
+
+use json.lib.json;
+
+use gen.diag;
+use gen.document;
+use gen.source;
+
+pub val REGISTERS: str = "Registers.json";
+
+pub val BAD_ACCESSOR: str = "system register accessor is malformed";
+pub val BAD_FIELD:    str = "system register encoding field is not its width of bits, a slice of the index or a group of them";
+pub val BAD_INDEX:    str = "system register array index is outside 0 to 63";
+
+# the most elements a register array states, so an element's storage is found by its index
+pub val MOST_ELEMENTS: u32 = 64;
+
+# the storage of an element no encoding names
+val NO_STORAGE: u32 = 0xFFFF_FFFF;
+
+# the fields of an encoding from its highest, and the bits of each
+val FIELDS: [5]str = [5]str{"op0", "op1", "CRn", "CRm", "op2"};
+val WIDTHS: [5]u8  = [5]u8{2, 3, 4, 4, 3};
+
+# one name of an encoding
+# ---
+# name:    the name, in lower case, as the syntax folds
+# number:  op0:op1:CRn:CRm:op2, sixteen bits
+# storage: the register or array element it accesses, by the order the model first states each
+# read:    whether it is an MRS accessor's name, false for an MSR one's
+# own:     whether it is the name of the register it accesses, as SCTLR_EL1's, where SCTLR_EL12 names SCTLR_EL1 from EL2
+#          and SCTLR_EL2's accessors name SCTLR_EL1 for the redirection its E2H makes
+pub rec Accessor {
+    name:    str;
+    number:  u32;
+    storage: u32;
+    read:    bool;
+    own:     bool;
+}
+
+# every named encoding, and how many registers and elements they access
+pub rec Model {
+    accessors: vector.Vector[Accessor];
+    storages:  u32;
+}
+
+rec Reader {
+    alloc:   *A.Allocator;
+    doc:     *document.Document;
+    failed:  bool;
+    failure: diag.Refusal;
+}
+
+fun fail(r: *Reader, message: str, subject: str) {
+    if (r.failed) { ret; }
+    r.failed  = true;
+    r.failure = diag.refusal(r.doc.file.path, 0, message, subject);
+}
+
+# member `key` of `v`, nil when absent
+fun at(v: *json.Value, key: str) *json.Value {
+    if (v == nil || v.kind != json.OBJECT) { ret nil; }
+    val m: opt[*json.Value] = json.value_find(v, key);
+    if (sel m.none) { ret nil; }
+    ret m.some;
+}
+
+# whether string member `key` of `v` is `text`
+fun is(v: *json.Value, key: str, text: str) bool {
+    val got: *json.Value = at(v, key);
+    if (got == nil || got.kind != json.STRING) { ret false; }
+    var i: usize = 0;
+    for (i < got.str_len) {
+        if (text[i] == 0 || text[i] != got.str_val[i]) { ret false; }
+        i = i + 1;
+    }
+    ret text[i] == 0;
+}
+
+# the decoded string member `key` of `v`, nil when it is not one
+fun text(r: *Reader, v: *json.Value, key: str) str {
+    val m: *json.Value = at(v, key);
+    if (m == nil || m.kind != json.STRING) { ret nil; }
+    val got: res[str, diag.Refusal] = document.text(r.alloc, r.doc, m, key);
+    if (sel got.err) {
+        fail(r, got.err.message, key);
+        ret nil;
+    }
+    ret got.ok;
+}
+
+# the literal bits of `s` from `at`, its quote passed, onto `bits`, or -1 when they are not bits closed by a quote
+fun literal(s: str, at: usize, bits: *u32, width: *u8) i64 {
+    var i: usize = at;
+    for (s[i] == '0' || s[i] == '1') {
+        @bits  = (@bits << 1) | (s[i] - '0')::u32;
+        @width = @width + 1;
+        i      = i + 1;
+    }
+    if (s[i] != '\'') { ret -1; }
+    ret (i + 1)::i64;
+}
+
+# the decimal digits of `s` at `at`, -1 when there are none
+fun digits(s: str, at: usize, n: *u32) i64 {
+    var i: usize = at;
+    @n = 0;
+    for (s[i] >= '0' && s[i] <= '9' && @n < 1000) {
+        @n = @n * 10 + (s[i] - '0')::u32;
+        i  = i + 1;
+    }
+    if (i == at) { ret -1; }
+    ret i::i64;
+}
+
+# a group's text, as `'011':p[3]` or `p[4:3]`, with `index` for its variable `named`, as bits, or -1 when it is not one
+fun group(s: str, named: str, index: u32, width: *u8) i64 {
+    val vl:   usize = str_len(named);
+    var bits: u32   = 0;
+    var i:    usize = 0;
+    @width = 0;
+    for (s[i] != 0) {
+        if (s[i] == '\'') {
+            val end: i64 = literal(s, i + 1, ?bits, width);
+            if (end < 0) { ret -1; }
+            i = end::usize;
+        }
+        or {
+            var k: usize = 0;
+            for (k < vl) {
+                if (s[i + k] != named[k]) { ret -1; }
+                k = k + 1;
+            }
+            if (s[i + vl] != '[') { ret -1; }
+            var hi:  u32 = 0;
+            var end: i64 = digits(s, i + vl + 1, ?hi);
+            if (end < 0) { ret -1; }
+            var lo: u32 = hi;
+            if (s[end::usize] == ':') {
+                end = digits(s, end::usize + 1, ?lo);
+                if (end < 0) { ret -1; }
+            }
+            if (s[end::usize] != ']' || lo > hi || hi >= 32) { ret -1; }
+            val w: u32 = hi - lo + 1;
+            bits   = (bits << w) | ((index >> lo) & ((1::u32 << w) - 1));
+            @width = @width + w::u8;
+            i      = end::usize + 1;
+        }
+        if (s[i] == ':') { i = i + 1; }
+        or (s[i] != 0)   { ret -1; }
+    }
+    ret bits::i64;
+}
+
+# field `v` of an encoding of `width` bits, the index variable `named` holding `index`, -1 when it is malformed
+fun field(r: *Reader, v: *json.Value, named: str, index: u32, width: u8) i64 {
+    val raw: str = text(r, v, "value");
+    if (raw == nil) { ret -1; }
+    if (is(v, "_type", "Values.Value")) {
+        var bits: u32 = 0;
+        var w:    u8  = 0;
+        if (raw[0] != '\'' || literal(raw, 1, ?bits, ?w) != str_len(raw)::i64 || w != width) { ret -1; }
+        ret bits::i64;
+    }
+    if (named == nil) { ret -1; }
+    if (is(v, "_type", "Values.Group")) {
+        var w:    u8  = 0;
+        val bits: i64 = group(raw, named, index, ?w);
+        if (bits < 0 || w != width) { ret -1; }
+        ret bits;
+    }
+    if (is(v, "_type", "Values.EquationValue")) {
+        val slices: *json.Value = at(v, "slice");
+        if (slices == nil || slices.kind != json.ARRAY || slices.count != 1) { ret -1; }
+        val start: *json.Value = at(document.item(slices, 0), "start");
+        val wide:  *json.Value = at(document.item(slices, 0), "width");
+        if (start == nil || wide == nil || start.kind != json.NUMBER || wide.kind != json.NUMBER) { ret -1; }
+        val lo: i64 = json.value_number(start);
+        if (json.value_number(wide) != width::i64 || lo < 0 || lo >= 32 || !str_equals(raw, named)) { ret -1; }
+        ret ((index >> lo::u32) & ((1::u32 << width::u32) - 1))::i64;
+    }
+    ret -1;
+}
+
+# `name` in lower case with `<named>`, its variable's name between angle brackets, replaced by the decimal digits of `index`, nil when it names no one encoding
+fun spelled(r: *Reader, name: str, named: str, index: u32) str {
+    val len: usize = str_len(name);
+    var at:  usize = 0;
+    for (at < len && name[at] != '<') {
+        at = at + 1;
+    }
+    var whole: str = name;
+    if (at < len) {
+        if (named == nil) { ret nil; }
+        val vl: usize = str_len(named);
+        var k:  usize = 0;
+        for (k < vl) {
+            if (name[at + 1 + k] != named[k]) { ret nil; }
+            k = k + 1;
+        }
+        if (name[at + 1 + vl] != '>') { ret nil; }
+        var number: [12]u8;
+        val n:      usize = format.put_i64(?number[0], index::i64);
+        number[n] = 0;
+        val head: res[str, StrError] = str_copy_slice(r.alloc, name, 0, at);
+        if (sel head.err) {
+            fail(r, diag.MEMORY, name);
+            ret nil;
+        }
+        val joined: res[str, StrError] = str_join(r.alloc, head.ok, ?number[0], ?name[at + vl + 2]);
+        if (sel joined.err) {
+            fail(r, diag.MEMORY, name);
+            ret nil;
+        }
+        whole = joined.ok;
+        var rest: usize = 0;
+        for (whole[rest] != 0) {
+            if (whole[rest] == '<') { ret nil; }
+            rest = rest + 1;
+        }
+    }
+    val low: res[str, StrError] = str_copy_slice(r.alloc, whole, 0, str_len(whole));
+    if (sel low.err) {
+        fail(r, diag.MEMORY, name);
+        ret nil;
+    }
+    var i: usize = 0;
+    for (low.ok[i] != 0) {
+        if (low.ok[i] >= 'A' && low.ok[i] <= 'Z') { low.ok[i] = low.ok[i] + ('a' - 'A'); }
+        i = i + 1;
+    }
+    ret low.ok;
+}
+
+# the encodings accessor `a` of a register states, the array's index `index` held by the variable `named`, appended to
+# `m`, each accessing the storage `storage` holds for the element, given one when it names its first encoding
+fun encodings(r: *Reader, m: *Model, a: *json.Value, named: str, index: u32, storage: *u32, own: str) {
+    val list: *json.Value = at(a, "encoding");
+    if (list == nil || list.kind != json.ARRAY) {
+        fail(r, BAD_ACCESSOR, "encoding");
+        ret;
+    }
+    var i: usize = 0;
+    for (i < list.count && !r.failed) {
+        val e:     *json.Value = document.item(list, i);
+        val asm:   str         = text(r, e, "asmvalue");
+        val parts: *json.Value = at(e, "encodings");
+        if (asm == nil || parts == nil) {
+            fail(r, BAD_ACCESSOR, "asmvalue");
+            ret;
+        }
+        val name: str = spelled(r, asm, named, index);
+        if (name != nil) {
+            var number: u32 = 0;
+            var k:      u32 = 0;
+            for (k < 5) {
+                val f: *json.Value = at(parts, FIELDS[k]);
+                if (f == nil) {
+                    fail(r, BAD_FIELD, asm);
+                    ret;
+                }
+                val bits: i64 = field(r, f, named, index, WIDTHS[k]);
+                if (bits < 0) {
+                    fail(r, BAD_FIELD, asm);
+                    ret;
+                }
+                number = (number << WIDTHS[k]::u32) | bits::u32;
+                k      = k + 1;
+            }
+            if (@storage == NO_STORAGE) {
+                @storage   = m.storages;
+                m.storages = m.storages + 1;
+            }
+            val pushed: res[usize, A.Error] = vector.push[Accessor](?m.accessors, Accessor{name: name, number: number, storage: @storage, read: is(a, "name", "A64.MRS"), own: own != nil && str_equals(own, name)});
+            if (sel pushed.err) { fail(r, diag.MEMORY, asm); }
+        }
+        i = i + 1;
+    }
+}
+
+# the indexes of an array accessor `a` into `out`, false when they are not ranges within the most elements
+fun indexes(a: *json.Value, out: *vector.Vector[u32]) bool {
+    out.len = 0;
+    val list: *json.Value = at(a, "indexes");
+    if (list == nil || list.kind != json.ARRAY) { ret false; }
+    var i: usize = 0;
+    for (i < list.count) {
+        val start: *json.Value = at(document.item(list, i), "start");
+        val width: *json.Value = at(document.item(list, i), "width");
+        if (start == nil || width == nil || start.kind != json.NUMBER || width.kind != json.NUMBER) { ret false; }
+        val lo: i64 = json.value_number(start);
+        val n:  i64 = json.value_number(width);
+        if (lo < 0 || n < 0 || lo + n > MOST_ELEMENTS::i64) { ret false; }
+        var k: i64 = lo;
+        for (k < lo + n) {
+            val pushed: res[usize, A.Error] = vector.push[u32](out, k::u32);
+            if (sel pushed.err) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the model of Registers.json
+# ---
+# a:   allocator for the model, which outlives every reader of it
+# f:   the Registers.json file
+# ret: every MRS and MSR name of an encoding of an A64 register, or the refusal of the file
+pub fun read(a: *A.Allocator, f: *source.File) res[Model, diag.Refusal] {
+    val parsed: res[document.Document, diag.Refusal] = document.read(a, f);
+    if (sel parsed.err) { ret res[Model, diag.Refusal].err{parsed.err}; }
+    var doc: document.Document = parsed.ok;
+    var r:   Reader            = Reader{alloc: a, doc: ?doc, failed: false, failure: diag.refusal(nil, 0, nil, nil)};
+    var m:   Model             = Model{accessors: vector.init[Accessor](a), storages: 0};
+    if (doc.root.kind != json.ARRAY) { ret res[Model, diag.Refusal].err{diag.refusal(f.path, 0, document.NOT_ARRAY, REGISTERS)}; }
+    var elements: vector.Vector[u32] = vector.init[u32](a);
+    # the storage of each element of the register being read, NO_STORAGE for one no encoding names yet
+    var storage: [64]u32;
+    var i:       usize = 0;
+    for (i < doc.root.count && !r.failed) {
+        val x:         *json.Value = document.item(?doc.root, i);
+        val accessors: *json.Value = at(x, "accessors");
+        val title:     str         = text(?r, x, "name");
+        if (is(x, "state", "AArch64") && accessors != nil && accessors.kind == json.ARRAY && title != nil) {
+            var e: u32 = 0;
+            for (e < MOST_ELEMENTS) {
+                storage[e] = NO_STORAGE;
+                e          = e + 1;
+            }
+            var k: usize = 0;
+            for (k < accessors.count && !r.failed) {
+                val acc: *json.Value = document.item(accessors, k);
+                if (is(acc, "name", "A64.MRS") || is(acc, "name", "A64.MSRregister")) {
+                    var named: str = nil;
+                    if (is(acc, "_type", "Accessors.SystemAccessorArray")) {
+                        named = text(?r, acc, "index_variable");
+                        if (named == nil || !indexes(acc, ?elements)) { fail(?r, BAD_INDEX, named); }
+                    }
+                    or {
+                        elements.len = 0;
+                        val pushed: res[usize, A.Error] = vector.push[u32](?elements, 0);
+                        if (sel pushed.err) { fail(?r, diag.MEMORY, nil); }
+                    }
+                    var j: usize = 0;
+                    for (j < elements.len && !r.failed) {
+                        val n:   u32 = elements.data[j];
+                        val own: str = spelled(?r, title, text(?r, x, "index_variable"), n);
+                        encodings(?r, ?m, acc, named, n, ?storage[n], own);
+                        j = j + 1;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (r.failed) { ret res[Model, diag.Refusal].err{r.failure}; }
+    ret res[Model, diag.Refusal].ok{m};
+}
