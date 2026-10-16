@@ -63,6 +63,8 @@ use wasm_text:      masc.isa.wasm.text;
 use masc.isa.wasm.gen_row;
 
 #[testing]
+use masc.core.ct;
+#[testing]
 use masc.core.extension;
 #[testing]
 use masc.core.mode;
@@ -1705,20 +1707,106 @@ test print__memarg_defaults_are_omitted {
     ret 0;
 }
 
-# a wasm function walked for constant time answers unread today, never unguaranteed, as the walk does not follow its
-# operand stack (masc#348)
-test walk__a_wasm_function_answers_unread {
+# local `index` of the function being read, as a seed of the constant-time walk
+#[testing]
+fun t_local(index: u32) ct_walk.Seed {
+    ret ct_walk.Seed.entry{ct_walk.Entry{space: wasm_kind.LOCALS, index: index}};
+}
+
+# the first function of module `text`, which imports none, walked for constant time from its first param a secret,
+# its instructions past its locals' declaration, the stream entered into it and its locals defined
+#[testing]
+fun t_walk(text: str) ct_walk.Verdict {
     var t: T;
-    if (!t_make(?t)) { ret 1; }
+    if (!t_make(?t)) { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "context", offset: 0}}; }
     var m: mink_model.Module;
-    if (!t_reads(?t, T_GA4, ?m)) { ret 2; }
-    val body:    store.Bytes                   = t_code(?m, 0);
-    var code:    ct_walk.Code                  = ct_walk.Code{set: ?wasm_set.SET, data: ?body.data[3], len: body.len - 3};
-    var secrets: ct_walk.Secrets               = ct_walk.Secrets{at: nil, len: 0};
+    if (!t_reads(?t, text, ?m)) { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "text", offset: 0}}; }
+    val body:    store.Bytes                       = t_code(?m, 0);
+    val type:    u64                               = table.at[mink_model.Leb](?m.functions, table.nth[mink_model.Leb](0)).value;
+    val entered: err[str]                          = wasm_stream.enter(t.ctx.stream, type::u32);
+    val runs:    res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(body.data, body.len, 0, 32, field.NO_OPERAND);
+    if (sel entered.err) { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "type", offset: 0}}; }
+    if (sel runs.err)    { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "locals", offset: 0}}; }
+    var at: usize = runs.ok.len;
+    var r:  u64   = 0;
+    for (r < runs.ok.value) {
+        val n: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(body.data, body.len, at, 32, field.NO_OPERAND);
+        if (sel n.err) { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "locals", offset: 0}}; }
+        var k: u64 = 0;
+        for (k < n.ok.value) {
+            val defined: res[u32, str] = wasm_stream.define(t.ctx.stream, wasm_kind.LOCALS, body.data[at + n.ok.len]::u32, View{data: nil, len: 0});
+            k = k + 1;
+        }
+        at = at + n.ok.len + 1;
+        r  = r + 1;
+    }
+    var seeds:   [1]ct_walk.Seed               = [1]ct_walk.Seed{t_local(0)};
+    var code:    ct_walk.Code                  = ct_walk.Code{set: ?wasm_set.SET, data: ?body.data[at], len: body.len - at};
+    var secrets: ct_walk.Secrets               = ct_walk.Secrets{at: ?seeds[0], len: 1};
     val got:     res[ct_walk.Verdict, A.Error] = ct_walk.check(testing.allocator_of(?t.t), ?code, ?t.ctx, ?secrets);
-    if (sel got.err)                              { ret 3; }
-    if (!sel got.ok.unread)                       { ret 4; }
-    if (got.ok.unread.message != ct_walk.STACKED) { ret 5; }
     t_drop(?t, ?m);
+    if (sel got.err) { ret ct_walk.Verdict.unread{ct_walk.Unread{message: "storage", offset: 0}}; }
+    ret got.ok;
+}
+
+# whether `v` refuses the instruction at `offset` for `reason`
+#[testing]
+fun t_refuses(v: ct_walk.Verdict, offset: u64, reason: ct.Reason) bool {
+    if (!sel v.refused) {
+        if (sel v.unread) { print.eprintlnf("unread at {}: {}", v.unread.offset, v.unread.message); }
+        ret false;
+    }
+    ret v.refused.offset == offset && v.refused.refusal.reason == reason;
+}
+
+# br_if at 4 and if at 2 on the secret param, br_table at 4 indexed by it and call_indirect at 4 calling the table
+# entry it indexes are each refused as a control transfer a secret decides
+test walk__a_secret_branch_condition_table_index_or_callee_index_is_refused {
+    if (!t_refuses(t_walk("(module (func (param i32) (block (br_if 0 (local.get 0)))))"), 4, ct.CONTROL))      { ret 1; }
+    if (!t_refuses(t_walk("(module (func (param i32) (if (local.get 0) (then nop))))"), 2, ct.CONTROL))        { ret 2; }
+    if (!t_refuses(t_walk("(module (func (param i32) (block (br_table 0 0 (local.get 0)))))"), 4, ct.CONTROL)) { ret 3; }
+    val called: str = "(module (type $t (func (param i32) (result i32))) (table 1 funcref) (func (param i32) (drop (call_indirect (type $t) (i32.const 1) (local.get 0)))))";
+    if (!t_refuses(t_walk(called), 4, ct.CONTROL)) { ret 4; }
+    ret 0;
+}
+
+# i32.load at 2 of the address the secret param holds is refused as a memory access a secret forms
+test walk__a_load_from_a_secret_address_is_refused {
+    if (!t_refuses(t_walk("(module (memory 1) (func (param i32) (result i32) (i32.load (local.get 0))))"), 2, ct.MEMORY)) { ret 1; }
+    ret 0;
+}
+
+# a loop over a public count that folds the secret param into a local and stores it at public addresses branches on
+# no secret and forms no address from one, so it is answered unguaranteed, as wasm's timing is
+#[testing]
+val T_CLEAN: str = "(module (memory 1) (func (param $k i32) (param $n i32) (result i32) (local $i i32) (local $acc i32) (block $done (loop $next (br_if $done (i32.ge_u (local.get $i) (local.get $n))) (local.set $acc (i32.xor (local.get $acc) (local.get $k))) (i32.store (local.get $i) (local.get $acc)) (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $next))) (local.get $acc)))";
+
+test walk__a_function_clear_of_secret_control_and_addresses_is_unguaranteed {
+    val v: ct_walk.Verdict = t_walk(T_CLEAN);
+    if (!sel v.unguaranteed) {
+        if (sel v.refused) { print.eprintlnf("refused at {}", v.refused.offset); }
+        if (sel v.unread)  { print.eprintlnf("unread at {}: {}", v.unread.offset, v.unread.message); }
+        ret 1;
+    }
+    ret 0;
+}
+
+# a local the loop's body sets from the secret param reaches the br_if heading it, at 6, on the loop's second pass,
+# and of two values a block leaves through a branch carrying both, the one dropped decides nothing while the one left
+# decides the br_if at 10
+#[testing]
+val T_LOOPED: str = "(module (func (param $k i32) (param $c i32) (block $done (loop $next (br_if $done (local.get $c)) (local.set $c (local.get $k)) (br $next)))))";
+
+#[testing]
+val T_LEFT: str = "(module (type $two (func (result i32 i32))) (func (param $k i32) (param $p i32) (block (type $two) (br 0 (local.get $k) (local.get $p))) drop br_if 0))";
+
+#[testing]
+val T_DROPPED: str = "(module (type $two (func (result i32 i32))) (func (param $k i32) (param $p i32) (block (type $two) (br 0 (local.get $p) (local.get $k))) drop br_if 0))";
+
+test walk__secrecy_follows_the_stack_and_locals_through_loops_blocks_and_multiple_results {
+    if (!t_refuses(t_walk(T_LOOPED), 6, ct.CONTROL)) { ret 1; }
+    if (!t_refuses(t_walk(T_LEFT), 10, ct.CONTROL))  { ret 2; }
+    val dropped: ct_walk.Verdict = t_walk(T_DROPPED);
+    if (!sel dropped.unguaranteed) { ret 3; }
     ret 0;
 }
