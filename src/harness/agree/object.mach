@@ -2,23 +2,39 @@
 #
 # every vector of a source file is in its own section, `.text.<n>` for the
 # vector n, so the bytes each tool gave a vector are that section's whole
-# contents, whatever lengths the tools chose.
+# contents, whatever lengths the tools chose, and its relocations those that
+# patch the section. a relocation is compared by its offset, its kind and
+# what it names: a symbol another object resolves by its name and addend, a
+# place the object defines locally by its offset with the addend folded in,
+# as `.+8` in the section itself, which the tools name by labels of their
+# own or the section, and nothing for a marker.
 
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_compare;
 use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
 use std.collections.vector;
 
-use mink;
+use mink.base.fail;
+use mink.base.intern;
+use mink.base.store;
+use mink.base.table;
+use mink.format.contract;
+use mink.format.registry;
+use mink.model.object;
+use mink.model.symbol;
 
 use masc.core.operand;
+use masc.tool.text;
 
 # the prefix of the section every vector is written in, its number after it
 pub val PREFIX: str = ".text.";
@@ -27,9 +43,83 @@ pub val PREFIX: str = ".text.";
 # ---
 # vector: the vector's number in its source file
 # bytes:  the section's contents, owned by the run
+# relocs: its relocations as `relocations` spells them, empty for none, owned by the run
 pub rec Placed {
     vector: u32;
     bytes:  operand.Bytes;
+    relocs: str;
+}
+
+# the relocations of `o` that patch section `s`, in order of offset and then kind, each as its offset, its kind's name
+# and what it names, `; ` between two, copied into `a`, none when it refuses
+pub fun relocations(a: *A.Allocator, o: *object.Object, s: u32) opt[str] {
+    var picked: vector.Vector[usize] = vector.init[usize](a);
+    var i:      usize                = 0;
+    for (i < o.relocs.count) {
+        if (o.relocs.items[i].section.index == s) {
+            val pushed: res[usize, A.Error] = vector.push[usize](?picked, i);
+            if (sel pushed.err) { ret opt[str].none{}; }
+        }
+        i = i + 1;
+    }
+    # an insertion sort, as a section of one vector holds a handful
+    var j: usize = 1;
+    for (j < picked.len) {
+        var k: usize = j;
+        for (k > 0 && after(o, picked.data[k - 1], picked.data[k])) {
+            val held: usize = picked.data[k - 1];
+            picked.data[k - 1] = picked.data[k];
+            picked.data[k]     = held;
+            k                  = k - 1;
+        }
+        j = j + 1;
+    }
+    var t: text.Text = text.make(a);
+    j = 0;
+    for (j < picked.len) {
+        val r: *object.Reloc = ?o.relocs.items[picked.data[j]];
+        if (j > 0) { text.put(?t, "; "); }
+        text.decimal(?t, r.offset:~i64);
+        text.byte(?t, ' ');
+        text.put(?t, r.kind.name);
+        if (sel r.target.symbol) {
+            val sym: *object.Symbol = object.symbol_at(o, r.target.symbol);
+            text.byte(?t, ' ');
+            var local: bool = false;
+            if (sel sym.def.placed) {
+                if (sym.binding == ?symbol.LOCAL) {
+                    val p:    object.Place               = sym.def.placed;
+                    val at:   u32                        = p.section.index;
+                    val name: opt[table.Id[intern.Name]] = o.sections.items[at].name;
+                    if (at == s)       { text.byte(?t, '.'); }
+                    or (sel name.some) { text.view(?t, object.name_of(o, name.some)); }
+                    signed(?t, p.offset:~i64 + r.addend);
+                    local = true;
+                }
+            }
+            if (!local) {
+                text.view(?t, object.name_of(o, sym.name));
+                if (r.addend != 0) { signed(?t, r.addend); }
+            }
+        }
+        j = j + 1;
+    }
+    vector.dnit[usize](?picked);
+    ret text.copy(?t, a);
+}
+
+# whether relocation `x` of `o` sorts after relocation `y`: by offset, then by kind name
+fun after(o: *object.Object, x: usize, y: usize) bool {
+    val p: *object.Reloc = ?o.relocs.items[x];
+    val q: *object.Reloc = ?o.relocs.items[y];
+    if (p.offset != q.offset) { ret p.offset > q.offset; }
+    ret str_compare(p.kind.name, q.kind.name) > 0;
+}
+
+# `n` with its sign, as `+8` or `-4`
+fun signed(t: *text.Text, n: i64) {
+    if (n >= 0) { text.byte(t, '+'); }
+    text.decimal(t, n);
 }
 
 # `len` bytes at `p` copied into storage of `a`, none when it refuses
@@ -63,58 +153,76 @@ pub fun numbered(name: *u8, len: usize) opt[u32] {
     ret opt[u32].some{v};
 }
 
+# why mink cannot read an object, its failure's text and subject copied into `a`
+fun unread(a: *A.Allocator, f: fail.Fail) str {
+    var t: text.Text = text.make(a);
+    text.put(?t, "mink cannot read the object: ");
+    if (f.text != nil) { text.put(?t, f.text); }
+    if (f.subject != nil) {
+        text.put(?t, ", ");
+        text.put(?t, f.subject);
+    }
+    val kept: opt[str] = text.copy(?t, a);
+    if (sel kept.none) { ret "mink cannot read the object"; }
+    ret kept.some;
+}
+
 # the vectors' sections of the elf file at `path`, read through `formats` into mink's neutral object, appended to
 # `out` with their bytes copied into `a`
 # ---
 # scratch: the allocator of the file and its object, given back by the caller once this returns
 # ret:     ok, or why the file cannot be read
-pub fun elf_sections(formats: *mink.registry.Registry, a: *A.Allocator, scratch: *A.Allocator, path: str, out: *vector.Vector[Placed]) err[str] {
-    val loaded: res[mink.registry.Loaded, mink.fail.Fail] = mink.registry.load(formats, scratch, path);
-    if (sel loaded.err) { ret err[str].err{"mink cannot read the object"}; }
-    var l:         mink.registry.Loaded = loaded.ok;
-    var o:         mink.object.Object   = mink.object.make(scratch, nil);
-    val converted: err[mink.fail.Fail]  = mink.contract.to_neutral(?l.model, ?o);
-    var why:       str                  = nil;
-    if (sel converted.err) { why = "mink cannot read the object"; }
+pub fun elf_sections(formats: *registry.Registry, a: *A.Allocator, scratch: *A.Allocator, path: str, out: *vector.Vector[Placed]) err[str] {
+    val loaded: res[registry.Loaded, fail.Fail] = registry.load(formats, scratch, path);
+    if (sel loaded.err) { ret err[str].err{unread(a, loaded.err)}; }
+    var l:         registry.Loaded = loaded.ok;
+    var o:         object.Object   = object.make(scratch, nil);
+    val converted: err[fail.Fail]  = contract.to_neutral(?l.model, ?formats.relocs, ?o);
+    var why:       str             = nil;
+    if (sel converted.err) { why = unread(a, converted.err); }
     var i: usize = 0;
     for (why == nil && i < o.sections.count) {
-        val s:     *mink.object.Section                 = ?o.sections.items[i];
-        val named: opt[mink.table.Id[mink.intern.Name]] = s.name;
-        var n:     opt[u32]                             = opt[u32].none{};
+        val s:     *object.Section            = ?o.sections.items[i];
+        val named: opt[table.Id[intern.Name]] = s.name;
+        var n:     opt[u32]                   = opt[u32].none{};
         if (sel named.some) {
-            val name: View = mink.object.name_of(?o, named.some);
+            val name: View = object.name_of(?o, named.some);
             n = numbered(name.data, name.len);
         }
         if (sel n.some) {
-            val held:  mink.store.Bytes   = mink.object.bytes(?o, ?s.contents);
-            val owned: opt[operand.Bytes] = own(a, held.data, held.len);
-            if (sel owned.none) { why = "out of memory"; }
+            val held:   store.Bytes        = object.bytes(?o, ?s.contents);
+            val owned:  opt[operand.Bytes] = own(a, held.data, held.len);
+            val relocs: opt[str]           = relocations(a, ?o, i::u32);
+            why = "out of memory";
             if (sel owned.some) {
-                val pushed: res[usize, A.Error] = vector.push[Placed](out, Placed{vector: n.some, bytes: owned.some});
-                if (sel pushed.err) { why = "out of memory"; }
+                if (sel relocs.some) {
+                    val pushed: res[usize, A.Error] = vector.push[Placed](out, Placed{vector: n.some, bytes: owned.some, relocs: relocs.some});
+                    if (sel pushed.ok) { why = nil; }
+                }
             }
         }
         i = i + 1;
     }
-    val released: err[mink.fail.Fail] = mink.object.release(?o);
-    val unloaded: err[mink.fail.Fail] = mink.registry.unload(?l);
+    val released: err[fail.Fail] = object.release(?o);
+    val unloaded: err[fail.Fail] = registry.unload(?l);
     if (why != nil) { ret err[str].err{why}; }
     ret err[str].ok{};
 }
 
-# the contents of the section of `o` named `name`, copied into `a`. a nameless section is named nothing
+# the contents and relocations of the section of `o` named `name`, copied into `a`, as vector 0. a nameless section is
+# named nothing
 # ---
-# ret: the bytes, or why there are none
-pub fun section_bytes(a: *A.Allocator, o: *mink.object.Object, name: str) res[operand.Bytes, str] {
+# ret: the section, or why there is none
+pub fun section_of(a: *A.Allocator, o: *object.Object, name: str) res[Placed, str] {
     val want: usize = str_len(name);
     var i:    usize = 0;
     for (i < o.sections.count) {
-        val named: opt[mink.table.Id[mink.intern.Name]] = o.sections.items[i].name;
+        val named: opt[table.Id[intern.Name]] = o.sections.items[i].name;
         if (sel named.none) {
             i = i + 1;
             cnt;
         }
-        val n:    View  = mink.object.name_of(o, named.some);
+        val n:    View  = object.name_of(o, named.some);
         var same: bool  = n.len == want;
         var k:    usize = 0;
         for (same && k < want) {
@@ -122,12 +230,15 @@ pub fun section_bytes(a: *A.Allocator, o: *mink.object.Object, name: str) res[op
             k    = k + 1;
         }
         if (same) {
-            val got:   mink.store.Bytes   = mink.object.bytes(o, ?o.sections.items[i].contents);
-            val owned: opt[operand.Bytes] = own(a, got.data, got.len);
-            if (sel owned.none) { ret res[operand.Bytes, str].err{"out of memory"}; }
-            ret res[operand.Bytes, str].ok{owned.some};
+            val got:    store.Bytes        = object.bytes(o, ?o.sections.items[i].contents);
+            val owned:  opt[operand.Bytes] = own(a, got.data, got.len);
+            val relocs: opt[str]           = relocations(a, o, i::u32);
+            if (sel owned.some) {
+                if (sel relocs.some) { ret res[Placed, str].ok{Placed{vector: 0, bytes: owned.some, relocs: relocs.some}}; }
+            }
+            ret res[Placed, str].err{"out of memory"};
         }
         i = i + 1;
     }
-    ret res[operand.Bytes, str].err{"the object has no such section"};
+    ret res[Placed, str].err{"the object has no such section"};
 }
