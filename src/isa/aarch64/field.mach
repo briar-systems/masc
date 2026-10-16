@@ -9,6 +9,10 @@
 # kind exists only where slices cannot express the encoding:
 #   bitmask  the N:immr:imms logical immediate, a rotated run of ones repeated
 #            across the register, which no slice of the value's bits encodes
+#   float8   fmov's 8-bit floating-point immediate, VFPExpandImm
+#   multiple an odd multiple of a number of its bits, as ld3's `#-24, mul vl`
+#   bytemask movi's 64-bit immediate, each byte all ones or all zeros by one
+#            bit of a:b:c:d:e:f:g:h
 #
 # sources, read as published:
 #   Arm Architecture Reference Manual for A-profile, machine-readable instruction model, AARCHMRS
@@ -65,6 +69,7 @@ pub val UNIT_KIND:     u16 = 0;
 pub val BITMASK_KIND:  u16 = 1;
 pub val FLOAT8_KIND:   u16 = 2;
 pub val MULTIPLE_KIND: u16 = 3;
+pub val BYTEMASK_KIND: u16 = 4;
 
 pub val NO_BITMASK: str = "value is not a bitmask immediate";
 pub val RESERVED:   str = "reserved bitmask immediate encoding";
@@ -358,10 +363,65 @@ fun multiple_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
 # encoded number divided by the multiplier its slices place
 pub val MULTIPLE: field.Kind = field.Kind{name: "multiple", admit: multiple_admit, encode: multiple_encode, decode: multiple_decode, finish: nil, complete: nil, check: nil};
 
-val KINDS: [4]*field.Kind = [4]*field.Kind{?field.UNIT, ?BITMASK, ?FLOAT8, ?MULTIPLE};
+pub val NO_BYTEMASK: str = "value is not bytes each all ones or all zeros";
+
+# the 8 bits of `v`, a bit per byte, each byte of `v` all ones or all zeros, none where one is neither
+pub fun encode_bytemask(v: u64) opt[u64] {
+    var code: u64 = 0;
+    var i:    u64 = 0;
+    for (i < 8) {
+        val b: u64 = (v >> (i * 8)) & 0xFF;
+        if (b == 0xFF)   { code = code | (1::u64 << i); }
+        or (b != 0)      { ret opt[u64].none{}; }
+        i = i + 1;
+    }
+    ret opt[u64].some{code};
+}
+
+# the 64 bits whose byte i is all ones where bit i of `code` is set, AdvSIMDExpandImm's op 1 cmode 1110
+pub fun decode_bytemask(code: u64) u64 {
+    var v: u64 = 0;
+    var i: u64 = 0;
+    for (i < 8) {
+        if (((code >> i) & 1) != 0) { v = v | (0xFF::u64 << (i * 8)); }
+        i = i + 1;
+    }
+    ret v;
+}
+
+fun bytemask_code(enc: *field.Encoder, f: *field.Field, at: usize) res[u64, field.Refusal] {
+    if (f.operand::u32 >= enc.count) { ret res[u64, field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    val code: opt[u64] = encode_bytemask(enc.parts[f.operand].bits[field.NUMBER]);
+    if (sel code.none) { ret res[u64, field.Refusal].err{field.refusal(NO_BYTEMASK, f.operand, at)}; }
+    ret res[u64, field.Refusal].ok{code.some};
+}
+
+fun bytemask_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val code: res[u64, field.Refusal] = bytemask_code(enc, f, 0);
+    if (sel code.err) { ret err[field.Refusal].err{code.err}; }
+    ret err[field.Refusal].ok{};
+}
+
+fun bytemask_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val code: res[u64, field.Refusal] = bytemask_code(enc, f, enc.out.len);
+    if (sel code.err) { ret err[field.Refusal].err{code.err}; }
+    ret put_number(enc, f, code.ok);
+}
+
+fun bytemask_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val got: err[field.Refusal] = got_unit(dec, f);
+    if (sel got.err) { ret got; }
+    field.replace(dec, f.operand, field.NUMBER, decode_bytemask(dec.parts[f.operand].bits[field.NUMBER] & 0xFF));
+    ret err[field.Refusal].ok{};
+}
+
+# movi's 64-bit immediate: the field operand's value, a byte per bit of the 8-bit immediate its slices place
+pub val BYTEMASK: field.Kind = field.Kind{name: "bytemask", admit: bytemask_admit, encode: bytemask_encode, decode: bytemask_decode, finish: nil, complete: nil, check: nil};
+
+val KINDS: [5]*field.Kind = [5]*field.Kind{?field.UNIT, ?BITMASK, ?FLOAT8, ?MULTIPLE, ?BYTEMASK};
 
 # the aarch64 field table, its units little-endian
-pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 4, order: field.LITTLE};
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 5, order: field.LITTLE};
 
 # the value a bitmask field's operand holds: the register's bits for a64, the element's for sve
 pub val BITMASK_32: operand.Immediate = operand.Immediate{bits: 32, sign: operand.UNSIGNED, scale: 0, bias: 0, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: operand.NO_INTEGERS};
@@ -793,6 +853,18 @@ test bitmask__a_value_with_no_bitmask_encoding_is_refused {
     val wide:  opt[u64] = decode_bitmask(0x1000, 32);
     val whole: opt[u64] = decode_bitmask(0x003F, 64);
     if (sel wide.some || sel whole.some) { ret 4; }
+    ret 0;
+}
+
+# movi d16, #0xff00ff00ff00ff00 holds a:b:c:d:e:f:g:h 10101010, as llvm-mc encodes it, and a byte neither all ones nor
+# all zeros has no code
+test bytemask__each_byte_is_one_bit_of_the_code {
+    val code: opt[u64] = encode_bytemask(0xFF00_FF00_FF00_FF00);
+    if (sel code.none)                                   { ret 1; }
+    if (code.some != 0xAA)                               { ret 1; }
+    if (decode_bytemask(0xAA) != 0xFF00_FF00_FF00_FF00) { ret 2; }
+    val half: opt[u64] = encode_bytemask(0x0000_0000_0000_00F0);
+    if (sel half.some) { ret 3; }
     ret 0;
 }
 
