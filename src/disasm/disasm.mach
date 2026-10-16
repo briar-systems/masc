@@ -297,9 +297,6 @@ pub rec Refusal {
     offset:  u64;
 }
 
-# alternatives a refused decode notes
-val ALTERNATIVES: u32 = 16;
-
 # bytes of raw data on one line
 val PER_LINE: usize = 16;
 
@@ -499,9 +496,7 @@ rec Disasm {
     names:      u32;
     scratch:    [core_syntax.MAX_ANONYMOUS + 10]u8;
     steps:      [relax.MAX_STEPS]Step;
-    pool:       vector.Vector[operand.Value];
-    room:       [ALTERNATIVES]requirement.Alternative;
-    lits:       vector.Vector[u8];
+    stores:     core_syntax.Stores;
 }
 
 fun refusal(message: str, section: u32, offset: u64) err[Refusal] {
@@ -1322,69 +1317,39 @@ fun stated_datum(d: *Disasm, why: Refusal) res[u64, Refusal] {
     ret res[u64, Refusal].ok{0};
 }
 
-# the text from `start` to the output's end parsed as the assembler parses a statement, into `ex`, its pool and its
-# literal bytes grown and the parse retried while they hold less than the statement takes, a store that failed to grow
-# noted
+# the text from `start` to the output's end parsed as the assembler parses a statement, into `ex`, its stores grown
+# and the parse retried while they hold less than the statement takes, a store that failed to grow noted
 fun reparse(d: *Disasm, start: usize, ex: *relax.Expansion) bool {
     for {
-        val got: opt[bool] = reparsed(d, start, ex);
-        if (sel got.some) { ret got.some; }
+        var rd: core_syntax.Reader = core_syntax.Reader{
+            text:    d.out.data,
+            start:   start,
+            at:      start,
+            end:     d.out.len,
+            origin:  diagnostic.START,
+            codec:   d.s.codec,
+            ctx:     d.v,
+            syntax:  d.syntax,
+            modes:   ?d.modes,
+            symbols: ?d.symbols,
+            context: nil,
+            row:     nil,
+        };
+        core_syntax.over(?rd, ?d.stores);
+        val got:   err[diagnostic.Diagnostic] = parse.statement(?rd, ex);
+        val again: res[bool, A.Error]         = core_syntax.regrown(?rd, ?d.stores);
+        if (sel again.err) {
+            d.full = true;
+            ret false;
+        }
+        if (!again.ok) { ret sel got.ok; }
     }
-}
-
-# one parse of the text from `start` into `ex` under the stores as they are, none once they are grown to retry
-fun reparsed(d: *Disasm, start: usize, ex: *relax.Expansion) opt[bool] {
-    var rd: core_syntax.Reader = core_syntax.Reader{
-        text:    d.out.data,
-        start:   start,
-        at:      start,
-        end:     d.out.len,
-        origin:  diagnostic.START,
-        codec:   d.s.codec,
-        ctx:     d.v,
-        syntax:  d.syntax,
-        modes:   ?d.modes,
-        symbols: ?d.symbols,
-        context: nil,
-        row:     nil,
-        pool:    d.pool.data,
-        cap:     held_count(d.pool.cap),
-        used:    0,
-        bytes:   d.lits.data,
-        room:    held_count(d.lits.cap),
-        taken:   0,
-        refused: field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0},
-    };
-    val got: err[diagnostic.Diagnostic] = parse.statement(?rd, ex);
-    if (!core_syntax.was_short(?rd)) { ret opt[bool].some{sel got.ok}; }
-    if (!grown[operand.Value](?d.pool, rd.short.pool) || !grown[u8](?d.lits, rd.short.bytes)) {
-        d.full = true;
-        ret opt[bool].some{false};
-    }
-    ret opt[bool].none{};
-}
-
-# a store's capacity as the count a reader is given, which never passes a u32
-fun held_count(cap: usize) u32 {
-    if (cap > 0xFFFF_FFFF) { ret 0xFFFF_FFFF; }
-    ret cap::u32;
-}
-
-# whether `v` holds `need` or was grown to, doubled at least, so a parse that learns its need a list at a time retries
-# a logarithmic number of times
-fun grown[T](v: *vector.Vector[T], need: u32) bool {
-    if (need::usize <= v.cap) { ret true; }
-    var want: usize = need::usize;
-    if (want < v.cap * 2)   { want = v.cap * 2; }
-    if (want > 0xFFFF_FFFF) { want = 0xFFFF_FFFF; }
-    ret held(vector.ensure[T](v, want));
 }
 
 # step `i` decoded at `at` of the `len` bytes at `data`, ending by `limit`, a store that failed to grow noted
 fun decode_step(d: *Disasm, i: u32, data: *u8, len: usize, at: u64, limit: u64) bool {
-    val st:   *Step                            = ?d.steps[i];
-    var alts: field.Admissions                 = field.Admissions{at: ?d.room[0], cap: ALTERNATIVES, used: 0};
-    val got:  res[walk.Decoded, field.Refusal] = walk.decode_grown(d.s.codec, d.v, data, len, at::usize, ?st.values, ?alts);
+    val st:  *Step                            = ?d.steps[i];
+    val got: res[walk.Decoded, field.Refusal] = walk.decode_grown(d.s.codec, d.v, data, len, at::usize, ?st.values, ?d.stores.refused);
     if (sel got.err) {
         if (sel got.err.cause.memory) { d.full = true; }
         ret false;
@@ -3482,8 +3447,7 @@ fun released(d: *Disasm) {
     vector.dnit[Basis](?d.bases);
     vector.dnit[u8](?d.bytes);
     vector.dnit[field.Fixup](?d.fixups);
-    vector.dnit[operand.Value](?d.pool);
-    vector.dnit[u8](?d.lits);
+    core_syntax.release(?d.stores);
     var k: u32 = 0;
     for (k < relax.MAX_STEPS) {
         vector.dnit[operand.Value](?d.steps[k].values);
@@ -3644,8 +3608,7 @@ fun sectioned(a: *A.Allocator, s: *set.Set, v: *state.Context, options: Options,
         full:       false,
         forms:      options.spelling == FORMS,
         names:      0,
-        pool:       vector.init[operand.Value](a),
-        lits:       vector.init[u8](a),
+        stores:     core_syntax.stores(a),
     };
     var k: u32 = 0;
     for (k < relax.MAX_STEPS) {
