@@ -136,6 +136,8 @@ pub rec Reading {
 #           addressing takes
 # twin:     the register numbers the row it gives way to reaches, 0 for none
 # written:  the operands its template writes in order, as the operands topic states them, nil for XED's order
+# unshown:  whether its operands show no address size another row of its ICLASS differs from it by alone, so its
+#           mnemonic names a size other than the width's, as llvm-objdump 23.1.1's `addr16 loop`
 pub rec Row {
     ins:      *xed.instruction.Instruction;
     index:    u32;
@@ -153,6 +155,7 @@ pub rec Row {
     bytes:    u32;
     twin:     u8;
     written:  *vector.Vector[Token];
+    unshown:  bool;
 }
 
 # one operand a template writes where the operands topic states them, or text of its own
@@ -1753,6 +1756,14 @@ fun mnemonics(a: *A.Allocator, t: *overlay.Topic, rows: *vector.Vector[*Row]) er
             put(?t, r.mnemonic);
             r.mnemonic = done(?t);
         }
+        if (r.unshown && size_bits(r.address) != forms.width_of(first_mode(r.modes))) {
+            var t: Text = text(a);
+            put(?t, "addr");
+            put_number(?t, size_bits(r.address)::u64);
+            put(?t, " ");
+            put(?t, r.mnemonic);
+            r.mnemonic = done(?t);
+        }
         if (r.mnemonic == nil) { ret err[diag.Refusal].err{memory(r.key)}; }
         i = i + 1;
     }
@@ -1803,7 +1814,7 @@ fun make_row(a: *A.Allocator, g: *Group, modes: u8, part: u8, s: *Solution, out:
     val got: res[*Row, A.Error] = A.allocate[Row](a, 1);
     if (sel got.err) { ret err[diag.Refusal].err{memory(g.ins.iclass)}; }
     val row: *Row = got.ok;
-    @row             = Row{ins: g.ins, index: g.index, space: g.form.config.space, modes: modes, size: s.size, address: s.address, flags: s.flags, reading: g.reading, form: g.form, configs: configs_at(a, g, modes, part), set: g.set, key: nil, mnemonic: nil, bytes: 0, twin: 0, written: nil};
+    @row             = Row{ins: g.ins, index: g.index, space: g.form.config.space, modes: modes, size: s.size, address: s.address, flags: s.flags, reading: g.reading, form: g.form, configs: configs_at(a, g, modes, part), set: g.set, key: nil, mnemonic: nil, bytes: 0, twin: 0, written: nil, unshown: false};
     row.reading.simd = s.simd;
     row.key          = key_of(a, row);
     row.bytes        = length_of(row);
@@ -1953,6 +1964,80 @@ fun split_spelled(a: *A.Allocator, t: *overlay.Topic, rows: *vector.Vector[*Row]
     ret err[diag.Refusal].ok{};
 }
 
+# the key of `r` without its address size, as `loop_rel8_e2` of `loop_rel8_e2_a16`
+fun unaddressed(a: *A.Allocator, r: *Row) str {
+    var t: Text  = text(a);
+    var i: usize = 0;
+    for (r.key[i] != 0) {
+        if (address_piece(r.key, i)) { i = i + 4; }
+        or {
+            put_byte(?t, r.key[i]);
+            i = i + 1;
+        }
+    }
+    ret done(?t);
+}
+
+# whether `key` holds an address size's piece at `i`, as `_a16` before `_` or its end
+fun address_piece(key: str, i: usize) bool {
+    if (key[i] != '_' || key[i + 1] != 'a') { ret false; }
+    val hi: u8 = key[i + 2];
+    if (hi == 0) { ret false; }
+    val lo: u8 = key[i + 3];
+    if (lo == 0) { ret false; }
+    val sized: bool = (hi == '1' && lo == '6') || (hi == '3' && lo == '2') || (hi == '6' && lo == '4');
+    ret sized && (key[i + 4] == '_' || key[i + 4] == 0);
+}
+
+# each row whose operands show no address size another row of its ICLASS differs from it by alone marked unshown,
+# and such a row split into a row at the widths whose address size it is and one at those it overrides, so the
+# mnemonic of the one names the size: llvm-objdump 23.1.1 writes `addr16 loop` for a 67 the operands do not show
+fun split_unshown(a: *A.Allocator, rows: *vector.Vector[*Row]) err[diag.Refusal] {
+    var by: map.Map[str, u32] = map.init[str, u32](a);
+    var i:  usize             = 0;
+    for (i < rows.len) {
+        val r: *Row = rows.data[i];
+        if (r.address != x86_opcode.NO_ADDRESS) {
+            val k: str       = unaddressed(a, r);
+            val n: opt[*u32] = map.get[str, u32](?by, ?k);
+            if (sel n.some) { @n.some = @n.some | (1::u32 << r.address::u32); }
+            or {
+                val put_in: res[bool, A.Error] = map.insert[str, u32](?by, k, 1::u32 << r.address::u32);
+                if (sel put_in.err) { ret err[diag.Refusal].err{memory(k)}; }
+            }
+        }
+        i = i + 1;
+    }
+    val count: usize = rows.len;
+    i = 0;
+    for (i < count) {
+        val r: *Row = rows.data[i];
+        if (r.address != x86_opcode.NO_ADDRESS) {
+            val k: str       = unaddressed(a, r);
+            val n: opt[*u32] = map.get[str, u32](?by, ?k);
+            if (sel n.some && (@n.some & (@n.some - 1)) != 0) {
+                r.unshown = true;
+                var own:  u8 = 0;
+                var mode: u8 = 0;
+                for (mode < 3) {
+                    if (((r.modes >> mode) & 1) != 0 && forms.width_of(mode) == size_bits(r.address)) { own = own | (1::u8 << mode); }
+                    mode = mode + 1;
+                }
+                if (own != 0 && own != r.modes) {
+                    val at:   res[*Row, A.Error] = at_modes(a, r, own);
+                    val rest: res[*Row, A.Error] = at_modes(a, r, r.modes & ~own);
+                    if (sel at.err)   { ret err[diag.Refusal].err{memory(r.key)}; }
+                    if (sel rest.err) { ret err[diag.Refusal].err{memory(r.key)}; }
+                    rows.data[i] = at.ok;
+                    if (!pushed(vector.push[*Row](rows, rest.ok))) { ret err[diag.Refusal].err{memory(r.key)}; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
 # the rows of every instruction of XED's four encoding spaces evaluated at each width, its agreeing configurations made
 # rows, sized, keyed, spelled and put in the encoder's order
 # ---
@@ -2042,6 +2127,8 @@ pub fun build(a: *A.Allocator, r: *forms.Reader, t: Topics, out: *vector.Vector[
     }
     val apart: err[diag.Refusal] = split_spelled(a, t.mnemonics, out);
     if (sel apart.err) { ret apart; }
+    val sized: err[diag.Refusal] = split_unshown(a, out);
+    if (sel sized.err) { ret sized; }
     # a key two rows share is each one's with the widths it is one at
     var count: map.Map[str, u32] = map.init[str, u32](a);
     i = 0;
