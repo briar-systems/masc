@@ -3,15 +3,19 @@
 # each row reads its operands and makes the call of the same name on the
 # assembler's builder, so the text is only a front end: what a directive
 # states is what the call states. a register is a register of the set, read by
-# its syntax's names and never by a dwarf number, and an offset is a constant
-# number of bytes. a directive outside a procedure, an end without a start, a
-# restore where no state is remembered and a procedure left open at the end of
-# the source are refused.
+# its syntax's names, or by its dwarf number as gcc writes it, which names the
+# register of that number under the object's context and is refused when none
+# has it. an offset is a constant number of bytes. a directive outside a
+# procedure, an end without a start, a restore where no state is remembered
+# and a procedure left open at the end of the source are refused.
 #
 # a personality or lsda pointer's encoding is mink's to choose, as every
-# frame byte is, so its operand is read and the omit encoding 0xff states
-# none. `.cfi_sections` is refused, as mink's frame model states no choice of
-# the sections a frame is written to.
+# frame byte is, so its format bits are read and the omit encoding 0xff states
+# none. an indirect encoding names the slot that holds the pointer, as gcc's
+# `DW.ref.__gxx_personality_v0`, which mink's frame cannot state, so it is
+# refused. `.cfi_sections` is refused, as mink's frame model states no choice
+# of the sections a frame is written to, and so is `.cfi_startproc simple`,
+# as the frame always begins from the rules the set states.
 
 use std.types.bool.false;
 use std.types.error.err;
@@ -27,14 +31,24 @@ use masc.asm.model;
 use masc.build.build;
 use masc.core.diagnostic;
 use masc.core.field;
-use rf: masc.core.register;
+use masc.core.operand;
+use rf:          masc.core.register;
+use core_syntax: masc.core.syntax;
 use masc.emit.cfi;
+use masc.syntax.expr;
+use masc.syntax.read;
 
 pub val NOT_A_REGISTER: str = "expected a register";
 pub val NOT_A_BYTE:     str = "expected a byte";
 pub val NEVER_ENDED:    str = "procedure never ended";
 pub val NO_SECTIONS:    str = "the sections a frame is written to, which mink's frame model states no choice of";
 pub val NO_FUNCTION:    str = "procedure with no label where it starts, which mink's frame names its function by";
+pub val INDIRECT:       str = "indirect pointer encoding, whose symbol is the slot holding the pointer, which mink's frame cannot state";
+pub val SIMPLE:         str = "procedure begun with no starting rules, which mink's frame always begins from the set's";
+pub val NOT_SIMPLE:     str = "expected `simple` or nothing";
+
+# the indirect bit of a pointer encoding
+val INDIRECTLY: i64 = 0x80;
 
 # the encoding of a pointer that is omitted
 val OMIT: i64 = 0xFF;
@@ -51,19 +65,77 @@ fun built(args: *model.Args, e: err[build.Refusal]) err[diagnostic.Diagnostic] {
     ret err[diagnostic.Diagnostic].ok{};
 }
 
-# operand `k` as a register
-fun register_of(args: *model.Args, k: u32) res[rf.Id, diagnostic.Diagnostic] {
-    if (k >= args.count) { ret res[rf.Id, diagnostic.Diagnostic].err{model.refuse(args, k, NOT_A_REGISTER)}; }
-    val v: model.Argument = args.items[k].value;
-    if (!sel v.register) { ret res[rf.Id, diagnostic.Diagnostic].err{model.refuse(args, k, NOT_A_REGISTER)}; }
-    ret res[rf.Id, diagnostic.Diagnostic].ok{v.register};
+# the register at the reader: a name of the set's syntax, or a dwarf number as gcc writes one, which names the register
+# of that number under the object's context
+fun register_at(m: *model.Assembler, rd: *core_syntax.Reader) res[rf.Id, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at: usize = rd.at;
+    val c:  u8    = read.peek(rd);
+    if (c >= '0' && c <= '9') {
+        val n: res[i64, diagnostic.Diagnostic] = read.number(rd);
+        if (sel n.err)                      { ret res[rf.Id, diagnostic.Diagnostic].err{n.err}; }
+        if (n.ok < 0 || n.ok > 0xFFFF_FFFF) { ret res[rf.Id, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_REGISTER, at, rd.at - at)}; }
+        val r: res[rf.Id, build.Refusal] = cfi.numbered(model.builder(m), n.ok::u32);
+        if (sel r.err) { ret res[rf.Id, diagnostic.Diagnostic].err{read.refuse(rd, r.err.message, at, rd.at - at)}; }
+        ret res[rf.Id, diagnostic.Diagnostic].ok{r.ok};
+    }
+    val v: res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.REGISTER);
+    if (sel v.err) { ret res[rf.Id, diagnostic.Diagnostic].err{v.err}; }
+    val got: model.Argument = v.ok;
+    if (!sel got.register) { ret res[rf.Id, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_REGISTER, at, rd.at - at)}; }
+    ret res[rf.Id, diagnostic.Diagnostic].ok{got.register};
 }
 
-# operand `k` as a number of bytes
-fun offset_of(args: *model.Args, k: u32) res[cfi.Offset, diagnostic.Diagnostic] {
-    val n: res[i64, diagnostic.Diagnostic] = model.constant(args, k);
-    if (sel n.err) { ret res[cfi.Offset, diagnostic.Diagnostic].err{n.err}; }
-    ret res[cfi.Offset, diagnostic.Diagnostic].ok{cfi.bytes(n.ok)};
+# the comma between two operands at the reader
+fun comma(rd: *core_syntax.Reader) err[diagnostic.Diagnostic] {
+    read.skip(rd);
+    if (read.peek(rd) != ',') { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.EXPECTED, rd.at, read.token(rd, rd.at))}; }
+    rd.at = rd.at + 1;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the end of the operands at the reader
+fun ended(rd: *core_syntax.Reader) err[diagnostic.Diagnostic] {
+    read.skip(rd);
+    if (rd.at < rd.end) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.UNEXPECTED, rd.at, rd.end - rd.at)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the constant number of bytes at the reader
+fun offset_at(rd: *core_syntax.Reader) res[cfi.Offset, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at: usize                                 = rd.at;
+    val e:  res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+    if (sel e.err)          { ret res[cfi.Offset, diagnostic.Diagnostic].err{e.err}; }
+    if (!sel e.ok.constant) { ret res[cfi.Offset, diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_CONSTANT, at, rd.at - at)}; }
+    ret res[cfi.Offset, diagnostic.Diagnostic].ok{cfi.bytes(e.ok.constant)};
+}
+
+# one register and the end
+fun one_register(m: *model.Assembler, args: *model.Args) res[rf.Id, diagnostic.Diagnostic] {
+    val r: res[rf.Id, diagnostic.Diagnostic] = register_at(m, args.reader);
+    if (sel r.err) { ret r; }
+    val e: err[diagnostic.Diagnostic] = ended(args.reader);
+    if (sel e.err) { ret res[rf.Id, diagnostic.Diagnostic].err{e.err}; }
+    ret r;
+}
+
+# a register, a comma, an offset and the end
+rec Saved {
+    reg: rf.Id;
+    off: cfi.Offset;
+}
+
+fun register_offset(m: *model.Assembler, args: *model.Args) res[Saved, diagnostic.Diagnostic] {
+    val r: res[rf.Id, diagnostic.Diagnostic] = register_at(m, args.reader);
+    if (sel r.err) { ret res[Saved, diagnostic.Diagnostic].err{r.err}; }
+    val c: err[diagnostic.Diagnostic] = comma(args.reader);
+    if (sel c.err) { ret res[Saved, diagnostic.Diagnostic].err{c.err}; }
+    val o: res[cfi.Offset, diagnostic.Diagnostic] = offset_at(args.reader);
+    if (sel o.err) { ret res[Saved, diagnostic.Diagnostic].err{o.err}; }
+    val e: err[diagnostic.Diagnostic] = ended(args.reader);
+    if (sel e.err) { ret res[Saved, diagnostic.Diagnostic].err{e.err}; }
+    ret res[Saved, diagnostic.Diagnostic].ok{Saved{reg: r.ok, off: o.ok}};
 }
 
 # the label placed where the procedure starts, which names its function
@@ -74,6 +146,16 @@ fun function_of(m: *model.Assembler, args: *model.Args) res[build.Label, diagnos
 }
 
 fun do_startproc(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val rd: *core_syntax.Reader = args.reader;
+    read.skip(rd);
+    if (rd.at < rd.end) {
+        val at: usize = rd.at;
+        if (read.take(rd, "simple")) {
+            read.skip(rd);
+            if (rd.at == rd.end) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, SIMPLE, at, 6)}; }
+        }
+        ret err[diagnostic.Diagnostic].err{read.refuse(rd, NOT_SIMPLE, at, rd.end - at)};
+    }
     val target: res[build.Label, diagnostic.Diagnostic] = function_of(m, args);
     if (sel target.err) { ret err[diagnostic.Diagnostic].err{target.err}; }
     val done: err[diagnostic.Diagnostic] = built(args, cfi.start_proc(model.builder(m), target.ok));
@@ -92,43 +174,41 @@ fun do_endproc(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic
 }
 
 fun do_def_cfa(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val r: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 0);
-    if (sel r.err) { ret err[diagnostic.Diagnostic].err{r.err}; }
-    val o: res[cfi.Offset, diagnostic.Diagnostic] = offset_of(args, 1);
-    if (sel o.err) { ret err[diagnostic.Diagnostic].err{o.err}; }
-    ret built(args, cfi.def_cfa(model.builder(m), r.ok, o.ok));
+    val s: res[Saved, diagnostic.Diagnostic] = register_offset(m, args);
+    if (sel s.err) { ret err[diagnostic.Diagnostic].err{s.err}; }
+    ret built(args, cfi.def_cfa(model.builder(m), s.ok.reg, s.ok.off));
 }
 
 fun do_def_cfa_register(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val r: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 0);
+    val r: res[rf.Id, diagnostic.Diagnostic] = one_register(m, args);
     if (sel r.err) { ret err[diagnostic.Diagnostic].err{r.err}; }
     ret built(args, cfi.def_cfa_register(model.builder(m), r.ok));
 }
 
 # `.cfi_def_cfa_offset` when the row's parameter is 0, `.cfi_adjust_cfa_offset` when 1
 fun do_cfa_offset(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val o: res[cfi.Offset, diagnostic.Diagnostic] = offset_of(args, 0);
-    if (sel o.err)                 { ret err[diagnostic.Diagnostic].err{o.err}; }
-    if (args.directive.param == 1) { ret built(args, cfi.adjust_cfa_offset(model.builder(m), o.ok)); }
-    ret built(args, cfi.def_cfa_offset(model.builder(m), o.ok));
+    val n: res[i64, diagnostic.Diagnostic] = model.constant(args, 0);
+    if (sel n.err)                 { ret err[diagnostic.Diagnostic].err{n.err}; }
+    if (args.directive.param == 1) { ret built(args, cfi.adjust_cfa_offset(model.builder(m), cfi.bytes(n.ok))); }
+    ret built(args, cfi.def_cfa_offset(model.builder(m), cfi.bytes(n.ok)));
 }
 
 # a register saved at an offset: `.cfi_offset` when the row's parameter is 0, `.cfi_rel_offset` when 1 and
 # `.cfi_val_offset` when 2
 fun do_save(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val r: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 0);
-    if (sel r.err) { ret err[diagnostic.Diagnostic].err{r.err}; }
-    val o: res[cfi.Offset, diagnostic.Diagnostic] = offset_of(args, 1);
-    if (sel o.err)                 { ret err[diagnostic.Diagnostic].err{o.err}; }
-    if (args.directive.param == 1) { ret built(args, cfi.rel_offset(model.builder(m), r.ok, o.ok)); }
-    if (args.directive.param == 2) { ret built(args, cfi.val_offset(model.builder(m), r.ok, o.ok)); }
-    ret built(args, cfi.offset(model.builder(m), r.ok, o.ok));
+    val s: res[Saved, diagnostic.Diagnostic] = register_offset(m, args);
+    if (sel s.err)                 { ret err[diagnostic.Diagnostic].err{s.err}; }
+    if (args.directive.param == 1) { ret built(args, cfi.rel_offset(model.builder(m), s.ok.reg, s.ok.off)); }
+    if (args.directive.param == 2) { ret built(args, cfi.val_offset(model.builder(m), s.ok.reg, s.ok.off)); }
+    ret built(args, cfi.offset(model.builder(m), s.ok.reg, s.ok.off));
 }
 
 fun do_register(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val r: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 0);
+    val r: res[rf.Id, diagnostic.Diagnostic] = register_at(m, args.reader);
     if (sel r.err) { ret err[diagnostic.Diagnostic].err{r.err}; }
-    val other: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 1);
+    val c: err[diagnostic.Diagnostic] = comma(args.reader);
+    if (sel c.err) { ret c; }
+    val other: res[rf.Id, diagnostic.Diagnostic] = one_register(m, args);
     if (sel other.err) { ret err[diagnostic.Diagnostic].err{other.err}; }
     ret built(args, cfi.register(model.builder(m), r.ok, other.ok));
 }
@@ -136,7 +216,7 @@ fun do_register(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnosti
 # a rule of one register: `.cfi_restore` when the row's parameter is 0, `.cfi_undefined` when 1, `.cfi_same_value`
 # when 2 and `.cfi_return_column` when 3
 fun do_alone(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val r: res[rf.Id, diagnostic.Diagnostic] = register_of(args, 0);
+    val r: res[rf.Id, diagnostic.Diagnostic] = one_register(m, args);
     if (sel r.err)                 { ret err[diagnostic.Diagnostic].err{r.err}; }
     if (args.directive.param == 1) { ret built(args, cfi.undefined(model.builder(m), r.ok)); }
     if (args.directive.param == 2) { ret built(args, cfi.same_value(model.builder(m), r.ok)); }
@@ -177,13 +257,14 @@ fun do_escape(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic]
     ret done;
 }
 
-# `.cfi_personality` when the row's parameter is 0 and `.cfi_lsda` when 1: an encoding, which mink chooses, and the
-# symbol it points at, none when the encoding is the omit one
+# `.cfi_personality` when the row's parameter is 0 and `.cfi_lsda` when 1: an encoding, whose format mink chooses, and
+# the symbol it points at, none when the encoding is the omit one. an indirect encoding is refused
 fun do_pointer(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
     val enc: res[i64, diagnostic.Diagnostic] = model.constant(args, 0);
     if (sel enc.err)                { ret err[diagnostic.Diagnostic].err{enc.err}; }
     if (enc.ok < 0 || enc.ok > 255) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, NOT_A_BYTE)}; }
     if (enc.ok == OMIT)             { ret err[diagnostic.Diagnostic].ok{}; }
+    if ((enc.ok & INDIRECTLY) != 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, INDIRECT)}; }
     val target: res[build.Label, diagnostic.Diagnostic] = model.symbol(m, args, 1);
     if (sel target.err)            { ret err[diagnostic.Diagnostic].err{target.err}; }
     if (args.directive.param == 1) { ret built(args, cfi.lsda(model.builder(m), target.ok)); }
@@ -194,34 +275,28 @@ fun do_sections(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnosti
     ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, NO_SECTIONS)};
 }
 
-val ONE_REGISTER:    [1]model.Item = [1]model.Item{model.REGISTER};
-val TWO_REGISTERS:   [2]model.Item = [2]model.Item{model.REGISTER, model.REGISTER};
-val REGISTER_OFFSET: [2]model.Item = [2]model.Item{model.REGISTER, model.EXPRESSION};
-val ONE_OFFSET:      [1]model.Item = [1]model.Item{model.EXPRESSION};
-val ENCODED_NAME:    [2]model.Item = [2]model.Item{model.EXPRESSION, model.NAME};
+val ONE_OFFSET:   [1]model.Item = [1]model.Item{model.EXPRESSION};
+val ENCODED_NAME: [2]model.Item = [2]model.Item{model.EXPRESSION, model.NAME};
 
-val REGISTER_ONLY: model.Shape = model.Shape{items: ?ONE_REGISTER[0], len: 1, least: 1, repeat: false, text: false};
-val REGISTER_PAIR: model.Shape = model.Shape{items: ?TWO_REGISTERS[0], len: 2, least: 2, repeat: false, text: false};
-val SAVED:         model.Shape = model.Shape{items: ?REGISTER_OFFSET[0], len: 2, least: 2, repeat: false, text: false};
-val OFFSET_ONLY:   model.Shape = model.Shape{items: ?ONE_OFFSET[0], len: 1, least: 1, repeat: false, text: false};
-val POINTER:       model.Shape = model.Shape{items: ?ENCODED_NAME[0], len: 2, least: 1, repeat: false, text: false};
+val OFFSET_ONLY: model.Shape = model.Shape{items: ?ONE_OFFSET[0], len: 1, least: 1, repeat: false, text: false};
+val POINTER:     model.Shape = model.Shape{items: ?ENCODED_NAME[0], len: 2, least: 1, repeat: false, text: false};
 
 # the call frame rows (gas manual, "CFI directives")
 val ROWS: [21]model.Directive = [21]model.Directive{
-    model.Directive{name: ".cfi_startproc", operands: model.NO_ITEMS, handler: do_startproc, param: 0},
+    model.Directive{name: ".cfi_startproc", operands: model.TEXT, handler: do_startproc, param: 0},
     model.Directive{name: ".cfi_endproc", operands: model.NO_ITEMS, handler: do_endproc, param: 0},
-    model.Directive{name: ".cfi_def_cfa", operands: SAVED, handler: do_def_cfa, param: 0},
-    model.Directive{name: ".cfi_def_cfa_register", operands: REGISTER_ONLY, handler: do_def_cfa_register, param: 0},
+    model.Directive{name: ".cfi_def_cfa", operands: model.TEXT, handler: do_def_cfa, param: 0},
+    model.Directive{name: ".cfi_def_cfa_register", operands: model.TEXT, handler: do_def_cfa_register, param: 0},
     model.Directive{name: ".cfi_def_cfa_offset", operands: OFFSET_ONLY, handler: do_cfa_offset, param: 0},
     model.Directive{name: ".cfi_adjust_cfa_offset", operands: OFFSET_ONLY, handler: do_cfa_offset, param: 1},
-    model.Directive{name: ".cfi_offset", operands: SAVED, handler: do_save, param: 0},
-    model.Directive{name: ".cfi_rel_offset", operands: SAVED, handler: do_save, param: 1},
-    model.Directive{name: ".cfi_val_offset", operands: SAVED, handler: do_save, param: 2},
-    model.Directive{name: ".cfi_register", operands: REGISTER_PAIR, handler: do_register, param: 0},
-    model.Directive{name: ".cfi_restore", operands: REGISTER_ONLY, handler: do_alone, param: 0},
-    model.Directive{name: ".cfi_undefined", operands: REGISTER_ONLY, handler: do_alone, param: 1},
-    model.Directive{name: ".cfi_same_value", operands: REGISTER_ONLY, handler: do_alone, param: 2},
-    model.Directive{name: ".cfi_return_column", operands: REGISTER_ONLY, handler: do_alone, param: 3},
+    model.Directive{name: ".cfi_offset", operands: model.TEXT, handler: do_save, param: 0},
+    model.Directive{name: ".cfi_rel_offset", operands: model.TEXT, handler: do_save, param: 1},
+    model.Directive{name: ".cfi_val_offset", operands: model.TEXT, handler: do_save, param: 2},
+    model.Directive{name: ".cfi_register", operands: model.TEXT, handler: do_register, param: 0},
+    model.Directive{name: ".cfi_restore", operands: model.TEXT, handler: do_alone, param: 0},
+    model.Directive{name: ".cfi_undefined", operands: model.TEXT, handler: do_alone, param: 1},
+    model.Directive{name: ".cfi_same_value", operands: model.TEXT, handler: do_alone, param: 2},
+    model.Directive{name: ".cfi_return_column", operands: model.TEXT, handler: do_alone, param: 3},
     model.Directive{name: ".cfi_remember_state", operands: model.NO_ITEMS, handler: do_state, param: 0},
     model.Directive{name: ".cfi_restore_state", operands: model.NO_ITEMS, handler: do_state, param: 1},
     model.Directive{name: ".cfi_signal_frame", operands: model.NO_ITEMS, handler: do_state, param: 2},
