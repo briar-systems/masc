@@ -1,0 +1,395 @@
+# the spir-v field kinds: the lead word, whole operands, the set operand and fixed words
+#
+# a spir-v instruction is words: its lead holds the opcode in its low half and the word count in its high, and each
+# operand follows whole, an id or a 32-bit literal a word, a string its bytes and a nul padded to a word with nuls, a
+# context-dependent literal the whole words its type's width takes, an enumerant its value and then each param it
+# takes, a pair its members in order. an optional operand is present exactly when words remain, and a variadic one
+# takes every word left. the lead's count is the instruction's length once every operand is written, and decode reads
+# it first and declares the instruction's end by it, so no operand reads past it.
+#
+# a literal whose width its type states takes it from the stream: the width of the scalar type its `width_of`
+# operand's id is, or names the value of, which the stream's state knows once that type is defined. an extended
+# instruction's set operand is an id the stream's imports space names the row's set by.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use masc.core.field;
+use masc.core.operand;
+use masc.core.state;
+
+use spirv_kind:   masc.isa.spirv.kind;
+use spirv_stream: masc.isa.spirv.stream;
+
+pub val COUNT:        str = "instruction longer than its word count holds";
+pub val PADDING:      str = "string padded with other than nul bytes";
+pub val UNTERMINATED: str = "string holds no nul before the instruction ends";
+pub val UNSIZED:      str = "literal's width names an id of no scalar type the stream has defined";
+pub val UNSTREAMED:   str = "literal's width or set read with no stream";
+pub val OTHER_SET:    str = "set operand names no import of the row's set";
+pub val ORDER:        str = "optional operand absent before an operand that is present";
+pub val NO_LEAD:      str = "lead word names an operand";
+pub val NO_SET:       str = "set field names no id operand or no set";
+
+fun refuse(message: str, op: u8, at: usize) err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(message, op, at)};
+}
+
+# the bytes a literal of operand `desc` holds in an instruction of values `values`: its type's whole words, or its own
+# whole words for a literal that states its width
+fun literal_bytes(ctx: *state.Context, desc: *operand.Literal, values: *operand.Value, own: u32, op: u8, at: usize) res[u32, field.Refusal] {
+    if (desc.width_of == 0)              { ret res[u32, field.Refusal].ok{(own + 3) / 4 * 4}; }
+    if (ctx == nil || ctx.stream == nil) { ret res[u32, field.Refusal].err{field.refusal(UNSTREAMED, op, at)}; }
+    val by: *operand.Value = ?values[desc.width_of - 1];
+    if (!sel by.id) { ret res[u32, field.Refusal].err{field.refusal(UNSIZED, op, at)}; }
+    val got: opt[u8] = spirv_stream.width(ctx.stream, by.id);
+    if (sel got.none) { ret res[u32, field.Refusal].err{field.refusal(UNSIZED, op, at)}; }
+    ret res[u32, field.Refusal].ok{got.some::u32};
+}
+
+# the word `w` written, or only admitted when the encoder has no output
+fun word(enc: *field.Encoder, w: u64) err[field.Refusal] {
+    if (enc.out == nil) { ret err[field.Refusal].ok{}; }
+    ret field.put(enc, w & 0xFFFF_FFFF, 4);
+}
+
+fun byte(enc: *field.Encoder, b: u8) err[field.Refusal] {
+    if (enc.out == nil) { ret err[field.Refusal].ok{}; }
+    ret field.put(enc, b::u64, 1);
+}
+
+# one value `v` of shape `shape` written, of operand `op`
+fun encode_one(enc: *field.Encoder, shape: *operand.Shape, v: *operand.Value, op: u8) err[field.Refusal] {
+    if (sel shape.id) {
+        if (!sel v.id) { ret refuse(field.WRONG_KIND, op, 0); }
+        ret word(enc, v.id::u64);
+    }
+    if (sel shape.immediate) {
+        if (!sel v.immediate) { ret refuse(field.WRONG_KIND, op, 0); }
+        ret word(enc, v.immediate:~u64);
+    }
+    if (sel shape.enumerant) {
+        if (!sel v.enumerant) { ret refuse(field.WRONG_KIND, op, 0); }
+        val c:    operand.Chosen     = v.enumerant;
+        val lead: err[field.Refusal] = word(enc, c.value::u64);
+        if (sel lead.err)                                                   { ret lead; }
+        if (c.params.len != operand.param_count(?shape.enumerant, c.value)) { ret refuse(field.PARAMS, op, 0); }
+        var k: u32 = 0;
+        for (k < c.params.len) {
+            val one: err[field.Refusal] = encode_one(enc, ?operand.param(?shape.enumerant, c.value, k).shape, ?c.params.at[k], op);
+            if (sel one.err) { ret one; }
+            k = k + 1;
+        }
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.group) {
+        if (!sel v.group) { ret refuse(field.WRONG_KIND, op, 0); }
+        val members: operand.Values = v.group;
+        if (members.len != shape.group.len) { ret refuse(field.WRONG_KIND, op, 0); }
+        var i: u32 = 0;
+        for (i < members.len) {
+            val one: err[field.Refusal] = encode_one(enc, ?shape.group.at[i].shape, ?members.at[i], op);
+            if (sel one.err) { ret one; }
+            i = i + 1;
+        }
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.literal) {
+        if (!sel v.literal) { ret refuse(field.WRONG_KIND, op, 0); }
+        val bytes: operand.Bytes = v.literal;
+        if (shape.literal.content == operand.STRING) {
+            var i: u32 = 0;
+            for (i < bytes.len) {
+                if (bytes.at[i] == 0) { ret refuse(field.NUL_IN_STRING, op, 0); }
+                val b: err[field.Refusal] = byte(enc, bytes.at[i]);
+                if (sel b.err) { ret b; }
+                i = i + 1;
+            }
+            # the nul and the padding to a word
+            var pad: u32 = 4 - bytes.len % 4;
+            for (pad > 0) {
+                val b: err[field.Refusal] = byte(enc, 0);
+                if (sel b.err) { ret b; }
+                pad = pad - 1;
+            }
+            ret err[field.Refusal].ok{};
+        }
+        val want: res[u32, field.Refusal] = literal_bytes(enc.ctx, ?shape.literal, enc.values, bytes.len, op, 0);
+        if (sel want.err)         { ret err[field.Refusal].err{want.err}; }
+        if (bytes.len != want.ok) { ret refuse(field.LITERAL_LENGTH, op, 0); }
+        var i: u32 = 0;
+        for (i < bytes.len) {
+            val b: err[field.Refusal] = byte(enc, bytes.at[i]);
+            if (sel b.err) { ret b; }
+            i = i + 1;
+        }
+        ret err[field.Refusal].ok{};
+    }
+    ret refuse(field.WRONG_KIND, op, 0);
+}
+
+# whether operand `k` of the encoder holds a value, an empty list holding none
+fun present(enc: *field.Encoder, k: u32) bool {
+    val v: *operand.Value = ?enc.values[k];
+    if (sel v.none) { ret false; }
+    if (sel v.list) { ret v.list.len > 0; }
+    ret true;
+}
+
+# operand `f.operand` written whole, or only admitted when the encoder has no output: an absent optional operand
+# writes nothing and every operand after it must be absent too, since decode reads an optional operand while words
+# remain
+fun operand_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val op:   u8               = f.operand;
+    val desc: *operand.Operand = ?enc.operands[op];
+    val v:    *operand.Value   = ?enc.values[op];
+    if (sel v.none) {
+        var k: u32 = op::u32 + 1;
+        for (k < enc.count) {
+            if (present(enc, k)) { ret refuse(ORDER, k::u8, 0); }
+            k = k + 1;
+        }
+        ret err[field.Refusal].ok{};
+    }
+    if (desc.quantity != operand.VARIADIC) { ret encode_one(enc, ?desc.shape, v, op); }
+    if (!sel v.list)                       { ret refuse(field.WRONG_KIND, op, 0); }
+    val members: operand.Values = v.list;
+    var i:       u32            = 0;
+    for (i < members.len) {
+        val one: err[field.Refusal] = encode_one(enc, ?desc.shape, ?members.at[i], op);
+        if (sel one.err) { ret one; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# the next word, consumed
+fun next(dec: *field.Decoder, op: u8) res[u32, field.Refusal] {
+    val got: res[u64, field.Refusal] = field.get(dec, 4);
+    if (sel got.err) {
+        var refused: field.Refusal = got.err;
+        refused.operand = op;
+        ret res[u32, field.Refusal].err{refused};
+    }
+    ret res[u32, field.Refusal].ok{got.ok::u32};
+}
+
+# the most params an enumerant takes and members a pair has that a decode holds
+val MEMBERS: u32 = 16;
+
+# `values` pushed into the decoder's pool as one run
+fun run(dec: *field.Decoder, values: *operand.Value, count: u32) res[operand.Values, field.Refusal] {
+    if (count == 0) { ret res[operand.Values, field.Refusal].ok{operand.NO_VALUES}; }
+    var first: *operand.Value = nil;
+    var i:     u32            = 0;
+    for (i < count) {
+        val slot: res[*operand.Value, field.Refusal] = field.push(dec, values[i]);
+        if (sel slot.err) { ret res[operand.Values, field.Refusal].err{slot.err}; }
+        if (i == 0)       { first = slot.ok; }
+        i = i + 1;
+    }
+    ret res[operand.Values, field.Refusal].ok{operand.Values{at: first, len: count}};
+}
+
+# one value of shape `shape` read into `out`, of operand `op`, what it holds within it pushed into the decoder's pool
+fun decode_one(dec: *field.Decoder, shape: *operand.Shape, out: *operand.Value, op: u8) err[field.Refusal] {
+    val at: usize = dec.at;
+    if (sel shape.id) {
+        val w: res[u32, field.Refusal] = next(dec, op);
+        if (sel w.err) { ret err[field.Refusal].err{w.err}; }
+        @out = operand.Value.id{w.ok};
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.immediate) {
+        val w: res[u32, field.Refusal] = next(dec, op);
+        if (sel w.err) { ret err[field.Refusal].err{w.err}; }
+        @out = operand.Value.immediate{w.ok::i64};
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.enumerant) {
+        val w: res[u32, field.Refusal] = next(dec, op);
+        if (sel w.err)                               { ret err[field.Refusal].err{w.err}; }
+        if (!operand.member(?shape.enumerant, w.ok)) { ret refuse(field.NOT_A_MEMBER, op, at); }
+        val n: u32 = operand.param_count(?shape.enumerant, w.ok);
+        if (n > MEMBERS) { ret refuse(field.STORAGE, op, at); }
+        var held: [16]operand.Value;
+        var k:    u32 = 0;
+        for (k < n) {
+            val one: err[field.Refusal] = decode_one(dec, ?operand.param(?shape.enumerant, w.ok, k).shape, ?held[k], op);
+            if (sel one.err) { ret one; }
+            k = k + 1;
+        }
+        val params: res[operand.Values, field.Refusal] = run(dec, ?held[0], n);
+        if (sel params.err) { ret err[field.Refusal].err{params.err}; }
+        @out = operand.Value.enumerant{operand.Chosen{value: w.ok, params: params.ok}};
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.group) {
+        val n: u32 = shape.group.len;
+        if (n > MEMBERS) { ret refuse(field.STORAGE, op, at); }
+        var held: [16]operand.Value;
+        var k:    u32 = 0;
+        for (k < n) {
+            val one: err[field.Refusal] = decode_one(dec, ?shape.group.at[k].shape, ?held[k], op);
+            if (sel one.err) { ret one; }
+            k = k + 1;
+        }
+        val members: res[operand.Values, field.Refusal] = run(dec, ?held[0], n);
+        if (sel members.err) { ret err[field.Refusal].err{members.err}; }
+        @out = operand.Value.group{members.ok};
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.literal) {
+        if (shape.literal.content == operand.STRING) {
+            var len: usize = 0;
+            for (dec.at + len < dec.end && dec.in.data[dec.at + len] != 0) { len = len + 1; }
+            if (dec.at + len >= dec.end) { ret refuse(UNTERMINATED, op, at); }
+            val bytes: res[operand.Bytes, field.Refusal] = field.borrow(dec, len);
+            if (sel bytes.err) { ret err[field.Refusal].err{bytes.err}; }
+            # the nul and the padding to a word, every byte of them nul
+            var pad: usize = 4 - len % 4;
+            if (dec.end - dec.at < pad) { ret refuse(field.TRUNCATED, op, at); }
+            for (pad > 0) {
+                if (dec.in.data[dec.at] != 0) { ret refuse(PADDING, op, dec.at); }
+                dec.at = dec.at + 1;
+                pad    = pad - 1;
+            }
+            @out = operand.Value.literal{bytes.ok};
+            ret err[field.Refusal].ok{};
+        }
+        val want: res[u32, field.Refusal] = literal_bytes(dec.ctx, ?shape.literal, dec.values, 0, op, at);
+        if (sel want.err) { ret err[field.Refusal].err{want.err}; }
+        val bytes: res[operand.Bytes, field.Refusal] = field.borrow(dec, want.ok::usize);
+        if (sel bytes.err) { ret err[field.Refusal].err{bytes.err}; }
+        @out = operand.Value.literal{bytes.ok};
+        ret err[field.Refusal].ok{};
+    }
+    ret refuse(field.WRONG_KIND, op, at);
+}
+
+# operand `f.operand` read whole and placed: an optional one when words remain, a variadic one every member until the
+# end, its members one run in the pool after what they hold within them
+fun operand_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val op:   u8               = f.operand;
+    val desc: *operand.Operand = ?dec.operands[op];
+    if (desc.quantity == operand.OPTIONAL && dec.at >= dec.end) { ret err[field.Refusal].ok{}; }
+    if (desc.quantity != operand.VARIADIC) {
+        var v:   operand.Value;
+        val got: err[field.Refusal] = decode_one(dec, ?desc.shape, ?v, op);
+        if (sel got.err) { ret got; }
+        field.place(dec, op, v);
+        ret err[field.Refusal].ok{};
+    }
+    # the members counted first, so their run is reserved before what each holds within it
+    val from: usize = dec.at;
+    val used: u32   = dec.used;
+    var n:    u32   = 0;
+    for (dec.at < dec.end) {
+        var v:   operand.Value;
+        val got: err[field.Refusal] = decode_one(dec, ?desc.shape, ?v, op);
+        if (sel got.err) { ret got; }
+        n = n + 1;
+    }
+    dec.at   = from;
+    dec.used = used;
+    if (n > dec.cap - dec.used) { ret refuse(field.STORAGE, op, from); }
+    val first: *operand.Value = ?dec.pool[dec.used];
+    dec.used = dec.used + n;
+    var k: u32 = 0;
+    for (k < n) {
+        val got: err[field.Refusal] = decode_one(dec, ?desc.shape, ?first[k], op);
+        if (sel got.err) { ret got; }
+        k = k + 1;
+    }
+    var members: operand.Values = operand.Values{at: first, len: n};
+    if (n == 0) { members = operand.NO_VALUES; }
+    field.place(dec, op, operand.Value.list{members});
+    ret err[field.Refusal].ok{};
+}
+
+fun lead_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    ret field.put(enc, f.fixed & 0xFFFF, 4);
+}
+
+# the word count patched into the lead at `offset` once every operand is written
+fun lead_finish(enc: *field.Encoder, f: *field.Field, offset: usize) err[field.Refusal] {
+    val bytes: usize = enc.out.len - enc.start;
+    if (bytes % 4 != 0)     { ret refuse(field.LENGTH, field.NO_OPERAND, 0); }
+    if (bytes / 4 > 0xFFFF) { ret refuse(COUNT, field.NO_OPERAND, 0); }
+    field.patch(enc, offset, ((bytes / 4)::u64 << 16) | (f.fixed & 0xFFFF), 4);
+    ret err[field.Refusal].ok{};
+}
+
+# the lead read: its opcode the row's, its word count the instruction's end
+fun lead_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at: usize                   = dec.at;
+    val w:  res[u32, field.Refusal] = next(dec, field.NO_OPERAND);
+    if (sel w.err)                                  { ret err[field.Refusal].err{w.err}; }
+    if ((w.ok::u64 & 0xFFFF) != (f.fixed & 0xFFFF)) { ret refuse(field.MISMATCH, field.NO_OPERAND, at); }
+    val count: u32 = w.ok >> 16;
+    if (count == 0) { ret refuse(field.LENGTH, field.NO_OPERAND, at); }
+    ret field.limit(dec, dec.start + count::usize * 4);
+}
+
+fun lead_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand != field.NO_OPERAND || f.mask != 0xFFFF) { ret opt[str].some{NO_LEAD}; }
+    ret opt[str].none{};
+}
+
+fun operand_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count) { ret opt[str].some{field.OPERAND_COUNT}; }
+    ret opt[str].none{};
+}
+
+# whether the set id `id` names an import of set `code` under the context's stream
+fun of_set(ctx: *state.Context, id: u32, code: u64, op: u8, at: usize) err[field.Refusal] {
+    if (ctx == nil || ctx.stream == nil) { ret refuse(UNSTREAMED, op, at); }
+    val set: opt[u32] = spirv_stream.space(ctx.stream, spirv_kind.IMPORTS, id);
+    if (!(sel set.some && set.some::u64 == code)) { ret refuse(OTHER_SET, op, at); }
+    ret err[field.Refusal].ok{};
+}
+
+fun extset_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.id) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    ret of_set(enc.ctx, v.id, f.param, f.operand, 0);
+}
+
+fun extset_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.id) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    ret field.put(enc, v.id::u64, 4);
+}
+
+fun extset_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at: usize                   = dec.at;
+    val w:  res[u32, field.Refusal] = next(dec, f.operand);
+    if (sel w.err) { ret err[field.Refusal].err{w.err}; }
+    val held: err[field.Refusal] = of_set(dec.ctx, w.ok, f.param, f.operand, at);
+    if (sel held.err) { ret held; }
+    field.place(dec, f.operand, operand.Value.id{w.ok});
+    ret err[field.Refusal].ok{};
+}
+
+fun extset_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count || f.param == 0) { ret opt[str].some{NO_SET}; }
+    val set: *operand.Operand = ?ops[f.operand];
+    if (!sel set.shape.id) { ret opt[str].some{NO_SET}; }
+    ret opt[str].none{};
+}
+
+pub val LEAD_KIND:    field.Kind = field.Kind{name: "lead", admit: nil, encode: lead_encode, decode: lead_decode, finish: lead_finish, complete: nil, check: lead_check};
+pub val OPERAND_KIND: field.Kind = field.Kind{name: "operand", admit: operand_encode, encode: operand_encode, decode: operand_decode, finish: nil, complete: nil, check: operand_check};
+pub val EXTSET_KIND:  field.Kind = field.Kind{name: "set", admit: extset_admit, encode: extset_encode, decode: extset_decode, finish: nil, complete: nil, check: extset_check};
+
+val KINDS: [4]*field.Kind = [4]*field.Kind{?LEAD_KIND, ?OPERAND_KIND, ?EXTSET_KIND, ?field.UNIT};
+
+# the spir-v field table, each kind at its index in `masc.isa.spirv.kind`, its words little-endian as a module of
+# magic 0x07230203 read in its own order holds them
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 4, order: field.LITTLE};
