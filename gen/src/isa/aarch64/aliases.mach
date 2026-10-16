@@ -1,0 +1,1046 @@
+# the mapping of the instruction model's aliases onto the rows they respell
+#
+# the model states each alias of an instruction as its own assembly over the instruction's fields, the condition under
+# which it is an alias at all and the one under which it is the preferred disassembly. an alias is read as an
+# instruction of its own (mapping.alias_rows): the base's bits with every field its conditions fix to one pattern
+# fixed, its symbols the operands the operands topic states. each row of it is then paired with each row of its base
+# whose fixed bits it holds, and every operand of the base row takes its value from where the alias states it:
+#
+# - an operand whose every bit the alias row fixes takes that value, as cmp's xzr destination;
+# - an operand whose bits one alias operand holds alike, the same register, immediate or member list, is that operand,
+#   and one whose members spell the base's with bits flipped is it flipped, as cset's inverted condition;
+# - an operand on a field the preferred condition sets equal to another, as ror's `Rn == Rm`, is the operand on that
+#   other field.
+#
+# what the alias's operands admit beyond its base operand's, from the tests its conditions make, are its exclusions. a
+# preferred condition of field tests holds where the alias applies at all, each of its alternatives an alias of its
+# own, so `MOV` of `ADD` is the alias only where one register is sp and `mov x0, x1` reads as `ORR`. an alias the model
+# never prefers is only read. the aliases topic (gen/data/aarch64/aliases.txt) names, for each alias whose operands are
+# computed or whose preference is a function the model does not spell, as lsl over ubfm or mov over movz, the
+# derivation in masc.isa.aarch64.alias that computes them, and a rank among the aliases of one row where their
+# preferences overlap, the highest printed:
+#
+#   derive <base instruction or row> <alias> | <derivation> [rank=<n>]
+#
+# a line of a row, by its key, as `dupm_z_i_.b`, derives the alias over that row alone, as an element width the
+# derivation reads but no value states.
+# the model states no alias's derivation, so no line overrides it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use json.lib.json;
+
+use masc.core.field;
+use masc.core.operand;
+
+use gen.diag;
+use gen.isa.aarch64;
+use gen.isa.aarch64.expr;
+use gen.isa.aarch64.instructions;
+use gen.isa.aarch64.mapping;
+use gen.isa.aarch64.operands;
+use topic: gen.overlay;
+use gen.source;
+
+pub val TOPIC: str = "aliases";
+
+pub val BAD_LINE:    str = "aliases line is not `derive <base> <alias> | <derivation> [rank=<n>]`";
+pub val TWICE:       str = "alias derived twice";
+pub val NO_ALIAS:    str = "aliases line names an alias its base does not have";
+pub val PREFERRED:   str = "alias is preferred under a condition no field test states, and the aliases topic derives nothing for it";
+pub val UNRESOLVED:  str = "alias gives no value for an operand of its row, and the aliases topic derives nothing for it";
+pub val UNUSED:      str = "alias operand gives no operand of its row its value, and the aliases topic derives nothing for it";
+pub val UNPAIRED:    str = "alias pairs with no row of its base";
+pub val DERIVED_OUT: str = "derived alias leaves out an optional group, which its derivation does not read";
+pub val CROWDED:     str = "row has more spellings than preferences tell apart";
+pub val UNDERIVED:   str = "aliases topic derives an alias for some rows of its base but not this one";
+
+# the first preference of an alias of the model, above every spelling of a row's own with groups left out
+val MODEL_PREFERENCE: u8 = 8;
+
+# a derivation the topic names
+# ---
+# name: its name, whose `<name>_base` and `<name>_alias` functions masc.isa.aarch64.alias states
+# rank: its rank among the aliases of one row whose preferences overlap
+# used: whether an alias of the model took it
+# fact: its line
+pub rec Derivation {
+    name: str;
+    rank: u8;
+    used: bool;
+    fact: *topic.Fact;
+}
+
+# the aliases topic: each derivation's line by `<base> <alias>`
+pub rec Aliases {
+    derived: map.Map[str, u32];
+    lines:   vector.Vector[Derivation];
+}
+
+fun inserted(r: res[bool, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun memory() diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, nil);
+}
+
+# the key of alias `alias` of instruction `base`
+fun key_of(a: *A.Allocator, base: str, alias: str) str {
+    val got: res[str, StrError] = str_join(a, base, " ", alias);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# the aliases topic of the data tree `tree`
+pub fun read(a: *A.Allocator, tree: *source.Tree) res[Aliases, diag.Refusal] {
+    val got: res[topic.Topic, diag.Refusal] = topic.read(a, tree, TOPIC);
+    if (sel got.err) { ret res[Aliases, diag.Refusal].err{got.err}; }
+    var t:       topic.Topic       = got.ok;
+    val checked: err[diag.Refusal] = topic.check(?t, nil, topic.unstated);
+    if (sel checked.err) { ret res[Aliases, diag.Refusal].err{checked.err}; }
+    var out: Aliases = Aliases{derived: map.init[str, u32](a), lines: vector.init[Derivation](a)};
+    var i:   usize   = 0;
+    for (i < t.facts.len) {
+        var l:    topic.Line        = topic.Line{fact: nil, key: vector.init[str](a), ws: vector.init[str](a)};
+        val read: err[diag.Refusal] = topic.line(a, ?t.facts.data[i], ?l);
+        if (sel read.err)                                               { ret res[Aliases, diag.Refusal].err{read.err}; }
+        if (!topic.is(?l, "derive", 3) || l.ws.len < 1 || l.ws.len > 2) { ret res[Aliases, diag.Refusal].err{topic.refuse(l.fact, BAD_LINE, nil)}; }
+        var d: Derivation = Derivation{name: l.ws.data[0], rank: 0, used: false, fact: l.fact};
+        if (l.ws.len == 2) {
+            val rank: opt[str] = topic.value(?l.ws, "rank");
+            if (sel rank.none) { ret res[Aliases, diag.Refusal].err{topic.refuse(l.fact, BAD_LINE, l.ws.data[1])}; }
+            val n: res[i64, diag.Refusal] = topic.number(l.fact, rank.some);
+            if (sel n.err)             { ret res[Aliases, diag.Refusal].err{n.err}; }
+            if (n.ok < 0 || n.ok > 15) { ret res[Aliases, diag.Refusal].err{topic.refuse(l.fact, BAD_LINE, rank.some)}; }
+            d.rank = n.ok::u8;
+        }
+        val key: str = key_of(a, l.key.data[1], l.key.data[2]);
+        if (key == nil) { ret res[Aliases, diag.Refusal].err{memory()}; }
+        val prior: opt[*u32] = map.get[str, u32](?out.derived, ?key);
+        if (sel prior.some)                                                         { ret res[Aliases, diag.Refusal].err{topic.refuse(l.fact, TWICE, key)}; }
+        if (!inserted(map.insert[str, u32](?out.derived, key, out.lines.len::u32))) { ret res[Aliases, diag.Refusal].err{memory()}; }
+        val pushed: res[usize, A.Error] = vector.push[Derivation](?out.lines, d);
+        if (sel pushed.err) { ret res[Aliases, diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    ret res[Aliases, diag.Refusal].ok{out};
+}
+
+# one alternative of a preferred condition: the field tests it makes and the fields it sets equal
+rec Alternative {
+    tests:  vector.Vector[*json.Value];
+    copies: vector.Vector[mapping.Tie];
+}
+
+rec Pairing {
+    alloc:   *A.Allocator;
+    src:     *mapping.Sources;
+    failed:  bool;
+    failure: diag.Refusal;
+}
+
+fun fail(p: *Pairing, message: str, subject: str) {
+    if (p.failed) { ret; }
+    p.failed  = true;
+    p.failure = diag.refusal(instructions.INSTRUCTIONS, 0, message, subject);
+}
+
+fun pushed(p: *Pairing, got: res[usize, A.Error]) {
+    if (sel got.err) { fail(p, diag.MEMORY, nil); }
+}
+
+fun at(v: *json.Value, key: str) *json.Value {
+    if (v == nil || v.kind != json.OBJECT) { ret nil; }
+    val got: opt[*json.Value] = json.value_find(v, key);
+    if (sel got.none) { ret nil; }
+    ret got.some;
+}
+
+# whether string member `key` of `v` is `text`
+fun is(v: *json.Value, key: str, text: str) bool {
+    val got: *json.Value = at(v, key);
+    if (got == nil || got.kind != json.STRING) { ret false; }
+    var i: usize = 0;
+    for (i < got.str_len) {
+        if (text[i] == 0 || text[i] != got.str_val[i]) { ret false; }
+        i = i + 1;
+    }
+    ret text[i] == 0;
+}
+
+# the text of string member `key` of `v`, owned, nil when it is absent
+fun string(p: *Pairing, v: *json.Value, key: str) str {
+    val s: *json.Value = at(v, key);
+    if (s == nil || s.kind != json.STRING) { ret nil; }
+    val got: res[*u8, A.Error] = A.allocate[u8](p.alloc, s.str_len + 1);
+    if (sel got.err) {
+        fail(p, diag.MEMORY, nil);
+        ret nil;
+    }
+    var i: usize = 0;
+    for (i < s.str_len) {
+        got.ok[i] = s.str_val[i];
+        i         = i + 1;
+    }
+    got.ok[s.str_len] = 0;
+    ret got.ok;
+}
+
+# whether `e` is the constant `value`
+fun constant(e: *json.Value, value: bool) bool {
+    if (!instructions.kind(e, "AST.Bool")) { ret false; }
+    val v: *json.Value = at(e, "value");
+    ret v != nil && v.kind == json.BOOL && json.value_bool(v) == value;
+}
+
+# whether `e` is `SysOp(...) == Sys_<group>` or one of its kin: a system instruction's fields name an operation of the
+# group, which holds wherever the alias's operation operand reads them, since its members are that group's operations
+fun system_operation(e: *json.Value) bool {
+    if (!instructions.kind(e, "AST.BinaryOp") || !is(e, "op", "==")) { ret false; }
+    val left:  *json.Value = at(e, "left");
+    val right: *json.Value = at(e, "right");
+    if (!instructions.kind(left, "AST.Function") || !instructions.kind(right, "AST.Identifier")) { ret false; }
+    ret is(left, "name", "SysOp") || is(left, "name", "SysLOp") || is(left, "name", "SysOp128");
+}
+
+# whether `e` names a field of `ins`
+fun field_named(p: *Pairing, ins: *instructions.Instruction, e: *json.Value) bool {
+    if (!instructions.kind(e, "AST.Identifier")) { ret false; }
+    var places: vector.Vector[u8] = vector.init[u8](p.alloc);
+    ret expr.places_in(?ins.bits, string(p, e, "value"), ?places);
+}
+
+# whether `e` is a test the mapping reads of the fields of `ins`: a field against a pattern or a set of them, or the
+# negation or conjunction of such tests
+fun field_test(p: *Pairing, ins: *instructions.Instruction, e: *json.Value) bool {
+    if (instructions.kind(e, "AST.UnaryOp"))   { ret is(e, "op", "!") && field_test(p, ins, at(e, "expr")); }
+    if (!instructions.kind(e, "AST.BinaryOp")) { ret false; }
+    if (is(e, "op", "&&"))                     { ret field_test(p, ins, at(e, "left")) && field_test(p, ins, at(e, "right")); }
+    if (!field_named(p, ins, at(e, "left")))   { ret false; }
+    val right: *json.Value = at(e, "right");
+    if (is(e, "op", "==") || is(e, "op", "!=")) { ret instructions.kind(right, "Values.Value"); }
+    if (is(e, "op", "IN"))                      { ret instructions.kind(right, "AST.Set"); }
+    ret false;
+}
+
+# the alternatives of preferred condition `e` into `out`, false when a part of it is neither a field test nor two fields
+# set equal
+fun alternatives(p: *Pairing, ins: *instructions.Instruction, e: *json.Value, out: *vector.Vector[Alternative]) bool {
+    if (instructions.kind(e, "AST.BinaryOp") && is(e, "op", "||")) { ret alternatives(p, ins, at(e, "left"), out) && alternatives(p, ins, at(e, "right"), out); }
+    if (instructions.kind(e, "AST.BinaryOp") && is(e, "op", "&&")) {
+        var left:  vector.Vector[Alternative] = vector.init[Alternative](p.alloc);
+        var right: vector.Vector[Alternative] = vector.init[Alternative](p.alloc);
+        if (!alternatives(p, ins, at(e, "left"), ?left) || !alternatives(p, ins, at(e, "right"), ?right)) { ret false; }
+        var i: usize = 0;
+        for (i < left.len) {
+            var k: usize = 0;
+            for (k < right.len) {
+                var both: Alternative = Alternative{tests: vector.init[*json.Value](p.alloc), copies: vector.init[mapping.Tie](p.alloc)};
+                var j:    usize       = 0;
+                for (j < left.data[i].tests.len) {
+                    pushed(p, vector.push[*json.Value](?both.tests, left.data[i].tests.data[j]));
+                    j = j + 1;
+                }
+                j = 0;
+                for (j < right.data[k].tests.len) {
+                    pushed(p, vector.push[*json.Value](?both.tests, right.data[k].tests.data[j]));
+                    j = j + 1;
+                }
+                j = 0;
+                for (j < left.data[i].copies.len) {
+                    pushed(p, vector.push[mapping.Tie](?both.copies, left.data[i].copies.data[j]));
+                    j = j + 1;
+                }
+                j = 0;
+                for (j < right.data[k].copies.len) {
+                    pushed(p, vector.push[mapping.Tie](?both.copies, right.data[k].copies.data[j]));
+                    j = j + 1;
+                }
+                pushed(p, vector.push[Alternative](out, both));
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        ret true;
+    }
+    var one: Alternative = Alternative{tests: vector.init[*json.Value](p.alloc), copies: vector.init[mapping.Tie](p.alloc)};
+    if (instructions.kind(e, "AST.BinaryOp") && is(e, "op", "==") && field_named(p, ins, at(e, "left")) && field_named(p, ins, at(e, "right"))) {
+        pushed(p, vector.push[mapping.Tie](?one.copies, mapping.Tie{from: string(p, at(e, "left"), "value"), to: string(p, at(e, "right"), "value")}));
+    }
+    or (field_test(p, ins, e)) { pushed(p, vector.push[*json.Value](?one.tests, e)); }
+    or (!system_operation(e))  { ret false; }
+    pushed(p, vector.push[Alternative](out, one));
+    ret true;
+}
+
+# the bits operand `op` holds, its slices' and its field kind's own
+fun bits_of(op: *mapping.Operand) u64 {
+    ret mapping.placed_bits(op, 0xFFFF_FFFF_FFFF_FFFF) | op.own;
+}
+
+# the raw number operand `op`'s slices read from bits `bits`
+fun raw(op: *mapping.Operand, bits: u64) u64 {
+    var out: u64   = 0;
+    var i:   usize = 0;
+    for (i < op.slices.len) {
+        val s: *field.Slice = ?op.slices.data[i];
+        var b: u64          = (bits >> s.at::u64) & field.ones(s.len);
+        if (s.invert) { b = ~b & field.ones(s.len); }
+        out = out | (b << s.lo::u64);
+        i   = i + 1;
+    }
+    ret out;
+}
+
+# the register file row of number `n` of the first of `op`'s classes that has it, -1 for none
+fun register_row(rf: *aarch64.Families, op: *mapping.Operand, n: u32) i64 {
+    var c: usize = 0;
+    for (c < op.classes.len) {
+        val ci:    u32            = op.classes.data[c]::u32;
+        val class: *aarch64.Class = ?rf.classes.data[ci];
+        if (n >= class.first && n <= class.last) {
+            var i: usize = 0;
+            for (i < rf.rows.len) {
+                if (rf.rows.data[i].class == ci && rf.rows.data[i].number == n) { ret i::i64; }
+                i = i + 1;
+            }
+        }
+        c = c + 1;
+    }
+    ret -1;
+}
+
+# what an operand whose every bit an alias row fixes takes
+# ---
+# value:   this value
+# refused: none, as a value the operand does not admit, so the alias respells another row
+# unread:  nothing the pairing reads, as an operand of a field kind of its own
+pub tag Fixed: u8 {
+    value: mapping.Source;
+    refused;
+    unread;
+}
+
+# the value operand `op` holds where the alias row fixes all its bits to `fixed`
+fun decoded(p: *Pairing, op: *mapping.Operand, fixed: u64) Fixed {
+    if (op.kind != mapping.UNIT_KIND || op.list || op.own != 0) { ret Fixed.unread{}; }
+    val n: u64 = raw(op, fixed);
+    if (op.shape == mapping.REGISTER) {
+        val number: u32 = op.first + n::u32;
+        if (holds_u32(?op.excluded, number)) { ret Fixed.refused{}; }
+        val row: i64 = register_row(p.src.registers, op, number);
+        if (row < 0) { ret Fixed.refused{}; }
+        ret Fixed.value{mapping.Source.register{row::u32}};
+    }
+    if (op.shape == mapping.IMMEDIATE) {
+        val imm: *operand.Immediate = ?op.immediate;
+        var v:   u64                = n & field.ones(imm.bits);
+        if (imm.sign == operand.SIGNED && imm.bits > 0 && imm.bits < 64 && ((v >> (imm.bits - 1)::u64) & 1) != 0) { v = v | ~field.ones(imm.bits); }
+        val value: i64 = v:~i64 + imm.bias;
+        if (holds_i64(?op.excluded_values, value)) { ret Fixed.refused{}; }
+        ret Fixed.value{mapping.Source.immediate{value}};
+    }
+    if (op.shape == mapping.ENUMERANT) {
+        if (op.open) { ret Fixed.value{mapping.Source.enumerant{n::u32}}; }
+        var i: usize = 0;
+        for (i < op.members.len) {
+            if (op.members.data[i].value::u64 == n) { ret Fixed.value{mapping.Source.enumerant{n::u32}}; }
+            i = i + 1;
+        }
+        ret Fixed.refused{};
+    }
+    ret Fixed.unread{};
+}
+
+# the value operand `op` takes where its text is left out, as an optional `<Xt>` is xzr, none where it states none
+fun defaulted(p: *Pairing, op: *mapping.Operand) opt[mapping.Source] {
+    val f: *operands.Fact = op.fact;
+    if (op.shape == mapping.IMMEDIATE && f.defaulted) { ret opt[mapping.Source].some{mapping.Source.immediate{f.default}}; }
+    if (f.omitted == nil)                             { ret opt[mapping.Source].none{}; }
+    if (op.shape == mapping.REGISTER) {
+        var i: usize = 0;
+        for (i < p.src.registers.rows.len) {
+            if (str_equals(p.src.registers.rows.data[i].name, f.omitted)) { ret opt[mapping.Source].some{mapping.Source.register{i::u32}}; }
+            i = i + 1;
+        }
+    }
+    if (op.shape == mapping.ENUMERANT) {
+        var i: usize = 0;
+        for (i < op.members.len) {
+            if (equal_folded(op.members.data[i].name, f.omitted)) { ret opt[mapping.Source].some{mapping.Source.enumerant{op.members.data[i].value}}; }
+            i = i + 1;
+        }
+    }
+    ret opt[mapping.Source].none{};
+}
+
+# whether `a` and `b` are one text without regard to case
+fun equal_folded(a: str, b: str) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0) {
+        if ((a[i] | 0x20) != (b[i] | 0x20)) { ret false; }
+        i = i + 1;
+    }
+    ret a[i] == 0 && b[i] == 0;
+}
+
+fun same_u16(a: *vector.Vector[u16], b: *vector.Vector[u16]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun holds_u32(v: *vector.Vector[u32], x: u32) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == x) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun holds_i64(v: *vector.Vector[i64], x: i64) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == x) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the member of `op` named `name`, nil for none
+fun member_named(op: *mapping.Operand, name: str) *mapping.Member {
+    var i: usize = 0;
+    for (i < op.members.len) {
+        if (str_equals(op.members.data[i].name, name)) { ret ?op.members.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# how alias operand `a` gives base operand `b` its value
+# ---
+# SAME:    as it is
+# FLIPPED: with the bits of the mask flipped
+# OTHER:   by no source
+def Likeness: u8;
+
+val SAME:    Likeness = 0;
+val FLIPPED: Likeness = 1;
+val OTHER:   Likeness = 2;
+
+# whether alias operand `a` is base operand `b` but for the values it excludes, and the mask an enumerant's members
+# flip into `mask`
+fun likeness(a: *mapping.Operand, b: *mapping.Operand, element: bool, mask: *u32) Likeness {
+    @mask = 0;
+    if (a.shape != b.shape || a.kind != b.kind || a.param != b.param || a.list != b.list) { ret OTHER; }
+    if (a.shape == mapping.REGISTER) {
+        if (!same_u16(?a.classes, ?b.classes) || a.first != b.first || a.count != b.count || a.fields != b.fields) { ret OTHER; }
+        if (a.list && (a.length != b.length || a.stride != b.stride))                                              { ret OTHER; }
+        var x: i64 = -1;
+        var y: i64 = -1;
+        if (sel a.element.fixed) { x = a.element.fixed::i64; }
+        if (sel b.element.fixed) { y = b.element.fixed::i64; }
+        if (element && x != y)   { ret OTHER; }
+        ret SAME;
+    }
+    if (a.shape == mapping.IMMEDIATE || a.shape == mapping.RELATIVE) {
+        val x: *operand.Immediate = ?a.immediate;
+        val y: *operand.Immediate = ?b.immediate;
+        if (x.bits != y.bits || x.sign != y.sign || x.scale != y.scale || x.bias != y.bias || x.format != y.format || a.page != b.page) { ret OTHER; }
+        ret SAME;
+    }
+    if (a.open != b.open || a.mask != b.mask) { ret OTHER; }
+    var flip: u32   = 0;
+    var i:    usize = 0;
+    for (i < a.members.len) {
+        val m: *mapping.Member = member_named(b, a.members.data[i].name);
+        if (m == nil) { ret OTHER; }
+        val x: u32 = m.value ^ a.members.data[i].value;
+        if (i == 0)    { flip = x; }
+        or (x != flip) { ret OTHER; }
+        i = i + 1;
+    }
+    if (flip == 0) { ret SAME; }
+    @mask = flip;
+    ret FLIPPED;
+}
+
+# the values alias operand `a` of alias `al` excludes beyond base operand `b`'s, into the alias's exclusions at `k`
+fun exclusions(p: *Pairing, al: *mapping.Alias, k: u8, a: *mapping.Operand, b: *mapping.Operand) {
+    if (a.shape == mapping.REGISTER) {
+        var i: usize = 0;
+        for (i < a.excluded.len) {
+            if (!holds_u32(?b.excluded, a.excluded.data[i]) && !mapping.withhold(p.alloc, al, k, mapping.REGISTER, a.excluded.data[i]::i64)) { fail(p, diag.MEMORY, nil); }
+            i = i + 1;
+        }
+        ret;
+    }
+    if (a.shape == mapping.IMMEDIATE) {
+        var i: usize = 0;
+        for (i < a.excluded_values.len) {
+            if (!holds_i64(?b.excluded_values, a.excluded_values.data[i]) && !mapping.withhold(p.alloc, al, k, mapping.IMMEDIATE, a.excluded_values.data[i])) { fail(p, diag.MEMORY, nil); }
+            i = i + 1;
+        }
+        ret;
+    }
+    if (a.shape == mapping.ENUMERANT && !a.open && !a.mask) {
+        var i: usize = 0;
+        for (i < b.members.len) {
+            if (member_named(a, b.members.data[i].name) == nil && !mapping.withhold(p.alloc, al, k, mapping.ENUMERANT, b.members.data[i].value::i64)) { fail(p, diag.MEMORY, nil); }
+            i = i + 1;
+        }
+    }
+}
+
+# the bits of field `name` of `ins`
+fun field_bits(p: *Pairing, ins: *instructions.Instruction, name: str) u64 {
+    var places: vector.Vector[u8] = vector.init[u8](p.alloc);
+    if (!expr.places_in(?ins.bits, name, ?places)) { ret 0; }
+    var out: u64   = 0;
+    var i:   usize = 0;
+    for (i < places.len) {
+        out = out | (1::u64 << places.data[i]::u64);
+        i   = i + 1;
+    }
+    ret out;
+}
+
+# the alias operand of row `alias` whose bits are `bits`, -1 for none
+fun holding(alias: *mapping.Row, bits: u64) i64 {
+    var k: usize = 0;
+    for (k < alias.operands.len) {
+        if (bits_of(?alias.operands.data[k]) == bits) { ret k::i64; }
+        k = k + 1;
+    }
+    ret -1;
+}
+
+fun same_alternatives(a: *vector.Vector[mapping.Alternative], b: *vector.Vector[mapping.Alternative]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        val x: *mapping.Alternative = ?a.data[i];
+        val y: *mapping.Alternative = ?b.data[i];
+        if (x.all.len != y.all.len || x.none.len != y.none.len) { ret false; }
+        var k: usize = 0;
+        for (k < x.all.len) {
+            if (!str_equals(x.all.data[k], y.all.data[k])) { ret false; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < x.none.len) {
+            if (!str_equals(x.none.data[k], y.none.data[k])) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a description of alias `name` over row `row`, for a refusal
+fun subject(p: *Pairing, row: *mapping.Row, name: str, rule: str) str {
+    var s: str                = row.key;
+    val a: res[str, StrError] = str_join(p.alloc, s, " as ", name);
+    if (sel a.ok) { s = a.ok; }
+    if (rule != nil) {
+        val b: res[str, StrError] = str_join(p.alloc, s, ": ", rule);
+        if (sel b.ok) { s = b.ok; }
+    }
+    ret s;
+}
+
+# the alias operand holding a field that the preferred condition's equalities `copies` set equal, directly or through
+# others, to the field whose bits are `bits`, -1 for none
+fun copy_of(p: *Pairing, ins: *instructions.Instruction, alias: *mapping.Row, copies: *vector.Vector[mapping.Tie], bits: u64) i64 {
+    var reached: vector.Vector[u64] = vector.init[u64](p.alloc);
+    pushed(p, vector.push[u64](?reached, bits));
+    var grew: bool = true;
+    for (grew) {
+        grew = false;
+        var c: usize = 0;
+        for (c < copies.len) {
+            val x:  u64   = field_bits(p, ins, copies.data[c].from);
+            val y:  u64   = field_bits(p, ins, copies.data[c].to);
+            var hx: bool  = false;
+            var hy: bool  = false;
+            var r:  usize = 0;
+            for (r < reached.len) {
+                if (reached.data[r] == x) { hx = true; }
+                if (reached.data[r] == y) { hy = true; }
+                r = r + 1;
+            }
+            if (hx && !hy) {
+                pushed(p, vector.push[u64](?reached, y));
+                grew = true;
+            }
+            if (hy && !hx) {
+                pushed(p, vector.push[u64](?reached, x));
+                grew = true;
+            }
+            c = c + 1;
+        }
+    }
+    var r: usize = 1;
+    for (r < reached.len) {
+        val k: i64 = holding(alias, reached.data[r]);
+        if (k >= 0) { ret k; }
+        r = r + 1;
+    }
+    ret -1;
+}
+
+# whether rows `a` and `b` take one member of every choice both are made of, as cmp's `.w` row respelling only subs's
+# `.w` row, the width a choice of members of several patterns leaves to its operands' values rather than the bits
+fun picks_agree(a: *mapping.Row, b: *mapping.Row) bool {
+    var i: usize = 0;
+    for (i < a.picked.len) {
+        var k: usize = 0;
+        for (k < b.picked.len) {
+            if (str_equals(a.picked.data[i].rule, b.picked.data[k].rule) && !str_equals(a.picked.data[i].member, b.picked.data[k].member)) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bits of the value of one operand of alias row `alias` that base operand `b` holds whole, an unsigned number of
+# them, none where no enumerant or plain number holds them in order
+fun part_of(alias: *mapping.Row, b: *mapping.Operand) opt[mapping.Part] {
+    if (b.kind != mapping.UNIT_KIND || b.list || b.own != 0 || b.slices.len == 0)                                                                               { ret opt[mapping.Part].none{}; }
+    if (b.shape == mapping.IMMEDIATE && (b.immediate.sign != operand.UNSIGNED || b.immediate.scale != 0 || b.immediate.bias != 0 || b.excluded_values.len > 0)) { ret opt[mapping.Part].none{}; }
+    if (b.shape != mapping.IMMEDIATE)                                                                                                                           { ret opt[mapping.Part].none{}; }
+    val bits: u64   = bits_of(b);
+    var k:    usize = 0;
+    for (k < alias.operands.len) {
+        val a:   *mapping.Operand = ?alias.operands.data[k];
+        val raw: bool             = a.shape == mapping.ENUMERANT || (a.shape == mapping.IMMEDIATE && a.immediate.sign == operand.UNSIGNED && a.immediate.scale == 0 && a.immediate.bias == 0);
+        if (a.kind == mapping.UNIT_KIND && !a.list && a.own == 0 && raw && (bits & ~bits_of(a)) == 0) {
+            # the alias value's bit at each instruction bit the base operand's raw bits lie at, in order from its low bit
+            var lo:   i64   = -1;
+            var len:  u8    = 0;
+            var fine: bool  = true;
+            var i:    usize = 0;
+            for (i < b.slices.len && fine) {
+                val s: *field.Slice = ?b.slices.data[i];
+                var n: u8           = 0;
+                for (n < s.len && fine) {
+                    val at:  u8  = s.at + n;
+                    val got: i64 = raw_bit(a, at);
+                    val raw: i64 = (s.lo + n)::i64;
+                    if (got < 0 || s.invert) { fine = false; }
+                    or (lo < 0 && raw == 0)  { lo = got; }
+                    n = n + 1;
+                }
+                i = i + 1;
+            }
+            i = 0;
+            for (i < b.slices.len && fine) {
+                val s: *field.Slice = ?b.slices.data[i];
+                var n: u8           = 0;
+                for (n < s.len && fine) {
+                    if (lo < 0 || raw_bit(a, s.at + n) != lo + (s.lo + n)::i64) { fine = false; }
+                    n = n + 1;
+                }
+                len = len + s.len;
+                i   = i + 1;
+            }
+            if (fine && lo >= 0) { ret opt[mapping.Part].some{mapping.Part{operand: k::u8, lo: lo::u8, len: len}}; }
+        }
+        k = k + 1;
+    }
+    ret opt[mapping.Part].none{};
+}
+
+# the bit of operand `a`'s raw value at instruction bit `at`, -1 where it holds none there or holds it inverted
+fun raw_bit(a: *mapping.Operand, at: u8) i64 {
+    var i: usize = 0;
+    for (i < a.slices.len) {
+        val s: *field.Slice = ?a.slices.data[i];
+        if (at >= s.at && at < s.at + s.len) {
+            if (s.invert) { ret -1; }
+            ret (s.lo + (at - s.at))::i64;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# alias row `alias` of model alias `name` paired with base row `base`: its spelling over the base row's operands, none
+# when the alias row does not hold the base row's fixed bits
+fun pair(p: *Pairing, ins: *instructions.Instruction, name: str, alias: *mapping.Row, base: *mapping.Row, copies: *vector.Vector[mapping.Tie], d: *Derivation) opt[mapping.Alias] {
+    # the base row's fixed bits the alias row leaves free are its own where no alias operand holds them, as bfi's
+    # 32-bit immr and imms its derivation computes
+    var held: u64   = 0;
+    var h:    usize = 0;
+    for (h < alias.operands.len) {
+        held = held | bits_of(?alias.operands.data[h]);
+        h    = h + 1;
+    }
+    if ((base.mask & ~alias.mask & held) != 0 || ((alias.fixed ^ base.fixed) & base.mask & alias.mask) != 0 || !picks_agree(alias, base)) { ret opt[mapping.Alias].none{}; }
+    var out:  mapping.Alias = mapping.Alias{template: alias.template, count: alias.operands.len::u8, sources: vector.init[mapping.Source](p.alloc), exclusions: vector.init[mapping.Exclusion](p.alloc), preference: 0, requires: vector.init[mapping.Alternative](p.alloc), derive: nil, operands: vector.init[mapping.Operand](p.alloc)};
+    var used: u64           = 0;
+    var own:  bool          = d != nil;
+    var j:    usize         = 0;
+    for (j < base.operands.len && !p.failed) {
+        val b:    *mapping.Operand = ?base.operands.data[j];
+        val bits: u64              = bits_of(b);
+        var got:  bool             = false;
+        if (bits != 0 && (bits & ~alias.mask) == 0) {
+            val v: Fixed = decoded(p, b, alias.fixed);
+            if (sel v.refused) { ret opt[mapping.Alias].none{}; }
+            if (sel v.value) {
+                pushed(p, vector.push[mapping.Source](?out.sources, v.value));
+                got = true;
+            }
+        }
+        var k:      i64  = -1;
+        var copied: bool = false;
+        if (!got) { k = holding(alias, bits); }
+        if (!got && k < 0) {
+            # an operand on a field the preferred condition sets equal to one an alias operand holds
+            k      = copy_of(p, ins, alias, copies, bits);
+            copied = true;
+        }
+        if (!got && k >= 0) {
+            val a:    *mapping.Operand = ?alias.operands.data[k::usize];
+            var mask: u32              = 0;
+            val like: Likeness         = likeness(a, b, !copied, ?mask);
+            if (like == SAME)    { pushed(p, vector.push[mapping.Source](?out.sources, mapping.Source.operand{k::u8})); }
+            if (like == FLIPPED) { pushed(p, vector.push[mapping.Source](?out.sources, mapping.Source.flipped{mapping.Flip{operand: k::u8, mask: mask}})); }
+            if (like != OTHER) {
+                exclusions(p, ?out, k::u8, a, b);
+                used = used | (1::u64 << k::u64);
+                got  = true;
+            }
+        }
+        if (!got) {
+            # an operand whose bits are some of one alias operand's, as sys's op1 of dc's operation
+            val part: opt[mapping.Part] = part_of(alias, b);
+            if (sel part.some) {
+                pushed(p, vector.push[mapping.Source](?out.sources, mapping.Source.bits{part.some}));
+                used = used | (1::u64 << part.some.operand::u64);
+                own  = true;
+                got  = true;
+            }
+        }
+        if (!got && d == nil) {
+            # an operand of an optional group the alias does not spell takes its default
+            val v: opt[mapping.Source] = defaulted(p, b);
+            if (sel v.some) {
+                pushed(p, vector.push[mapping.Source](?out.sources, v.some));
+                got = true;
+            }
+        }
+        if (!got) {
+            if (d == nil) {
+                fail(p, UNRESOLVED, subject(p, base, name, b.rule.id));
+                ret opt[mapping.Alias].none{};
+            }
+            pushed(p, vector.push[mapping.Source](?out.sources, mapping.Source.derived{}));
+        }
+        j = j + 1;
+    }
+    if (d == nil) {
+        var k: usize = 0;
+        for (k < alias.operands.len) {
+            if (((used >> k::u64) & 1) == 0) {
+                fail(p, UNUSED, subject(p, base, name, alias.operands.data[k].rule.id));
+                ret opt[mapping.Alias].none{};
+            }
+            k = k + 1;
+        }
+    }
+    if (d != nil) { out.derive = d.name; }
+    if (own) {
+        var k: usize = 0;
+        for (k < alias.operands.len) {
+            pushed(p, vector.push[mapping.Operand](?out.operands, alias.operands.data[k]));
+            k = k + 1;
+        }
+    }
+    if (!same_alternatives(?alias.requires, ?base.requires)) { out.requires = alias.requires; }
+    ret opt[mapping.Alias].some{out};
+}
+
+# spelling `s` of alias row `alias`, an optional group of it left out, over base row `base` through `paired`, the alias
+# row's own spelling paired with the base row
+fun composed(p: *Pairing, paired: *mapping.Alias, s: *mapping.Alias) mapping.Alias {
+    var out: mapping.Alias = mapping.Alias{template: s.template, count: s.count, sources: vector.init[mapping.Source](p.alloc), exclusions: vector.init[mapping.Exclusion](p.alloc), preference: 0, requires: paired.requires, derive: nil, operands: vector.init[mapping.Operand](p.alloc)};
+    var j:   usize         = 0;
+    for (j < paired.sources.len) {
+        val src: mapping.Source = paired.sources.data[j];
+        var got: mapping.Source = src;
+        if (sel src.operand) { got = s.sources.data[src.operand]; }
+        if (sel src.flipped) {
+            val inner: mapping.Source = s.sources.data[src.flipped.operand];
+            if (sel inner.operand)   { got = mapping.Source.flipped{mapping.Flip{operand: inner.operand, mask: src.flipped.mask}}; }
+            or (sel inner.enumerant) { got = mapping.Source.enumerant{inner.enumerant ^ src.flipped.mask}; }
+            or                       { fail(p, UNRESOLVED, s.template); }
+        }
+        if (sel src.bits) {
+            val part:  mapping.Part   = src.bits;
+            val inner: mapping.Source = s.sources.data[part.operand];
+            var whole: i64            = 0;
+            if (sel inner.immediate)                        { whole = inner.immediate; }
+            if (sel inner.enumerant)                        { whole = inner.enumerant::i64; }
+            if (sel inner.operand)                          { got = mapping.Source.bits{mapping.Part{operand: inner.operand, lo: part.lo, len: part.len}}; }
+            or (sel inner.immediate || sel inner.enumerant) { got = mapping.Source.immediate{((whole:~u64 >> part.lo::u64) & field.ones(part.len)):~i64}; }
+            or                                              { fail(p, UNRESOLVED, s.template); }
+        }
+        pushed(p, vector.push[mapping.Source](?out.sources, got));
+        j = j + 1;
+    }
+    # an alias of operands of its own writes those of the spelling
+    j = 0;
+    for (j < s.count::usize && paired.operands.len > 0) {
+        var k: usize = 0;
+        for (k < s.sources.len) {
+            val src: mapping.Source = s.sources.data[k];
+            if (sel src.operand && src.operand::usize == j) { pushed(p, vector.push[mapping.Operand](?out.operands, paired.operands.data[k])); }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    if (paired.operands.len > 0 && out.operands.len != s.count::usize) { fail(p, UNRESOLVED, s.template); }
+    # the exclusions of the spelling, then the paired alias's of each operand the spelling still writes
+    j = 0;
+    for (j < s.exclusions.len) {
+        val x: *mapping.Exclusion = ?s.exclusions.data[j];
+        var k: usize              = 0;
+        for (k < x.values.len) {
+            if (!mapping.withhold(p.alloc, ?out, x.operand, x.shape, x.values.data[k])) { fail(p, diag.MEMORY, nil); }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < paired.exclusions.len) {
+        val x:  *mapping.Exclusion = ?paired.exclusions.data[j];
+        val to: mapping.Source     = s.sources.data[x.operand];
+        if (sel to.operand) {
+            var k: usize = 0;
+            for (k < x.values.len) {
+                if (!mapping.withhold(p.alloc, ?out, to.operand, x.shape, x.values.data[k])) { fail(p, diag.MEMORY, nil); }
+                k = k + 1;
+            }
+        }
+        j = j + 1;
+    }
+    ret out;
+}
+
+# a model alias's spelling pushed onto a row's aliases, its preference set once every alias of the row is
+# ---
+# at:        its index in the row's aliases
+# rank:      its derivation's rank, 0 for none
+# group:     the pairing of one alias row with the row it spells, which its spellings with groups left out share
+# offset:    how much its spelling with groups left out is preferred over the group's own spelling
+# preferred: whether the model prefers it at all, an alias it never prefers only read
+rec Placed {
+    at:        usize;
+    rank:      u8;
+    group:     u32;
+    offset:    u8;
+    preferred: bool;
+}
+
+# whether placement `a` is below `b`: of lower rank, or of equal rank and paired first
+fun below(a: *Placed, b: *Placed) bool {
+    ret a.rank < b.rank || (a.rank == b.rank && a.group < b.group);
+}
+
+# the preferences of the model aliases `placed` of row `row`: each group a block of MODEL_PREFERENCE above the one
+# below it in rank and pairing order, its spellings offset in it, so no two of the row's printed spellings tie
+fun prefer(p: *Pairing, row: *mapping.Row, placed: *vector.Vector[Placed]) {
+    var i: usize = 0;
+    for (i < row.aliases.len) {
+        if (row.aliases.data[i].preference >= MODEL_PREFERENCE && !placed_at(placed, i)) {
+            fail(p, CROWDED, row.key);
+            ret;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < placed.len && !p.failed) {
+        val x: *Placed = ?placed.data[i];
+        if (x.offset >= MODEL_PREFERENCE) {
+            fail(p, CROWDED, row.key);
+            ret;
+        }
+        # the block is one more than the groups below this one
+        var under: u32   = 0;
+        var k:     usize = 0;
+        for (k < placed.len) {
+            val y: *Placed = ?placed.data[k];
+            if (y.preferred && below(y, x) && first_of(placed, k)) { under = under + 1; }
+            k = k + 1;
+        }
+        var preference: u32 = 0;
+        if (x.preferred) { preference = (under + 1) * MODEL_PREFERENCE::u32 + x.offset::u32; }
+        if (preference > 255) {
+            fail(p, CROWDED, row.key);
+            ret;
+        }
+        row.aliases.data[x.at].preference = preference::u8;
+        i                                 = i + 1;
+    }
+}
+
+# whether placement `k` of `placed` is the first of its group
+fun first_of(placed: *vector.Vector[Placed], k: usize) bool {
+    var i: usize = 0;
+    for (i < k) {
+        if (placed.data[i].group == placed.data[k].group) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `placed` holds the alias at `at`
+fun placed_at(placed: *vector.Vector[Placed], at: usize) bool {
+    var i: usize = 0;
+    for (i < placed.len) {
+        if (placed.data[i].at == at) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the derivation the aliases topic names for `key`, an instruction's or a row's alias, nil for none
+fun derivation(known: *Aliases, key: str) *Derivation {
+    val found: opt[*u32] = map.get[str, u32](?known.derived, ?key);
+    if (sel found.none) { ret nil; }
+    ret ?known.lines.data[@found.some];
+}
+
+# every alias of instruction `ins`, whose rows are `rows`, paired with those rows and pushed onto each row's aliases
+fun aliases_of(p: *Pairing, known: *Aliases, ins: *instructions.Instruction, rows: *mapping.Row, count: usize) {
+    var placed: vector.Vector[vector.Vector[Placed]] = vector.init[vector.Vector[Placed]](p.alloc);
+    var b:      usize                                = 0;
+    for (b < count) {
+        pushed(p, vector.push[vector.Vector[Placed]](?placed, vector.init[Placed](p.alloc)));
+        b = b + 1;
+    }
+    var group: u32   = 0;
+    var i:     usize = 0;
+    for (i < ins.aliases.len && !p.failed) {
+        val al:  *instructions.Alias = ?ins.aliases.data[i];
+        val key: str                 = key_of(p.alloc, ins.name, al.name);
+        val off: opt[*topic.Fact]    = operands.withheld(p.src.operands, mapping.join_alias(p.alloc, ins.name, al.name));
+        # the derivation of every row of the instruction, or of each row its own
+        val d:   *Derivation = derivation(known, key);
+        var any: bool        = d != nil;
+        b = 0;
+        for (b < count) {
+            if (derivation(known, key_of(p.alloc, rows[b].key, al.name)) != nil) { any = true; }
+            b = b + 1;
+        }
+        var alts:      vector.Vector[Alternative] = vector.init[Alternative](p.alloc);
+        val preferred: bool                       = !constant(al.preferred, false);
+        if (sel off.some)                                                              {}
+        or (any || al.preferred == nil || instructions.kind(al.preferred, "AST.Bool")) { pushed(p, vector.push[Alternative](?alts, Alternative{tests: vector.init[*json.Value](p.alloc), copies: vector.init[mapping.Tie](p.alloc)})); }
+        or (!alternatives(p, ins, al.preferred, ?alts))                                { fail(p, PREFERRED, key); }
+        var paired: usize = 0;
+        var a:      usize = 0;
+        for (a < alts.len && !p.failed) {
+            var made: vector.Vector[mapping.Row] = vector.init[mapping.Row](p.alloc);
+            val got:  res[bool, diag.Refusal]    = mapping.alias_rows(p.alloc, p.src, ins, al, ?alts.data[a].tests, ?alts.data[a].copies, any, ?made);
+            if (sel got.err) {
+                p.failed  = true;
+                p.failure = got.err;
+            }
+            var r: usize = 0;
+            for (r < made.len && !p.failed) {
+                val alias: *mapping.Row = ?made.data[r];
+                b = 0;
+                for (b < count && !p.failed) {
+                    val base: *mapping.Row = ?rows[b];
+                    # an alias withheld from one row of its instruction, as dupm's mov of a byte, which no value prefers
+                    val held: opt[*topic.Fact] = operands.withheld(p.src.operands, mapping.join_alias(p.alloc, base.key, al.name));
+                    if (sel held.some) {
+                        b = b + 1;
+                        cnt;
+                    }
+                    var dr: *Derivation = derivation(known, key_of(p.alloc, base.key, al.name));
+                    if (dr == nil)        { dr = d; }
+                    if (any && dr == nil) { fail(p, UNDERIVED, subject(p, base, al.name, nil)); }
+                    var rank: u8 = 0;
+                    if (dr != nil) {
+                        rank    = dr.rank;
+                        dr.used = true;
+                    }
+                    var one: opt[mapping.Alias] = opt[mapping.Alias].none{};
+                    if (!p.failed) { one = pair(p, ins, al.name, alias, base, ?alts.data[a].copies, dr); }
+                    if (sel one.some) {
+                        var spelled: mapping.Alias = one.some;
+                        pushed(p, vector.push[mapping.Alias](?base.aliases, spelled));
+                        pushed(p, vector.push[Placed](?placed.data[b], Placed{at: base.aliases.len - 1, rank: rank, group: group, offset: 0, preferred: preferred}));
+                        paired = paired + 1;
+                        var s: usize = 0;
+                        for (s < alias.aliases.len && !p.failed) {
+                            if (dr != nil) { fail(p, DERIVED_OUT, key); }
+                            or {
+                                pushed(p, vector.push[mapping.Alias](?base.aliases, composed(p, ?spelled, ?alias.aliases.data[s])));
+                                pushed(p, vector.push[Placed](?placed.data[b], Placed{at: base.aliases.len - 1, rank: rank, group: group, offset: alias.aliases.data[s].preference, preferred: preferred}));
+                            }
+                            s = s + 1;
+                        }
+                        group = group + 1;
+                    }
+                    b = b + 1;
+                }
+                r = r + 1;
+            }
+            a = a + 1;
+        }
+        if (!p.failed && paired == 0 && sel off.none) { fail(p, UNPAIRED, key); }
+        i = i + 1;
+    }
+    b = 0;
+    for (b < count && !p.failed) {
+        prefer(p, ?rows[b], ?placed.data[b]);
+        b = b + 1;
+    }
+}
+
+# every alias of the model mapped onto the rows `all`, the rows of one instruction consecutive, each pushed onto the
+# aliases of the rows it respells after their own spellings
+pub fun map_aliases(a: *A.Allocator, src: *mapping.Sources, t: *Aliases, all: *vector.Vector[mapping.Row]) err[diag.Refusal] {
+    var p: Pairing = Pairing{alloc: a, src: src, failed: false, failure: diag.refusal(nil, 0, nil, nil)};
+    var i: usize   = 0;
+    for (i < all.len && !p.failed) {
+        val ins: *instructions.Instruction = all.data[i].instruction;
+        var end: usize                     = i;
+        for (end < all.len && all.data[end].instruction == ins) { end = end + 1; }
+        if (ins.aliases.len > 0) { aliases_of(?p, t, ins, ?all.data[i], end - i); }
+        i = end;
+    }
+    if (p.failed) { ret err[diag.Refusal].err{p.failure}; }
+    i = 0;
+    for (i < t.lines.len) {
+        if (!t.lines.data[i].used) { ret err[diag.Refusal].err{topic.refuse(t.lines.data[i].fact, NO_ALIAS, t.lines.data[i].name)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
