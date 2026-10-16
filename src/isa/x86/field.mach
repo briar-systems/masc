@@ -1,19 +1,22 @@
-# the x86 field kinds: legacy prefixes, rex, rex2, vex and evex, the opcode, ModRM, SIB and displacement, and absolute
-# addresses
+# the x86 field kinds: legacy prefixes, rex, rex2, vex, evex and xop, the opcode, ModRM, SIB and displacement, absolute
+# addresses and string memory
 #
 # an x86 instruction is a run of legacy prefixes, a rex or rex2 prefix in
-# 64-bit code or a vex or evex prefix, the opcode's escape bytes and its
-# opcode byte, a ModRM byte, SIB byte and displacement, and its immediates.
+# 64-bit code or a vex, evex or xop prefix, the opcode's escape bytes and its
+# opcode byte, a ModRM byte, SIB byte and displacement, and its immediates,
+# 3dnow's opcode the byte after them.
 # every field of a row reads one opcode record (Opcode), which the generator
 # states once per row and the row's fields point at: its encoding space, map,
 # opcode byte, mandatory prefix, operand size, vector length, and the operands
 # in ModRM.reg and rm, in the opcode's low bits, in vvvv, the opmask, `{z}`
 # and the rounding, and the memory operand the prefixes apply to. the kinds
 # are:
-#   head    the legacy prefixes, rex, rex2, vex or evex, the escape bytes and the opcode
-#   modrm   ModRM, SIB and the displacement of a register or memory operand, an evex disp8 scaled by its N
+#   head    the legacy prefixes, rex, rex2, vex, evex or xop, the escape bytes and the opcode
+#   modrm   ModRM, SIB and the displacement of a register or memory operand, a vector index (VSIB) or an opcode
+#           extension in ModRM.rm, an evex disp8 scaled by its N
 #   moffs   the absolute address of the a0 to a3 moves, as wide as the address size
-# immediates, relative targets and vex's /is4 register are the core's units.
+#   string  a string instruction's memory, at the one register of the row's address size, which no byte encodes
+# immediates, relative targets, vex's /is4 register and 3dnow's opcode are the core's units.
 #
 # what the prefixes mean is a function of the code width (the context's
 # width state), the row, the operands' values and the form, which the kinds
@@ -39,6 +42,8 @@
 # sources, read as published:
 #   Intel SDM 325462-093US, Volume 2A, 2.1 to 2.2: the prefix groups, ModRM and SIB (Tables 2-1 to 2-3), rex
 #   Intel SDM 325462-093US, Volume 2A, 2.3 and 2.7: vex, evex, embedded rounding, broadcast and compressed disp8
+#   Intel SDM 325462-093US, Volume 2A, 2.3.12 and 2.7.9: VSIB, the vector index of a gather or scatter
+#   AMD APM 24594 Vol 3, 1.8 and Appendix A.3: the xop prefix and 3dnow's 0f 0f, its opcode after ModRM
 #   Intel APX 355828-009US, 3.1: the rex2 prefix, its payload and the maps it reaches, evex's extended registers, nd
 #                                and nf
 #   llvm-mc 23.1.1: the canonical prefix order (segment, 67, 66, f0, then f2 or f3) and every expected encoding below
@@ -74,6 +79,7 @@ use masc.isa.x86.opcode.LOAD;
 use masc.isa.x86.opcode.LOCKED;
 use masc.isa.x86.opcode.ND;
 use masc.isa.x86.opcode.NF;
+use masc.isa.x86.opcode.NOW_MAP;
 use masc.isa.x86.opcode.NO_DIGIT;
 use masc.isa.x86.opcode.NO_REX2;
 use masc.isa.x86.opcode.NO_SIMD;
@@ -91,12 +97,15 @@ use masc.isa.x86.opcode.Space;
 use masc.isa.x86.opcode.VEX;
 use masc.isa.x86.opcode.W1;
 use masc.isa.x86.opcode.WIG;
+use masc.isa.x86.opcode.XOP;
+use masc.isa.x86.opcode.YIELDS;
 
 # the kinds, by their index in TABLE
-pub val UNIT_KIND:  u16 = 0;
-pub val HEAD_KIND:  u16 = 1;
-pub val MODRM_KIND: u16 = 2;
-pub val MOFFS_KIND: u16 = 3;
+pub val UNIT_KIND:   u16 = 0;
+pub val HEAD_KIND:   u16 = 1;
+pub val MODRM_KIND:  u16 = 2;
+pub val MOFFS_KIND:  u16 = 3;
+pub val STRING_KIND: u16 = 4;
 
 pub val HIGH_BYTE:       str = "high byte register beside a rex prefix";
 pub val REX_WIDTH:       str = "register or form needs a rex prefix, which only 64-bit code has";
@@ -125,13 +134,17 @@ pub val UNREAD_BITS:     str = "vex or evex bits the row reads no operand from a
 pub val ZEROING_STORE:   str = "zeroing masking on a store, whose destination is memory";
 pub val ROUNDING_MEMORY: str = "embedded rounding on a memory form, where evex.b is a broadcast";
 pub val BROADCAST_SPACE: str = "broadcast on a row of no evex encoding or no element";
-pub val NDD_WRITE:       str = "new data destination the row does not write";
+pub val NO_INDEX:        str = "vector-indexed address with no index";
+pub val STRING_SIZE:     str = "string memory of another address size than the row's";
 
 # the longest instruction
 pub val MAX_LENGTH: usize = 15;
 
 # the segment prefixes, by segment register number: es, cs, ss, ds, fs and gs
 pub val SEGMENTS: [6]u8 = [6]u8{0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65};
+
+# the number of ds among the segment registers
+val DS_NUMBER: u64 = 3;
 
 # the rex and rex2 payload bits, in the rex2 payload's order, a rex prefix holding the low four
 pub val B3: u8 = 0x01;
@@ -182,12 +195,12 @@ pub fun overridden(f: form.Form) bool {
 # rex2:    whether it holds a rex2 prefix
 # payload: the rex prefix's low four bits or the rex2 payload, as B3 to M0 name them, or the same bits of a vex or evex
 #          prefix, uninverted: r, x, b and w, and evex's r', b4 and x4
-# vex:     the vex or evex prefix byte, c4, c5 or 62, 0 for none
+# vex:     the vex, evex or xop prefix byte, c4, c5, 62 or 8f, 0 for none
 # bytes:   its payload bytes
 # space:   the encoding space
-# map:     the opcode map
-# opcode:  the offset of the opcode byte
-# vvvv:    the register number vex.vvvv, or evex.vvvv and v', hold, uninverted
+# map:     the opcode map, NOW_MAP for 3dnow's 0f 0f
+# opcode:  the offset of the opcode byte, or of 3dnow's second 0f, whose opcode follows ModRM and its displacement
+# vvvv:    the register number vex.vvvv, xop.vvvv, or evex.vvvv and v', hold, uninverted
 # length:  vex.l or evex.l'l
 # pp:      vex.pp or evex.pp
 # aaa:     evex.aaa
@@ -240,7 +253,7 @@ fun refused[T](message: str, at: usize) res[T, field.Refusal] {
 # the prefixes of the instruction at `at` of `s` in code of width `w`
 # ---
 # ret: the prefixes, or a refusal: the stream ends, the prefixes run past the longest instruction, or a rex prefix is
-#      one the processor ignores, followed by a legacy prefix, another rex or a rex2, vex or evex prefix
+#      one the processor ignores, followed by a legacy prefix, another rex or a rex2, vex, evex or xop prefix
 pub fun scan(s: *field.Stream, at: usize, w: u8) res[Prefixes, field.Refusal] {
     var p: Prefixes;
     var i: usize = at;
@@ -305,6 +318,23 @@ pub fun scan(s: *field.Stream, at: usize, w: u8) res[Prefixes, field.Refusal] {
             ret res[Prefixes, field.Refusal].ok{p};
         }
     }
+    if (b == 0x8F) {
+        # 8f is pop's unless the next byte's map field is 8 or more, which a ModRM.reg of 0 never is (AMD APM 24594 Vol
+        # 3 1.8.1)
+        val next: res[u8, field.Refusal] = byte_at(s, i + 1);
+        if (sel next.err) { ret res[Prefixes, field.Refusal].err{next.err}; }
+        if ((next.ok & 0x1F) >= 8) {
+            if (p.rex) { ret refused[Prefixes](IGNORED_REX, i); }
+            val tail: res[u8, field.Refusal] = byte_at(s, i + 2);
+            if (sel tail.err) { ret res[Prefixes, field.Refusal].err{tail.err}; }
+            p.vex      = b;
+            p.bytes[0] = next.ok;
+            p.bytes[1] = tail.ok;
+            unpack_vex(?p);
+            p.opcode = i + 3;
+            ret res[Prefixes, field.Refusal].ok{p};
+        }
+    }
     if (b != 0x0F) {
         p.opcode = i;
         ret res[Prefixes, field.Refusal].ok{p};
@@ -321,6 +351,7 @@ pub fun scan(s: *field.Stream, at: usize, w: u8) res[Prefixes, field.Refusal] {
         p.map    = 3;
         p.opcode = i + 2;
     }
+    or (second.ok == 0x0F) { p.map = NOW_MAP; }
     ret res[Prefixes, field.Refusal].ok{p};
 }
 
@@ -330,19 +361,20 @@ fun bit_if(set: bool, bit: u8) u8 {
     ret 0;
 }
 
-# the space, map and fields of the vex or evex prefix `p` holds, its inverted bits read uninverted (Intel SDM
-# 325462-093US Vol 2A 2.3.5 and 2.7.1, Intel APX 355828-009US 3.1.2.3)
+# the space, map and fields of the vex, evex or xop prefix `p` holds, its inverted bits read uninverted (Intel SDM
+# 325462-093US Vol 2A 2.3.5 and 2.7.1, Intel APX 355828-009US 3.1.2.3, AMD APM 24594 Vol 3 1.8)
 fun unpack_vex(p: *Prefixes) {
     val first: u8 = p.bytes[0];
     p.space = VEX;
     p.map   = 1;
+    if (p.vex == 0x8F) { p.space = XOP; }
     var tail: u8 = first;
     if (p.vex == 0xC5) { p.payload = bit_if((first & 0x80) == 0, R3); }
     or {
         p.payload = bit_if((first & 0x80) == 0, R3) | bit_if((first & 0x40) == 0, X3) | bit_if((first & 0x20) == 0, B3);
         tail      = p.bytes[1];
     }
-    if (p.vex == 0xC4) { p.map = first & 0x1F; }
+    if (p.vex == 0xC4 || p.vex == 0x8F) { p.map = first & 0x1F; }
     if (p.vex == 0x62) {
         p.space   = EVEX;
         p.map     = first & 0x07;
@@ -406,18 +438,38 @@ fun registered(p: *field.Parts) bool {
     ret field.has(p, field.NUMBER) || field.has(p, field.INDEX);
 }
 
-# the address size of memory operand `m` holding `p` in code of width `w` under form `f`: its registers' width, or for
-# an address of no register the width's own, or the other size the width reaches where the form overrides it
-fun memory_size(w: u8, m: *operand.Memory, p: *field.Parts, f: form.Form) res[u8, field.Refusal] {
-    if (!registered(p)) { ret res[u8, field.Refusal].ok{address_size(w, overridden(f))}; }
-    if (overridden(f))  { ret refused[u8](OVERRIDE, 0); }
+# whether memory operand `m` is indexed by a vector register, VSIB's (Intel SDM 325462-093US Vol 2A 2.3.12)
+pub fun vsib(m: *operand.Memory) bool {
+    ret m.index.classes.len > 0 && class_size(m.index.classes.at[0]) == 0;
+}
+
+# the bits of address size `a`, as masc.isa.x86.opcode.Address numbers it, 0 for none
+fun address_bits(a: x86_opcode.Address) u8 {
+    if (a == x86_opcode.A16) { ret 16; }
+    if (a == x86_opcode.A32) { ret 32; }
+    if (a == x86_opcode.A64) { ret 64; }
+    ret 0;
+}
+
+# the address size of memory operand `m` of row `op` holding `p` in code of width `w` under form `f`: the row's own
+# where it states one, else its registers' width, a vector index stating none, or for an address of no general
+# register the width's own, or the other size the width reaches where the form overrides it
+fun memory_size(w: u8, op: *Opcode, m: *operand.Memory, p: *field.Parts, f: form.Form) res[u8, field.Refusal] {
     var size: u8 = 0;
     if (field.has(p, field.NUMBER)) { size = class_size(class_at(m.base.classes, p.bits[field.CLASS])); }
-    if (field.has(p, field.INDEX)) {
+    if (field.has(p, field.INDEX) && !vsib(m)) {
         val index: u8 = class_size(class_at(m.index.classes, p.bits[field.INDEX_CLASS]));
         if (size != 0 && index != size) { ret refused[u8](ADDRESS, 0); }
         size = index;
     }
+    val own: u8 = address_bits(op.address);
+    if (own != 0) {
+        if (overridden(f))            { ret refused[u8](OVERRIDE, 0); }
+        if (size != 0 && size != own) { ret refused[u8](ADDRESS, 0); }
+        size = own;
+    }
+    or (size == 0)                                                       { ret res[u8, field.Refusal].ok{address_size(w, overridden(f))}; }
+    or (overridden(f))                                                   { ret refused[u8](OVERRIDE, 0); }
     if (size != address_size(w, false) && size != address_size(w, true)) { ret refused[u8](ADDRESS, 0); }
     ret res[u8, field.Refusal].ok{size};
 }
@@ -503,20 +555,26 @@ fun sib_of(scale: u64, x: i64, low: u8) u8 {
     ret ((scale::u8 & 3) << 6) | ((x::u8 & 7) << 3) | low;
 }
 
-# the layout of memory operand `m` holding `p` at address size `size` in code of width `w` under form `f`, a disp8
-# scaled by 2^`scale`
-pub fun layout(w: u8, size: u8, m: *operand.Memory, p: *field.Parts, f: form.Form, scale: u8) res[Layout, field.Refusal] {
-    var l:      Layout;
-    val d:      i64  = displacement(m, p);
-    val based:  bool = field.has(p, field.NUMBER);
-    val listed: bool = field.has(p, field.INDEX);
-    var b:      i64  = -1;
-    var x:      i64  = -1;
-    if (based)  { b = p.bits[field.NUMBER]:~i64; }
-    if (listed) { x = p.bits[field.INDEX]:~i64; }
+# the layout of memory operand `m` of row `op` holding `p` at address size `size` in code of width `w` under form `f`, a
+# disp8 scaled by 2^`scale`. a vector index and a row whose memory is SIB's (SIBMEM) take a SIB byte, which 16-bit
+# addressing has none of
+pub fun layout(w: u8, size: u8, op: *Opcode, m: *operand.Memory, p: *field.Parts, f: form.Form, scale: u8) res[Layout, field.Refusal] {
+    var l:        Layout;
+    val d:        i64  = displacement(m, p);
+    val based:    bool = field.has(p, field.NUMBER);
+    val listed:   bool = field.has(p, field.INDEX);
+    val vectored: bool = vsib(m);
+    val sibmem:   bool = vectored || (op.flags & x86_opcode.SIBMEM) != 0;
+    var b:        i64  = -1;
+    var x:        i64  = -1;
+    if (vectored && !listed)  { ret refused[Layout](NO_INDEX, 0); }
+    if (sibmem && size == 16) { ret refused[Layout](ADDRESS, 0); }
+    if (based)                { b = p.bits[field.NUMBER]:~i64; }
+    if (listed)               { x = p.bits[field.INDEX]:~i64; }
     l.value = d;
     if (p.bits[field.MODE] == operand.RELATIVE_PC::u64) {
         if (w != 64) { ret refused[Layout](PCREL_WIDTH, 0); }
+        if (sibmem)  { ret refused[Layout](ADDRESS, 0); }
         l.rm   = 5;
         l.disp = 4;
         ret res[Layout, field.Refusal].ok{l};
@@ -536,7 +594,7 @@ pub fun layout(w: u8, size: u8, m: *operand.Memory, p: *field.Parts, f: form.For
         if (l.disp == 1) { l.value = d >> scale::i64; }
         ret res[Layout, field.Refusal].ok{l};
     }
-    val sib_form: bool = (f.bits & x86_form.SIB) != 0;
+    val sib_form: bool = (f.bits & x86_form.SIB) != 0 || sibmem;
     if (!based) {
         # no base is disp32 alone, through a SIB byte where 64-bit code's rm 101 is rip-relative or an index is given
         l.disp = 4;
@@ -580,8 +638,11 @@ pub fun layout(w: u8, size: u8, m: *operand.Memory, p: *field.Parts, f: form.For
 # naming:    the operand that names it, which a refusal of the prefix names
 # memory:    the row has a memory operand the address-size prefix applies to
 # segmented: that operand takes a segment, so a segment prefix applies to it
+# string:    that operand is a string's, at the one register of its address size
 # reach:     one past the highest register number a register field holds, 0 for none
-# vvvv:      the register number vex.vvvv or evex.vvvv and v' hold, 0 for none
+# vvvv:      the register number vex.vvvv, xop.vvvv or evex.vvvv and v' hold, 0 for none
+# dfv:       the default flags apx's ccmp and ctest hold in evex.vvvv, uninverted, 0 for none
+# vhigh:     a vector index's fifth bit, which evex.v' holds and a vex prefix cannot
 # aaa:       the opmask number evex.aaa holds, 0 for none
 # zeroing:   `{z}` is given
 # rounded:   embedded rounding or SAE is given
@@ -601,8 +662,11 @@ pub rec Needs {
     naming:    u8;
     memory:    bool;
     segmented: bool;
+    string:    bool;
     reach:     u8;
     vvvv:      u8;
+    dfv:       u8;
+    vhigh:     bool;
     aaa:       u8;
     zeroing:   bool;
     rounded:   bool;
@@ -653,6 +717,21 @@ fun holds_memory(operands: *operand.Operand, k: u8) bool {
     ret sel desc.shape.memory;
 }
 
+# whether operand `k` is one and an enumerant operand, as apx's default flags in vvvv are
+fun holds_enumerant(operands: *operand.Operand, k: u8) bool {
+    if (k == field.NO_OPERAND) { ret false; }
+    val desc: *operand.Operand = ?operands[k];
+    ret sel desc.shape.enumerant;
+}
+
+# whether operand `k` is one and a memory operand of a vector index
+fun holds_vsib(operands: *operand.Operand, k: u8) bool {
+    if (k == field.NO_OPERAND) { ret false; }
+    val desc: *operand.Operand = ?operands[k];
+    if (!sel desc.shape.memory) { ret false; }
+    ret vsib(?desc.shape.memory);
+}
+
 # register number `number` noted as one a register field holds
 fun note_reach(n: *Needs, number: u64) {
     if (number + 1 > n.reach::u64) { n.reach = (number + 1)::u8; }
@@ -673,9 +752,11 @@ fun rm_high(op: *Opcode, desc: *operand.Operand) u8 {
     ret B4;
 }
 
-# the vex and evex operands of row `op` noted in `n`: vvvv's register, the opmask, `{z}` and the rounding
+# the vex, evex and xop operands of row `op` noted in `n`: vvvv's register or default flags, the opmask, `{z}` and the
+# rounding
 fun note_vex(n: *Needs, op: *Opcode, operands: *operand.Operand, parts: *field.Parts) {
-    if (op.vvvv != field.NO_OPERAND) {
+    if (holds_enumerant(operands, op.vvvv)) { n.dfv = parts[op.vvvv].bits[field.NUMBER]::u8; }
+    or (op.vvvv != field.NO_OPERAND) {
         val p: *field.Parts = ?parts[op.vvvv];
         n.vvvv = p.bits[field.NUMBER]::u8;
         note_reach(n, p.bits[field.NUMBER]);
@@ -699,7 +780,9 @@ fun note_vex(n: *Needs, op: *Opcode, operands: *operand.Operand, parts: *field.P
 # the needs of the row `op` reads, holding the operand parts `parts` of `operands`
 pub fun needs(w: u8, op: *Opcode, operands: *operand.Operand, parts: *field.Parts, f: form.Form) res[Needs, field.Refusal] {
     var n: Needs;
-    n.o66  = (op.size == O16 && w != 16) || (op.size == O32 && w == 16) || op.simd == P66;
+    # a row immune to 66 is 32 bits in 16-bit code too, as XED's IMMUNE66() writes no 66 for it
+    val immune: bool = (op.flags & IMMUNE_66) != 0;
+    n.o66  = (!immune && ((op.size == O16 && w != 16) || (op.size == O32 && w == 16))) || op.simd == P66;
     n.lock = (op.flags & LOCKED) != 0;
     if (op.space != LEGACY) { n.o66 = op.size == O16 || op.simd == P66; }
     if (op.simd == PF3)     { n.rep = 0xF3; }
@@ -720,33 +803,49 @@ pub fun needs(w: u8, op: *Opcode, operands: *operand.Operand, parts: *field.Part
     note_vex(?n, op, operands, parts);
     if (op.memory == field.NO_OPERAND) {
         if (overridden(f)) { ret refused[Needs](OVERRIDE, 0); }
+        # a row of an address size and no memory operand, as jcxz's and loop's on cx, ecx or rcx, takes 67 for it
+        val own: u8 = address_bits(op.address);
+        if (own != 0) {
+            if (own != address_size(w, false) && own != address_size(w, true)) { ret refused[Needs](ADDRESS, 0); }
+            n.a67 = own != address_size(w, false);
+        }
         ret res[Needs, field.Refusal].ok{n};
     }
     val desc: *operand.Operand = ?operands[op.memory];
     val p:    *field.Parts     = ?parts[op.memory];
     if (!sel desc.shape.memory) { ret refused[Needs](field.WRONG_KIND, 0); }
     val m:    *operand.Memory        = ?desc.shape.memory;
-    val size: res[u8, field.Refusal] = memory_size(w, m, p, f);
-    if (sel size.err) { ret res[Needs, field.Refusal].err{size.err}; }
-    n.memory    = true;
-    n.a67       = size.ok != address_size(w, false);
-    n.segmented = m.segment.classes.len > 0;
+    val size: res[u8, field.Refusal] = memory_size(w, op, m, p, f);
+    if (sel size.err) { ret res[Needs, field.Refusal].err{field.refusal(size.err.message, op.memory, 0)}; }
+    n.memory = true;
+    n.a67    = size.ok != address_size(w, false);
+    n.string = m.base.count == 1 && m.base.classes.len == 1 && m.index.classes.len == 0 && m.disp.bits == 0;
+    # a segment of one register, a string's es, takes no override
+    n.segmented = m.segment.classes.len > 0 && m.segment.count != 1;
     n.broadcast = field.has(p, field.BROADCAST);
     if (n.broadcast) { n.evex = true; }
     if (n.segmented && field.has(p, field.SEGMENT)) {
         val s: u64 = p.bits[field.SEGMENT];
-        if (s < 6) { n.segment = SEGMENTS[s]; }
+        # a string's ds is the segment it is at with no override, as llvm-mc writes `lodsb al, byte ptr ds:[rsi]` as ac
+        if (s < 6 && !(n.string && s == DS_NUMBER)) { n.segment = SEGMENTS[s]; }
     }
     if (op.memory == op.rm) {
-        val l: res[Layout, field.Refusal] = layout(w, size.ok, m, p, f, scale_of(op, n.broadcast));
-        if (sel l.err) { ret res[Needs, field.Refusal].err{l.err}; }
+        val l: res[Layout, field.Refusal] = layout(w, size.ok, op, m, p, f, scale_of(op, n.broadcast));
+        if (sel l.err) { ret res[Needs, field.Refusal].err{field.refusal(l.err.message, op.memory, 0)}; }
         if (size.ok != 16) {
             if (l.ok.base) {
                 n.decided = n.decided | B3 | B4;
                 n.bits    = n.bits | extension_bits(p.bits[field.NUMBER], B3, B4);
                 note_reach(?n, p.bits[field.NUMBER]);
             }
-            if (l.ok.sib) {
+            # a vector index's fifth bit is evex.v', and x4 is none of it (Intel SDM 325462-093US Vol 2A 2.7.9)
+            if (l.ok.sib && vsib(m)) {
+                n.decided = n.decided | X3;
+                n.bits    = n.bits | extension_bits(p.bits[field.INDEX], X3, 0);
+                n.vhigh   = ((p.bits[field.INDEX] >> 4) & 1) != 0;
+                note_reach(?n, p.bits[field.INDEX]);
+            }
+            or (l.ok.sib) {
                 n.decided = n.decided | X3 | X4;
                 if (field.has(p, field.INDEX)) {
                     n.bits = n.bits | extension_bits(p.bits[field.INDEX], X3, X4);
@@ -758,11 +857,31 @@ pub fun needs(w: u8, op: *Opcode, operands: *operand.Operand, parts: *field.Part
     ret res[Needs, field.Refusal].ok{n};
 }
 
-# the canonical prefix run of `n` into `out`: the segment, 67, 66, f0, then f2 or f3, as llvm-mc writes them
+# the canonical prefix run of `n` into `out`: the segment, 67, 66, f0, then f2 or f3, as llvm-mc writes them, and of a
+# string's, f2 or f3, 67, the segment and 66, as llvm-mc writes `rep lodsw ax, word ptr fs:[esi]` as f3 67 64 66 ad
 # ---
 # ret: its length
 pub fun canonical(n: *Needs, out: *u8) u8 {
     var k: u8 = 0;
+    if (n.string) {
+        if (n.rep != 0) {
+            out[k] = n.rep;
+            k      = k + 1;
+        }
+        if (n.a67) {
+            out[k] = 0x67;
+            k      = k + 1;
+        }
+        if (n.segment != 0) {
+            out[k] = n.segment;
+            k      = k + 1;
+        }
+        if (n.o66) {
+            out[k] = 0x66;
+            k      = k + 1;
+        }
+        ret k;
+    }
     if (n.segment != 0) {
         out[k] = n.segment;
         k      = k + 1;
@@ -920,18 +1039,19 @@ fun set_at(bits: u8, bit: u8, at: u8) u8 {
     ret 0;
 }
 
-# the vex or evex prefix of row `op` into `pl`, its operands needing `n` in code of width `w` under form bits `fm`: the
-# payload bits, vvvv, the vector length or rounding, the opmask, zeroing and pp (Intel SDM 325462-093US Vol 2A 2.3.5,
-# 2.7.1, Intel APX 355828-009US 3.1.2.3)
+# the vex, evex or xop prefix of row `op` into `pl`, its operands needing `n` in code of width `w` under form bits
+# `fm`: the payload bits, vvvv, the vector length or rounding, the opmask, zeroing and pp (Intel SDM 325462-093US Vol 2A
+# 2.3.5, 2.7.1, Intel APX 355828-009US 3.1.2.3, AMD APM 24594 Vol 3 1.8). apx's ccmp and ctest hold their default flags
+# in vvvv uninverted and their condition in aaa and v', its fourth bit uninverted (XED APX_CC_EVEX_BYTE3_ENC)
 fun vex_plan(op: *Opcode, n: *Needs, w: u8, fm: u32, pl: *Plan) err[field.Refusal] {
     if ((fm & (x86_form.REX | x86_form.REX2)) != 0) { ret field_refused(OTHER_ROW, field.NO_OPERAND); }
     if (n.high)                                     { ret field_refused(HIGH_BYTE, n.naming); }
     val free: u8 = ((fm & x86_form.PAYLOAD) >> x86_form.PAYLOAD_SHIFT)::u8;
     if ((free & n.decided) != 0 || (free & (R4 | X4 | B4)) != 0) { ret field_refused(RUN, field.NO_OPERAND); }
     val bits: u8 = n.bits | free;
-    if (op.space == VEX && ((bits & (R4 | X4 | B4)) != 0 || n.vvvv >= 16))       { ret field_refused(VEX_REACH, field.NO_OPERAND); }
-    if (w != 64 && ((bits & (R3 | X3 | B3 | R4 | X4 | B4)) != 0 || n.vvvv >= 8)) { ret field_refused(REACH_WIDTH, field.NO_OPERAND); }
-    if (n.zeroing && n.aaa == 0)                                                 { ret field_refused(UNMASKED, op.zeroing); }
+    if (op.space != EVEX && ((bits & (R4 | X4 | B4)) != 0 || n.vvvv >= 16 || n.vhigh)) { ret field_refused(VEX_REACH, field.NO_OPERAND); }
+    if (w != 64 && ((bits & (R3 | X3 | B3 | R4 | X4 | B4)) != 0 || n.vvvv >= 8))       { ret field_refused(REACH_WIDTH, field.NO_OPERAND); }
+    if (n.zeroing && n.aaa == 0)                                                       { ret field_refused(UNMASKED, op.zeroing); }
     var length:  u8   = op.length;
     var ignored: bool = op.length == LIG;
     var b:       bool = (op.flags & ND) != 0 || n.broadcast;
@@ -945,11 +1065,19 @@ fun vex_plan(op: *Opcode, n: *Needs, w: u8, fm: u32, pl: *Plan) err[field.Refusa
         or { ignored = true; }
     }
     val chosen: u8 = ((fm & x86_form.LENGTH) >> x86_form.LENGTH_SHIFT)::u8;
-    if (ignored)                       { length = chosen; }
-    or (chosen != 0)                   { ret field_refused(RUN, field.NO_OPERAND); }
-    if (op.space == VEX && length > 1) { ret field_refused(RUN, field.NO_OPERAND); }
+    if (ignored)                        { length = chosen; }
+    or (chosen != 0)                    { ret field_refused(RUN, field.NO_OPERAND); }
+    if (op.space != EVEX && length > 1) { ret field_refused(RUN, field.NO_OPERAND); }
     val pp:   u8 = pp_of(n);
-    val vvvv: u8 = (~n.vvvv & 0x0F) << 3;
+    var vvvv: u8 = (~n.vvvv & 0x0F) << 3;
+    if (op.vvvv != field.NO_OPERAND && op.scc != x86_opcode.NO_SCC) { vvvv = (n.dfv & 0x0F) << 3; }
+    if (op.space == XOP) {
+        pl.vex      = 0x8F;
+        pl.bytes[0] = clear_at(bits, R3, 7) | clear_at(bits, X3, 6) | clear_at(bits, B3, 5) | op.map;
+        pl.bytes[1] = set_at(bits, W, 7) | vvvv | (length << 2) | pp;
+        pl.length   = 2;
+        ret err[field.Refusal].ok{};
+    }
     if (op.space == VEX) {
         if (op.map == 1 && (bits & (W | X3 | B3)) == 0 && (fm & x86_form.ENCODING) != x86_form.VEX3) {
             pl.vex      = 0xC5;
@@ -964,14 +1092,16 @@ fun vex_plan(op: *Opcode, n: *Needs, w: u8, fm: u32, pl: *Plan) err[field.Refusa
         ret err[field.Refusal].ok{};
     }
     var aaa: u8 = n.aaa;
-    if ((op.flags & NF) != 0) { aaa = 0x04; }
+    if ((op.flags & NF) != 0)        { aaa = 0x04; }
+    if (op.scc != x86_opcode.NO_SCC) { aaa = op.scc & 7; }
     pl.vex      = 0x62;
     pl.bytes[0] = clear_at(bits, R3, 7) | clear_at(bits, X3, 6) | clear_at(bits, B3, 5) | clear_at(bits, R4, 4) | set_at(bits, B4, 3) | op.map;
     pl.bytes[1] = set_at(bits, W, 7) | vvvv | clear_at(bits, X4, 2) | pp;
     pl.bytes[2] = (length << 5) | aaa;
-    if (n.zeroing)   { pl.bytes[2] = pl.bytes[2] | 0x80; }
-    if (b)           { pl.bytes[2] = pl.bytes[2] | 0x10; }
-    if (n.vvvv < 16) { pl.bytes[2] = pl.bytes[2] | 0x08; }
+    if (n.zeroing)                   { pl.bytes[2] = pl.bytes[2] | 0x80; }
+    if (b)                           { pl.bytes[2] = pl.bytes[2] | 0x10; }
+    if (op.scc != x86_opcode.NO_SCC) { pl.bytes[2] = pl.bytes[2] | ((op.scc >> 3) << 3); }
+    or (n.vvvv < 16 && !n.vhigh)     { pl.bytes[2] = pl.bytes[2] | 0x08; }
     pl.length = 3;
     ret err[field.Refusal].ok{};
 }
@@ -1006,7 +1136,8 @@ fun plan(enc: *field.Encoder, f: *field.Field) res[Plan, field.Refusal] {
     }
     val free: u8 = ((fm & x86_form.PAYLOAD) >> x86_form.PAYLOAD_SHIFT)::u8;
     if ((free & n.decided) != 0) { ret refused[Plan](RUN, 0); }
-    val wide:  bool = (n.bits & (R4 | X4 | B4)) != 0 || (fm & x86_form.REX2) != 0 || (free & (R4 | X4 | B4)) != 0;
+    # a row whose encoding a rex2 prefix is part of, as jmpabs's, takes one whatever its registers reach
+    val wide:  bool = (n.bits & (R4 | X4 | B4)) != 0 || (fm & x86_form.REX2) != 0 || (free & (R4 | X4 | B4)) != 0 || (op.flags & x86_opcode.REX2) != 0;
     val rexed: bool = wide || n.bits != 0 || n.byte || (fm & x86_form.REX) != 0 || free != 0;
     if (rexed) {
         if (w != 64)                                                { ret refused[Plan](REX_WIDTH, 0); }
@@ -1084,11 +1215,17 @@ fun head_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
             escape = 0x3A0F;
             bytes  = 2;
         }
+        or (op.map == NOW_MAP) {
+            escape = 0x0F0F;
+            bytes  = 2;
+        }
         if (bytes > 0) {
             val put: err[field.Refusal] = field.put(enc, escape, bytes);
             if (sel put.err) { ret put; }
         }
     }
+    # 3dnow's opcode is a unit after ModRM and its displacement
+    if (op.map == NOW_MAP) { ret err[field.Refusal].ok{}; }
     var b: u64 = op.byte::u64;
     if (op.opreg != field.NO_OPERAND) { b = b | (enc.parts[op.opreg].bits[field.NUMBER] & 7); }
     ret field.put(enc, b, 1);
@@ -1125,11 +1262,13 @@ fun head_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
     val s:        Prefixes      = got.ok;
     val mismatch: field.Refusal = field.refusal(field.MISMATCH, field.NO_OPERAND, s.opcode);
     if (s.space != op.space || s.map != op.map) { ret err[field.Refusal].err{mismatch}; }
+    if (!x86_opcode.addressed(w, s.asz, op))    { ret err[field.Refusal].err{mismatch}; }
     val read: res[u8, field.Refusal] = byte_at(?dec.in, s.opcode);
     if (sel read.err) { ret err[field.Refusal].err{read.err}; }
     var mask: u8 = 0xFF;
     if (op.opreg != field.NO_OPERAND) { mask = 0xF8; }
-    if ((read.ok & mask) != op.byte)  { ret err[field.Refusal].err{mismatch}; }
+    # 3dnow's opcode is its unit's, after ModRM
+    if (op.map != NOW_MAP && (read.ok & mask) != op.byte) { ret err[field.Refusal].err{mismatch}; }
     if (op.space != LEGACY) {
         val done: err[field.Refusal] = vex_decode(dec, op, ?s, w, mismatch);
         if (sel done.err) { ret done; }
@@ -1143,6 +1282,7 @@ fun head_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
     if (!sized(w, ?s, op))                                             { ret err[field.Refusal].err{mismatch}; }
     if ((op.flags & LOCKED) == 0 && s.lock)                            { ret err[field.Refusal].err{field.refusal(LOCK, field.NO_OPERAND, dec.start)}; }
     if (s.rex2 && (op.flags & NO_REX2) != 0)                           { ret err[field.Refusal].err{field.refusal(REX2_ROW, field.NO_OPERAND, dec.start)}; }
+    if (!s.rex2 && (op.flags & x86_opcode.REX2) != 0)                  { ret err[field.Refusal].err{mismatch}; }
     if (s.rex2 && (op.flags & REFINED_W) != 0 && (s.payload & W) != 0) { ret err[field.Refusal].err{field.refusal(REFINED, field.NO_OPERAND, dec.start)}; }
     if (op.opreg != field.NO_OPERAND) {
         val rexed: bool = s.rex || s.rex2;
@@ -1169,15 +1309,21 @@ fun vex_decode(dec: *field.Decoder, op: *Opcode, s: *Prefixes, w: u8, mismatch: 
     val wide: bool = (s.payload & W) != 0;
     if (s.pp != pp || !x86_opcode.sized(w, s.pp == 1, wide, op))                       { ret err[field.Refusal].err{mismatch}; }
     if (op.size == NO_SIZE && (op.flags & WIG) == 0 && wide != ((op.flags & W1) != 0)) { ret err[field.Refusal].err{mismatch}; }
-    if (op.vvvv != field.NO_OPERAND) {
+    # evex.v' is the fifth bit of a vector index, or the fourth of apx's condition, as it is
+    var vhigh: u8 = 0;
+    if (op.space == EVEX && (op.scc != x86_opcode.NO_SCC || holds_vsib(dec.operands, op.rm))) { vhigh = 0x10; }
+    if (op.scc != x86_opcode.NO_SCC && ((s.vvvv & 0x10) == 0) != ((op.scc >> 3) != 0))        { ret err[field.Refusal].err{mismatch}; }
+    if (holds_enumerant(dec.operands, op.vvvv))                                               { field.replace(dec, op.vvvv, field.NUMBER, (~s.vvvv & 0x0F)::u64); }
+    or (op.vvvv != field.NO_OPERAND) {
         field.replace(dec, op.vvvv, field.NUMBER, s.vvvv::u64);
         field.replace(dec, op.vvvv, field.CLASS, pick(?dec.operands[op.vvvv], s.vvvv::u64, true));
     }
-    or (s.vvvv != 0) { ret err[field.Refusal].err{field.refusal(UNREAD_BITS, field.NO_OPERAND, dec.start)}; }
+    or ((s.vvvv & ~vhigh) != 0) { ret err[field.Refusal].err{field.refusal(UNREAD_BITS, field.NO_OPERAND, dec.start)}; }
     var length: bool = true;
     if (op.space == EVEX) {
         var aaa: u8 = 0;
-        if ((op.flags & NF) != 0) { aaa = 0x04; }
+        if ((op.flags & NF) != 0)        { aaa = 0x04; }
+        if (op.scc != x86_opcode.NO_SCC) { aaa = op.scc & 7; }
         if (op.mask != field.NO_OPERAND) {
             if (s.aaa != 0) { field.replace(dec, op.mask, field.NUMBER, s.aaa::u64); }
         }
@@ -1285,10 +1431,12 @@ fun head_complete(dec: *field.Decoder, f: *field.Field, at: usize) err[field.Ref
         if (n.high)                          { ret err[field.Refusal].err{field.refusal(HIGH_BYTE, field.NO_OPERAND, dec.start)}; }
         val free: u8 = payload & ~n.decided;
         dec.form.bits = dec.form.bits | (free::u32 << x86_form.PAYLOAD_SHIFT);
-        if (s.rex2 && (n.bits & (R4 | X4 | B4)) == 0 && (free & (R4 | X4 | B4)) == 0) { dec.form.bits = dec.form.bits | x86_form.REX2; }
-        if (s.rex && n.bits == 0 && !n.byte && free == 0)                             { dec.form.bits = dec.form.bits | x86_form.REX; }
+        # a rex2 prefix its row's encoding holds, as jmpabs's, is no choice
+        if (s.rex2 && (n.bits & (R4 | X4 | B4)) == 0 && (free & (R4 | X4 | B4)) == 0 && (op.flags & x86_opcode.REX2) == 0) { dec.form.bits = dec.form.bits | x86_form.REX2; }
+        if (s.rex && n.bits == 0 && !n.byte && free == 0)                                                                  { dec.form.bits = dec.form.bits | x86_form.REX; }
     }
-    if ((op.flags & LOAD) != 0) { dec.form.bits = dec.form.bits | x86_form.LOAD; }
+    if ((op.flags & YIELDS) != 0 && (op.flags & LOAD) != 0)  { dec.form.bits = dec.form.bits | x86_form.LOAD; }
+    if ((op.flags & YIELDS) != 0 && (op.flags & STORE) != 0) { dec.form.bits = dec.form.bits | x86_form.STORE; }
     ret err[field.Refusal].ok{};
 }
 
@@ -1318,7 +1466,7 @@ fun enumerated(operands: *operand.Operand, count: u32, k: u8, quantity: operand.
 # what is wrong with the vex or evex facts of row `op` holding `count` operands, none when nothing is
 fun vex_check(op: *Opcode, operands: *operand.Operand, count: u32) opt[str] {
     val vector:     Flags = W1 | WIG | ND | NF;
-    val legacy:     Flags = DEFAULT_64 | IMMUNE_66 | NO_REX2 | REFINED_W | LOCKED;
+    val legacy:     Flags = DEFAULT_64 | IMMUNE_66 | NO_REX2 | REFINED_W | LOCKED | x86_opcode.REX2;
     val extra:      bool  = op.vvvv != field.NO_OPERAND || op.mask != field.NO_OPERAND || op.zeroing != field.NO_OPERAND || op.rounding != field.NO_OPERAND;
     val memory:     bool  = holds_memory(operands, op.rm);
     var broadcasts: u8    = 0;
@@ -1328,15 +1476,28 @@ fun vex_check(op: *Opcode, operands: *operand.Operand, count: u32) opt[str] {
     }
     if (op.twin != 0 && op.twin != 16 && op.twin != 32) { ret opt[str].some{RECORD}; }
     if (op.space == LEGACY) {
-        if (extra || (op.flags & vector) != 0 || op.length != LIG || op.disp8 != 0 || op.element != 0) { ret opt[str].some{RECORD}; }
-        if (broadcasts != 0)                                                                           { ret opt[str].some{BROADCAST_SPACE}; }
+        if (extra || (op.flags & (W1 | ND | NF)) != 0 || op.length != LIG || op.disp8 != 0 || op.element != 0) { ret opt[str].some{RECORD}; }
+        if (op.scc != x86_opcode.NO_SCC)                                                                       { ret opt[str].some{RECORD}; }
+        if ((op.flags & x86_opcode.REX2) != 0 && ((op.flags & NO_REX2) != 0 || op.map > 1))                    { ret opt[str].some{RECORD}; }
+        if (broadcasts != 0)                                                                                   { ret opt[str].some{BROADCAST_SPACE}; }
         ret opt[str].none{};
     }
     if ((op.flags & legacy) != 0 || op.opreg != field.NO_OPERAND || op.length > LIG || op.map == 0) { ret opt[str].some{RECORD}; }
     if (op.size == O16 && op.simd != NO_SIMD)                                                       { ret opt[str].some{RECORD}; }
     if (op.size != NO_SIZE && (op.flags & (W1 | WIG)) != 0)                                         { ret opt[str].some{RECORD}; }
     if ((op.flags & W1) != 0 && (op.flags & WIG) != 0)                                              { ret opt[str].some{RECORD}; }
-    if (!shaped(operands, count, op.vvvv, 1))                                                       { ret opt[str].some{RECORD}; }
+    # apx's ccmp and ctest hold their condition in evex map 4 and their default flags in vvvv
+    if (op.scc != x86_opcode.NO_SCC) {
+        if (op.scc > 15 || op.space != EVEX || op.map != 4 || op.mask != field.NO_OPERAND) { ret opt[str].some{RECORD}; }
+        if (!enumerated(operands, count, op.vvvv, operand.ONE))                            { ret opt[str].some{RECORD}; }
+    }
+    or (!shaped(operands, count, op.vvvv, 1)) { ret opt[str].some{RECORD}; }
+    if (op.space == XOP) {
+        if (op.map < 8 || op.map > 31 || op.mask != field.NO_OPERAND || op.zeroing != field.NO_OPERAND || op.rounding != field.NO_OPERAND) { ret opt[str].some{RECORD}; }
+        if ((op.flags & (ND | NF)) != 0 || op.length == L512 || op.disp8 != 0 || op.element != 0 || op.twin != 0)                          { ret opt[str].some{RECORD}; }
+        if (broadcasts != 0)                                                                                                               { ret opt[str].some{BROADCAST_SPACE}; }
+        ret opt[str].none{};
+    }
     if (op.space == VEX) {
         if (op.map > 31 || op.mask != field.NO_OPERAND || op.zeroing != field.NO_OPERAND || op.rounding != field.NO_OPERAND) { ret opt[str].some{RECORD}; }
         if ((op.flags & (ND | NF)) != 0 || op.length == L512 || op.disp8 != 0 || op.element != 0)                            { ret opt[str].some{RECORD}; }
@@ -1344,8 +1505,9 @@ fun vex_check(op: *Opcode, operands: *operand.Operand, count: u32) opt[str] {
         ret opt[str].none{};
     }
     if (op.map > 7 || op.disp8 > 6) { ret opt[str].some{RECORD}; }
+    # an opmask is optional, its absence k0's no masking, or one of k1 to k7 a gather or scatter needs
     if (op.mask != field.NO_OPERAND) {
-        if (!shaped(operands, count, op.mask, 1) || operands[op.mask].quantity != operand.OPTIONAL) { ret opt[str].some{RECORD}; }
+        if (!shaped(operands, count, op.mask, 1) || operands[op.mask].quantity == operand.VARIADIC) { ret opt[str].some{RECORD}; }
     }
     if (!enumerated(operands, count, op.zeroing, operand.OPTIONAL)) { ret opt[str].some{RECORD}; }
     if (op.zeroing != field.NO_OPERAND) {
@@ -1360,18 +1522,19 @@ fun vex_check(op: *Opcode, operands: *operand.Operand, count: u32) opt[str] {
         if (op.length != L512 && op.length != LIG) { ret opt[str].some{RECORD}; }
     }
     if (broadcasts != 0 && (op.length == LIG || op.element > 4 + op.length)) { ret opt[str].some{BROADCAST_SPACE}; }
-    if ((op.flags & (ND | NF)) != 0 && op.map != 4)                          { ret opt[str].some{RECORD}; }
-    if ((op.flags & ND) != 0) {
-        if (op.vvvv == field.NO_OPERAND || (operands[op.vvvv].role & operand.WRITE) == 0) { ret opt[str].some{NDD_WRITE}; }
-        if (memory && broadcasts != 0)                                                    { ret opt[str].some{RECORD}; }
-    }
+    # nd is map 4's, a new data destination, push2's and pop2's pair or setcc's zeroing of the rest, and nf map 4's and
+    # the promoted vex instructions' of maps 2 and 3 (Intel APX 355828-009US 3.1.2.3)
+    if ((op.flags & ND) != 0 && (op.map != 4 || (memory && broadcasts != 0))) { ret opt[str].some{RECORD}; }
+    if ((op.flags & NF) != 0 && (op.map < 2 || op.map > 4))                   { ret opt[str].some{RECORD}; }
     ret opt[str].none{};
 }
 
 fun head_check(f: *field.Field, operands: *operand.Operand, count: u32) opt[str] {
     if (f.data == nil) { ret opt[str].some{NO_RECORD}; }
     val op: *Opcode = opcode_of(f);
-    if (op.space > EVEX || (op.space == LEGACY && op.map > 3) || op.size > O64 || op.simd > PF2) { ret opt[str].some{RECORD}; }
+    if (op.space > XOP || (op.space == LEGACY && op.map > 3 && op.map != NOW_MAP) || op.size > O64 || op.simd > PF2) { ret opt[str].some{RECORD}; }
+    if (op.address > x86_opcode.A64)                                                                                 { ret opt[str].some{RECORD}; }
+    if (op.map == NOW_MAP && op.reg == field.NO_OPERAND)                                                             { ret opt[str].some{RECORD}; }
     val vex: opt[str] = vex_check(op, operands, count);
     if (sel vex.some)                                                                 { ret vex; }
     if (op.digit != NO_DIGIT && (op.digit > 7 || op.reg != field.NO_OPERAND))         { ret opt[str].some{RECORD}; }
@@ -1386,7 +1549,9 @@ fun head_check(f: *field.Field, operands: *operand.Operand, count: u32) opt[str]
 fun modrm_check(f: *field.Field, operands: *operand.Operand, count: u32) opt[str] {
     if (f.data == nil) { ret opt[str].some{NO_RECORD}; }
     val op: *Opcode = opcode_of(f);
-    if (op.rm == field.NO_OPERAND || (op.reg == field.NO_OPERAND && op.digit == NO_DIGIT)) { ret opt[str].some{RECORD}; }
+    if (op.reg == field.NO_OPERAND && op.digit == NO_DIGIT)      { ret opt[str].some{RECORD}; }
+    if ((op.rm == field.NO_OPERAND) == (op.rmdigit == NO_DIGIT)) { ret opt[str].some{RECORD}; }
+    if (op.rmdigit != NO_DIGIT && op.rmdigit > 7)                { ret opt[str].some{RECORD}; }
     ret opt[str].none{};
 }
 
@@ -1404,18 +1569,19 @@ fun reg_bits(enc: *field.Encoder, op: *Opcode) u64 {
 }
 
 # the fixup kind a symbolic displacement takes when its symbol states none: pc-relative for a rip-relative address,
-# else absolute at the address size, sign-extended where 64-bit addressing extends a 32-bit displacement
-fun disp_fixup(p: *field.Parts, size: u8) {
+# else absolute at the address size, a 32-bit one sign-extended in 64-bit code, under 32-bit addressing too, as llvm-mc
+# 23.1.1 writes R_X86_64_32S for `[ebx + ext]`
+fun disp_fixup(p: *field.Parts, w: u8, size: u8) {
     if (p.symbol.fixup != operand.NO_FIXUP) { ret; }
     if (p.bits[field.MODE] == operand.RELATIVE_PC::u64) {
         p.fixup = x86_fixup.PC32;
         ret;
     }
-    if (size == 64) {
-        p.fixup = x86_fixup.ABS32S;
+    if (size == 16) {
+        p.fixup = x86_fixup.ABS16;
         ret;
     }
-    p.fixup = x86_fixup.absolute(size, false);
+    p.fixup = x86_fixup.absolute(32, w == 64);
 }
 
 # the displacement of the memory value of operand `op` held to the address size's range
@@ -1435,29 +1601,32 @@ fun disp_admitted(enc: *field.Encoder, op: u8, size: u8) err[field.Refusal] {
 }
 
 fun modrm_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
-    val op:   *Opcode          = opcode_of(f);
+    val op: *Opcode = opcode_of(f);
+    if (op.rm == field.NO_OPERAND) { ret err[field.Refusal].ok{}; }
     val desc: *operand.Operand = ?enc.operands[op.rm];
     if (!sel desc.shape.memory) { ret err[field.Refusal].ok{}; }
     val p:    *field.Parts           = ?enc.parts[op.rm];
     val w:    u8                     = width(enc.ctx);
-    val size: res[u8, field.Refusal] = memory_size(w, ?desc.shape.memory, p, @enc.form);
+    val size: res[u8, field.Refusal] = memory_size(w, op, ?desc.shape.memory, p, @enc.form);
     if (sel size.err) { ret field_refused(size.err.message, op.rm); }
-    val l: res[Layout, field.Refusal] = layout(w, size.ok, ?desc.shape.memory, p, @enc.form, scale_of(op, field.has(p, field.BROADCAST)));
+    val l: res[Layout, field.Refusal] = layout(w, size.ok, op, ?desc.shape.memory, p, @enc.form, scale_of(op, field.has(p, field.BROADCAST)));
     if (sel l.err) { ret field_refused(l.err.message, op.rm); }
     ret disp_admitted(enc, op.rm, size.ok);
 }
 
 fun modrm_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
-    val op:   *Opcode          = opcode_of(f);
-    val reg:  u64              = reg_bits(enc, op);
+    val op:  *Opcode = opcode_of(f);
+    val reg: u64     = reg_bits(enc, op);
+    # an opcode extension in ModRM.rm is a register form's, mod 11
+    if (op.rm == field.NO_OPERAND) { ret field.put(enc, 0xC0 | (reg << 3) | op.rmdigit::u64, 1); }
     val desc: *operand.Operand = ?enc.operands[op.rm];
     val p:    *field.Parts     = ?enc.parts[op.rm];
     if (sel desc.shape.register) { ret field.put(enc, 0xC0 | (reg << 3) | (p.bits[field.NUMBER] & 7), 1); }
     if (!sel desc.shape.memory)  { ret field_refused(field.WRONG_KIND, op.rm); }
     val w:    u8                     = width(enc.ctx);
-    val size: res[u8, field.Refusal] = memory_size(w, ?desc.shape.memory, p, @enc.form);
+    val size: res[u8, field.Refusal] = memory_size(w, op, ?desc.shape.memory, p, @enc.form);
     if (sel size.err) { ret field_refused(size.err.message, op.rm); }
-    val got: res[Layout, field.Refusal] = layout(w, size.ok, ?desc.shape.memory, p, @enc.form, scale_of(op, field.has(p, field.BROADCAST)));
+    val got: res[Layout, field.Refusal] = layout(w, size.ok, op, ?desc.shape.memory, p, @enc.form, scale_of(op, field.has(p, field.BROADCAST)));
     if (sel got.err) { ret field_refused(got.err.message, op.rm); }
     val l:   Layout             = got.ok;
     val put: err[field.Refusal] = field.put(enc, ((l.mod::u64) << 6) | (reg << 3) | l.rm::u64, 1);
@@ -1468,7 +1637,7 @@ fun modrm_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     }
     if (l.disp == 0) { ret err[field.Refusal].ok{}; }
     if (p.symbolic) {
-        disp_fixup(p, size.ok);
+        disp_fixup(p, w, size.ok);
         val noted: err[field.Refusal] = field.fixup(enc, op.rm, enc.out.len - enc.start);
         if (sel noted.err) { ret noted; }
     }
@@ -1505,20 +1674,23 @@ fun decode_segment(dec: *field.Decoder, m: *operand.Memory, op: u8, s: *Prefixes
     if (s.segment != 0 && m.segment.classes.len > 0) { field.replace(dec, op, field.SEGMENT, segment_number(s.segment)); }
 }
 
-# memory operand `op` of shape `m` decoded from ModRM bits `mod` and `rm` under prefixes `s`, a disp8 scaled by
-# 2^`shift`
-fun decode_address(dec: *field.Decoder, m: *operand.Memory, op: u8, mod: u8, rm: u8, s: *Prefixes, w: u8, shift: u8) err[field.Refusal] {
-    val at:     usize = dec.at;
-    val size:   u8    = address_size(w, s.asz);
-    val class:  i64   = operand.find(m.base.classes, size_class(size));
-    val iclass: i64   = operand.find(m.index.classes, size_class(size));
-    var b:      i64   = -1;
-    var x:      i64   = -1;
-    var scale:  u64   = 0;
-    var wide:   u8    = 0;
-    var mode:   u64   = operand.OFFSET::u64;
-    var sib:    bool  = false;
-    val rexed:  bool  = s.rex || s.rex2 || s.space != LEGACY;
+# memory operand `op` of row `row` of shape `m` decoded from ModRM bits `mod` and `rm` under prefixes `s`, a disp8
+# scaled by 2^`shift`. a vector index's every number is a register, its fifth bit evex.v'
+fun decode_address(dec: *field.Decoder, row: *Opcode, m: *operand.Memory, op: u8, mod: u8, rm: u8, s: *Prefixes, w: u8, shift: u8) err[field.Refusal] {
+    val at:       usize = dec.at;
+    val size:     u8    = address_size(w, s.asz);
+    val vectored: bool  = vsib(m);
+    val class:    i64   = operand.find(m.base.classes, size_class(size));
+    var iclass:   i64   = operand.find(m.index.classes, size_class(size));
+    if (vectored)                                                                      { iclass = 0; }
+    if ((vectored || (row.flags & x86_opcode.SIBMEM) != 0) && (size == 16 || rm != 4)) { ret err[field.Refusal].err{field.refusal(field.MISMATCH, op, at)}; }
+    var b:     i64  = -1;
+    var x:     i64  = -1;
+    var scale: u64  = 0;
+    var wide:  u8   = 0;
+    var mode:  u64  = operand.OFFSET::u64;
+    var sib:   bool = false;
+    val rexed: bool = s.rex || s.rex2 || s.space != LEGACY;
     if (size == 16) {
         if (mod == 0 && rm == 6) { wide = 2; }
         or {
@@ -1540,9 +1712,16 @@ fun decode_address(dec: *field.Decoder, m: *operand.Memory, op: u8, mod: u8, rm:
             val byte: u64 = got.ok;
             scale = byte >> 6;
             var index: u64 = (byte >> 3) & 7;
-            if (rexed)      { index = index | extension_of(s.payload, X3, X4); }
-            if (index != 4) { x = index:~i64; }
-            or (scale != 0) { ret err[field.Refusal].err{field.refusal(NO_SCALE, op, at)}; }
+            if (vectored) {
+                if (rexed)           { index = index | extension_of(s.payload, X3, 0); }
+                if (s.space == EVEX) { index = index | (s.vvvv & 0x10)::u64; }
+                x = index:~i64;
+            }
+            or {
+                if (rexed)      { index = index | extension_of(s.payload, X3, X4); }
+                if (index != 4) { x = index:~i64; }
+                or (scale != 0) { ret err[field.Refusal].err{field.refusal(NO_SCALE, op, at)}; }
+            }
             var base: u64 = byte & 7;
             if (base == 5 && mod == 0) { wide = 4; }
             or {
@@ -1580,10 +1759,10 @@ fun decode_address(dec: *field.Decoder, m: *operand.Memory, op: u8, mod: u8, rm:
     decode_segment(dec, m, op, s);
     field.replace(dec, op, field.DISP, disp_bits(m, d));
     field.replace(dec, op, field.MODE, mode);
-    # an address of no register states its size by the form alone
-    if (b < 0 && x < 0 && s.asz) { dec.form.bits = dec.form.bits | x86_form.ADDRESS; }
+    # an address of no register states its size by the form alone, where the row states none
+    if (b < 0 && x < 0 && s.asz && row.address == x86_opcode.NO_ADDRESS) { dec.form.bits = dec.form.bits | x86_form.ADDRESS; }
     # the zero form's layout of what was read, whose displacement width and SIB byte the form restates where they differ
-    val preferred: res[Layout, field.Refusal] = layout(w, size, m, ?dec.parts[op], @dec.form, shift);
+    val preferred: res[Layout, field.Refusal] = layout(w, size, row, m, ?dec.parts[op], @dec.form, shift);
     if (sel preferred.err) {
         var refused: field.Refusal = preferred.err;
         refused.operand = op;
@@ -1620,6 +1799,10 @@ fun modrm_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
         field.replace(dec, op.reg, field.NUMBER, n);
         field.replace(dec, op.reg, field.CLASS, pick(?dec.operands[op.reg], n, rexed));
     }
+    if (op.rm == field.NO_OPERAND) {
+        if (mod != 3 || rm != op.rmdigit) { ret err[field.Refusal].err{field.refusal(field.MISMATCH, field.NO_OPERAND, at)}; }
+        ret err[field.Refusal].ok{};
+    }
     val desc: *operand.Operand = ?dec.operands[op.rm];
     if (sel desc.shape.register) {
         if (mod != 3) { ret err[field.Refusal].err{field.refusal(field.MISMATCH, op.rm, at)}; }
@@ -1631,7 +1814,15 @@ fun modrm_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
     }
     if (mod == 3)               { ret err[field.Refusal].err{field.refusal(field.MISMATCH, op.rm, at)}; }
     if (!sel desc.shape.memory) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, op.rm, at)}; }
-    ret decode_address(dec, ?desc.shape.memory, op.rm, mod, rm, ?s, w, scale_of(op, s.b && s.space == EVEX && (op.flags & ND) == 0));
+    ret decode_address(dec, op, ?desc.shape.memory, op.rm, mod, rm, ?s, w, scale_of(op, s.b && s.space == EVEX && (op.flags & ND) == 0));
+}
+
+# the address size of an a0 to a3 move of row `op` in code of width `w` under form `f`: the row's own, else the width's
+# or the other the form overrides it to
+fun moffs_size(op: *Opcode, w: u8, f: form.Form) u8 {
+    val own: u8 = address_bits(op.address);
+    if (own != 0) { ret own; }
+    ret address_size(w, overridden(f));
 }
 
 # an absolute address of an a0 to a3 move is as wide as the address size, any value of 64 bits and either reading of
@@ -1639,7 +1830,7 @@ fun modrm_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
 fun moffs_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     val p: *field.Parts = ?enc.parts[f.operand];
     if (registered(p) || p.bits[field.MODE] != operand.OFFSET::u64) { ret field_refused(field.FORM, f.operand); }
-    val size: u8             = address_size(width(enc.ctx), overridden(@enc.form));
+    val size: u8             = moffs_size(opcode_of(f), width(enc.ctx), @enc.form);
     val v:    *operand.Value = ?enc.values[f.operand];
     if (size == 64)    { ret err[field.Refusal].ok{}; }
     if (!sel v.memory) { ret err[field.Refusal].ok{}; }
@@ -1651,7 +1842,7 @@ fun moffs_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
 
 fun moffs_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     val p:     *field.Parts = ?enc.parts[f.operand];
-    val size:  u8           = address_size(width(enc.ctx), overridden(@enc.form));
+    val size:  u8           = moffs_size(opcode_of(f), width(enc.ctx), @enc.form);
     val bytes: u8           = size / 8;
     if (p.symbolic) {
         if (p.symbol.fixup == operand.NO_FIXUP) { p.fixup = x86_fixup.absolute(size, false); }
@@ -1674,18 +1865,57 @@ fun moffs_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
     decode_segment(dec, ?desc.shape.memory, f.operand, ?s);
     field.replace(dec, f.operand, field.DISP, addr.ok & field.ones(desc.shape.memory.disp.bits));
     field.replace(dec, f.operand, field.MODE, operand.OFFSET::u64);
-    if (got.ok.asz) { dec.form.bits = dec.form.bits | x86_form.ADDRESS; }
+    if (got.ok.asz && opcode_of(f).address == x86_opcode.NO_ADDRESS) { dec.form.bits = dec.form.bits | x86_form.ADDRESS; }
     ret err[field.Refusal].ok{};
 }
 
-pub val HEAD:  field.Kind = field.Kind{name: "head", admit: head_admit, encode: head_encode, decode: head_decode, finish: head_finish, complete: head_complete, check: head_check};
-pub val MODRM: field.Kind = field.Kind{name: "modrm", admit: modrm_admit, encode: modrm_encode, decode: modrm_decode, finish: nil, complete: nil, check: modrm_check};
-pub val MOFFS: field.Kind = field.Kind{name: "moffs", admit: moffs_admit, encode: moffs_encode, decode: moffs_decode, finish: nil, complete: nil, check: moffs_check};
+fun string_check(f: *field.Field, operands: *operand.Operand, count: u32) opt[str] {
+    if (f.data == nil) { ret opt[str].some{NO_RECORD}; }
+    val op: *Opcode = opcode_of(f);
+    if (op.address == x86_opcode.NO_ADDRESS || !shaped(operands, count, f.operand, 2)) { ret opt[str].some{RECORD}; }
+    val desc: *operand.Operand = ?operands[f.operand];
+    if (!sel desc.shape.memory) { ret opt[str].some{RECORD}; }
+    val m: *operand.Memory = ?desc.shape.memory;
+    if (m.base.count != 1 || m.base.classes.len != 1 || m.index.classes.len != 0 || m.disp.bits != 0) { ret opt[str].some{RECORD}; }
+    if (class_size(m.base.classes.at[0]) != address_bits(op.address))                                 { ret opt[str].some{RECORD}; }
+    ret opt[str].none{};
+}
 
-val KINDS: [4]*field.Kind = [4]*field.Kind{?field.UNIT, ?HEAD, ?MODRM, ?MOFFS};
+# a string's memory is its one register, which no byte encodes and the row's address size states, in its segment or
+# the one its prefix overrides it to where it takes one
+fun string_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val p: *field.Parts = ?enc.parts[f.operand];
+    if (!field.has(p, field.NUMBER) || field.has(p, field.INDEX) || p.bits[field.MODE] != operand.OFFSET::u64 || p.symbolic) { ret field_refused(field.FORM, f.operand); }
+    ret err[field.Refusal].ok{};
+}
+
+fun string_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    ret string_admit(enc, f);
+}
+
+fun string_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val desc: *operand.Operand = ?dec.operands[f.operand];
+    if (!sel desc.shape.memory) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, dec.at)}; }
+    val got: res[Prefixes, field.Refusal] = scan(?dec.in, dec.start, width(dec.ctx));
+    if (sel got.err) { ret err[field.Refusal].err{got.err}; }
+    var s: Prefixes = got.ok;
+    field.replace(dec, f.operand, field.NUMBER, 0);
+    field.replace(dec, f.operand, field.CLASS, 0);
+    field.replace(dec, f.operand, field.DISP, 0);
+    field.replace(dec, f.operand, field.MODE, operand.OFFSET::u64);
+    if (desc.shape.memory.segment.count != 1) { decode_segment(dec, ?desc.shape.memory, f.operand, ?s); }
+    ret err[field.Refusal].ok{};
+}
+
+pub val HEAD:   field.Kind = field.Kind{name: "head", admit: head_admit, encode: head_encode, decode: head_decode, finish: head_finish, complete: head_complete, check: head_check};
+pub val MODRM:  field.Kind = field.Kind{name: "modrm", admit: modrm_admit, encode: modrm_encode, decode: modrm_decode, finish: nil, complete: nil, check: modrm_check};
+pub val MOFFS:  field.Kind = field.Kind{name: "moffs", admit: moffs_admit, encode: moffs_encode, decode: moffs_decode, finish: nil, complete: nil, check: moffs_check};
+pub val STRING: field.Kind = field.Kind{name: "string", admit: string_admit, encode: string_encode, decode: string_decode, finish: nil, complete: nil, check: string_check};
+
+val KINDS: [5]*field.Kind = [5]*field.Kind{?field.UNIT, ?HEAD, ?MODRM, ?MOFFS, ?STRING};
 
 # the x86 field table: units are little-endian
-pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 4, order: field.LITTLE};
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 5, order: field.LITTLE};
 
 # the prefixes `bytes` scan to in code of width `w`
 #[testing]

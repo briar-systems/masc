@@ -27,6 +27,7 @@ use mink.base.table;
 use arch_x86: mink.catalog.arch.x86;
 use mink.format.registry;
 use mink.model.object;
+use mink.model.reloc;
 
 use masc.asm.asm;
 use masc.asm.model;
@@ -45,6 +46,7 @@ use masc.core.row;
 use masc.core.set;
 use masc.core.state;
 use masc.format.dialect;
+use masc.syntax.parse;
 
 use x86_extension: masc.isa.x86.extension;
 use x86_field:     masc.isa.x86.field;
@@ -53,9 +55,11 @@ use x86_form:      masc.isa.x86.form;
 use x86_opcode:    masc.isa.x86.opcode;
 use x86_set:       masc.isa.x86.set;
 use x86_source:    masc.isa.x86.source;
+use x86_syntax:    masc.isa.x86.syntax;
 
 use masc.isa.x86.gen_register;
 use masc.isa.x86.gen_row;
+use masc.isa.x86.gen_row_index;
 
 # a test's allocator, formats, selection, register view and context
 #[testing]
@@ -275,6 +279,25 @@ test encoding__prefixes_are_written_in_the_canonical_order {
 test encoding__16_bit_code_addresses_by_its_own_forms {
     val want: [10]u8 = [10]u8{0x8B, 0x40, 0x04, 0x8B, 0x46, 0x00, 0x67, 0x66, 0x8B, 0x00};
     if (!t_writes(".intel_syntax noprefix\n.code16\nmov ax, word ptr [bx + si + 4]\nmov ax, word ptr [bp]\nmov eax, dword ptr [eax]\n", ?want[0], 10)) { ret 1; }
+    # a row 66 does not size is 32 bits in 16-bit code with no 66
+    val immune: [3]u8 = [3]u8{0x0F, 0xC7, 0x0F};
+    if (!t_writes(".intel_syntax noprefix\n.code16\ncmpxchg8b qword ptr [bx]\n", ?immune[0], 3)) { ret 2; }
+    val adox: [5]u8 = [5]u8{0xF3, 0x0F, 0x38, 0xF6, 0xE6};
+    if (!t_writes_with("x86-64-v3,adx", ".intel_syntax noprefix\n.code16\nadox esp, esi\n", ?adox[0], 5)) { ret 3; }
+    ret 0;
+}
+
+# xchg of the accumulator is 90+r in either order, as llvm-mc writes it, and 87 /r of two other registers
+test encoding__xchg_of_the_accumulator_is_its_short_form {
+    val want: [9]u8 = [9]u8{0x66, 0x41, 0x90, 0x66, 0x41, 0x90, 0x66, 0x87, 0xCB};
+    if (!t_writes(".intel_syntax noprefix\nxchg ax, r8w\nxchg r8w, ax\nxchg cx, bx\n", ?want[0], 9)) { ret 1; }
+    ret 0;
+}
+
+# memory of no size is a near jump's or call's at the code width, and a far one's is fword, as llvm-mc reads them
+test encoding__a_far_jump_through_memory_is_fword {
+    val want: [8]u8 = [8]u8{0xFF, 0x23, 0xFF, 0x13, 0xFF, 0x2B, 0xFF, 0x1B};
+    if (!t_writes(".intel_syntax noprefix\n.code32\njmp [ebx]\ncall [ebx]\njmp fword ptr [ebx]\ncall fword ptr [ebx]\n", ?want[0], 8)) { ret 1; }
     ret 0;
 }
 
@@ -284,12 +307,59 @@ test encoding__a_rip_relative_address_is_refused_outside_64_bit_code {
     ret 0;
 }
 
+# whether `text` assembles in dialect `d` to the `n` bytes at `want` with one relocation per line, the `count` at
+# `offsets` of `kinds` and `addends`
+#[testing]
+fun t_relocates(d: *dialect.Dialect, text: str, want: *u8, n: usize, offsets: *u64, kinds: **reloc.Kind, addends: *i64, count: u32) bool {
+    var t: T;
+    if (!t_make(?t)) { ret false; }
+    var got: res[object.Object, model.Refusal] = t_assemble_in(?t, d, text);
+    if (sel got.err) { ret false; }
+    var o:  object.Object = got.ok;
+    var ok: bool          = t_text(?o, want, n) && o.relocs.count == count::usize;
+    var i:  u32           = 0;
+    for (ok && i < count) {
+        val r: *object.Reloc = ?o.relocs.items[i];
+        ok = r.offset == offsets[i] && r.kind == kinds[i] && r.addend == addends[i];
+        i  = i + 1;
+    }
+    object.release(?o);
+    ret ok;
+}
+
+# a rip-relative operand naming a symbol and its addend, as compiler output reaches a global, is pc-relative from the
+# instruction's end, as llvm-mc 23.1.1 writes it: ext-4, ext+4 past an addend of 8, and ext-8 past a 4-byte immediate,
+# in elf and coff alike, and a call's target is a branch's, BRANCH32. beside a base register it is absolute,
+# sign-extended in 64-bit code
+test encoding__a_rip_relative_symbol_relocates_from_the_instruction_end {
+    val rip:     str            = ".intel_syntax noprefix\nmov eax, dword ptr [rip + ext]\nmov eax, dword ptr [rip + ext + 8]\nmov dword ptr [rip + ext], 1\n";
+    val want:    [22]u8         = [22]u8{0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
+    val offsets: [3]u64         = [3]u64{2, 8, 14};
+    val kinds:   [3]*reloc.Kind = [3]*reloc.Kind{?reloc.PC32, ?reloc.PC32, ?reloc.PC32};
+    val addends: [3]i64         = [3]i64{-4, 4, -8};
+    if (!t_relocates(?dialect.ELF, rip, ?want[0], 22, ?offsets[0], ?kinds[0], ?addends[0], 3))         { ret 1; }
+    if (!t_relocates(?dialect.COFF_X86_64, rip, ?want[0], 22, ?offsets[0], ?kinds[0], ?addends[0], 3)) { ret 2; }
+    val call:   [5]u8          = [5]u8{0xE8, 0x00, 0x00, 0x00, 0x00};
+    val target: [1]u64         = [1]u64{1};
+    val pc:     [1]*reloc.Kind = [1]*reloc.Kind{?reloc.BRANCH32};
+    val back:   [1]i64         = [1]i64{-4};
+    if (!t_relocates(?dialect.ELF, ".intel_syntax noprefix\ncall ext\n", ?call[0], 5, ?target[0], ?pc[0], ?back[0], 1))         { ret 5; }
+    if (!t_relocates(?dialect.COFF_X86_64, ".intel_syntax noprefix\ncall ext\n", ?call[0], 5, ?target[0], ?pc[0], ?back[0], 1)) { ret 6; }
+    val based: [6]u8          = [6]u8{0x8B, 0x83, 0x00, 0x00, 0x00, 0x00};
+    val at:    [1]u64         = [1]u64{2};
+    val wide:  [1]*reloc.Kind = [1]*reloc.Kind{?reloc.ABS32S};
+    val none:  [1]i64         = [1]i64{0};
+    if (!t_relocates(?dialect.ELF, ".intel_syntax noprefix\nmov eax, dword ptr [rbx + ext]\n", ?based[0], 6, ?at[0], ?wide[0], ?none[0], 1)) { ret 3; }
+    if (!t_refuses(".intel_syntax noprefix\nmov eax, dword ptr [rip - ext]\n", x86_syntax.NEGATED))                                          { ret 4; }
+    ret 0;
+}
+
 # a rex2 prefix reaches maps 0 and 1 only (Intel APX 355828-009US 3.1.2.1), so a {rex2} row of map 2, movzx's moved
 # there, is refused
 test encoding__rex2_with_an_unreachable_map_is_refused {
     var t: T;
     if (!t_make(?t)) { ret 1; }
-    val base: *row.Row          = gen_row.MOVZX_GPR32_GPR8_0FB6_O32_W64;
+    val base: *row.Row          = ?gen_row.ROWS[gen_row_index.MOVZX_GPR32_GPR8_0FB6_O32];
     var op:   x86_opcode.Opcode = @x86_field.opcode_of(?base.encoding.at[0]);
     op.map = 2;
     var fields: [2]field.Field;
@@ -392,7 +462,7 @@ fun t_memory(role: operand.Role, width: u16, broadcasts: u8) operand.Operand {
 #[testing]
 fun t_opcode(space: x86_opcode.Space, map: u8, byte: u8, length: x86_opcode.Length) x86_opcode.Opcode {
     val none: u8 = field.NO_OPERAND;
-    ret x86_opcode.Opcode{space: space, map: map, byte: byte, simd: x86_opcode.NO_SIMD, size: x86_opcode.NO_SIZE, flags: 0, reg: none, digit: x86_opcode.NO_DIGIT, rm: none, opreg: none, memory: none, vvvv: none, mask: none, zeroing: none, rounding: none, length: length, disp8: 0, element: 0, twin: 0};
+    ret x86_opcode.Opcode{space: space, map: map, byte: byte, simd: x86_opcode.NO_SIMD, size: x86_opcode.NO_SIZE, address: x86_opcode.NO_ADDRESS, flags: 0, reg: none, digit: x86_opcode.NO_DIGIT, rmdigit: x86_opcode.NO_DIGIT, scc: x86_opcode.NO_SCC, rm: none, opreg: none, memory: none, vvvv: none, mask: none, zeroing: none, rounding: none, length: length, disp8: 0, element: 0, twin: 0};
 }
 
 # fixture `x` made a row of its first `count` operands and its opcode record, a head and a ModRM field
@@ -404,7 +474,7 @@ fun t_seal(x: *Fixture, key: str, count: u32) {
         k           = k + 1;
     }
     x.fields[1].kind = x86_field.MODRM_KIND;
-    x.row            = @gen_row.MOV_GPR32_GPR32_89_O32_W64;
+    x.row            = gen_row.ROWS[gen_row_index.MOV_GPR32_GPR32_89_O32];
     x.row.key        = key;
     x.row.operands   = row.Operands{at: ?x.operands[0], len: count};
     x.row.encoding   = field.Fields{at: ?x.fields[0], len: 2};
@@ -720,8 +790,6 @@ test encoding__an_ndd_form_writes_its_new_destination {
     v[2] = t_gpr64(18);
     val high: [6]u8 = [6]u8{0x62, 0xEC, 0xFC, 0x10, 0x01, 0xD1};
     if (!t_row_writes(?t, ?x.row, ?v[0], 3, 0, ?high[0], 6)) { ret 4; }
-    x.operands[0].role = operand.READ;
-    if (t_check(?x) != x86_field.NDD_WRITE) { ret 5; }
     ret 0;
 }
 
@@ -741,5 +809,40 @@ test encoding__an_extended_register_forces_evex_or_rex2 {
     if (t_row_refusal(?t, ?vex.row, ?three[0], 3, 0) != x86_field.VEX_REACH) { ret 3; }
     val wide: [6]u8 = [6]u8{0x62, 0xE1, 0x74, 0x08, 0x58, 0xC2};
     if (!t_row_writes(?t, ?evex.row, ?five[0], 5, 0, ?wide[0], 6)) { ret 4; }
+    ret 0;
+}
+
+# a marker's form holds through the layout, which measures each instruction in the form it is written in
+test encoding__a_marker_selects_its_encoding_through_the_layout {
+    val evex: [6]u8 = [6]u8{0x62, 0xF1, 0x6C, 0x08, 0x58, 0xCB};
+    if (!t_writes_with("x86-64-v4", ".intel_syntax noprefix\n{evex} vaddps xmm1, xmm2, xmm3\n", ?evex[0], 6)) { ret 1; }
+    val vex3: [5]u8 = [5]u8{0xC4, 0xE1, 0x68, 0x58, 0xCB};
+    if (!t_writes_with("x86-64-v4", ".intel_syntax noprefix\n{vex3} vaddps xmm1, xmm2, xmm3\n", ?vex3[0], 5)) { ret 2; }
+    ret 0;
+}
+
+# a string instruction written with no operands is the row of its width's own address size, as llvm-mc reads `rep movsb`
+test encoding__a_string_instruction_reads_with_no_operands_at_its_width {
+    val wide: [5]u8 = [5]u8{0xF3, 0xA4, 0xA4, 0xAB, 0xAC};
+    if (!t_writes(".intel_syntax noprefix\nrep movsb\nmovsb\nstosd\nlodsb\n", ?wide[0], 5)) { ret 1; }
+    val one: [1]u8 = [1]u8{0xA4};
+    if (!t_writes(".intel_syntax noprefix\n.code32\nmovsb\n", ?one[0], 1)) { ret 2; }
+    if (!t_writes(".intel_syntax noprefix\n.code16\nmovsb\n", ?one[0], 1)) { ret 3; }
+    # a string's prefixes are in llvm-mc's order, and its ds is its own segment
+    val run: [6]u8 = [6]u8{0xF3, 0x67, 0x64, 0x66, 0xAD, 0xAC};
+    if (!t_writes(".intel_syntax noprefix\nrep lodsw ax, word ptr fs:[esi]\nlodsb al, byte ptr ds:[rsi]\n", ?run[0], 6)) { ret 4; }
+    ret 0;
+}
+
+# memory written with no size is the one size the rows that read the text take, the code width's for push, and refused
+# where more than one size reads it, as llvm-mc reads them
+test encoding__memory_of_no_size_reads_as_the_one_size_its_rows_take {
+    val mov: [2]u8 = [2]u8{0x8B, 0x00};
+    if (!t_writes(".intel_syntax noprefix\nmov eax, [rax]\n", ?mov[0], 2)) { ret 1; }
+    val push: [2]u8 = [2]u8{0xFF, 0x30};
+    if (!t_writes(".intel_syntax noprefix\npush [rax]\n", ?push[0], 2)) { ret 2; }
+    val movaps: [3]u8 = [3]u8{0x0F, 0x28, 0x00};
+    if (!t_writes_with("x86-64-v2", ".intel_syntax noprefix\nmovaps xmm0, [rax]\n", ?movaps[0], 3)) { ret 3; }
+    if (!t_refuses(".intel_syntax noprefix\nadd [rax], 1\n", parse.AMBIGUOUS_SIZE))                 { ret 4; }
     ret 0;
 }
