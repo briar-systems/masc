@@ -5,8 +5,9 @@
 # of one encoded number with its zero low bits stated as the immediate's scale,
 # a register is five bits of its number, and a condition, shift, extend,
 # arrangement size or tile direction is bits holding an enumerant's value. those
-# go through the core's unit kind, stated once here as core layout records. a
-# kind exists only where slices cannot express the encoding:
+# go through the word kind, the core's unit with the bits a symbol's fixup kind
+# fixes beyond its field, stated once here as core layout records. a kind
+# exists only where slices cannot express the encoding:
 #   bitmask  the N:immr:imms logical immediate, a rotated run of ones repeated
 #            across the register, which no slice of the value's bits encodes
 #   float8   fmov's 8-bit floating-point immediate, VFPExpandImm
@@ -63,6 +64,7 @@ use masc.core.row;
 use masc.core.state;
 
 use aarch64:          masc.isa.aarch64.extension;
+use aarch64_fixup:    masc.isa.aarch64.fixup;
 use aarch64_register: masc.isa.aarch64.register;
 
 pub val UNIT_KIND:     u16 = 0;
@@ -423,7 +425,84 @@ fun bytemask_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
 # movi's 64-bit immediate: the field operand's value, a byte per bit of the 8-bit immediate its slices place
 pub val BYTEMASK: field.Kind = field.Kind{name: "bytemask", admit: bytemask_admit, encode: bytemask_encode, decode: bytemask_decode, finish: nil, complete: nil, check: nil};
 
-val KINDS: [5]*field.Kind = [5]*field.Kind{?field.UNIT, ?BITMASK, ?FLOAT8, ?MULTIPLE, ?BYTEMASK};
+pub val WIDE_GROUP: str = "move wide group past the register's width, or under another shift than its own";
+
+# a move wide's hw, its two bits of shift
+val HW_AT:   u64 = 21;
+val HW_BITS: u64 = 3::u64 << 21;
+
+# a movz's fixed bits, and the bit that makes it a movn
+val MOVZ_MASK: u64 = 0x7F80_0000;
+val MOVZ:      u64 = 0x5280_0000;
+val MOVZ_BIT:  u64 = 1::u64 << 30;
+
+# the bit that shifts an add's twelve bits by twelve
+val HIGH_BIT: u64 = 1::u64 << 22;
+
+# the bits of `f`'s operand slices over its fixed bits, as `field.pack` places them, without recording a fixup
+fun composed(enc: *field.Encoder, f: *field.Field) u64 {
+    var unit: u64 = f.fixed & f.mask;
+    var i:    u32 = 0;
+    for (i < f.slices.len) {
+        val s:    *field.Slice = ?f.slices.at[i];
+        var bits: u64          = (enc.parts[s.operand].bits[s.part] >> s.lo) & field.ones(s.len);
+        if (s.invert) { bits = bits ^ field.ones(s.len); }
+        unit = unit | (bits << s.at);
+        i    = i + 1;
+    }
+    ret unit;
+}
+
+# word `unit` of `f` with the bits its symbolic operands' fixup kinds fix beyond their own field, as llvm-mc 23.1.1
+# encodes them (AArch64MCCodeEmitter): a move wide group's hw, a movz of a signed group written as a movn (fixMOVZ), and
+# the shift of an add's high twelve bits (getAddSubImmOpValue). a group past a w register's two halfwords, or under a
+# shift the text states otherwise, is refused
+fun implied(enc: *field.Encoder, f: *field.Field, unit: u64, at: usize) res[u64, field.Refusal] {
+    var word: u64 = unit;
+    var i:    u32 = 0;
+    for (i < f.slices.len) {
+        val op: u8           = f.slices.at[i].operand;
+        val p:  *field.Parts = ?enc.parts[op];
+        i = i + 1;
+        if (!p.symbolic)                 { cnt; }
+        if (aarch64_fixup.high(p.fixup)) { word = word | HIGH_BIT; }
+        val g: opt[*aarch64_fixup.Group] = aarch64_fixup.group_of(p.fixup);
+        if (sel g.none) { cnt; }
+        val hw:     u64 = g.some.hw::u64;
+        val stated: u64 = (word & HW_BITS) >> HW_AT;
+        if ((hw > 1 && (word >> 31) == 0) || (stated != 0 && stated != hw)) { ret res[u64, field.Refusal].err{field.refusal(WIDE_GROUP, op, at)}; }
+        word = (word & ~HW_BITS) | (hw << HW_AT);
+        if (g.some.signed && (f.fixed & MOVZ_MASK) == MOVZ) { word = word & ~MOVZ_BIT; }
+    }
+    ret res[u64, field.Refusal].ok{word};
+}
+
+fun word_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val word: res[u64, field.Refusal] = implied(enc, f, composed(enc, f), 0);
+    if (sel word.err) { ret err[field.Refusal].err{word.err}; }
+    ret err[field.Refusal].ok{};
+}
+
+fun word_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val unit: res[u64, field.Refusal] = field.pack(enc, f);
+    if (sel unit.err) { ret err[field.Refusal].err{unit.err}; }
+    val word: res[u64, field.Refusal] = implied(enc, f, unit.ok, enc.out.len);
+    if (sel word.err) { ret err[field.Refusal].err{word.err}; }
+    ret field.put(enc, word.ok, f.width / 8);
+}
+
+fun word_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:   usize                   = dec.at;
+    val unit: res[u64, field.Refusal] = field.get(dec, f.width / 8);
+    if (sel unit.err) { ret err[field.Refusal].err{unit.err}; }
+    ret field.unpack(dec, f, unit.ok, at);
+}
+
+# the core's unit, its fixed bits and slices, with the bits a symbol's fixup kind fixes beyond its field, which decode
+# reads back as the slices they are
+pub val WORD: field.Kind = field.Kind{name: "unit", admit: word_admit, encode: word_encode, decode: word_decode, finish: nil, complete: nil, check: nil};
+
+val KINDS: [5]*field.Kind = [5]*field.Kind{?WORD, ?BITMASK, ?FLOAT8, ?MULTIPLE, ?BYTEMASK};
 
 # the aarch64 field table, its units little-endian
 pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 5, order: field.LITTLE};
