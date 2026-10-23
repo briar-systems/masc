@@ -13,6 +13,14 @@
 # unguaranteed (`ct.required`).
 #
 # secrecy is held per register row of the set's file and per memory extent.
+# a row is secret when some bit of it may hold a secret, so every row sharing
+# storage with a secret is: a seed or a write taints each row overlapping the
+# register it names, as the file's rows state the relation
+# (`register.overlapping`), and a read asks its own row alone. a write leaves
+# a row it overwrites holding what it writes, as eax's write zeroing the rest
+# of rax or w0's of x0, and adds its secret to a row it overlaps and leaves
+# part of, as al's within rax or a lane's within its vector register, whose
+# version of its value it moves either way.
 # an extent is named by the register its address is formed from, the version
 # of that register's value, an offset and a length: the walk states no
 # register values, so two extents are known apart only when both are of one
@@ -33,6 +41,9 @@
 # it keeps the place's own secrecy unless the instruction writes it. a point
 # after an instruction makes the place it writes hold no secret from there
 # until it is written again, memory until a secret may be stored where it is.
+# a point on a register row makes public with it the rows lying within it,
+# and after a write the rows that write overwrites, as a point after a write
+# of eax makes rax public, while a row holding more than it keeps its secret.
 # a point is applied each time its instruction is walked, so one inside a
 # loop holds on every pass to the fixed point, and one on a path into a join
 # reaches the join only on that path, merged there with what the others hold.
@@ -278,7 +289,8 @@ rec Held {
 
 # what is secret where an instruction starts
 # ---
-# taint:    the register rows holding a secret, one bit per row
+# taint:    the register rows that may hold a secret in some bit, one bit per row, every row overlapping one that does
+#           included
 # versions: the version of each register row's value
 # held:     the extents that may hold a secret
 # public:   the extents a declassify point after an instruction made public, which hold no secret whatever `held` and
@@ -377,6 +389,7 @@ rec Block {
 # public:   the caller's declassify points
 # declared: the first declassify point at each offset, by index into `public`, NO_POINT for none
 # chain:    the next declassify point at the offset of each, NO_POINT for none
+# overlaps: the rows each row of the file shares storage with
 rec Walk {
     a:        *A.Allocator;
     code:     *Code;
@@ -400,6 +413,7 @@ rec Walk {
     public:   *Declassified;
     declared: vector.Vector[u32];
     chain:    vector.Vector[u32];
+    overlaps: register.Overlaps;
 }
 
 val NO_POINT:  u32   = 0xFFFF_FFFF;
@@ -1256,19 +1270,29 @@ fun push_count(w: *Walk, s: *Shape, sig: *effect.Signature) usize {
     ret n;
 }
 
-# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, a write leaving part
-# of a register's old value keeping that part's, and its stores hold the extent they write. a call, whose callee the
-# walk does not read, leaves every register and every address secret when anything is
+# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, in every row overlapping
+# a register written, a row the write leaves part of keeping that part's old secret, and its stores hold the extent
+# they write. a call, whose callee the walk does not read, leaves every register and every address secret when
+# anything is
 fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Footprint, value: bool) err[A.Error] {
     val version: u64 = at::u64 * 2 + 1;
     var i:       u32 = 0;
     for (i < w.file.register_count) {
-        if (bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i)) {
-            val row: *register.Register = ?w.file.registers[i];
-            if ((row.flags & register.ZERO) == 0) {
-                if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, i, value); }
-                or (value)                                    { set_bit(p.taint.data, i, true); }
-                p.versions.data[i] = version;
+        val written: bool = bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i);
+        # a write through a register reading zero is discarded
+        if (written && (w.file.registers[i].flags & register.ZERO) == 0) {
+            val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, i);
+            if (sel span.err) { ret err[A.Error].err{span.err}; }
+            var k: u32 = 0;
+            for (k < span.ok.count) {
+                val o:   u32                = w.overlaps.rows.data[span.ok.first + k];
+                val row: *register.Register = ?w.file.registers[o];
+                if ((row.flags & register.ZERO) == 0) {
+                    if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, o, value); }
+                    or (value)                                    { set_bit(p.taint.data, o, true); }
+                    p.versions.data[o] = version;
+                }
+                k = k + 1;
             }
         }
         i = i + 1;
@@ -1460,6 +1484,22 @@ fun touched(ok: bool) res[bool, A.Error] {
     ret res[bool, A.Error].ok{ok};
 }
 
+# register row `row` made public in `p`, and every row a write through it extending as `extend` overwrites, as
+# `register.overwrites` decides: KEEP for the rows lying within it, or what the write a point after it names leaves
+fun publish_row(w: *Walk, p: *Point, row: u32, extend: opt[register.Extend]) err[A.Error] {
+    set_bit(p.taint.data, row, false);
+    val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, row);
+    if (sel span.err) { ret err[A.Error].err{span.err}; }
+    val by: *register.Register = ?w.file.registers[row];
+    var k:  u32                = 0;
+    for (k < span.ok.count) {
+        val o: u32 = w.overlaps.rows.data[span.ok.first + k];
+        if (register.overwrites(w.file, by, ?w.file.registers[o], extend)) { set_bit(p.taint.data, o, false); }
+        k = k + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
 # the place of the declassify point `d` before `ins` made public in `r`, the state the instruction's reads are decided
 # under: a register row it reads, an entry it reads through an operand holding its id, a value it pops, and with
 # `memory` set, once `w.touches` holds its touches, an extent one it reads holds whole. a place of the other pass is
@@ -1481,7 +1521,8 @@ fun lift(w: *Walk, r: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, s: *
         val row: opt[u32] = row_index(w, q.register);
         if (sel row.none)                     { ret touched(false); }
         if (!bit_of(fp.reads.data, row.some)) { ret touched(false); }
-        set_bit(r.taint.data, row.some, false);
+        val made: err[A.Error] = publish_row(w, r, row.some, opt[register.Extend].some{register.KEEP});
+        if (sel made.err) { ret failed[bool](made.err); }
         ret touched(true);
     }
     if (sel q.entry) {
@@ -1517,7 +1558,14 @@ fun clear(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, d: 
         val row: opt[u32] = row_index(w, q.register);
         if (sel row.none)                                                              { ret touched(false); }
         if (!bit_of(fp.written.data, row.some) && !bit_of(fp.clobbers.data, row.some)) { ret touched(false); }
-        set_bit(p.taint.data, row.some, false);
+        var extend: opt[register.Extend] = opt[register.Extend].some{register.KEEP};
+        var i:      usize                = 0;
+        for (i < fp.writes.len) {
+            if (fp.writes.data[i].at == q.register) { extend = fp.writes.data[i].write.extend; }
+            i = i + 1;
+        }
+        val made: err[A.Error] = publish_row(w, p, row.some, extend);
+        if (sel made.err) { ret failed[bool](made.err); }
         ret touched(true);
     }
     if (sel q.entry) {
@@ -1674,7 +1722,8 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     ret successors(w, ?p, at, ?ins, ?c, shape);
 }
 
-# the entry state the seeds make, refused naming a register the file has no row of or an entry the stream does not hold
+# the entry state the seeds make, a register's secret in every row overlapping it but one reading zero, refused naming
+# a register the file has no row of or an entry the stream does not hold
 fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
     var i: u32 = 0;
     for (i < secrets.len) {
@@ -1682,7 +1731,14 @@ fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
         if (sel s.register) {
             val row: opt[u32] = row_index(w, s.register);
             if (sel row.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
-            set_bit(p.taint.data, row.some, true);
+            val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, row.some);
+            if (sel span.err) { ret failed[opt[Verdict]](span.err); }
+            var k: u32 = 0;
+            for (k < span.ok.count) {
+                val o: u32 = w.overlaps.rows.data[span.ok.first + k];
+                if ((w.file.registers[o].flags & register.ZERO) == 0) { set_bit(p.taint.data, o, true); }
+                k = k + 1;
+            }
         }
         if (sel s.memory) {
             var h: Held = Held{base: effect.NO_ROW, version: ENTRY, offset: s.memory.offset, length: s.memory.length};
@@ -1910,6 +1966,7 @@ fun release(w: *Walk) {
     vector.dnit[Block](?w.blocks);
     vector.dnit[bool](?w.carried);
     vector.dnit[bool](?w.popped);
+    register.release_overlaps(?w.overlaps);
     vector.dnit[u32](?w.declared);
     vector.dnit[u32](?w.chain);
 }
@@ -2004,6 +2061,8 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
     if (code.set.codec.stream != nil && sel answer.held) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: TIMED, offset: 0}}}; }
     var file: *register.File = code.set.codec.registers;
     if (file == nil) { file = ?NO_FILE; }
+    val overlaps: res[register.Overlaps, A.Error] = register.overlaps_of(a, file);
+    if (sel overlaps.err) { ret failed[Verdict](overlaps.err); }
     var w: Walk = Walk{
         a:        a,
         code:     code,
@@ -2027,6 +2086,7 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
         public:   public,
         declared: vector.init[u32](a),
         chain:    vector.init[u32](a),
+        overlaps: overlaps.ok,
     };
     val verdict: res[Verdict, A.Error] = walked(?w, secrets);
     release(?w);
