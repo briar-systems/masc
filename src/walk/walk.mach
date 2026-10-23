@@ -27,11 +27,29 @@
 # version of one register and do not overlap, and every other pair may alias.
 # a secret stored where the address is not known, or anything secret at a
 # call, whose callee the walk does not read, may be anywhere afterwards.
-# memory is never made public again, since a store the walk cannot place
+# no store makes memory public again, since a store the walk cannot place
 # exactly may miss the secret it would overwrite. a register's version is
 # the offset of the instruction that last wrote it, or of the join that
 # merged two, so the states a loop reaches are finite and the worklist over
 # instruction starts reaches a fixed point.
+#
+# secrecy leaves a value only where the caller declares it public, at a
+# declassify point: an instruction offset, a side and a place, as the
+# trap guard before a division makes its condition public. a point before an
+# instruction makes the place public as that instruction reads it, so what
+# the instruction decides and writes from it is public, and the state after
+# it keeps the place's own secrecy unless the instruction writes it. a point
+# after an instruction makes the place it writes hold no secret from there
+# until it is written again, memory until a secret may be stored where it is.
+# a point on a register row makes public with it the rows lying within it,
+# and after a write the rows that write overwrites, as a point after a write
+# of eax makes rax public, while a row holding more than it keeps its secret.
+# a point is applied each time its instruction is walked, so one inside a
+# loop holds on every pass to the fixed point, and one on a path into a join
+# reaches the join only on that path, merged there with what the others hold.
+# a point never changes a row's class. a point at an offset where no
+# instruction the walk reaches starts, or naming a place its instruction does
+# not read before it or write after it, is answered unread.
 #
 # code of a typed stream passes its values on an operand stack and in the
 # entries of its index spaces, as wasm's locals and globals, and nests its
@@ -133,6 +151,51 @@ pub rec Secrets {
     len: u32;
 }
 
+# what a declassify point makes public
+# ---
+# register: the value of a register row of the set's file, a row as footprints name it, so x86's zf and not rflags
+# memory:   the bytes of an extent, of a known length
+# entry:    the value of an index space entry of a typed stream
+# value:    a value of a typed stream's operand stack, by depth from its top, 0 the top
+pub tag Place: u8 {
+    register: register.Id;
+    memory:   Extent;
+    entry:    Entry;
+    value:    u32;
+}
+
+# which side of its instruction a declassify point is on
+# ---
+# before: the instruction reads the place as public, which holds what it held after the instruction unless the
+#         instruction writes it, as a branch reads a guard's condition
+# after:  the instruction writes the place and it holds no secret from there until it is written again, as a compare
+#         leaves its result, or a spill the slot it stores
+pub tag Side: u8 {
+    before;
+    after;
+}
+
+# where a value becomes public: a declassify point, which removes the secret from one value at one place and never
+# makes a row's timing independent of its inputs
+# ---
+# at:    where the instruction starts
+# side:  which side of it
+# place: what it makes public, a place the instruction reads for a point before it and writes for one after it
+pub rec Declassify {
+    at:    u64;
+    side:  Side;
+    place: Place;
+}
+
+# declassify points as a pointer to the caller's rows and a count, in any order, more than one at an offset allowed
+pub rec Declassified {
+    at:  *Declassify;
+    len: u32;
+}
+
+# no declassify point
+pub val NO_DECLASSIFIED: Declassified = Declassified{at: nil, len: 0};
+
 # encoded code of one function, the bytes the caller encoded. code of a typed stream is the instructions of the
 # function's body, read under a context whose stream the caller has entered into that function
 # ---
@@ -188,6 +251,8 @@ pub val UNBALANCED:   str = "a value popped past the bottom of the operand stack
 pub val UNSTRUCTURED: str = "blocks the code does not close in order, a depth past every block open, or code past its body's block";
 pub val CAUGHT:       str = "a block whose catches take control from any throw in it, which the walk does not follow";
 pub val TIMED:        str = "code of a typed stream whose set classifies its rows' timing, which no class states over the values a row pops";
+pub val MISPLACED:    str = "a declassify point at an offset where no instruction the walk reaches starts";
+pub val UNTOUCHED:    str = "a declassify point naming a place the instruction at its offset does not read before it or write after it";
 
 # the version of a register's value on entry
 val ENTRY: u64 = 0;
@@ -228,6 +293,8 @@ rec Held {
 #           included
 # versions: the version of each register row's value
 # held:     the extents that may hold a secret
+# public:   the extents a declassify point after an instruction made public, which hold no secret whatever `held` and
+#           `anywhere` say until a secret may be stored there
 # anywhere: whether a secret may be at any address
 # config:   the configuration state in force, none when not known
 # stack:    a typed stream's operand stack, the bottom first, whether each value may hold a secret
@@ -238,6 +305,7 @@ rec Point {
     taint:    vector.Vector[u64];
     versions: vector.Vector[u64];
     held:     vector.Vector[Held];
+    public:   vector.Vector[Held];
     anywhere: bool;
     config:   opt[config.State];
     stack:    vector.Vector[bool];
@@ -318,6 +386,9 @@ rec Block {
 # blocks:   the blocks of a typed stream's code, the function's body first
 # carried:  the values a branch of the instruction walked carries to its label, the deepest first
 # popped:   the values the instruction walked pops, the deepest first
+# public:   the caller's declassify points
+# declared: the first declassify point at each offset, by index into `public`, NO_POINT for none
+# chain:    the next declassify point at the offset of each, NO_POINT for none
 # overlaps: the rows each row of the file shares storage with
 rec Walk {
     a:        *A.Allocator;
@@ -339,6 +410,9 @@ rec Walk {
     blocks:   vector.Vector[Block];
     carried:  vector.Vector[bool];
     popped:   vector.Vector[bool];
+    public:   *Declassified;
+    declared: vector.Vector[u32];
+    chain:    vector.Vector[u32];
     overlaps: register.Overlaps;
 }
 
@@ -435,6 +509,7 @@ fun blank(w: *Walk) res[Point, A.Error] {
         taint:    vector.init[u64](w.a),
         versions: vector.init[u64](w.a),
         held:     vector.init[Held](w.a),
+        public:   vector.init[Held](w.a),
         anywhere: false,
         config:   opt[config.State].none{},
         stack:    vector.init[bool](w.a),
@@ -460,6 +535,7 @@ fun drop(p: *Point) {
     vector.dnit[u64](?p.taint);
     vector.dnit[u64](?p.versions);
     vector.dnit[Held](?p.held);
+    vector.dnit[Held](?p.public);
     vector.dnit[bool](?p.stack);
     vector.dnit[u64](?p.entries);
 }
@@ -482,6 +558,15 @@ fun copy(w: *Walk, from: *Point) res[Point, A.Error] {
     i = 0;
     for (i < from.held.len) {
         val pushed: res[usize, A.Error] = vector.push[Held](?p.held, from.held.data[i]);
+        if (sel pushed.err) {
+            drop(?p);
+            ret failed[Point](pushed.err);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < from.public.len) {
+        val pushed: res[usize, A.Error] = vector.push[Held](?p.public, from.public.data[i]);
         if (sel pushed.err) {
             drop(?p);
             ret failed[Point](pushed.err);
@@ -536,10 +621,37 @@ fun may_alias(held: *Held, at: *Held) bool {
     ret held.offset < at.offset + at.length::i64 && at.offset < held.offset + held.length::i64;
 }
 
+# whether every byte of `inner` is one of `outer`: both of one version of one register and of known length
+fun inside(inner: *Held, outer: *Held) bool {
+    if (inner.base != outer.base || inner.version != outer.version || inner.base == effect.NO_ROW) { ret false; }
+    if (inner.length == 0 || outer.length == 0)                                                    { ret false; }
+    ret inner.offset >= outer.offset && inner.offset + inner.length::i64 <= outer.offset + outer.length::i64;
+}
+
+# the extents `p` knows public taken out where a secret stored at `at` may reach them, every one for an address the walk
+# does not place
+fun unpublish(p: *Point, at: *Held) {
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < p.public.len) {
+        if (at.base != effect.NO_ROW && !may_alias(?p.public.data[i], at)) {
+            p.public.data[kept] = p.public.data[i];
+            kept                = kept + 1;
+        }
+        i = i + 1;
+    }
+    p.public.len = kept;
+}
+
 # whether the bytes of `at` may hold a secret under `p`
 fun secret_at(p: *Point, at: *Held) bool {
-    if (p.anywhere) { ret true; }
     var i: usize = 0;
+    for (i < p.public.len) {
+        if (inside(at, ?p.public.data[i])) { ret false; }
+        i = i + 1;
+    }
+    if (p.anywhere) { ret true; }
+    i = 0;
     for (i < p.held.len) {
         if (may_alias(?p.held.data[i], at)) { ret true; }
         i = i + 1;
@@ -616,6 +728,26 @@ fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[opt[bool], A.Erro
         if (sel held.err)            { ret failed[opt[bool]](held.err); }
         if (into.held.len != before) { changed = true; }
         i = i + 1;
+    }
+    # an extent is known public in the join only when it is on both paths
+    var kept: usize = 0;
+    i = 0;
+    for (i < into.public.len) {
+        var both: bool  = false;
+        var k:    usize = 0;
+        for (k < from.public.len) {
+            if (same(?into.public.data[i], ?from.public.data[k])) { both = true; }
+            k = k + 1;
+        }
+        if (both) {
+            into.public.data[kept] = into.public.data[i];
+            kept                   = kept + 1;
+        }
+        i = i + 1;
+    }
+    if (kept != into.public.len) {
+        into.public.len = kept;
+        changed         = true;
     }
     if (from.anywhere && !into.anywhere) {
         into.anywhere = true;
@@ -755,8 +887,10 @@ fun bytes_of(width: *effect.Width) u64 {
     ret (width.element.fixed::u64 + 7) / 8;
 }
 
-# the extent an address of `ins` touches, from the operand that is or holds it, or the register row `base` when none
-fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, length: u64, touch: *Touch) {
+# the extent an address of `ins` touches, from the operand that is or holds it plus the immediates of the further
+# operands `forming` names, or the register row `base` when none. an address a further operand forms that is no
+# immediate, as a risc-v stride, is placed nowhere
+fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, forming: operand.Positions, length: u64, touch: *Touch) {
     touch.operand = field.NO_OPERAND;
     touch.at      = Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: length};
     if (op != field.NO_OPERAND && op::u32 < ins.inst.count) {
@@ -770,6 +904,15 @@ fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, length: u
         or (sel v.register) {
             val row: opt[u32] = row_index(w, v.register);
             if (sel row.some) { touch.at.base = row.some; }
+        }
+        var k: u32 = 0;
+        for (k < ins.inst.count && k < 32) {
+            if ((forming & (1::u32 << k)) != 0) {
+                val f: operand.Value = ins.inst.values[k];
+                if (sel f.immediate) { touch.at.offset = touch.at.offset + f.immediate; }
+                or                   { touch.at.base = effect.NO_ROW; }
+            }
+            k = k + 1;
         }
     }
     or                                  { touch.at.base = base; }
@@ -807,7 +950,7 @@ fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) r
         var role: operand.Role   = acc.role;
         if (role == operand.NONE && acc.operand != field.NO_OPERAND && acc.operand::u32 < ins.inst.count) { role = r[acc.operand].role; }
         var t: Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}};
-        placed(w, p, ins, acc.operand, acc.base, bytes_of(?acc.width), ?t);
+        placed(w, p, ins, acc.operand, acc.base, acc.forming, bytes_of(?acc.width), ?t);
         if (names_secret(w, p, ins, acc.operand))                                      { ret found(ct.refusal(ct.MEMORY, acc.operand)); }
         if (acc.base != effect.NO_ROW && bit_of(p.taint.data, acc.base))               { ret found(ct.refusal(ct.MEMORY, field.NO_OPERAND)); }
         if (acc.governor != field.NO_OPERAND && names_secret(w, p, ins, acc.governor)) { ret found(ct.refusal(ct.MEMORY, acc.governor)); }
@@ -837,7 +980,7 @@ fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) r
             if (!stated) {
                 val role: operand.Role = r[op].role;
                 var t:    Touch        = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}};
-                placed(w, p, ins, op::u8, effect.NO_ROW, 0, ?t);
+                placed(w, p, ins, op::u8, effect.NO_ROW, 0, 0, ?t);
                 val pushed: res[usize, A.Error] = vector.push[Touch](?w.touches, t);
                 if (sel pushed.err) { ret failed[opt[ct.Refusal]](pushed.err); }
             }
@@ -1110,6 +1253,7 @@ fun apply_stream(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footpri
             p.except      = true;
             p.entries.len = 0;
             p.anywhere    = true;
+            p.public.len  = 0;
         }
     }
     ret err[A.Error].ok{};
@@ -1157,6 +1301,7 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
     for (k < w.touches.len) {
         val t: *Touch = ?w.touches.data[k];
         if (t.writes && value) {
+            unpublish(p, ?t.at);
             if (t.at.base == effect.NO_ROW) { p.anywhere = true; }
             or {
                 val held: err[A.Error] = hold(p, t.at);
@@ -1180,7 +1325,10 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
             }
             i = i + 1;
         }
-        if (secret) { p.anywhere = true; }
+        if (secret) {
+            p.anywhere   = true;
+            p.public.len = 0;
+        }
     }
     val hooks: *config.Hooks = w.code.set.config;
     if (hooks != nil) {
@@ -1286,7 +1434,174 @@ fun successors(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, c: *effect.Co
     ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
 }
 
-# the instruction at `at` walked from the state there
+# `h` added to the extents `p` knows public unless it knows it
+fun publish(p: *Point, h: Held) err[A.Error] {
+    var i: usize = 0;
+    for (i < p.public.len) {
+        if (same(?p.public.data[i], ?h)) { ret err[A.Error].ok{}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Held](?p.public, h);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# the extent `e` of the memory a declassify point names as the touch of the instruction walked holding it whole would
+# name it, a touch that writes for `writes` and else one that reads. none when no touch does, or `e` is of no register
+# row or of no length
+fun held_by_touch(w: *Walk, e: *Extent, writes: bool) opt[Held] {
+    val row: opt[u32] = row_index(w, e.base);
+    if (sel row.none)  { ret opt[Held].none{}; }
+    if (e.length == 0) { ret opt[Held].none{}; }
+    var k: usize = 0;
+    for (k < w.touches.len) {
+        val t: *Touch = ?w.touches.data[k];
+        val h: Held   = Held{base: row.some, version: t.at.version, offset: e.offset, length: e.length};
+        if (((writes && t.writes) || (!writes && t.reads)) && inside(?h, ?t.at)) { ret opt[Held].some{h}; }
+        k = k + 1;
+    }
+    ret opt[Held].none{};
+}
+
+# whether `ins` reads, for `role` operand.READ, or writes, for operand.WRITE, the entry of key `k` through an operand
+# holding its id
+fun names_entry(ins: *walk.Decoded, fp: *footprint.Footprint, k: u64, role: operand.Role) bool {
+    var i: u32 = 0;
+    for (i < fp.entries.len) {
+        val n: *effect.Entry = ?fp.entries.at[i];
+        if ((n.role & role) != 0) {
+            val got: opt[u64] = entry_key(ins, n.operand);
+            if (sel got.some) {
+                if (got.some == k) { ret true; }
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun touched(ok: bool) res[bool, A.Error] {
+    ret res[bool, A.Error].ok{ok};
+}
+
+# register row `row` made public in `p`, and every row a write through it extending as `extend` overwrites, as
+# `register.overwrites` decides: KEEP for the rows lying within it, or what the write a point after it names leaves
+fun publish_row(w: *Walk, p: *Point, row: u32, extend: opt[register.Extend]) err[A.Error] {
+    set_bit(p.taint.data, row, false);
+    val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, row);
+    if (sel span.err) { ret err[A.Error].err{span.err}; }
+    val by: *register.Register = ?w.file.registers[row];
+    var k:  u32                = 0;
+    for (k < span.ok.count) {
+        val o: u32 = w.overlaps.rows.data[span.ok.first + k];
+        if (register.overwrites(w.file, by, ?w.file.registers[o], extend)) { set_bit(p.taint.data, o, false); }
+        k = k + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# the place of the declassify point `d` before `ins` made public in `r`, the state the instruction's reads are decided
+# under: a register row it reads, an entry it reads through an operand holding its id, a value it pops, and with
+# `memory` set, once `w.touches` holds its touches, an extent one it reads holds whole. a place of the other pass is
+# left as it is
+# ---
+# ret: whether the instruction reads the place, false refusing the point
+fun lift(w: *Walk, r: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, s: *Shape, d: *Declassify, memory: bool) res[bool, A.Error] {
+    val q: Place = d.place;
+    if (sel q.memory) {
+        if (!memory) { ret touched(true); }
+        val h: opt[Held] = held_by_touch(w, ?q.memory, false);
+        if (sel h.none) { ret touched(false); }
+        val made: err[A.Error] = publish(r, h.some);
+        if (sel made.err) { ret failed[bool](made.err); }
+        ret touched(true);
+    }
+    if (memory) { ret touched(true); }
+    if (sel q.register) {
+        val row: opt[u32] = row_index(w, q.register);
+        if (sel row.none)                     { ret touched(false); }
+        if (!bit_of(fp.reads.data, row.some)) { ret touched(false); }
+        val made: err[A.Error] = publish_row(w, r, row.some, opt[register.Extend].some{register.KEEP});
+        if (sel made.err) { ret failed[bool](made.err); }
+        ret touched(true);
+    }
+    if (sel q.entry) {
+        val k: u64 = key(q.entry.space, q.entry.index);
+        if (!names_entry(ins, fp, k, operand.READ)) { ret touched(false); }
+        val set: err[A.Error] = set_entry(r, k, false);
+        if (sel set.err) { ret failed[bool](set.err); }
+        ret touched(true);
+    }
+    if (sel q.value) {
+        if (s == nil || q.value::usize >= pop_count(w, s, ?fp.signature)) { ret touched(false); }
+        r.stack.data[r.stack.len - 1 - q.value::usize] = false;
+        ret touched(true);
+    }
+    ret touched(false);
+}
+
+# the place of the declassify point `d` after `ins` made to hold no secret in `p`, the state the instruction leaves: a
+# register row it writes, an entry it writes through an operand holding its id, a value of the `left` it leaves on top
+# of the stack, and an extent one of its touches writes whole, known public until a secret may be stored there
+# ---
+# ret: whether the instruction writes the place, false refusing the point
+fun clear(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint, d: *Declassify, left: usize) res[bool, A.Error] {
+    val q: Place = d.place;
+    if (sel q.memory) {
+        val h: opt[Held] = held_by_touch(w, ?q.memory, true);
+        if (sel h.none) { ret touched(false); }
+        val made: err[A.Error] = publish(p, h.some);
+        if (sel made.err) { ret failed[bool](made.err); }
+        ret touched(true);
+    }
+    if (sel q.register) {
+        val row: opt[u32] = row_index(w, q.register);
+        if (sel row.none)                                                              { ret touched(false); }
+        if (!bit_of(fp.written.data, row.some) && !bit_of(fp.clobbers.data, row.some)) { ret touched(false); }
+        var extend: opt[register.Extend] = opt[register.Extend].some{register.KEEP};
+        var i:      usize                = 0;
+        for (i < fp.writes.len) {
+            if (fp.writes.data[i].at == q.register) { extend = fp.writes.data[i].write.extend; }
+            i = i + 1;
+        }
+        val made: err[A.Error] = publish_row(w, p, row.some, extend);
+        if (sel made.err) { ret failed[bool](made.err); }
+        ret touched(true);
+    }
+    if (sel q.entry) {
+        val k: u64 = key(q.entry.space, q.entry.index);
+        if (!names_entry(ins, fp, k, operand.WRITE)) { ret touched(false); }
+        val set: err[A.Error] = set_entry(p, k, false);
+        if (sel set.err) { ret failed[bool](set.err); }
+        ret touched(true);
+    }
+    if (sel q.value) {
+        if (q.value::usize >= left) { ret touched(false); }
+        p.stack.data[p.stack.len - 1 - q.value::usize] = false;
+        ret touched(true);
+    }
+    ret touched(false);
+}
+
+# the declassify points before `ins` at `at` applied to `r`, its places of one pass as `lift` takes them
+# ---
+# ret: none when every one names a place the instruction reads, else the refusal of the first that does not
+fun lifts(w: *Walk, r: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Footprint, s: *Shape, memory: bool) res[opt[Verdict], A.Error] {
+    var i: u32 = w.declared.data[at];
+    for (i != NO_POINT) {
+        val d: *Declassify = ?w.public.at[i];
+        if (sel d.side.before) {
+            val ok: res[bool, A.Error] = lift(w, r, ins, fp, s, d, memory);
+            if (sel ok.err) { ret failed[opt[Verdict]](ok.err); }
+            if (!ok.ok)     { ret res[opt[Verdict], A.Error].ok{unread(UNTOUCHED, at)}; }
+        }
+        i = w.chain.data[i];
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
+# the instruction at `at` walked from the state there. a declassify point before it makes its place public in a copy
+# of that state its reads are decided under, and one after it clears its place in the state it leaves
 # ---
 # ret: a verdict when it ends the walk, none to go on
 fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vector.Vector[requirement.Alternative], fp: *footprint.Footprint) res[opt[Verdict], A.Error] {
@@ -1305,19 +1620,47 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     val foot:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(fp, ins.inst.row, values, w.ctx, cfg);
     if (sel foot.err)          { ret failed[opt[Verdict]](foot.err); }
     if (sel foot.ok.undecided) { ret res[opt[Verdict], A.Error].ok{unread(UNDECIDED, at)}; }
-    var shape:   *Shape = nil;
-    var stacked: bool   = false;
-    if (w.stream != nil) {
-        shape = ?w.shapes.data[w.shaped.data[at]];
-        val popped: usize = pop_count(w, shape, ?fp.signature);
-        if (p.stack.len < popped) { ret stays(at); }
-        var k: usize = p.stack.len - popped;
-        for (k < p.stack.len) {
-            if (p.stack.data[k]) { stacked = true; }
-            k = k + 1;
-        }
+    var k: usize = at + 1;
+    for (k < at + ins.len && k < w.code.len) {
+        if (w.declared.data[k] != NO_POINT) { ret res[opt[Verdict], A.Error].ok{unread(MISPLACED, k)}; }
+        k = k + 1;
     }
-    var k: usize = 0;
+    var shape:  *Shape = nil;
+    var popped: usize  = 0;
+    if (w.stream != nil) {
+        shape  = ?w.shapes.data[w.shaped.data[at]];
+        popped = pop_count(w, shape, ?fp.signature);
+        if (p.stack.len < popped) { ret stays(at); }
+    }
+    var before: bool = false;
+    var i:      u32  = w.declared.data[at];
+    for (i != NO_POINT) {
+        if (sel w.public.at[i].side.before) { before = true; }
+        i = w.chain.data[i];
+    }
+    var lifted: Point;
+    var r:      *Point = ?p;
+    if (before) {
+        val made: res[Point, A.Error] = copy(w, ?p);
+        if (sel made.err) { ret failed[opt[Verdict]](made.err); }
+        lifted = made.ok;
+        r      = ?lifted;
+    }
+    fin {
+        if (before) { drop(?lifted); }
+    }
+    if (before) {
+        val lifting: res[opt[Verdict], A.Error] = lifts(w, r, at, ?ins, fp, shape, false);
+        if (sel lifting.err)     { ret lifting; }
+        if (sel lifting.ok.some) { ret lifting; }
+    }
+    var stacked: bool = false;
+    k = r.stack.len - popped;
+    for (k < r.stack.len) {
+        if (r.stack.data[k]) { stacked = true; }
+        k = k + 1;
+    }
+    k = 0;
     for (k < w.words) {
         w.named.data[k] = 0;
         k               = k + 1;
@@ -1325,28 +1668,33 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     var secret: u32 = 0;
     var op:     u32 = 0;
     for (op < ins.inst.count) {
-        if (operand_secret(w, ?p, ?ins, op::u8, cfg, w.named.data) && op < 32) { secret = secret | (1::u32 << op); }
+        if (operand_secret(w, r, ?ins, op::u8, cfg, w.named.data) && op < 32) { secret = secret | (1::u32 << op); }
         op = op + 1;
     }
-    val address: res[opt[ct.Refusal], A.Error] = touches(w, ?p, ?ins, fp);
+    val address: res[opt[ct.Refusal], A.Error] = touches(w, r, ?ins, fp);
     if (sel address.err)     { ret failed[opt[Verdict]](address.err); }
     if (sel address.ok.some) { ret res[opt[Verdict], A.Error].ok{refused(address.ok.some, at)}; }
-    var read: bool = entries_read(?p, ?ins, fp);
+    if (before) {
+        val lifting: res[opt[Verdict], A.Error] = lifts(w, r, at, ?ins, fp, shape, true);
+        if (sel lifting.err)     { ret lifting; }
+        if (sel lifting.ok.some) { ret lifting; }
+    }
+    var read: bool = entries_read(r, ?ins, fp);
     k = 0;
     for (k < w.words) {
-        if ((fp.reads.data[k] & p.taint.data[k]) != 0) { read = true; }
+        if ((fp.reads.data[k] & r.taint.data[k]) != 0) { read = true; }
         k = k + 1;
     }
     k = 0;
     for (k < w.touches.len) {
-        if (w.touches.data[k].reads && secret_at(?p, ?w.touches.data[k].at)) { read = true; }
+        if (w.touches.data[k].reads && secret_at(r, ?w.touches.data[k].at)) { read = true; }
         k = k + 1;
     }
     var c:        effect.Control  = fp.control;
-    val transfer: opt[ct.Refusal] = control(w, ?p, ?ins, ?c, read, stacked, secret);
+    val transfer: opt[ct.Refusal] = control(w, r, ?ins, ?c, read, stacked, secret);
     if (sel transfer.some) { ret res[opt[Verdict], A.Error].ok{refused(transfer.some, at)}; }
     if (w.timed) {
-        val timing: opt[ct.Refusal] = latency(w, ?p, ?ins, fp, secret);
+        val timing: opt[ct.Refusal] = latency(w, r, ?ins, fp, secret);
         if (sel timing.some) { ret res[opt[Verdict], A.Error].ok{refused(timing.some, at)}; }
     }
     val value: bool = read || stacked;
@@ -1356,9 +1704,20 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     }
     val applied: err[A.Error] = apply(w, ?p, at, ?ins, fp, value);
     if (sel applied.err) { ret failed[opt[Verdict]](applied.err); }
+    val bottom: usize = p.stack.len - popped;
     if (shape != nil) {
         val streamed: err[A.Error] = apply_stream(w, ?p, ?ins, fp, shape, value);
         if (sel streamed.err) { ret failed[opt[Verdict]](streamed.err); }
+    }
+    i = w.declared.data[at];
+    for (i != NO_POINT) {
+        val d: *Declassify = ?w.public.at[i];
+        if (sel d.side.after) {
+            val ok: res[bool, A.Error] = clear(w, ?p, ?ins, fp, d, p.stack.len - bottom);
+            if (sel ok.err) { ret failed[opt[Verdict]](ok.err); }
+            if (!ok.ok)     { ret res[opt[Verdict], A.Error].ok{unread(UNTOUCHED, at)}; }
+        }
+        i = w.chain.data[i];
     }
     ret successors(w, ?p, at, ?ins, ?c, shape);
 }
@@ -1608,6 +1967,22 @@ fun release(w: *Walk) {
     vector.dnit[bool](?w.carried);
     vector.dnit[bool](?w.popped);
     register.release_overlaps(?w.overlaps);
+    vector.dnit[u32](?w.declared);
+    vector.dnit[u32](?w.chain);
+}
+
+# the declassify points indexed by offset into `w.declared` and `w.chain`, refused at one past the code
+fun index_points(w: *Walk) res[opt[Verdict], A.Error] {
+    var i: u32 = 0;
+    for (i < w.public.len) {
+        val at: u64 = w.public.at[i].at;
+        if (at >= w.code.len::u64) { ret res[opt[Verdict], A.Error].ok{unread(MISPLACED, at::usize)}; }
+        val pushed: res[usize, A.Error] = vector.push[u32](?w.chain, w.declared.data[at::usize]);
+        if (sel pushed.err) { ret failed[opt[Verdict]](pushed.err); }
+        w.declared.data[at::usize] = i;
+        i                          = i + 1;
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
 }
 
 fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
@@ -1615,6 +1990,8 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     for (i < w.code.len) {
         val pushed: res[usize, A.Error] = vector.push[u32](?w.points, NO_POINT);
         if (sel pushed.err) { ret failed[Verdict](pushed.err); }
+        val declared: res[usize, A.Error] = vector.push[u32](?w.declared, NO_POINT);
+        if (sel declared.err) { ret failed[Verdict](declared.err); }
         if (w.stream != nil) {
             val shaped: res[usize, A.Error] = vector.push[u32](?w.shaped, NO_POINT);
             if (sel shaped.err) { ret failed[Verdict](shaped.err); }
@@ -1638,7 +2015,10 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     val seeded: res[opt[Verdict], A.Error] = seed(w, secrets, ?entry);
     if (sel seeded.err)     { ret failed[Verdict](seeded.err); }
     if (sel seeded.ok.some) { ret res[Verdict, A.Error].ok{seeded.ok.some}; }
-    if (w.code.len == 0)    { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
+    val indexed: res[opt[Verdict], A.Error] = index_points(w);
+    if (sel indexed.err)     { ret failed[Verdict](indexed.err); }
+    if (sel indexed.ok.some) { ret res[Verdict, A.Error].ok{indexed.ok.some}; }
+    if (w.code.len == 0)     { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
     if (w.stream != nil) {
         val read: res[opt[Verdict], A.Error] = scan(w, ?store, ?alts);
         if (sel read.err)     { ret failed[Verdict](read.err); }
@@ -1657,17 +2037,25 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
         if (sel stepped.err)     { ret failed[Verdict](stepped.err); }
         if (sel stepped.ok.some) { ret res[Verdict, A.Error].ok{stepped.ok.some}; }
     }
+    # a point in code the walk never reaches, or within an instruction of code no path walks, is applied nowhere
+    var n: u32 = 0;
+    for (n < w.public.len) {
+        val at: u64 = w.public.at[n].at;
+        if (w.points.data[at::usize] == NO_POINT) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: MISPLACED, offset: at}}}; }
+        n = n + 1;
+    }
     ret res[Verdict, A.Error].ok{Verdict.clear{}};
 }
 
-# the constant-time walk of `code` under the context the function runs under, from the secrets the caller seeds. a
+# the constant-time walk of `code` under the context the function runs under, from the secrets the caller seeds,
+# public again only at the declassify points `public` states, NO_DECLASSIFIED for none. a
 # set whose timing is `none` is refused before any walk, worded UNCLASSIFIED, and one whose timing is not guaranteed
 # is walked asking no row's latency, code it clears answered unguaranteed. code of a typed stream is read once in its
 # own order first, observed on the context's stream, which it leaves as reading the function's body leaves it, and is
 # answered unread when its set classifies its rows' timing, as no class states inputs among the values a row pops
 # ---
 # ret: the verdict, or the allocator's refusal of the walk's storage
-pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secrets) res[Verdict, A.Error] {
+pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secrets, public: *Declassified) res[Verdict, A.Error] {
     val answer: ct.Required = ct.required(code.set.ct);
     if (sel answer.refused)                              { ret res[Verdict, A.Error].ok{Verdict.refused{Finding{offset: 0, refusal: answer.refused}}}; }
     if (code.set.codec.stream != nil && sel answer.held) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: TIMED, offset: 0}}}; }
@@ -1695,6 +2083,9 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
         blocks:   vector.init[Block](a),
         carried:  vector.init[bool](a),
         popped:   vector.init[bool](a),
+        public:   public,
+        declared: vector.init[u32](a),
+        chain:    vector.init[u32](a),
         overlaps: overlaps.ok,
     };
     val verdict: res[Verdict, A.Error] = walked(?w, secrets);
@@ -1724,7 +2115,7 @@ fun t_walk_as(t: *testing.Testing, s: *set.Set, selection: str, bytes: *u8, len:
     var ctx:     state.Context         = opened.ok;
     var code:    Code                  = Code{set: s, data: bytes, len: len};
     var secrets: Secrets               = Secrets{at: seeds, len: count};
-    val got:     res[Verdict, A.Error] = check(a, ?code, ?ctx, ?secrets);
+    val got:     res[Verdict, A.Error] = check(a, ?code, ?ctx, ?secrets, ?NO_DECLASSIFIED);
     val viewed:  err[A.Error]          = register.release(?view);
     extension.release(?picked);
     if (sel got.err) { ret t_unread("storage"); }
