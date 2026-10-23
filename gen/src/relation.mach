@@ -1,0 +1,199 @@
+# the value relations an overlay states, read and emitted alike for every set (masc.core.effect.Relation)
+#
+# a set's effects topic states a relation of its rows in these words, each operand named as the set names its
+# operands: risc-v by its argument, the stack pointer an implicit line places by its register's name, aarch64 by its
+# assembly rule, and x86 by its XED operand number
+#
+#   to=<operand> from=<operand> [by=<operand>] [negated=yes] [shift=<operand> step=<bits>] [constant=<n>]
+#   to=<operand> base=<operand> [constant=<n>]
+#
+# `to` is the register written, `from` the register read and `by` the immediate added, subtracted with `negated=yes`,
+# and shifted left by `step` bits for each unit of the value of `shift`. `base` starts from the base of a memory
+# operand and adds its displacement, as x86 lea. masc's set check holds each relation to its row
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use std.collections.vector;
+
+use masc.core.effect;
+use masc.core.field;
+
+use gen.diag;
+use gen.emit;
+use gen.overlay;
+
+pub val BAD_OFFSET: str = "offset line states no to, both or neither of from and base, a by beside base, or a shift and step not together";
+pub val NO_NAMED:   str = "offset line names an operand the row does not have";
+
+# an offset line read, its operands by the set's names
+# ---
+# to:       the register written
+# from:     the register read, nil when base is given
+# base:     the memory operand whose base is read and whose displacement is added, nil when from is given
+# by:       the immediate added, nil for none
+# shift:    the operand whose value times step shifts the immediate, nil for none
+# step:     the bits each unit of shift shifts by
+# negated:  whether the immediate is subtracted
+# constant: a number added whatever the operands
+pub rec Stated {
+    to:       str;
+    from:     str;
+    base:     str;
+    by:       str;
+    shift:    str;
+    step:     u8;
+    negated:  bool;
+    constant: i64;
+}
+
+val NAMES: [8]str = [8]str{"to", "from", "base", "by", "shift", "step", "negated", "constant"};
+
+# whether word `w` is a named value of NAMES
+fun named(w: str) bool {
+    var k: usize = 0;
+    for (k < 8) {
+        val n:   str   = NAMES[k];
+        val len: usize = str_len(n);
+        if (str_len(w) > len && w[len] == '=') {
+            var same: bool  = true;
+            var c:    usize = 0;
+            for (c < len) {
+                if (w[c] != n[c]) { same = false; }
+                c = c + 1;
+            }
+            if (same) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the words of line `l`'s fact from `from` on read as an offset into `out`
+pub fun read(l: *overlay.Line, from: usize, out: *Stated) err[diag.Refusal] {
+    var i: usize = from;
+    for (i < l.ws.len) {
+        if (!named(l.ws.data[i])) { ret overlay.reject(l, overlay.UNKNOWN_WORD, l.ws.data[i]); }
+        i = i + 1;
+    }
+    @out = Stated{to: nil, from: overlay.optional(l, "from", nil), base: overlay.optional(l, "base", nil), by: overlay.optional(l, "by", nil), shift: overlay.optional(l, "shift", nil), step: 0, negated: false, constant: 0};
+    val to: err[diag.Refusal] = overlay.needed(l, "to", ?out.to);
+    if (sel to.err)                                                                   { ret to; }
+    if ((out.from == nil) == (out.base == nil) || (out.base != nil && out.by != nil)) { ret overlay.reject(l, BAD_OFFSET, l.fact.key); }
+    val negated: res[bool, diag.Refusal] = overlay.yes(l, "negated", false);
+    if (sel negated.err) { ret err[diag.Refusal].err{negated.err}; }
+    out.negated = negated.ok;
+    val step: opt[str] = overlay.value(?l.ws, "step");
+    if ((out.shift == nil) != (sel step.none)) { ret overlay.reject(l, BAD_OFFSET, l.fact.key); }
+    if (sel step.some) {
+        val n: res[i64, diag.Refusal] = overlay.number(l.fact, step.some);
+        if (sel n.err)              { ret err[diag.Refusal].err{n.err}; }
+        if (n.ok <= 0 || n.ok > 63) { ret overlay.reject(l, BAD_OFFSET, step.some); }
+        out.step = n.ok::u8;
+    }
+    val constant: opt[str] = overlay.value(?l.ws, "constant");
+    if (sel constant.some) {
+        val n: res[i64, diag.Refusal] = overlay.number(l.fact, constant.some);
+        if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+        out.constant = n.ok;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the operand of a row a set names `name`, field.NO_OPERAND when it has none
+pub def Find: fun(ptr, str) u8;
+
+# the operand `name` names through `find`, the name itself in `missing` when it names none
+fun found(ctx: ptr, find: Find, name: str, missing: *str) u8 {
+    val at: u8 = find(ctx, name);
+    if (at == field.NO_OPERAND) { @missing = name; }
+    ret at;
+}
+
+# offset `st` of a row as a relation, its operands found through `find`, or the first name that names none
+pub fun resolve(st: *Stated, ctx: ptr, find: Find) res[effect.Relation, str] {
+    var missing: str           = nil;
+    val to:      u8            = found(ctx, find, st.to, ?missing);
+    var from:    effect.Source = effect.Source.operand{0};
+    var by:      effect.Addend = effect.Addend.none{};
+    if (st.base != nil) {
+        val base: u8 = found(ctx, find, st.base, ?missing);
+        from = effect.Source.base{base};
+        by   = effect.Addend.displacement{base};
+    }
+    or                { from = effect.Source.operand{found(ctx, find, st.from, ?missing)}; }
+    if (st.by != nil) { by = effect.Addend.immediate{found(ctx, find, st.by, ?missing)}; }
+    var shift: u8 = field.NO_OPERAND;
+    if (st.shift != nil) { shift = found(ctx, find, st.shift, ?missing); }
+    if (missing != nil)  { ret res[effect.Relation, str].err{missing}; }
+    val o: effect.Offset = effect.Offset{from: from, by: by, negated: st.negated, shift: shift, step: st.step, constant: st.constant};
+    ret res[effect.Relation, str].ok{effect.Relation{to: effect.Place.operand{to}, holds: effect.Holds.offset{o}}};
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun place(f: *emit.File, p: *effect.Place) emit.Value {
+    if (sel p.row)     { ret emit.Value.variant{emit.variant(f, "effect.Place.row", number(p.row::i64))}; }
+    if (sel p.operand) { ret emit.Value.variant{emit.variant(f, "effect.Place.operand", number(p.operand::i64))}; }
+    ret emit.Value.name{"nil"};
+}
+
+fun source(f: *emit.File, s: *effect.Source) emit.Value {
+    if (sel s.row)     { ret emit.Value.variant{emit.variant(f, "effect.Source.row", number(s.row::i64))}; }
+    if (sel s.base)    { ret emit.Value.variant{emit.variant(f, "effect.Source.base", number(s.base::i64))}; }
+    if (sel s.operand) { ret emit.Value.variant{emit.variant(f, "effect.Source.operand", number(s.operand::i64))}; }
+    ret emit.Value.name{"nil"};
+}
+
+fun addend(f: *emit.File, a: *effect.Addend) emit.Value {
+    if (sel a.immediate)    { ret emit.Value.variant{emit.variant(f, "effect.Addend.immediate", number(a.immediate::i64))}; }
+    if (sel a.displacement) { ret emit.Value.variant{emit.variant(f, "effect.Addend.displacement", number(a.displacement::i64))}; }
+    ret emit.Value.variant{emit.bare(f, "effect.Addend.none")};
+}
+
+# relation `r` as a literal
+pub fun value(f: *emit.File, r: *effect.Relation) emit.Value {
+    val x: *emit.Record = emit.record(f, "effect.Relation");
+    emit.member(f, x, "to", place(f, ?r.to));
+    if (sel r.holds.offset) { emit.member(f, x, "holds", emit.Value.variant{emit.variant(f, "effect.Holds.offset", offset(f, ?r.holds.offset))}); }
+    ret emit.Value.record{x};
+}
+
+# offset `o` as a literal
+fun offset(f: *emit.File, o: *effect.Offset) emit.Value {
+    val of: *emit.Record = emit.record(f, "effect.Offset");
+    emit.member(f, of, "from", source(f, ?o.from));
+    emit.member(f, of, "by", addend(f, ?o.by));
+    if (o.negated)                   { emit.member(f, of, "negated", emit.Value.name{"true"}); }
+    or                               { emit.member(f, of, "negated", emit.Value.name{"false"}); }
+    if (o.shift == field.NO_OPERAND) { emit.member(f, of, "shift", emit.Value.name{"field.NO_OPERAND"}); }
+    or                               { emit.member(f, of, "shift", number(o.shift::i64)); }
+    emit.member(f, of, "step", number(o.step::i64));
+    emit.member(f, of, "constant", number(o.constant));
+    ret emit.Value.record{of};
+}
+
+# relations `rs` as a run of the array RELATIONS that `pool` fills, effect.NO_RELATIONS for none
+pub fun values(f: *emit.File, pool: *emit.Pool, rs: *vector.Vector[effect.Relation]) emit.Value {
+    if (rs.len == 0) { ret emit.Value.name{"effect.NO_RELATIONS"}; }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](f.alloc);
+    var i:     usize                     = 0;
+    for (i < rs.len) {
+        vector.push[emit.Value](?items, value(f, ?rs.data[i]));
+        i = i + 1;
+    }
+    val at: u32          = emit.pooled(f, pool, items.data, items.len::u32);
+    val r:  *emit.Record = emit.record(f, "effect.Relations");
+    emit.member(f, r, "at", emit.element(f, "RELATIONS", at));
+    emit.member(f, r, "len", number(rs.len::i64));
+    ret emit.Value.record{r};
+}

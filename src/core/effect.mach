@@ -91,6 +91,8 @@ pub rec Width {
 #           when an operand does or the address comes from where no row names, as wasm's operand stack
 # forming:  further operands whose values form the address, as the stride of a risc-v strided load or a wasm memarg's
 #           offset
+# offset:   bytes added to the address the operand or base states, as -8 for x86 push's store below rsp at 64 bits,
+#           0 for an access at the address itself. it places only an access an operand or base addresses
 # width:    the bits it covers
 # governor: the operand whose value decides which elements it touches, as an sve governing
 #           predicate or a risc-v vector mask, NO_OPERAND when none
@@ -101,6 +103,7 @@ pub rec Access {
     operand:  u8;
     base:     u32;
     forming:  operand.Positions;
+    offset:   i64;
     width:    Width;
     governor: u8;
     pop:      u8;
@@ -334,6 +337,101 @@ pub tag Stack: u8 {
     opaque;
 }
 
+# the register a relation writes
+# ---
+# operand: the register operand at this index
+# row:     the register at this row of the file, which no operand names, as rsp of x86 leave
+pub tag Place: u8 {
+    operand: u8;
+    row:     u32;
+}
+
+# the register a relation reads the value it starts from
+# ---
+# operand: the register operand at this index
+# row:     the register at this row of the file, which no operand names, as rbp of x86 leave
+# base:    the base register of the memory operand at this index, as x86 lea's. an address of that operand with an
+#          index register, a symbol or a mode other than OFFSET has no base value alone, so the relation states nothing
+pub tag Source: u8 {
+    operand: u8;
+    row:     u32;
+    base:    u8;
+}
+
+# what a relation adds to the value it starts from
+# ---
+# none:         nothing, as a copy
+# immediate:    the value of the immediate operand at this index. one holding a symbol has no value until it resolves,
+#               so the relation states nothing
+# displacement: the displacement of the memory operand at this index, the one whose base the relation starts from
+pub tag Addend: u8 {
+    none;
+    immediate:    u8;
+    displacement: u8;
+}
+
+# a register's value as another's plus a number: from, plus the addend shifted left by step times the value of the
+# shift operand and negated when the encoding subtracts it, plus the constant, as risc-v addi, aarch64 sub sp, sp, #1,
+# lsl #12 and x86 lea rbp, [rsp + 16]
+# ---
+# from:     the register it starts from
+# by:       the addend
+# negated:  whether the addend is subtracted, as a sub's immediate
+# shift:    the immediate or enumerant operand whose value times step is the addend's left shift, as aarch64's
+#           `lsl #12` of value 1, NO_OPERAND for none
+# step:     the bits each unit of the shift operand's value shifts by, 0 when there is no shift operand
+# constant: a number added whatever the operands
+pub rec Offset {
+    from:     Source;
+    by:       Addend;
+    negated:  bool;
+    shift:    u8;
+    step:     u8;
+    constant: i64;
+}
+
+# what a relation states the written register holds. a reader takes a member it does not know as stating nothing,
+# which is sound, so a member is added without changing any reader: register plus register, a scaled index, and a
+# mask, as x86 `and rsp, -16` aligning the stack, are drop-in members
+# ---
+# offset: another register's value plus a number
+pub tag Holds: u8 {
+    offset: Offset;
+}
+
+# a value an instruction writes, stated as a function of the values it reads, so a reader can follow a register
+# through code, as the walk follows the stack and frame pointers. it holds in the low bits of the narrower of the
+# registers it names, the bits the operation computes, and states nothing of a wider register's bits above them,
+# which the write itself states (`operand.Write`). a change to the stack pointer no operand names is the stack
+# pointer's own (`Stack`), and an address writeback its address's (`operand.Mode`)
+# ---
+# to:    the register written
+# holds: what it holds after
+pub rec Relation {
+    to:    Place;
+    holds: Holds;
+}
+
+# relations as a pointer to static relations and a count, each register written at most once
+pub rec Relations {
+    at:  *Relation;
+    len: u32;
+}
+
+pub val NO_RELATIONS: Relations = Relations{at: nil, len: 0};
+
+# a relation under operand values: the register written holds the register read plus `by`, in the low bits of the
+# narrower of the two
+# ---
+# to:   the register written
+# from: the register read
+# by:   the number added, wrapping as the registers' bits do
+pub rec Affine {
+    to:   register.Id;
+    from: register.Id;
+    by:   i64;
+}
+
 # how long an instruction takes, as a scheduler weighs it
 # ---
 # ONE:     a single-cycle operation
@@ -516,6 +614,7 @@ pub fun opens(s: Structure) bool {
 # entries:   the index space entries it reads and writes through the operands naming them, none for a set with no
 #            typed stream
 # structure: what it does to a typed stream's structured blocks, FLAT for a set whose stream has none
+# relations: the values it writes as functions of the values it reads, none where no relation is stated
 pub rec Effect {
     implicit:  Registers;
     flags:     Flags;
@@ -529,6 +628,7 @@ pub rec Effect {
     values:    Values;
     entries:   Entries;
     structure: Structure;
+    relations: Relations;
 }
 
 # what the effect's write of the register at row `at` leaves, operand.AS_ROW when no entry states it
@@ -824,6 +924,85 @@ pub fun fixed(file: *register.File, e: *Effect, op: u8) opt[register.Id] {
         i = i + 1;
     }
     ret opt[register.Id].none{};
+}
+
+# the register at row `at` of `file`, register.NONE past its rows
+fun row_register(file: *register.File, at: u32) register.Id {
+    if (at >= file.register_count) { ret register.NONE; }
+    ret register.id_of(?file.registers[at]);
+}
+
+# the register operand `op` holds among `values`, register.NONE when it holds none
+fun register_held(values: operand.Values, op: u8) register.Id {
+    if (op::u32 >= values.len) { ret register.NONE; }
+    val v: *operand.Value = ?values.at[op];
+    if (sel v.register) { ret v.register; }
+    ret register.NONE;
+}
+
+# the address operand `op` holds among `values` when it is a base plus a number alone: a base, no index or symbol, and
+# mode OFFSET
+fun plain_address(values: operand.Values, op: u8) opt[operand.Address] {
+    if (op::u32 >= values.len) { ret opt[operand.Address].none{}; }
+    val v: *operand.Value = ?values.at[op];
+    if (!sel v.memory) { ret opt[operand.Address].none{}; }
+    val a: operand.Address = v.memory;
+    if (a.base == register.NONE || a.index != register.NONE || a.mode != operand.OFFSET || a.symbol.id != operand.NO_SYMBOL) { ret opt[operand.Address].none{}; }
+    ret opt[operand.Address].some{a};
+}
+
+# the number operand `op` holds among `values`, an immediate's value or an enumerant's
+fun number_held(values: operand.Values, op: u8) opt[i64] {
+    if (op::u32 >= values.len) { ret opt[i64].none{}; }
+    val v: *operand.Value = ?values.at[op];
+    if (sel v.immediate) { ret opt[i64].some{v.immediate}; }
+    if (sel v.enumerant) { ret opt[i64].some{v.enumerant.value::i64}; }
+    ret opt[i64].none{};
+}
+
+# relation `r` of an instruction over `file` under its operand values, none where they give no number: an operand
+# holding no value or a symbol, an address with an index, a symbol or a mode other than OFFSET, a shift past the
+# register's bits, or a member of Holds this reads as stating nothing
+pub fun affine(file: *register.File, r: *Relation, values: operand.Values) opt[Affine] {
+    var to: register.Id = register.NONE;
+    if (sel r.to.operand)    { to = register_held(values, r.to.operand); }
+    or (sel r.to.row)        { to = row_register(file, r.to.row); }
+    if (to == register.NONE) { ret opt[Affine].none{}; }
+    if (sel r.holds.offset)  { ret offset(file, to, ?r.holds.offset, values); }
+    ret opt[Affine].none{};
+}
+
+# offset `o` writing `to` under operand values `values`, as `affine` reads it
+fun offset(file: *register.File, to: register.Id, o: *Offset, values: operand.Values) opt[Affine] {
+    var from: register.Id = register.NONE;
+    if (sel o.from.operand) { from = register_held(values, o.from.operand); }
+    or (sel o.from.row)     { from = row_register(file, o.from.row); }
+    or (sel o.from.base) {
+        val a: opt[operand.Address] = plain_address(values, o.from.base);
+        if (sel a.some) { from = a.some.base; }
+    }
+    if (from == register.NONE) { ret opt[Affine].none{}; }
+    var by: u64 = 0;
+    if (sel o.by.immediate) {
+        val n: opt[i64] = number_held(values, o.by.immediate);
+        if (sel n.none) { ret opt[Affine].none{}; }
+        by = n.some::u64;
+    }
+    or (sel o.by.displacement) {
+        val a: opt[operand.Address] = plain_address(values, o.by.displacement);
+        if (sel a.none) { ret opt[Affine].none{}; }
+        by = a.some.disp::u64;
+    }
+    if (o.shift != field.NO_OPERAND) {
+        val n: opt[i64] = number_held(values, o.shift);
+        if (sel n.none) { ret opt[Affine].none{}; }
+        if (n.some < 0) { ret opt[Affine].none{}; }
+        val bits: u64 = n.some::u64 * o.step::u64;
+        if (bits >= 64) { ret opt[Affine].none{}; }
+        by = by << bits;
+    }
+    if (o.negated) { by = 0 - by; }
+    ret opt[Affine].some{Affine{to: to, from: from, by: (by + o.constant::u64)::i64}};
 }
 
 # the transfer `control` decides, 0xFF when it is undecided
