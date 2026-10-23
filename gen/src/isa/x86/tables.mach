@@ -38,6 +38,8 @@ use std.collections.map;
 use std.collections.sort;
 use std.collections.vector;
 
+use masc.core.effect;
+use masc.core.field;
 use masc.core.operand;
 use x86_opcode: masc.isa.x86.opcode;
 
@@ -711,6 +713,46 @@ fun control_of(p: *Pools, r: *rows.Row) emit.Value {
     ret rec_value(c);
 }
 
+# an access no memory operand names, of `bits` bits: at the register at row `base` plus `offset` bytes, or at the
+# register operand `op` holds when base is effect.NO_ROW, governed by operand `governor`
+fun implied_access(f: *emit.File, role: operand.Role, op: u8, base: u32, offset: i32, bits: u16, governor: u8) emit.Value {
+    val w: *emit.Record = emit.record(f, "effect.Width");
+    val q: *emit.Record = emit.record(f, "quantity.Scaled");
+    emit.member(f, q, "fixed", number(bits::i64));
+    emit.member(f, q, "per", number(0));
+    emit.member(f, q, "scale", number(0));
+    emit.member(f, w, "element", rec_value(q));
+    emit.member(f, w, "count", bare(f, "effect.Count.one"));
+    val x: *emit.Record = emit.record(f, "effect.Access");
+    if (role == operand.WRITE)  { emit.member(f, x, "role", name("operand.WRITE")); }
+    or (role == operand.READ)   { emit.member(f, x, "role", name("operand.READ")); }
+    or                          { emit.member(f, x, "role", name("operand.READ_WRITE")); }
+    if (op == field.NO_OPERAND) { emit.member(f, x, "operand", name("field.NO_OPERAND")); }
+    or                          { emit.member(f, x, "operand", number(op::i64)); }
+    if (base == effect.NO_ROW)  { emit.member(f, x, "base", name("effect.NO_ROW")); }
+    or                          { emit.member(f, x, "base", number(base::i64)); }
+    emit.member(f, x, "forming", emit.Value.hex{0});
+    if (offset != 0) { emit.member(f, x, "offset", number(offset::i64)); }
+    emit.member(f, x, "width", rec_value(w));
+    if (governor == field.NO_OPERAND) { emit.member(f, x, "governor", name("field.NO_OPERAND")); }
+    or                                { emit.member(f, x, "governor", number(governor::i64)); }
+    ret rec_value(x);
+}
+
+# whether the register at row `row` is the stack pointer of code of some width, which an implied write changes by no
+# delta, as leave's of rsp and sysenter's
+fun stack_row(in: *Input, row: u32) bool {
+    var mode: u8 = 0;
+    for (mode < 3) {
+        val sp: res[*forms.Named, diag.Refusal] = stack_pointer(in, mode);
+        if (sel sp.ok) {
+            if (sp.ok.row == row) { ret true; }
+        }
+        mode = mode + 1;
+    }
+    ret false;
+}
+
 # the index in EFFECTS of `r`'s effect
 fun effect_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[u32, diag.Refusal] {
     val f:       *emit.File                = p.f;
@@ -719,40 +761,40 @@ fun effect_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[u32, dia
     var access:  vector.Vector[emit.Value] = vector.init[emit.Value](a);
     var delta:   i32                       = 0;
     var stacked: bool                      = false;
+    var opaque:  bool                      = false;
     var i:       usize                     = 0;
     for (i < r.form.implied.len) {
-        val m:   *forms.Implied = ?r.form.implied.data[i];
-        var row: *forms.Named   = m.register;
-        if (row == nil) {
+        val m: *forms.Implied = ?r.form.implied.data[i];
+        if (m.what == forms.STACK) {
             val sp: res[*forms.Named, diag.Refusal] = stack_pointer(in, rows.first_mode(r.modes));
             if (sel sp.err) { ret res[u32, diag.Refusal].err{sp.err}; }
-            row     = sp.ok;
             stacked = true;
-            val bytes: i32 = (m.width / 8)::i32;
-            if (m.push) { delta = delta - bytes; }
-            or          { delta = delta + bytes; }
-            val w: *emit.Record = emit.record(f, "effect.Width");
-            val q: *emit.Record = emit.record(f, "quantity.Scaled");
-            emit.member(f, q, "fixed", number(m.width::i64));
-            emit.member(f, q, "per", number(0));
-            emit.member(f, q, "scale", number(0));
-            emit.member(f, w, "element", rec_value(q));
-            emit.member(f, w, "count", bare(f, "effect.Count.one"));
-            val x: *emit.Record = emit.record(f, "effect.Access");
-            if (m.push) { emit.member(f, x, "role", name("operand.WRITE")); }
-            or          { emit.member(f, x, "role", name("operand.READ")); }
-            emit.member(f, x, "operand", name("field.NO_OPERAND"));
-            emit.member(f, x, "base", number(row.row::i64));
-            emit.member(f, x, "forming", emit.Value.hex{0});
-            emit.member(f, x, "width", rec_value(w));
-            emit.member(f, x, "governor", name("field.NO_OPERAND"));
-            vector.push[emit.Value](?access, rec_value(x));
-            add_row(?read, row.row);
-            add_row(?written, row.row);
+            # a push stores below the stack pointer it lowers and a pop loads at the one it raises, each from where
+            # the row's earlier pushes and pops left it (Intel SDM 325462-093US Vol 2B PUSH, POP)
+            val bytes: i32          = (m.width / 8)::i32;
+            var at:    i32          = delta;
+            var role:  operand.Role = operand.READ;
+            if (m.push) {
+                delta = delta - bytes;
+                at    = delta;
+                role  = operand.WRITE;
+            }
+            or { delta = delta + bytes; }
+            vector.push[emit.Value](?access, implied_access(f, role, field.NO_OPERAND, sp.ok.row, at, m.width, field.NO_OPERAND));
+            add_row(?read, sp.ok.row);
+            add_row(?written, sp.ok.row);
+        }
+        or (m.what == forms.ACCESS) {
+            var base: u32 = effect.NO_ROW;
+            if (m.register != nil) { base = m.register.row; }
+            vector.push[emit.Value](?access, implied_access(f, m.role, m.operand, base, 0, m.width, m.governor));
         }
         or {
-            if ((m.role & operand.READ) != 0)  { add_row(?read, row.row); }
-            if ((m.role & operand.WRITE) != 0) { add_row(?written, row.row); }
+            if ((m.role & operand.READ) != 0) { add_row(?read, m.register.row); }
+            if ((m.role & operand.WRITE) != 0) {
+                add_row(?written, m.register.row);
+                if (stack_row(in, m.register.row)) { opaque = true; }
+            }
         }
         i = i + 1;
     }
@@ -769,7 +811,8 @@ fun effect_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[u32, dia
     var mem: emit.Value = name("effect.NO_ACCESSES");
     if (access.len > 0) { mem = span(f, "effect.Accesses", "ACCESSES", emit.pooled(f, ?p.access, access.data, access.len::u32), access.len::u32); }
     var stack: emit.Value = bare(f, "effect.Stack.none");
-    if (stacked) {
+    if (opaque) { stack = bare(f, "effect.Stack.opaque"); }
+    or (stacked) {
         val d: *emit.Record = emit.record(f, "effect.Delta");
         emit.member(f, d, "bytes", number(delta::i64));
         # a return releases its immediate's bytes more (Intel SDM 325462-093US Vol 2A RET)
