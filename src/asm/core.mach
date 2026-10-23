@@ -16,6 +16,15 @@
 # section and kept apart from the others of its name by it. a group that is no
 # comdat group is refused, as mink's object holds comdat groups only, and so is
 # an exclusion, since the builder states none.
+#
+# the grammar of `.section` and the directives that enter a section by its
+# own name are the dialect's (`masc.format.dialect.Sections`): elf's above,
+# mach-o's `segment,section, type, attributes`, whose type word mink's mach-o
+# naming classifies, and coff's `"flags", selection, symbol`, whose flag
+# letters and selection words are the dialect's rows and whose content word
+# mink's coff naming classifies. each writes back as it reads, through
+# `macho_header` and `coff_header`, so the listing and the disassembler spell
+# a header the assembler reads to the same section.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -25,7 +34,6 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view.View;
 
@@ -37,7 +45,9 @@ use number: std.text.parse;
 
 use mink.base.fail;
 use mink.base.store;
+use mink.catalog.arch;
 use mink.format.contract;
+use mink_group:   mink.model.group;
 use mink_reloc:   mink.model.reloc;
 use mink_section: mink.model.section;
 use mink.model.symbol;
@@ -49,6 +59,7 @@ use masc.core.field;
 use masc.core.operand;
 use masc.core.source;
 use masc.core.syntax;
+use masc.format.dialect;
 use masc.syntax.expr;
 use masc.syntax.read;
 
@@ -66,6 +77,24 @@ pub val UNTYPED_ORDER:   str = "link-order section stated with no section type";
 pub val LINKED:          str = "expected the symbol or section a link-order section is linked to";
 pub val UNLINKED:        str = "linked-to symbol is in no section, nor names one, so far";
 pub val NO_FLOAT_FORMAT: str = "no ieee 754 format of the row's width";
+pub val SEGMENTED:       str = "expected a section named `segment,section`";
+pub val UNKNOWN_ATTRIBUTE: str = "section attribute the neutral section holds nothing of apart from its kind";
+pub val STUBS:           str = "symbol stub size, which no section mink's object holds states";
+pub val UNKNOWN_SELECTION: str = "comdat selection no rule of mink's groups keeps";
+pub val COMDAT_SYMBOL:   str = "expected the comdat symbol";
+
+# why a section's header was not written
+# ---
+# kind:    no header of the dialect reads back to the section's kind, flags and element size
+# quoted:  its name or its group's signature has no spelling the header takes
+# grouped: its group keeps a copy by a rule no word of the dialect states, or the dialect states no group
+# memory:  the output did not grow
+pub tag Unwritten: u8 {
+    kind;
+    quoted;
+    grouped;
+    memory;
+}
 
 # the key the object format's convention gives a section named `name`, as elf's `.text` and `.text.hot` take text and
 # mach-o's `__TEXT,__cstring` takes merged strings of one byte, none for none
@@ -383,6 +412,345 @@ fun section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.D
     ret err[diagnostic.Diagnostic].ok{};
 }
 
+# the word of `words` that `v` spells, none when none does
+fun word_of(words: dialect.Words, v: View) opt[str] {
+    var i: u32 = 0;
+    for (i < words.len) {
+        if (same(v, words.at[i])) { ret opt[str].some{words.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# a word at the reader, refused as `why` when there is none
+fun word_at(m: *model.Assembler, rd: *syntax.Reader, why: str) res[View, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at:   usize                                      = rd.at;
+    val word: res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.WORD);
+    if (sel word.err)      { ret res[View, diagnostic.Diagnostic].err{word.err}; }
+    if (!sel word.ok.word) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, why, at, rd.at - at)}; }
+    ret res[View, diagnostic.Diagnostic].ok{word.ok.word};
+}
+
+# the width of a pointer of the object's architecture, which mach-o's literal pointers type states its entries in
+fun pointer_width(m: *model.Assembler) u64 {
+    val p: opt[arch.Pointer] = model.builder(m).arch.pointer;
+    if (sel p.none) { ret 0; }
+    ret p.some.bytes::u64;
+}
+
+# the key mach-o's naming gives a section named `name` of type word `word`, its flags those of a section the image
+# loads, as every section a type word classifies is, and its literal pointers `pointer` bytes wide
+fun macho_key(n: *contract.Naming, name: View, word: str, pointer: u64) opt[mink_section.Key] {
+    val k: res[mink_section.Key, fail.Fail] = n.kind_for(store.Bytes{data: name.data, len: name.len}, word, mink_section.ALLOC, pointer);
+    if (sel k.err) { ret opt[mink_section.Key].none{}; }
+    ret opt[mink_section.Key].some{k.ok};
+}
+
+# `.section segment,section[, type[, attribute+attribute]]` read and entered, after a push when `push` (llvm
+# DarwinAsmParser.cpp, parseDirectiveSection). with no type the name's convention opens it, and a type opens it as the
+# format's naming classifies the name under that word. an attribute is read only where its meaning is the kind's, so it
+# states nothing more, and a stub size is refused
+fun macho_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd: *syntax.Reader   = args.reader;
+    val d:  *dialect.Sections = m.dialect.sections;
+    read.skip(rd);
+    val at: usize = rd.at;
+    var commas: u32 = 0;
+    for (rd.at < rd.end && !read.blank(rd.text[rd.at])) {
+        if (rd.text[rd.at] == ',') {
+            if (commas == 1) { brk; }
+            commas = commas + 1;
+        }
+        rd.at = rd.at + 1;
+    }
+    if (commas != 1 || rd.text[rd.at - 1] == ',' || rd.text[at] == ',') { ret err[diagnostic.Diagnostic].err{read.refuse(rd, SEGMENTED, at, rd.at - at)}; }
+    val name:   View       = read.span(rd, at, rd.at - at);
+    var spec:   build.Spec = conventional(model.naming(m), name);
+    var stated: bool       = false;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        val type_at: usize                            = rd.at;
+        val word:    res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_TYPE);
+        if (sel word.err) { ret err[diagnostic.Diagnostic].err{word.err}; }
+        val spelled: opt[str] = word_of(d.types, word.ok);
+        if (sel spelled.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+        read.skip(rd);
+        if (read.take(rd, ",")) {
+            for {
+                val attr_at: usize                            = rd.at;
+                val attr:    res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_ATTRIBUTE);
+                if (sel attr.err) { ret err[diagnostic.Diagnostic].err{attr.err}; }
+                val known: opt[str] = word_of(d.attributes, attr.ok);
+                if (sel known.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_ATTRIBUTE, attr_at, rd.at - attr_at)}; }
+                read.skip(rd);
+                if (!read.take(rd, "+")) { brk; }
+            }
+            read.skip(rd);
+            if (read.peek(rd) == ',') { ret err[diagnostic.Diagnostic].err{read.refuse(rd, STUBS, rd.at, rd.end - rd.at)}; }
+        }
+        val key: opt[mink_section.Key] = macho_key(model.naming(m), name, spelled.some, pointer_width(m));
+        if (sel key.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_KIND, type_at, rd.at - type_at)}; }
+        spec.kind    = key.some.kind;
+        spec.flags   = key.some.kind.flags;
+        spec.entsize = key.some.entsize;
+        stated       = true;
+    }
+    val rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel rest.err) { ret rest; }
+    if (push) {
+        val pushed: err[str] = model.push_section(m);
+        if (sel pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, pushed.err, at, 0)}; }
+    }
+    val entered: err[str] = model.enter_kept(m, name, spec, stated, model.NO_KEYS);
+    if (sel entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, entered.err, at, name.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# what a coff flag string states: the content word of its last content letter, nil for none, and the neutral flags of
+# a section that starts allocated
+# ---
+# type:  the content word
+# flags: the flags
+# bad:   the index of a letter no row of the dialect reads, none when every one is
+pub rec Lettered {
+    type:  str;
+    flags: mink_section.Flags;
+    bad:   opt[usize];
+}
+
+# the flag string `spelled` read by the letters of the dialect's sections `d`
+pub fun coff_letters(d: *dialect.Sections, spelled: View) Lettered {
+    var out: Lettered = Lettered{type: nil, flags: mink_section.ALLOC, bad: opt[usize].none{}};
+    var i:   usize    = 0;
+    for (i < spelled.len) {
+        var k: u32 = 0;
+        for (k < d.letters.len && d.letters.at[k].letter != spelled.data[i]) {
+            k = k + 1;
+        }
+        if (k == d.letters.len) {
+            out.bad = opt[usize].some{i};
+            ret out;
+        }
+        val l: *dialect.Letter = ?d.letters.at[k];
+        if (l.type != nil) { out.type = l.type; }
+        out.flags = (out.flags | l.sets) & ~l.clears;
+        i         = i + 1;
+    }
+    ret out;
+}
+
+# the content word a flag string of none states, initialized data, as llvm-mc reads `.section name, "w"`
+val INITIALIZED: str = "cnt_initialized_data";
+
+# the key coff's naming gives a section named `name` of the flag string read as `l`, none when it gives none
+fun coff_key(n: *contract.Naming, name: View, l: Lettered) opt[mink_section.Key] {
+    var t: str = l.type;
+    if (t == nil) { t = INITIALIZED; }
+    val k: res[mink_section.Key, fail.Fail] = n.kind_for(store.Bytes{data: name.data, len: name.len}, t, l.flags, 0);
+    if (sel k.err) { ret opt[mink_section.Key].none{}; }
+    ret opt[mink_section.Key].some{k.ok};
+}
+
+# the selection of the dialect's sections `d` spelled `v`, none for none
+fun selection_of(d: *dialect.Sections, v: View) opt[*dialect.Selection] {
+    var i: u32 = 0;
+    for (i < d.selections.len) {
+        if (same(v, d.selections.at[i].word)) { ret opt[*dialect.Selection].some{?d.selections.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*dialect.Selection].none{};
+}
+
+# `.section name[, "flags"[, selection, symbol]]` read and entered, after a push when `push` (llvm COFFAsmParser.cpp,
+# ParseDirectiveSection). the flags' letters state the section's content word and its neutral flags, and a selection
+# puts it in the comdat group the symbol signs, kept by the selection's rule, apart from every section of its name in
+# another group
+fun coff_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd:   *syntax.Reader                   = args.reader;
+    val d:    *dialect.Sections                 = m.dialect.sections;
+    val at:   usize                            = rd.at;
+    val name: res[View, diagnostic.Diagnostic] = section_name(m, rd);
+    if (sel name.err) { ret err[diagnostic.Diagnostic].err{name.err}; }
+    var spec:   build.Spec = conventional(model.naming(m), name.ok);
+    var stated: bool       = false;
+    var keys:   model.Keys = model.NO_KEYS;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        val flags_at: usize                            = rd.at;
+        val spelled:  res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel spelled.err) { ret err[diagnostic.Diagnostic].err{spelled.err}; }
+        val l: Lettered = coff_letters(d, spelled.ok);
+        if (sel l.bad.some) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FLAG, flags_at + 1 + l.bad.some, 1)}; }
+        val key: opt[mink_section.Key] = coff_key(model.naming(m), name.ok, l);
+        if (sel key.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_KIND, flags_at, rd.at - flags_at)}; }
+        if ((key.some.kind.flags & l.flags) != key.some.kind.flags) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, FLAGS_KIND, flags_at, rd.at - flags_at)}; }
+        spec.kind    = key.some.kind;
+        spec.flags   = l.flags;
+        spec.entsize = 0;
+        stated       = true;
+        read.skip(rd);
+        if (read.take(rd, ",")) {
+            val word_at_: usize                            = rd.at;
+            val word:     res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_SELECTION);
+            if (sel word.err) { ret err[diagnostic.Diagnostic].err{word.err}; }
+            val chosen: opt[*dialect.Selection] = selection_of(d, word.ok);
+            if (sel chosen.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_SELECTION, word_at_, rd.at - word_at_)}; }
+            read.skip(rd);
+            if (!read.take(rd, ",")) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, COMDAT_SYMBOL, rd.at, 0)}; }
+            read.skip(rd);
+            val sig_at:    usize                            = rd.at;
+            val signature: res[View, diagnostic.Diagnostic] = model.symbol_name(m, rd);
+            if (sel signature.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, COMDAT_SYMBOL, sig_at, 0)}; }
+            keys.group = opt[View].some{signature.ok};
+            keys.rule  = chosen.some.rule;
+        }
+    }
+    val rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel rest.err) { ret rest; }
+    if (push) {
+        val pushed: err[str] = model.push_section(m);
+        if (sel pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, pushed.err, at, 0)}; }
+    }
+    val entered: err[str] = model.enter_kept(m, name.ok, spec, stated, keys);
+    if (sel entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, entered.err, at, name.ok.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun put_text(out: *vector.Vector[u8], p: *u8, n: usize) bool {
+    if (!held(vector.reserve[u8](out, n))) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        out.data[out.len] = p[i];
+        out.len           = out.len + 1;
+        i                 = i + 1;
+    }
+    ret true;
+}
+
+fun put_str(out: *vector.Vector[u8], s: str) bool {
+    ret put_text(out, s, str_len(s));
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# whether `c` is a byte a section name or signature is written with unquoted
+fun plain_byte(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+}
+
+# `v` bare when every byte is plain, else in quotes, false when it holds a byte no string takes or the output did not
+# grow
+fun put_named(out: *vector.Vector[u8], v: View) bool {
+    var bare: bool  = v.len > 0;
+    var i:    usize = 0;
+    for (i < v.len) {
+        val c: u8 = v.data[i];
+        if (c == '"' || c == '\\' || c < 0x20) { ret false; }
+        if (!plain_byte(c)) { bare = false; }
+        i = i + 1;
+    }
+    if (bare) { ret put_text(out, v.data, v.len); }
+    ret put_str(out, "\"") && put_text(out, v.data, v.len) && put_str(out, "\"");
+}
+
+# the `.section` line that reads back, under mach-o's naming `n` and the dialect's sections `d`, to a section named
+# `name` of `kind`, `flags` and entries of `entsize`, a literal pointer `pointer` bytes wide, appended to `out`: the name
+# alone when its convention opens it so, else the name and the first type word that classifies it so, code marked
+# `pure_instructions` as llvm-mc marks `__TEXT,__text`. a section in a group is refused, as mach-o holds none
+pub fun macho_header(out: *vector.Vector[u8], n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, entsize: u64, pointer: u64, grouped: bool) err[Unwritten] {
+    if (grouped) { ret err[Unwritten].err{Unwritten.grouped{}}; }
+    var commas: u32   = 0;
+    var i:      usize = 0;
+    for (i < name.len) {
+        val c: u8 = name.data[i];
+        if (c == ',') { commas = commas + 1; }
+        or (!plain_byte(c)) { ret err[Unwritten].err{Unwritten.quoted{}}; }
+        i = i + 1;
+    }
+    if (commas != 1) { ret err[Unwritten].err{Unwritten.quoted{}}; }
+    var word: str = nil;
+    val c:    build.Spec = conventional(n, name);
+    if (c.kind != kind || c.flags != flags || c.entsize != entsize) {
+        var k: u32 = 0;
+        for (k < d.types.len && word == nil) {
+            val key: opt[mink_section.Key] = macho_key(n, name, d.types.at[k], pointer);
+            if (sel key.some) {
+                if (key.some.kind == kind && key.some.kind.flags == flags && key.some.entsize == entsize) { word = d.types.at[k]; }
+            }
+            k = k + 1;
+        }
+        if (word == nil) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    }
+    var ok: bool = put_str(out, "\t.section ") && put_text(out, name.data, name.len);
+    if (ok && word != nil) {
+        ok = put_str(out, ",") && put_str(out, word);
+        if (ok && (flags & mink_section.EXEC) != 0) { ok = put_str(out, ",pure_instructions"); }
+    }
+    if (!ok || !put_str(out, "\n")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    ret err[Unwritten].ok{};
+}
+
+# the coff flag string that reads back to `kind` and `flags` for a section named `name`, its content letter first, then
+# `w` or `r` and `D` for a section the link drops, as clang writes `"xr"` and `"dw"`, into `out`, which holds four
+# bytes. none when no content letter's string reads back to them
+fun coff_string(n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, out: *u8) opt[usize] {
+    var k: u32 = 0;
+    for (k < d.letters.len) {
+        val l: *dialect.Letter = ?d.letters.at[k];
+        k = k + 1;
+        if (l.type == nil) { cnt; }
+        var len: usize = 0;
+        out[len] = l.letter;
+        len      = len + 1;
+        if ((flags & mink_section.WRITE) != 0) { out[len] = 'w'; }
+        or                                     { out[len] = 'r'; }
+        len = len + 1;
+        if ((flags & mink_section.ALLOC) == 0 && (l.clears & mink_section.ALLOC) == 0) {
+            out[len] = 'D';
+            len      = len + 1;
+        }
+        val read_: Lettered = coff_letters(d, View{data: out, len: len});
+        if (sel read_.bad.some || read_.flags != flags) { cnt; }
+        val key: opt[mink_section.Key] = coff_key(n, name, read_);
+        if (sel key.some) {
+            if (key.some.kind == kind && key.some.entsize == 0) { ret opt[usize].some{len}; }
+        }
+    }
+    ret opt[usize].none{};
+}
+
+# the `.section` line that reads back, under coff's naming `n` and the dialect's sections `d`, to a section named
+# `name` of `kind`, `flags` and entries of `entsize`, in the comdat group `group` signs, kept by `rule`, appended to
+# `out`. an element size, which no coff header states, is refused, and so is a rule no selection word states
+pub fun coff_header(out: *vector.Vector[u8], n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, entsize: u64, group: opt[View], rule: *mink_group.Rule) err[Unwritten] {
+    if (entsize != 0) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    var letters: [4]u8;
+    val spelled: opt[usize] = coff_string(n, d, name, kind, flags, ?letters[0]);
+    if (sel spelled.none) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    var word: str = nil;
+    if (sel group.some) {
+        var k: u32 = 0;
+        for (k < d.selections.len) {
+            if (d.selections.at[k].rule == rule) { word = d.selections.at[k].word; }
+            k = k + 1;
+        }
+        if (word == nil) { ret err[Unwritten].err{Unwritten.grouped{}}; }
+    }
+    if (!put_str(out, "\t.section ")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    if (!put_named(out, name))        { ret err[Unwritten].err{Unwritten.quoted{}}; }
+    var ok: bool = put_str(out, ", \"") && put_text(out, ?letters[0], spelled.some) && put_str(out, "\"");
+    if (sel group.some) {
+        ok = ok && put_str(out, ", ") && put_str(out, word) && put_str(out, ", ");
+        if (ok && !put_named(out, group.some)) { ret err[Unwritten].err{Unwritten.quoted{}}; }
+    }
+    if (!ok || !put_str(out, "\n")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    ret err[Unwritten].ok{};
+}
+
 fun failed(args: *model.Args, k: u32, e: err[str]) err[diagnostic.Diagnostic] {
     if (sel e.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, e.err)}; }
     ret err[diagnostic.Diagnostic].ok{};
@@ -393,18 +761,28 @@ fun built(args: *model.Args, k: u32, e: err[build.Refusal]) err[diagnostic.Diagn
     ret err[diagnostic.Diagnostic].ok{};
 }
 
-# the section a directive names by its own name, as `.text`
-fun named_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    val name: View = View{data: args.directive.name, len: str_len(args.directive.name)};
+# the section the dialect's directive at the row's parameter enters by its own name, as `.text`, opened as that name's
+# convention states
+pub fun named_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val n:    *dialect.Named = ?m.dialect.sections.named.at[args.directive.param::u32];
+    val name: View           = View{data: n.name, len: str_len(n.name)};
     ret failed(args, 0, model.enter(m, name, conventional(model.naming(m), name), false, opt[u64].none{}));
 }
 
+# `.section` read in the dialect's grammar, after a push when `push`
+fun any_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val form: dialect.Form = m.dialect.sections.form;
+    if (sel form.macho) { ret macho_section(m, args, push); }
+    if (sel form.coff)  { ret coff_section(m, args, push); }
+    ret section(m, args, push);
+}
+
 fun do_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    ret section(m, args, false);
+    ret any_section(m, args, false);
 }
 
 fun do_pushsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
-    ret section(m, args, true);
+    ret any_section(m, args, true);
 }
 
 fun do_popsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
@@ -946,12 +1324,9 @@ val ZERO:   model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 1, least: 1,
 val COMMON: model.Shape = model.Shape{items: ?STORAGE[0], len: 3, least: 2, repeat: false, text: false};
 
 # the core rows (gas manual, "Assembler Directives")
-val ROW_COUNT: usize = 35;
+val ROW_COUNT: usize = 32;
 
 val ROWS: [ROW_COUNT]model.Directive = [ROW_COUNT]model.Directive{
-    model.Directive{name: ".text", operands: model.NO_ITEMS, handler: named_section, param: 0},
-    model.Directive{name: ".data", operands: model.NO_ITEMS, handler: named_section, param: 0},
-    model.Directive{name: ".bss", operands: model.NO_ITEMS, handler: named_section, param: 0},
     model.Directive{name: ".section", operands: model.TEXT, handler: do_section, param: 0},
     model.Directive{name: ".pushsection", operands: model.TEXT, handler: do_pushsection, param: 0},
     model.Directive{name: ".popsection", operands: model.NO_ITEMS, handler: do_popsection, param: 0},
@@ -989,35 +1364,30 @@ val ROWS: [ROW_COUNT]model.Directive = [ROW_COUNT]model.Directive{
 # the layer of the core rows
 pub val LAYER: model.Layer = model.Layer{name: "core", directives: model.Directives{at: ?ROWS[0], len: ROW_COUNT::u32}, context: nil, finish: model.finished};
 
-# the section an assembly starts in, as the gnu assembler starts in `.text`, opened as its convention states
-pub val START: str = ".text";
-
-# the assembly started in the section START names, opened as its convention states when something is first written to
-# it, a label is placed in it or a directive names it, so a source whose first statement is a `.section` holds no
-# empty START
+# the assembly started in the section the dialect starts in, as the gnu assembler starts in `.text` and llvm-mc on
+# mach-o in `__TEXT,__text`, opened as its convention states when something is first written to it, a label is placed
+# in it or a directive names it, so a source whose first statement is a `.section` holds no empty starting section
 pub fun begin(m: *model.Assembler) err[str] {
-    val name: View       = View{data: START, len: str_len(START)};
-    var spec: build.Spec = conventional(model.naming(m), name);
-    spec.name = opt[str].some{START};
+    val start: str        = m.dialect.sections.start;
+    val name:  View       = View{data: start, len: str_len(start)};
+    var spec:  build.Spec = conventional(model.naming(m), name);
+    spec.name = opt[str].some{start};
     val begun: err[build.Refusal] = build.begin(model.builder(m), spec);
     if (sel begun.err) { ret err[str].err{begun.err.message}; }
     ret err[str].ok{};
 }
 
-# the directive that enters a nameless section of `kind`, `flags`, `disposition` and entries of `entsize` by its key
-# alone under the object format's naming `n`: the row that enters a section by its own name, the name the format gives
-# the key, and opens it so by that name's convention, none when no row does. the section read back is named as the
-# directive spells it
-pub fun kind_directive(n: *contract.Naming, kind: *mink_section.Kind, flags: mink_section.Flags, disposition: *mink_section.Disposition, entsize: u64) opt[str] {
-    val named: res[str, fail.Fail] = n.name_of(mink_section.key_of(kind, entsize));
-    if (sel named.err) { ret opt[str].none{}; }
-    var i: usize = 0;
-    for (i < ROW_COUNT) {
-        if (ROWS[i].handler == named_section && str_equals(ROWS[i].name, named.ok)) {
-            val c: build.Spec = conventional(n, View{data: ROWS[i].name, len: str_len(ROWS[i].name)});
-            if (c.kind == kind && c.flags == flags && c.disposition == disposition && c.entsize == entsize) { ret opt[str].some{ROWS[i].name}; }
-        }
+# the directive of the dialect's sections `d` that enters a nameless section of `kind`, `flags`, `disposition` and
+# entries of `entsize` by its key alone under the object format's naming `n`: the first that enters a section by a
+# name whose convention opens it so, none when none does. the section read back is named as the directive's row names
+# it
+pub fun kind_directive(n: *contract.Naming, d: *dialect.Sections, kind: *mink_section.Kind, flags: mink_section.Flags, disposition: *mink_section.Disposition, entsize: u64) opt[*dialect.Named] {
+    var i: u32 = 0;
+    for (i < d.named.len) {
+        val row: *dialect.Named = ?d.named.at[i];
         i = i + 1;
+        val c: build.Spec = conventional(n, View{data: row.name, len: str_len(row.name)});
+        if (c.kind == kind && c.flags == flags && c.disposition == disposition && c.entsize == entsize) { ret opt[*dialect.Named].some{row}; }
     }
-    ret opt[str].none{};
+    ret opt[*dialect.Named].none{};
 }
