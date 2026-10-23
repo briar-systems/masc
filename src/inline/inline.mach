@@ -3,33 +3,79 @@
 # a consumer hands masc the text of an inline block and its operands, each
 # by name, what it may be placed in and how the block uses it. `parse` reads
 # the text under the context the enclosing function runs under into a block,
-# or refuses it with diagnostics at their spans in the text. `effects` answers
-# the footprint of the whole block, which the allocator reads as it reads an
-# instruction's, and `encode` writes the block through the builder once every
-# operand has its location. the types land before the implementation, so
-# consumers build against their shape.
+# or refuses it with diagnostics at their spans in the caller's file. `effects`
+# answers the footprint of the whole block, which the allocator reads as it
+# reads an instruction's, and `encode` writes the block through the builder
+# once every operand has its location.
+#
+# a block is text in the set's source dialect and established syntax, one
+# statement after another: instructions, numbered labels, as `1:`, which the
+# block's own branches name as `1b` and `1f`, and the set's integer data
+# directives, as `.word 0xd503201f`, for an encoding no row names. a data
+# directive may declare the registers its bytes write, as `.byte 0x0f, 0x31
+# :: writes(rax, rdx)`, since nothing reads what raw bytes do. an operand is
+# written `{x}`, where an instruction takes a whole operand, and only a name
+# the consumer declares is one: any other braced text is the syntax's own, as
+# aarch64's `{v0.16b}` list.
+#
+# every statement is read by the set's one parser, the name standing for a
+# value the reader asks of the block rather than one the text spells. parse
+# reads each name as a probe of its constraint, refusing it at its span where
+# the operand the instruction takes there does not admit every value the
+# constraint does, so a location the allocator later chooses within the
+# constraint always encodes. effects reads the block the same way and leaves
+# each name's operand without a value, so the footprint is the block's own
+# registers, flags, accesses, stack and control, and what a name's operand
+# does is the role the consumer stated for it. encode reads the block again
+# with each name standing for its location, so the rows, the aliases and the
+# sequences it takes are those the assembler takes for the same text, and
+# writes it at the builder's cursor: a numbered label is a label of the
+# builder no other block or function names, and a symbol, named in the text
+# or a location, becomes a relocation as any other operand's does.
 
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
+use std.collections.vector;
 
+use mink.base.fail;
+use mink_trait: mink.catalog.trait;
+
+use masc.asm.source;
 use masc.build.build;
+use masc.core.config;
 use masc.core.diagnostic;
 use masc.core.effect;
+use masc.core.field;
 use masc.core.footprint;
+use masc.core.mode;
 use masc.core.operand;
+use masc.core.quantity;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
 use masc.core.set;
+use core_source: masc.core.source;
 use masc.core.state;
+use core_syntax:  masc.core.syntax;
+use syntax_parse: masc.syntax.parse;
+use masc.syntax.read;
 
 # a parsed block: its text and what masc reads it as, which only masc reads
 # ---
-# text:   the block's text as the consumer wrote it, its text form
+# text:   the block's text as the consumer wrote it, its text form, held by the block
 # set:    the instruction set it is read in
-# parsed: masc's reading of it
+# parsed: masc's reading of it, which `release` gives back
 pub rec Block {
     text:   View;
     set:    *set.Set;
@@ -75,7 +121,8 @@ pub rec Operands {
     len: u32;
 }
 
-# diagnostics as a pointer to rows and a count, each at its span in the block's text
+# diagnostics as a pointer to rows and a count, each at its span in the caller's file, which `release_diagnostics`
+# gives back
 pub rec Diagnostics {
     at:  *diagnostic.Diagnostic;
     len: u32;
@@ -90,11 +137,1455 @@ pub rec Locations {
     len: u32;
 }
 
-# the block `text` read in set `s` under the context the enclosing function runs under, its operands `operands`
-pub def Parse: fun(*A.Allocator, View, *set.Set, *state.Context, Operands) res[Block, Diagnostics];
+# the block `text`, whose first byte is at `origin` in the caller's file, read in set `s` under the context the
+# enclosing function runs under, its operands `operands`
+pub def Parse: fun(*A.Allocator, View, diagnostic.Position, *set.Set, *state.Context, Operands) res[Block, Diagnostics];
 
 # the footprint of the whole block, filled into the footprint given, undecided with the reason when it is not decided
 pub def Effects: fun(*Block, *footprint.Footprint) res[effect.Answer[*footprint.Footprint], A.Error];
 
 # the block written through the builder at its cursor with its operands at `locations`
 pub def Encode: fun(*Block, Locations, *build.Builder) err[build.Refusal];
+
+pub val UNAVAILABLE: str = "inline assembly is not available on this instruction set";
+pub val UNDECLARED:  str = "name the block declares no operand of";
+pub val OUTSIDE:     str = "operand whose constraint the instruction does not admit every value of here";
+pub val UNFIT:       str = "location outside its operand's constraint";
+pub val UNLIKE:      str = "location of another kind than the operand the instruction takes here";
+pub val LOCATIONS:   str = "locations that are not one per operand of the block";
+pub val NAMED_LABEL: str = "label defined by name, where a block defines numbered labels only";
+pub val UNDEFINED:   str = "numbered label the block does not define there";
+pub val DIRECTIVE:   str = "directive a block does not read";
+pub val WIDTH:       str = "value the directive's width does not hold";
+pub val DECLARATION: str = "malformed declaration of what the directive writes";
+pub val DUPLICATE:   str = "operand the block declares twice";
+
+# the symbol a probe reads for a name in the text, which no builder holds
+val GLOBAL: u32 = 1;
+
+# the symbol a probe reads for a numbered label's reference, which is the block's own
+val LOCAL: u32 = 2;
+
+# where a probe or an encode leaves the offsets each value of a statement was read at
+val SPANS: u32 = relax.MAX_STEPS * row.MAX_OPERANDS;
+
+# a run of rows of one of a parsed block's lists
+rec Range {
+    first: u32;
+    len:   u32;
+}
+
+val EMPTY: Range = Range{first: 0, len: 0};
+
+# a name of an operand written in the text, as `{x}`
+# ---
+# operand: the operand it names, by its index in the block's operands
+# at:      the offset of its opening brace in the block's text
+# len:     its length, both braces included
+rec Name {
+    operand: u32;
+    at:      usize;
+    len:     usize;
+}
+
+# one statement of a block
+# ---
+# st:       the statement as the source model reads it, over the block's text
+# names:    the names its text writes, in the block's names
+# number:   a numbered label's number
+# width:    a data directive's width in bytes, 0 for any other statement
+# data:     a data directive's values, in the block's data
+# declared: whether a data directive declares what it writes
+# writes:   the registers a declaration names, in the block's writes
+rec Item {
+    st:       source.Statement;
+    names:    Range;
+    number:   u64;
+    width:    u8;
+    data:     Range;
+    declared: bool;
+    writes:   Range;
+}
+
+# masc's reading of a block
+# ---
+# a:           the allocator everything here is from
+# text:        the block's text, a copy the block holds
+# len:         its length
+# origin:      the position of its first byte in the caller's file
+# set:         the set it is read in
+# syntax:      the syntax it is read in, the set's established one
+# ctx:         the context it was parsed under, the caller's, which outlives the block
+# modes:       the assembler modes a probe reads it under, the set's initial ones
+# operands:    the block's operands, copies of the consumer's rows, their names in `spelled`
+# count:       how many operands there are
+# spelled:     the operands' names, each followed by a nul
+# spelled_len: its length
+# items:       its statements in order
+# names:       the names each statement writes
+# data:        each data directive's values
+# writes:      each declaration's registers
+# accesses:    the accesses the last effects answered, which the footprint it filled points into
+# stores:      the reader's storage, grown to the largest statement read
+# spans:       where the last read left the offset each value was read at
+rec Parsed {
+    a:           *A.Allocator;
+    text:        *u8;
+    len:         usize;
+    origin:      diagnostic.Position;
+    set:         *set.Set;
+    syntax:      *core_syntax.Syntax;
+    ctx:         *state.Context;
+    modes:       mode.State;
+    operands:    *Operand;
+    count:       u32;
+    spelled:     *u8;
+    spelled_len: usize;
+    items:       vector.Vector[Item];
+    names:       vector.Vector[Name];
+    data:        vector.Vector[u64];
+    writes:      vector.Vector[register.Id];
+    accesses:    vector.Vector[effect.Access];
+    stores:      core_syntax.Stores;
+    spans:       [SPANS]usize;
+}
+
+# the state a numbered label of an encode holds: the label it named last and the one a reference ahead made
+rec Numbered {
+    number: u64;
+    last:   u32;
+    next:   u32;
+}
+
+# one read of a statement
+# ---
+# p:         the block
+# item:      the statement
+# index:     its index among the block's statements
+# locations: the operands' locations when encoding, nil when probing
+# b:         the builder an encode writes through, nil when probing
+# numbered:  an encode's numbered labels
+# spelled:   a name spelled with a nul after it, as the builder takes it
+# failed:    the builder's refusal a resolve met, kept for the encode to answer
+rec Reading {
+    p:         *Parsed;
+    item:      *Item;
+    index:     u32;
+    locations: *Location;
+    b:         *build.Builder;
+    numbered:  *vector.Vector[Numbered];
+    spelled:   *vector.Vector[u8];
+    failed:    opt[build.Refusal];
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# whether set `s` reads inline blocks: a machine set, with a register file, a syntax and no typed stream
+fun available(s: *set.Set) bool {
+    if (s.codec == nil || s.codec.registers == nil || s.codec.stream != nil) { ret false; }
+    if (s.syntaxes.len == 0)                                                 { ret false; }
+    ret s.syntaxes.at[0].statement == nil;
+}
+
+# whether `c` may start an operand's name
+fun leading(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+# the length of the braced name at `at` of `text`, braces included, 0 when none starts there
+fun braced(text: *u8, at: usize, end: usize) usize {
+    if (at + 2 >= end || text[at] != '{' || !leading(text[at + 1])) { ret 0; }
+    var i: usize = at + 2;
+    for (i < end && read.word(text[i])) {
+        i = i + 1;
+    }
+    if (i >= end || text[i] != '}') { ret 0; }
+    ret i + 1 - at;
+}
+
+# whether the `len` bytes at `name` spell the nul-terminated `s`
+fun spells(name: *u8, len: usize, s: str) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (s[i] == 0 || s[i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret s[len] == 0;
+}
+
+# the operand of `p` the braced name at `at` names, its braces left out, none when the block declares none of it
+fun declared(p: *Parsed, at: usize, len: usize) opt[u32] {
+    var k: u32 = 0;
+    for (k < p.count) {
+        if (spells(?p.text[at + 1], len - 2, p.operands[k].name)) { ret opt[u32].some{k}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the end of statement `st`'s text
+fun end_of(st: *source.Statement) usize {
+    if (st.body.len > 0) { ret st.body.at + st.body.len; }
+    ret st.head.at + st.head.len;
+}
+
+# a diagnostic of `message` at `len` bytes of the block's text from `at`
+fun refusal(p: *Parsed, message: str, at: usize, len: usize) diagnostic.Diagnostic {
+    ret diagnostic.refusal(message, p.origin, p.text, at, len);
+}
+
+# `d` with what it requires copied into storage of its own, which `release_diagnostics` gives back
+fun owned(a: *A.Allocator, d: diagnostic.Diagnostic) res[diagnostic.Diagnostic, A.Error] {
+    var out: diagnostic.Diagnostic = d;
+    if (d.requires.len == 0) {
+        out.requires = requirement.NO_ALTERNATIVES;
+        ret res[diagnostic.Diagnostic, A.Error].ok{out};
+    }
+    val got: res[*requirement.Alternative, A.Error] = A.allocate[requirement.Alternative](a, d.requires.len::usize);
+    if (sel got.err) { ret res[diagnostic.Diagnostic, A.Error].err{got.err}; }
+    var i: u32 = 0;
+    for (i < d.requires.len) {
+        got.ok[i] = d.requires.at[i];
+        i         = i + 1;
+    }
+    out.requires = requirement.Requirement{at: got.ok, len: d.requires.len};
+    ret res[diagnostic.Diagnostic, A.Error].ok{out};
+}
+
+# every diagnostic of `d`, and what each requires, given back to `a`, the allocator `parse` was given
+pub fun release_diagnostics(a: *A.Allocator, d: Diagnostics) {
+    var i: u32 = 0;
+    for (i < d.len) {
+        val r: requirement.Requirement = d.at[i].requires;
+        if (r.len > 0) { A.deallocate[requirement.Alternative](a, r.at, r.len::usize); }
+        i = i + 1;
+    }
+    A.deallocate[diagnostic.Diagnostic](a, d.at, d.len::usize);
+}
+
+# the diagnostics gathered, as rows of their own
+fun gathered(a: *A.Allocator, got: *vector.Vector[diagnostic.Diagnostic]) Diagnostics {
+    val n:    usize                                = got.len;
+    val rows: res[*diagnostic.Diagnostic, A.Error] = A.allocate[diagnostic.Diagnostic](a, n);
+    if (sel rows.err) {
+        vector.dnit[diagnostic.Diagnostic](got);
+        ret Diagnostics{at: nil, len: 0};
+    }
+    var i: usize = 0;
+    for (i < n) {
+        rows.ok[i] = got.data[i];
+        i          = i + 1;
+    }
+    vector.dnit[diagnostic.Diagnostic](got);
+    ret Diagnostics{at: rows.ok, len: n::u32};
+}
+
+# `d` added to the diagnostics, its requirement copied, false when the allocator refused it
+fun diagnose(a: *A.Allocator, got: *vector.Vector[diagnostic.Diagnostic], d: diagnostic.Diagnostic) bool {
+    val kept: res[diagnostic.Diagnostic, A.Error] = owned(a, d);
+    if (sel kept.err) { ret false; }
+    if (!held(vector.push[diagnostic.Diagnostic](got, kept.ok))) {
+        if (kept.ok.requires.len > 0) { A.deallocate[requirement.Alternative](a, kept.ok.requires.at, kept.ok.requires.len::usize); }
+        ret false;
+    }
+    ret true;
+}
+
+# the refusal of a parse that gathered nothing more than `message` at the block's start
+fun refused_whole(a: *A.Allocator, origin: diagnostic.Position, message: str) Diagnostics {
+    var got: vector.Vector[diagnostic.Diagnostic] = vector.init[diagnostic.Diagnostic](a);
+    diagnose(a, ?got, diagnostic.Diagnostic{message: message, span: diagnostic.Span{start: origin, len: 0}, requires: requirement.NO_ALTERNATIVES});
+    ret gathered(a, ?got);
+}
+
+# the number a numbered label's definition spells, none when `v` is not all digits
+fun number_of(v: View) opt[u64] {
+    if (v.len == 0) { ret opt[u64].none{}; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < v.len) {
+        val c: u8 = v.data[i];
+        if (c < '0' || c > '9')         { ret opt[u64].none{}; }
+        if (value > (~0::u64 - 9) / 10) { ret opt[u64].none{}; }
+        value = value * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    ret opt[u64].some{value};
+}
+
+# whether `v` is a numbered label's reference, its number into `n` and whether it looks back into `back`
+fun numbered_reference(v: View, n: *u64, back: *bool) bool {
+    if (v.len < 2) { ret false; }
+    val last: u8 = v.data[v.len - 1];
+    if (last != 'b' && last != 'f') { ret false; }
+    val number: opt[u64] = number_of(View{data: v.data, len: v.len - 1});
+    if (sel number.none) { ret false; }
+    @n    = number.some;
+    @back = last == 'b';
+    ret true;
+}
+
+# a reader over statement `st` of the block, its names read through `g`
+fun reader(g: *Reading, st: *source.Statement, named: *core_syntax.Named, symbols: *core_syntax.Symbols, ctx: *state.Context, modes: *mode.State) core_syntax.Reader {
+    val p:  *Parsed            = g.p;
+    var rd: core_syntax.Reader = core_syntax.Reader{
+        text:    p.text,
+        start:   st.head.at,
+        at:      st.head.at,
+        end:     end_of(st),
+        origin:  st.head.position,
+        codec:   p.set.codec,
+        ctx:     ctx,
+        syntax:  p.syntax,
+        modes:   modes,
+        symbols: symbols,
+        context: nil,
+        row:     nil,
+        format:  nil,
+        named:   named,
+        spans:   ?p.spans[0],
+    };
+    if (g.b != nil) { rd.format = g.b.format; }
+    core_syntax.over(?rd, ?p.stores);
+    ret rd;
+}
+
+# the instruction statement of `g` read into `ex`, again into grown stores while a read finds them short
+fun read_statement(g: *Reading, ctx: *state.Context, modes: *mode.State, ex: *relax.Expansion) res[err[diagnostic.Diagnostic], A.Error] {
+    var named:   core_syntax.Named   = core_syntax.Named{context: g::ptr, read: name_read};
+    var symbols: core_syntax.Symbols = core_syntax.Symbols{context: g::ptr, resolve: resolve, name: name_of};
+    for {
+        var rd:    core_syntax.Reader         = reader(g, ?g.item.st, ?named, ?symbols, ctx, modes);
+        val got:   err[diagnostic.Diagnostic] = syntax_parse.statement(?rd, ex);
+        val again: res[bool, A.Error]         = core_syntax.regrown(?rd, ?g.p.stores);
+        if (sel again.err) { ret res[err[diagnostic.Diagnostic], A.Error].err{again.err}; }
+        if (again.ok)      { cnt; }
+        ret res[err[diagnostic.Diagnostic], A.Error].ok{got};
+    }
+}
+
+# the name of statement `item` whose opening brace is at `at`, none when none is there
+fun name_at(p: *Parsed, item: *Item, at: usize) opt[*Name] {
+    var i: u32 = 0;
+    for (i < item.names.len) {
+        val n: *Name = ?p.names.data[(item.names.first + i)::usize];
+        if (n.at == at) { ret opt[*Name].some{n}; }
+        i = i + 1;
+    }
+    ret opt[*Name].none{};
+}
+
+# whether value `k` of step `step` of the statement read last was read from one of its names
+fun named_slot(p: *Parsed, item: *Item, step: u32, k: u32) bool {
+    var at: usize = p.spans[(step * row.MAX_OPERANDS + k)::usize];
+    for (at < p.len && read.blank(p.text[at])) {
+        at = at + 1;
+    }
+    val found: opt[*Name] = name_at(p, item, at);
+    ret sel found.some;
+}
+
+# the value a name of the text stands for as operand `desc`: a probe of its constraint, or its location when encoding
+fun name_read(context: ptr, r: *core_syntax.Reader, desc: *operand.Operand, out: *operand.Value) opt[err[diagnostic.Diagnostic]] {
+    val g:  *Reading = context::*Reading;
+    val at: usize    = r.at;
+    if (at >= r.end || r.text[at] != '{') { ret opt[err[diagnostic.Diagnostic]].none{}; }
+    val found: opt[*Name] = name_at(g.p, g.item, at);
+    if (sel found.none) { ret opt[err[diagnostic.Diagnostic]].none{}; }
+    val n: *Name = found.some;
+    r.at = at + n.len;
+    var got: err[diagnostic.Diagnostic] = err[diagnostic.Diagnostic].ok{};
+    if (g.locations == nil) { got = probe(g.p, r, desc, ?g.p.operands[n.operand].constraint, at, n.len, out); }
+    or                      { got = placed(r, desc, ?g.locations[n.operand], at, n.len, out); }
+    if (sel got.err)        { r.at = at; }
+    ret opt[err[diagnostic.Diagnostic]].some{got};
+}
+
+# the lowest and highest values an immediate operand admits, its excluded values aside
+rec Bounds {
+    low:  i128;
+    high: i128;
+}
+
+# 2^n
+fun power(n: u32) i128 {
+    ret 1::i128 << n::i128;
+}
+
+# the values `imm` admits
+fun admitted_bounds(imm: *operand.Immediate) Bounds {
+    val bits: u32 = imm.bits::u32;
+    if (bits == 0)                  { ret Bounds{low: imm.bias::i128, high: imm.bias::i128}; }
+    if (imm.sign == operand.EITHER) { ret Bounds{low: imm.bias::i128 - power(bits - 1), high: imm.bias::i128 + power(bits) - 1}; }
+    if (imm.sign == operand.SIGNED) { ret Bounds{low: imm.bias::i128 - power(bits - 1), high: imm.bias::i128 + power(bits - 1) - 1}; }
+    ret Bounds{low: imm.bias::i128, high: imm.bias::i128 + power(bits) - 1};
+}
+
+# the values constraint `c` admits
+fun constrained_bounds(c: *Immediate) Bounds {
+    val bits: u32 = c.bits::u32;
+    if (bits == 0) { ret Bounds{low: 0, high: 0}; }
+    if (c.signed)  { ret Bounds{low: -power(bits - 1), high: power(bits - 1) - 1}; }
+    ret Bounds{low: 0, high: power(bits) - 1};
+}
+
+# whether immediate operand `imm` admits every value constraint `c` does
+fun covers_immediate(imm: *operand.Immediate, c: *Immediate) bool {
+    if (imm.format != operand.INTEGER || imm.scale != 0 || imm.excluded.len != 0) { ret false; }
+    if (c.symbolic && imm.fixup == operand.NO_FIXUP)                              { ret false; }
+    val have: Bounds = admitted_bounds(imm);
+    val want: Bounds = constrained_bounds(c);
+    ret have.low <= want.low && want.high <= have.high;
+}
+
+# whether register operand `reg` admits every register of class `class` the context's view holds
+fun covers_class(ctx: *state.Context, reg: *operand.Register, class: u16) bool {
+    if (operand.find(reg.classes, class) < 0)    { ret false; }
+    if (reg.first != 0 || reg.excluded.len != 0) { ret false; }
+    if (reg.count == 0)                          { ret true; }
+    ret reg.count::u64 >= register.members(ctx.view, class);
+}
+
+# whether `desc` is an operand of the row the reader reads that the row fixes to one register, as the al of x86's
+# `add al, imm8`, which a name that may be any register of its class never is
+fun fixed_operand(r: *core_syntax.Reader, desc: *operand.Operand) bool {
+    if (r.row == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < r.row.operands.len) {
+        if (desc == ?r.row.operands.at[i]) {
+            val f: opt[register.Id] = effect.fixed(r.codec.registers, r.row.effect, i::u8);
+            ret sel f.some;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a register of class `class` the view holds, one that is neither the stack pointer nor reads zero where the class has
+# one, none when it holds none
+fun member(ctx: *state.Context, class: u16) opt[register.Id] {
+    val file:  *register.File = ctx.view.file;
+    var first: register.Id    = register.NONE;
+    var i:     u32            = 0;
+    for (i < file.register_count) {
+        val reg:   *register.Register   = ?file.registers[i];
+        val id:    register.Id          = register.id_of(reg);
+        val held_: err[register.Absent] = register.admitted(ctx.view, id);
+        if (reg.class == class && sel held_.ok) {
+            if ((reg.flags & (register.STACK | register.ZERO)) == 0) { ret opt[register.Id].some{id}; }
+            if (first == register.NONE)                              { first = id; }
+        }
+        i = i + 1;
+    }
+    if (first == register.NONE) { ret opt[register.Id].none{}; }
+    ret opt[register.Id].some{first};
+}
+
+# a register of `reg`'s classes the view holds, the stack pointer where they hold it
+fun base_of(ctx: *state.Context, reg: *operand.Register) register.Id {
+    val file:  *register.File = ctx.view.file;
+    var first: register.Id    = register.NONE;
+    var i:     u32            = 0;
+    for (i < file.register_count) {
+        val r:     *register.Register   = ?file.registers[i];
+        val id:    register.Id          = register.id_of(r);
+        val held_: err[register.Absent] = register.admitted(ctx.view, id);
+        if (operand.find(reg.classes, r.class) >= 0 && sel held_.ok) {
+            if ((r.flags & register.STACK) != 0) { ret id; }
+            if (first == register.NONE)          { first = id; }
+        }
+        i = i + 1;
+    }
+    ret first;
+}
+
+# the probe a name of constraint `c` reads as operand `desc`, refused at the name where `desc` does not admit every value
+# `c` does
+fun probe(p: *Parsed, r: *core_syntax.Reader, desc: *operand.Operand, c: *Constraint, at: usize, len: usize, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel c.class) {
+        if (sel shape.register) {
+            if (covers_class(r.ctx, ?shape.register, c.class) && !fixed_operand(r, desc)) {
+                val reg: opt[register.Id] = member(r.ctx, c.class);
+                if (sel reg.some) {
+                    @out = operand.Value.register{reg.some};
+                    ret err[diagnostic.Diagnostic].ok{};
+                }
+            }
+        }
+    }
+    if (sel c.memory) {
+        # a set that spells an address across several operands, as risc-v's `<2>(<1>)`, reads the name for each
+        if (sel shape.register) {
+            r.within = at;
+            @out     = operand.Value.register{base_of(r.ctx, ?shape.register)};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (sel shape.immediate) {
+            r.within = at;
+            @out     = operand.Value.immediate{0};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (sel shape.memory) {
+            # a name states no size, so the row's width decides it, as text of no size reads
+            r.unsized = true;
+            @out      = operand.Value.memory{operand.Address{base: base_of(r.ctx, ?shape.memory.base), index: register.NONE, scale: 0, disp: 0, segment: register.NONE, mode: operand.OFFSET, symbol: operand.Symbol{id: operand.NO_SYMBOL, addend: 0, fixup: operand.NO_FIXUP}, extend: 0, broadcast: 0}};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+    }
+    if (sel c.immediate) {
+        if (sel shape.immediate) {
+            if (covers_immediate(?shape.immediate, ?c.immediate)) {
+                @out = operand.Value.immediate{0};
+                ret err[diagnostic.Diagnostic].ok{};
+            }
+        }
+        # a target is a symbol, which the linker or the layout places
+        if (sel shape.relative) {
+            if (c.immediate.symbolic) {
+                @out = operand.Value.symbol{operand.Symbol{id: GLOBAL, addend: 0, fixup: operand.NO_FIXUP}};
+                ret err[diagnostic.Diagnostic].ok{};
+            }
+        }
+    }
+    ret err[diagnostic.Diagnostic].err{read.refuse(r, OUTSIDE, at, len)};
+}
+
+# the location a name stands for as operand `desc` when encoding, refused when it is of another kind
+fun placed(r: *core_syntax.Reader, desc: *operand.Operand, location: *Location, at: usize, len: usize, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val shape: *operand.Shape = ?desc.shape;
+    val v:     operand.Value  = @location;
+    var fits:  bool           = false;
+    # an address spelled across several operands, as risc-v's `<2>(<1>)`, takes its base and its displacement
+    if (sel v.memory) {
+        if (sel shape.register) {
+            r.within = at;
+            @out     = operand.Value.register{v.memory.base};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (sel shape.immediate) {
+            r.within = at;
+            @out     = operand.Value.immediate{v.memory.disp};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+    }
+    if (sel shape.register)  { fits = sel v.register; }
+    if (sel shape.memory)    { fits = sel v.memory; }
+    if (sel shape.immediate) { fits = sel v.immediate || sel v.symbol; }
+    if (sel shape.relative)  { fits = sel v.symbol; }
+    if (!fits)               { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNLIKE, at, len)}; }
+    if (sel shape.memory)    { r.unsized = true; }
+    @out = v;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# whether a statement of the block before (`back`) or after statement `index` defines numbered label `n`
+fun defines(p: *Parsed, index: u32, n: u64, back: bool) bool {
+    var i: usize = 0;
+    for (i < p.items.len) {
+        val it: *Item = ?p.items.data[i];
+        if (it.st.kind == source.LABEL && it.number == n) {
+            if (back && i < index::usize)  { ret true; }
+            if (!back && i > index::usize) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the state of numbered label `n` of an encode, made when it is new
+fun numbered_state(g: *Reading, n: u64) opt[*Numbered] {
+    var i: usize = 0;
+    for (i < g.numbered.len) {
+        if (g.numbered.data[i].number == n) { ret opt[*Numbered].some{?g.numbered.data[i]}; }
+        i = i + 1;
+    }
+    if (!held(vector.push[Numbered](g.numbered, Numbered{number: n, last: operand.NO_SYMBOL, next: operand.NO_SYMBOL}))) { ret opt[*Numbered].none{}; }
+    ret opt[*Numbered].some{?g.numbered.data[g.numbered.len - 1]};
+}
+
+# `v` with a nul after it, as the builder takes a name
+fun spelled(g: *Reading, v: View) opt[str] {
+    g.spelled.len = 0;
+    if (!held(vector.reserve[u8](g.spelled, v.len + 1))) { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < v.len) {
+        g.spelled.data[i] = v.data[i];
+        i                 = i + 1;
+    }
+    g.spelled.data[v.len] = 0;
+    g.spelled.len         = v.len + 1;
+    ret opt[str].some{g.spelled.data};
+}
+
+# a name in an operand: `.`, a numbered label's reference, which only the block defines, or a symbol, which a probe
+# reads as one no builder holds and an encode as the builder's label of that name
+fun resolve(context: ptr, name: View, spelling: core_syntax.Spelling) res[core_syntax.Resolved, str] {
+    val g:    *Reading = context::*Reading;
+    val bare: bool     = sel spelling.bare;
+    if (bare && name.len == 1 && name.data[0] == '.') { ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{core_syntax.HERE}}; }
+    var n:    u64  = 0;
+    var back: bool = false;
+    if (bare && numbered_reference(name, ?n, ?back)) {
+        if (!defines(g.p, g.index, n, back)) { ret res[core_syntax.Resolved, str].err{UNDEFINED}; }
+        if (g.b == nil)                      { ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{LOCAL}}; }
+        val state: opt[*Numbered] = numbered_state(g, n);
+        if (sel state.none) { ret res[core_syntax.Resolved, str].err{field.MEMORY}; }
+        val st: *Numbered = state.some;
+        if (back) { ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{st.last}}; }
+        if (st.next == operand.NO_SYMBOL) {
+            val made: res[build.Label, build.Refusal] = build.anonymous(g.b);
+            if (sel made.err) {
+                g.failed = opt[build.Refusal].some{made.err};
+                ret res[core_syntax.Resolved, str].err{made.err.message};
+            }
+            st.next = made.ok.id;
+        }
+        ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{st.next}};
+    }
+    if (g.b == nil) { ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{GLOBAL}}; }
+    val text: opt[str] = spelled(g, name);
+    if (sel text.none) { ret res[core_syntax.Resolved, str].err{field.MEMORY}; }
+    val l: res[build.Label, build.Refusal] = build.label(g.b, text.some);
+    if (sel l.err) {
+        g.failed = opt[build.Refusal].some{l.err};
+        ret res[core_syntax.Resolved, str].err{l.err.message};
+    }
+    ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{l.ok.id}};
+}
+
+fun name_of(context: ptr, id: u32) View {
+    ret View{data: "", len: 0};
+}
+
+# the integer data directive of the set's dialect named `name`, its width, 0 when the dialect states none
+fun width_of(s: *set.Set, name: View) u8 {
+    val widths: core_source.Widths = s.source.widths;
+    var i:      u32                = 0;
+    for (i < widths.len) {
+        if (spells(name.data::*u8, name.len, widths.at[i].name)) { ret widths.at[i].width; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the reading of a block with `operands`, its text copied, none when the allocator refused it
+fun make(a: *A.Allocator, text: View, origin: diagnostic.Position, s: *set.Set, ctx: *state.Context, operands: Operands) opt[*Parsed] {
+    val got: res[*Parsed, A.Error] = A.allocate[Parsed](a, 1);
+    if (sel got.err) { ret opt[*Parsed].none{}; }
+    val p: *Parsed = got.ok;
+    p.a           = a;
+    p.text        = nil;
+    p.len         = text.len;
+    p.origin      = origin;
+    p.set         = s;
+    p.syntax      = ?s.syntaxes.at[0];
+    p.ctx         = ctx;
+    p.modes       = mode.initial(?s.assembly);
+    p.operands    = nil;
+    p.count       = operands.len;
+    p.spelled     = nil;
+    p.spelled_len = 0;
+    p.items       = vector.init[Item](a);
+    p.names       = vector.init[Name](a);
+    p.data        = vector.init[u64](a);
+    p.writes      = vector.init[register.Id](a);
+    p.accesses    = vector.init[effect.Access](a);
+    p.stores      = core_syntax.stores(a);
+    val copied: res[*u8, A.Error] = A.allocate[u8](a, text.len);
+    if (sel copied.err) {
+        release_parsed(p);
+        ret opt[*Parsed].none{};
+    }
+    p.text = copied.ok;
+    var i: usize = 0;
+    for (i < text.len) {
+        p.text[i] = text.data[i];
+        i         = i + 1;
+    }
+    var total: usize = 0;
+    var k:     u32   = 0;
+    for (k < operands.len) {
+        total = total + str_len(operands.at[k].name) + 1;
+        k     = k + 1;
+    }
+    val names: res[*u8, A.Error] = A.allocate[u8](a, total);
+    if (sel names.err) {
+        release_parsed(p);
+        ret opt[*Parsed].none{};
+    }
+    p.spelled     = names.ok;
+    p.spelled_len = total;
+    val rows: res[*Operand, A.Error] = A.allocate[Operand](a, operands.len::usize);
+    if (sel rows.err) {
+        release_parsed(p);
+        ret opt[*Parsed].none{};
+    }
+    p.operands = rows.ok;
+    var at: usize = 0;
+    k = 0;
+    for (k < operands.len) {
+        val name: str   = operands.at[k].name;
+        val n:    usize = str_len(name);
+        i = 0;
+        for (i <= n) {
+            p.spelled[at + i] = name[i];
+            i                 = i + 1;
+        }
+        p.operands[k]      = operands.at[k];
+        p.operands[k].name = ?p.spelled[at];
+        at                 = at + n + 1;
+        k                  = k + 1;
+    }
+    ret opt[*Parsed].some{p};
+}
+
+# everything `p` holds given back, and `p` itself
+fun release_parsed(p: *Parsed) {
+    val a: *A.Allocator = p.a;
+    if (p.text != nil)     { A.deallocate[u8](a, p.text, p.len); }
+    if (p.spelled != nil)  { A.deallocate[u8](a, p.spelled, p.spelled_len); }
+    if (p.operands != nil) { A.deallocate[Operand](a, p.operands, p.count::usize); }
+    vector.dnit[Item](?p.items);
+    vector.dnit[Name](?p.names);
+    vector.dnit[u64](?p.data);
+    vector.dnit[register.Id](?p.writes);
+    vector.dnit[effect.Access](?p.accesses);
+    core_syntax.release(?p.stores);
+    A.deallocate[Parsed](a, p, 1);
+}
+
+# everything the block holds given back, its text included
+pub fun release(b: *Block) {
+    if (b.parsed == nil) { ret; }
+    release_parsed(b.parsed::*Parsed);
+    b.parsed = nil;
+    b.text   = View{data: nil, len: 0};
+}
+
+# the names statement `it` writes that the block declares, noted in the block's names, false when the allocator refused
+fun note_names(p: *Parsed, it: *Item) bool {
+    val end: usize = end_of(?it.st);
+    var i:   usize = it.st.head.at;
+    it.names = Range{first: p.names.len::u32, len: 0};
+    for (i < end) {
+        val len: usize = braced(p.text, i, end);
+        if (len == 0) {
+            i = i + 1;
+            cnt;
+        }
+        val k: opt[u32] = declared(p, i, len);
+        if (sel k.some) {
+            if (!held(vector.push[Name](?p.names, Name{operand: k.some, at: i, len: len}))) { ret false; }
+            it.names.len = it.names.len + 1;
+        }
+        i = i + len;
+    }
+    ret true;
+}
+
+# the refusal of the first braced name of statement `it` the block declares no operand of, none when it has none
+fun undeclared(p: *Parsed, it: *Item) opt[diagnostic.Diagnostic] {
+    val end: usize = end_of(?it.st);
+    var i:   usize = it.st.head.at;
+    for (i < end) {
+        val len: usize = braced(p.text, i, end);
+        if (len == 0) {
+            i = i + 1;
+            cnt;
+        }
+        val k: opt[u32] = declared(p, i, len);
+        if (sel k.none) { ret opt[diagnostic.Diagnostic].some{refusal(p, UNDECLARED, i, len)}; }
+        i = i + len;
+    }
+    ret opt[diagnostic.Diagnostic].none{};
+}
+
+# a reader over the operands of data directive `it`, which reads numbers and register names alone
+fun body_reader(p: *Parsed, it: *Item) core_syntax.Reader {
+    val body: source.Token = it.st.body;
+    ret core_syntax.Reader{text: p.text, start: body.at, at: body.at, end: body.at + body.len, origin: body.position, codec: p.set.codec, ctx: p.ctx, syntax: p.syntax, modes: ?p.modes, symbols: nil, context: nil, row: nil, format: nil, named: nil, spans: nil};
+}
+
+# the offset of the declaration `::` in the operands of a data directive, the end of its operands when it has none
+fun clause_of(rd: *core_syntax.Reader) usize {
+    var i: usize = rd.at;
+    for (i + 1 < rd.end) {
+        if (rd.text[i] == ':' && rd.text[i + 1] == ':') { ret i; }
+        i = i + 1;
+    }
+    ret rd.end;
+}
+
+# the value read at the reader's position as a datum of `width` bytes, a negative one as its two's complement there
+fun datum_value(rd: *core_syntax.Reader, width: u8) res[u64, diagnostic.Diagnostic] {
+    val from:     usize = rd.at;
+    var negative: bool  = false;
+    if (read.peek(rd) == '-') {
+        negative = true;
+        rd.at    = rd.at + 1;
+    }
+    val n: res[i64, diagnostic.Diagnostic] = read.number(rd);
+    if (sel n.err) { ret res[u64, diagnostic.Diagnostic].err{n.err}; }
+    val magnitude: u64 = n.ok:~u64;
+    val bits:      u32 = width::u32 * 8;
+    var value:     u64 = magnitude;
+    if (negative) {
+        if (bits < 64 && magnitude > (1::u64 << (bits - 1)::u64)) { ret res[u64, diagnostic.Diagnostic].err{read.refuse(rd, WIDTH, from, rd.at - from)}; }
+        if (bits == 64 && magnitude > (1::u64 << 63))             { ret res[u64, diagnostic.Diagnostic].err{read.refuse(rd, WIDTH, from, rd.at - from)}; }
+        value = ~magnitude + 1;
+    }
+    or (bits < 64 && magnitude >= (1::u64 << bits::u64)) {
+        ret res[u64, diagnostic.Diagnostic].err{read.refuse(rd, WIDTH, from, rd.at - from)};
+    }
+    if (bits < 64) { value = value & ((1::u64 << bits::u64) - 1); }
+    ret res[u64, diagnostic.Diagnostic].ok{value};
+}
+
+# the values of data directive `it`, and the registers its declaration names, read into the block
+fun datum(p: *Parsed, it: *Item) res[err[diagnostic.Diagnostic], A.Error] {
+    var rd:     core_syntax.Reader = body_reader(p, it);
+    val end:    usize              = rd.end;
+    val clause: usize              = clause_of(?rd);
+    rd.end  = clause;
+    it.data = Range{first: p.data.len::u32, len: 0};
+    for {
+        read.skip(?rd);
+        if (rd.at >= rd.end) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(?rd, read.EXPECTED, rd.at, 0)}}; }
+        val v: res[u64, diagnostic.Diagnostic] = datum_value(?rd, it.width);
+        if (sel v.err) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{v.err}}; }
+        val pushed: res[usize, A.Error] = vector.push[u64](?p.data, v.ok);
+        if (sel pushed.err) { ret res[err[diagnostic.Diagnostic], A.Error].err{pushed.err}; }
+        it.data.len = it.data.len + 1;
+        read.skip(?rd);
+        if (rd.at >= rd.end)       { brk; }
+        if (read.peek(?rd) != ',') { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(?rd, read.UNEXPECTED, rd.at, read.token(?rd, rd.at))}}; }
+        rd.at = rd.at + 1;
+    }
+    if (clause >= end) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].ok{}}; }
+    rd.end = end;
+    rd.at  = clause + 2;
+    ret declaration(p, it, ?rd);
+}
+
+# the declaration `writes(...)` of data directive `it` at the reader's position, its registers read into the block
+fun declaration(p: *Parsed, it: *Item, rd: *core_syntax.Reader) res[err[diagnostic.Diagnostic], A.Error] {
+    read.skip(rd);
+    val from: usize = rd.at;
+    if (!read.take(rd, "writes")) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, DECLARATION, from, read.token(rd, from))}}; }
+    read.skip(rd);
+    if (read.peek(rd) != '(') { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, DECLARATION, rd.at, read.token(rd, rd.at))}}; }
+    rd.at       = rd.at + 1;
+    it.declared = true;
+    it.writes   = Range{first: p.writes.len::u32, len: 0};
+    read.skip(rd);
+    if (read.peek(rd) != ')') {
+        for {
+            read.skip(rd);
+            val at:  usize = rd.at;
+            val len: usize = read.name(rd);
+            if (len == 0) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, read.UNKNOWN_REGISTER, at, read.token(rd, at))}}; }
+            val found: res[register.Id, register.Absent] = register.lookup(p.ctx.view, read.span(rd, at, len));
+            if (sel found.err) {
+                if (sel found.err.unavailable) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse_unmet(rd, found.err.unavailable.requires, at, len)}}; }
+                ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, read.UNKNOWN_REGISTER, at, len)}};
+            }
+            val pushed: res[usize, A.Error] = vector.push[register.Id](?p.writes, found.ok);
+            if (sel pushed.err) { ret res[err[diagnostic.Diagnostic], A.Error].err{pushed.err}; }
+            it.writes.len = it.writes.len + 1;
+            rd.at         = at + len;
+            read.skip(rd);
+            if (read.peek(rd) != ',') { brk; }
+            rd.at = rd.at + 1;
+        }
+    }
+    if (read.peek(rd) != ')') { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, DECLARATION, rd.at, read.token(rd, rd.at))}}; }
+    rd.at = rd.at + 1;
+    read.skip(rd);
+    if (rd.at < rd.end) { ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].err{read.refuse(rd, read.UNEXPECTED, rd.at, read.token(rd, rd.at))}}; }
+    ret res[err[diagnostic.Diagnostic], A.Error].ok{err[diagnostic.Diagnostic].ok{}};
+}
+
+# the statements of the block read into its items, each refusal of one gathered, false when the allocator refused
+fun lex(p: *Parsed, got: *vector.Vector[diagnostic.Diagnostic]) bool {
+    var l:    source.Lexer = source.lexer(p.text, p.len, p.origin, ?p.set.source);
+    var feed: source.Feed  = source.feed(?l);
+    var st:   source.Statement;
+    for {
+        val more: res[bool, diagnostic.Diagnostic] = feed.next(feed.context, ?st);
+        # text the source model cannot split into statements ends the reading of the block
+        if (sel more.err) { ret diagnose(p.a, got, more.err); }
+        if (!more.ok)     { ret true; }
+        var it: Item = Item{st: st, names: EMPTY, number: 0, width: 0, data: EMPTY, declared: false, writes: EMPTY};
+        if (st.kind == source.LABEL) {
+            val n: opt[u64] = number_of(source.bytes(?st, st.head));
+            if (sel n.none) {
+                if (!diagnose(p.a, got, refusal(p, NAMED_LABEL, st.head.at, st.head.len))) { ret false; }
+            }
+            or { it.number = n.some; }
+        }
+        or (st.kind == source.DIRECTIVE) {
+            it.width = width_of(p.set, source.bytes(?st, st.head));
+            if (it.width == 0) {
+                if (!diagnose(p.a, got, refusal(p, DIRECTIVE, st.head.at, st.head.len))) { ret false; }
+            }
+            or {
+                val read_: res[err[diagnostic.Diagnostic], A.Error] = datum(p, ?it);
+                if (sel read_.err) { ret false; }
+                if (sel read_.ok.err) {
+                    if (!diagnose(p.a, got, read_.ok.err)) { ret false; }
+                }
+            }
+        }
+        or {
+            if (!note_names(p, ?it)) { ret false; }
+        }
+        if (!held(vector.push[Item](?p.items, it))) { ret false; }
+    }
+}
+
+# instruction statement `index` read under the block's context with every name a probe of its constraint, its refusal
+# gathered, false when the allocator refused
+fun check(p: *Parsed, index: u32, got: *vector.Vector[diagnostic.Diagnostic]) bool {
+    val it:    *Item                                    = ?p.items.data[index::usize];
+    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, failed: opt[build.Refusal].none{}};
+    var ex:    relax.Expansion;
+    val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(?g, p.ctx, ?p.modes, ?ex);
+    if (sel read_.err)     { ret false; }
+    if (!sel read_.ok.err) { ret true; }
+    # a name the block declares no operand of is the cause before the syntax's refusal of what it reads there
+    val named: opt[diagnostic.Diagnostic] = undeclared(p, it);
+    if (sel named.some) { ret diagnose(p.a, got, named.some); }
+    ret diagnose(p.a, got, read_.ok.err);
+}
+
+# the operand names of the block, the first declared twice refused
+fun unique(p: *Parsed, got: *vector.Vector[diagnostic.Diagnostic]) bool {
+    var k: u32 = 0;
+    for (k < p.count) {
+        val name: str = p.operands[k].name;
+        var j:    u32 = k + 1;
+        for (j < p.count) {
+            if (spells(name::*u8, str_len(name), p.operands[j].name)) {
+                ret diagnose(p.a, got, diagnostic.Diagnostic{message: DUPLICATE, span: diagnostic.Span{start: p.origin, len: 0}, requires: requirement.NO_ALTERNATIVES});
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the block `text`, whose first byte is at `origin` in the caller's file, read in set `s` under the context `ctx` the
+# enclosing function runs under, which outlives the block, its operands `operands`, copied
+# ---
+# ret: the block, which `release` gives back, or every refusal of its statements at its span in the caller's file,
+#      which `release_diagnostics` gives back
+pub fun parse(a: *A.Allocator, text: View, origin: diagnostic.Position, s: *set.Set, ctx: *state.Context, operands: Operands) res[Block, Diagnostics] {
+    if (!available(s)) { ret res[Block, Diagnostics].err{refused_whole(a, origin, UNAVAILABLE)}; }
+    val made: opt[*Parsed] = make(a, text, origin, s, ctx, operands);
+    if (sel made.none) { ret res[Block, Diagnostics].err{refused_whole(a, origin, field.MEMORY)}; }
+    val p:     *Parsed                              = made.some;
+    var got:   vector.Vector[diagnostic.Diagnostic] = vector.init[diagnostic.Diagnostic](a);
+    var whole: bool                                 = unique(p, ?got) && lex(p, ?got);
+    var i:     u32                                  = 0;
+    for (whole && i < p.items.len::u32) {
+        if (p.items.data[i::usize].st.kind == source.INSTRUCTION) { whole = check(p, i, ?got); }
+        i = i + 1;
+    }
+    if (!whole) {
+        release_parsed(p);
+        release_diagnostics(a, gathered(a, ?got));
+        ret res[Block, Diagnostics].err{refused_whole(a, origin, field.MEMORY)};
+    }
+    if (got.len > 0) {
+        release_parsed(p);
+        ret res[Block, Diagnostics].err{gathered(a, ?got)};
+    }
+    vector.dnit[diagnostic.Diagnostic](?got);
+    ret res[Block, Diagnostics].ok{Block{text: View{data: p.text, len: p.len}, set: s, parsed: p::ptr}};
+}
+
+# the control of a block that falls through
+val FALLS: effect.Control = effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: field.NO_OPERAND, rules: effect.NO_RULES, condition: 0, chooses: 0};
+
+# an access of what no row's facts state, as a data directive's bytes, which may reach any memory
+val ANYWHERE: effect.Access = effect.Access{role: operand.READ_WRITE, operand: field.NO_OPERAND, base: effect.NO_ROW, forming: operand.NO_POSITIONS, width: effect.Width{element: quantity.Scaled{fixed: 0, per: 0, scale: 0}, count: effect.Count.unstated{}}, governor: field.NO_OPERAND, pop: 0};
+
+# what the block's statements do to control so far
+# ---
+# leaves:  whether one leaves the block other than by a call, as a return or a jump to a symbol
+# control: the first such transfer
+# mixed:   whether two such transfers differ in kind or target
+# calls:   whether one calls
+# call:    the target of the calls, INDIRECT when any is
+rec Flow {
+    leaves:  bool;
+    control: effect.Control;
+    mixed:   bool;
+    calls:   bool;
+    call:    effect.Target;
+}
+
+# the row of register `reg` of `file`, effect.NO_ROW for none or one the file has no row of
+fun row_index(file: *register.File, reg: register.Id) u32 {
+    if (reg == register.NONE) { ret effect.NO_ROW; }
+    val at: opt[u32] = register.index_of(file, reg);
+    if (sel at.none) { ret effect.NO_ROW; }
+    ret at.some;
+}
+
+# the register row value `v` holds or forms its address from, effect.NO_ROW for none
+fun row_held(file: *register.File, v: *operand.Value) u32 {
+    if (sel v.register) { ret row_index(file, v.register); }
+    if (sel v.memory)   { ret row_index(file, v.memory.base); }
+    ret effect.NO_ROW;
+}
+
+# the `words` words of `set` or-ed into `into`
+fun add(into: *u64, from: *u64, words: usize) {
+    var w: usize = 0;
+    for (w < words) {
+        into[w] = into[w] | from[w];
+        w       = w + 1;
+    }
+}
+
+# row `at` set in the `words` words of `into`
+fun mark(into: *u64, at: u32) {
+    into[(at / 64)::usize] = into[(at / 64)::usize] | (1::u64 << (at % 64)::u64);
+}
+
+# the accesses of the instruction of row `r` holding `values` that its operands do not leave to the consumer, its
+# operands' memory and the accesses its effect states, as the block's own: a register an access names by an operand
+# stated by its row, and an access through a name's operand left out, since the consumer states that operand's role
+fun note_accesses(p: *Parsed, file: *register.File, r: *row.Row, values: *operand.Value) err[A.Error] {
+    var k: u32 = 0;
+    for (k < r.operands.len) {
+        val desc: *operand.Operand = ?r.operands.at[k];
+        val v:    *operand.Value   = ?values[k];
+        if (sel v.memory) {
+            if (desc.role == operand.NONE || desc.width == 0) {
+                k = k + 1;
+                cnt;
+            }
+            val a:      effect.Access       = effect.Access{role: desc.role, operand: field.NO_OPERAND, base: row_index(file, v.memory.base), forming: operand.NO_POSITIONS, width: effect.Width{element: quantity.Scaled{fixed: desc.width::u32, per: 0, scale: 0}, count: effect.Count.one{}}, governor: field.NO_OPERAND, pop: 0};
+            val pushed: res[usize, A.Error] = vector.push[effect.Access](?p.accesses, a);
+            if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        }
+        k = k + 1;
+    }
+    val e: *effect.Effect = r.effect;
+    var i: u32            = 0;
+    for (i < e.memory.len) {
+        val stated: *effect.Access = ?e.memory.at[i];
+        var a:      effect.Access  = @stated;
+        var skip:   bool           = false;
+        if (stated.operand != field.NO_OPERAND) {
+            val v:    *operand.Value   = ?values[stated.operand];
+            val desc: *operand.Operand = ?r.operands.at[stated.operand];
+            # an access through a name's memory operand is the consumer's
+            if (sel v.none && sel desc.shape.memory) { skip = true; }
+            if (stated.role == operand.NONE)         { a.role = desc.role; }
+            if (stated.base == effect.NO_ROW)        { a.base = row_held(file, v); }
+        }
+        val count: effect.Count = stated.width.count;
+        if (sel count.operand) {
+            val v: *operand.Value = ?values[count.operand];
+            if (sel v.register) { a.width.count = effect.Count.register{row_held(file, v)}; }
+            or                  { a.width.count = effect.Count.unstated{}; }
+        }
+        a.operand  = field.NO_OPERAND;
+        a.forming  = operand.NO_POSITIONS;
+        a.governor = field.NO_OPERAND;
+        if (!skip) {
+            val pushed: res[usize, A.Error] = vector.push[effect.Access](?p.accesses, a);
+            if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# the stack change `next` of an instruction holding `values` added to the block's `stack`
+fun add_stack(stack: effect.Stack, next: effect.Stack, values: *operand.Value) effect.Stack {
+    if (sel next.none)    { ret stack; }
+    if (sel stack.opaque) { ret stack; }
+    var bytes: i64 = 0;
+    if (sel next.delta) {
+        bytes = next.delta.bytes::i64;
+        if (next.delta.operand != field.NO_OPERAND) {
+            val v: operand.Value = values[next.delta.operand];
+            if (sel v.immediate) { bytes = bytes + v.immediate; }
+            or                   { ret effect.Stack.opaque{}; }
+        }
+    }
+    or                                               { ret effect.Stack.opaque{}; }
+    if (sel stack.delta)                             { bytes = bytes + stack.delta.bytes::i64; }
+    if (bytes < -0x8000_0000 || bytes > 0x7FFF_FFFF) { ret effect.Stack.opaque{}; }
+    ret effect.Stack.delta{effect.Delta{bytes: bytes::i32, operand: field.NO_OPERAND}};
+}
+
+# control `c` of an instruction holding `given`, read with every name a probe, noted in the block's flow. `last` is
+# whether nothing follows it in the block
+fun add_control(f: *Flow, c: effect.Control, given: *operand.Value, last: bool) {
+    if (c.transfer == effect.NONE || c.transfer == effect.MERGE) { ret; }
+    if (c.transfer == effect.JUMP && c.operand != field.NO_OPERAND) {
+        val v: operand.Value = given[c.operand];
+        # a branch to a numbered label stays within the block
+        if (sel v.symbol && v.symbol.id == LOCAL) { ret; }
+    }
+    if (c.transfer == effect.CALL) {
+        f.calls = true;
+        if (c.target == effect.INDIRECT || f.call == effect.UNTARGETED) { f.call = c.target; }
+        ret;
+    }
+    var out: effect.Control = FALLS;
+    out.transfer    = c.transfer;
+    out.target      = c.target;
+    out.conditional = c.conditional || !last;
+    if (!f.leaves) {
+        f.leaves  = true;
+        f.control = out;
+        ret;
+    }
+    if (f.control.transfer != out.transfer || f.control.target != out.target) { f.mixed = true; }
+    f.control.conditional = true;
+}
+
+# whether the block has a numbered label, so a branch may skip any statement of it
+fun branches(p: *Parsed) bool {
+    var i: usize = 0;
+    for (i < p.items.len) {
+        if (p.items.data[i].st.kind == source.LABEL) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the footprint of instruction statement `index` added to `fp`, through `scratch`, its configuration carried in `cfg`
+fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *footprint.Footprint, cfg: *config.Configured, f: *Flow, stack: *effect.Stack) res[effect.Answer[bool], A.Error] {
+    val it:    *Item                                    = ?p.items.data[index::usize];
+    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, failed: opt[build.Refusal].none{}};
+    var ex:    relax.Expansion;
+    val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(?g, p.ctx, ?p.modes, ?ex);
+    if (sel read_.err)    { ret res[effect.Answer[bool], A.Error].err{read_.err}; }
+    if (sel read_.ok.err) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{effect.Undecided.opaque{}}}; }
+    val words: usize = fp.reads.len;
+    var j:     u32   = 0;
+    for (j < ex.count) {
+        val r:      *row.Row = ex.steps[j].row;
+        var values: [row.MAX_OPERANDS]operand.Value;
+        var k:      u32      = 0;
+        for (k < r.operands.len) {
+            values[k] = ex.steps[j].values[k];
+            # a name's operand has no value until it is placed, and its role is the consumer's
+            if (named_slot(p, it, j, k)) { values[k] = operand.Value.none{}; }
+            k = k + 1;
+        }
+        val held_: operand.Values                                    = operand.Values{at: ?values[0], len: r.operands.len};
+        val one:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(scratch, r, held_, p.ctx, @cfg);
+        if (sel one.err)          { ret res[effect.Answer[bool], A.Error].err{one.err}; }
+        if (sel one.ok.undecided) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{one.ok.undecided}}; }
+        add(fp.reads.data, scratch.reads.data, words);
+        add(fp.written.data, scratch.written.data, words);
+        add(fp.clobbers.data, scratch.clobbers.data, words);
+        var w: usize = 0;
+        for (w < scratch.writes.len) {
+            val pushed: res[usize, A.Error] = vector.push[effect.Written](?fp.writes, scratch.writes.data[w]);
+            if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
+            w = w + 1;
+        }
+        val noted: err[A.Error] = note_accesses(p, fp.file, r, ?values[0]);
+        if (sel noted.err) { ret res[effect.Answer[bool], A.Error].err{noted.err}; }
+        @stack = add_stack(@stack, scratch.stack, ?values[0]);
+        val last: bool = index::usize + 1 == p.items.len && j + 1 == ex.count;
+        add_control(f, scratch.control, ?ex.steps[j].values[0], last);
+        if (cfg.hooks != nil) {
+            val e: config.Established = cfg.hooks.establish(r, held_);
+            if (sel e.sets)      { cfg.state = opt[config.State].some{e.sets}; }
+            if (sel e.undecided) { cfg.state = opt[config.State].none{}; }
+        }
+        j = j + 1;
+    }
+    ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
+}
+
+# data directive `it` added to `fp`: what it declares it writes, and as reading every register and any memory, since
+# nothing reads what its bytes do. undecided as opaque when it declares nothing
+fun add_datum(p: *Parsed, it: *Item, fp: *footprint.Footprint) res[effect.Answer[bool], A.Error] {
+    if (!it.declared) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{effect.Undecided.opaque{}}}; }
+    val file: *register.File = fp.file;
+    var r:    u32            = 0;
+    for (r < file.register_count) {
+        mark(fp.reads.data, r);
+        r = r + 1;
+    }
+    var i: u32 = 0;
+    for (i < it.writes.len) {
+        val reg: register.Id = p.writes.data[(it.writes.first + i)::usize];
+        val at:  u32         = row_index(file, reg);
+        if (at != effect.NO_ROW) { mark(fp.written.data, at); }
+        val pushed: res[usize, A.Error] = vector.push[effect.Written](?fp.writes, effect.Written{at: reg, write: operand.AS_ROW});
+        if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[effect.Access](?p.accesses, ANYWHERE);
+    if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
+    ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
+}
+
+# `fp` holding nothing, over its file
+fun cleared(fp: *footprint.Footprint) {
+    var w: usize = 0;
+    for (w < fp.reads.len) {
+        fp.reads.data[w]    = 0;
+        fp.written.data[w]  = 0;
+        fp.clobbers.data[w] = 0;
+        w                   = w + 1;
+    }
+    fp.writes.len = 0;
+    fp.memory     = effect.NO_ACCESSES;
+    fp.stack      = effect.Stack.none{};
+    fp.control    = FALLS;
+    fp.signature  = effect.NO_SIGNATURE;
+    fp.entries    = effect.NO_ENTRIES;
+    fp.structure  = effect.FLAT;
+}
+
+# the footprint of the whole block `b`, filled into `fp`, which is over the set's register file: every register and
+# flag its own instructions read, write and leave unspecified, the memory they access, what they do to the stack
+# pointer and where control leaves the block, each name's operand left out, as the consumer states its role. a block
+# that may branch past a write reads the register written as well, as a write that may keep its old value. its accesses
+# lie in the block and hold until the next effects of it or its release
+# ---
+# ret: `fp` when every part is decided, else why not, `fp` then holding nothing: a rule that turns on a name's location,
+#      configuration state the block does not set, or a data directive that declares nothing it does, which is opaque.
+#      refused only when the allocator cannot hold the footprint
+pub fun effects(b: *Block, fp: *footprint.Footprint) res[effect.Answer[*footprint.Footprint], A.Error] {
+    val p: *Parsed = b.parsed::*Parsed;
+    cleared(fp);
+    p.accesses.len = 0;
+    val made: res[footprint.Footprint, A.Error] = footprint.make(p.a, fp.file);
+    if (sel made.err) { ret res[effect.Answer[*footprint.Footprint], A.Error].err{made.err}; }
+    var scratch: footprint.Footprint               = made.ok;
+    var cfg:     config.Configured                 = config.Configured{hooks: p.set.config, state: opt[config.State].none{}};
+    var f:       Flow                              = Flow{leaves: false, control: FALLS, mixed: false, calls: false, call: effect.UNTARGETED};
+    var stack:   effect.Stack                      = effect.Stack.none{};
+    var answer:  res[effect.Answer[bool], A.Error] = res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
+    var i:       u32                               = 0;
+    for (i < p.items.len::u32) {
+        val it: *Item = ?p.items.data[i::usize];
+        # a label may be reached from anywhere the block branches from, so the configuration there is not known
+        if (it.st.kind == source.LABEL)       { cfg.state = opt[config.State].none{}; }
+        if (it.st.kind == source.DIRECTIVE)   { answer = add_datum(p, it, fp); }
+        if (it.st.kind == source.INSTRUCTION) { answer = add_instruction(p, i, fp, ?scratch, ?cfg, ?f, ?stack); }
+        if (sel answer.err)                   { brk; }
+        if (sel answer.ok.undecided)          { brk; }
+        i = i + 1;
+    }
+    footprint.release(?scratch);
+    if (sel answer.err) {
+        cleared(fp);
+        ret res[effect.Answer[*footprint.Footprint], A.Error].err{answer.err};
+    }
+    if (sel answer.ok.undecided) {
+        cleared(fp);
+        ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].undecided{answer.ok.undecided}};
+    }
+    if (f.mixed) {
+        cleared(fp);
+        ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].undecided{effect.Undecided.opaque{}}};
+    }
+    if (branches(p)) {
+        # a branch may skip a write, so what it writes may keep its old value, and a change to the stack pointer may not happen
+        add(fp.reads.data, fp.written.data, fp.reads.len);
+        val moved: bool = sel stack.delta;
+        if (moved)    { stack = effect.Stack.opaque{}; }
+        if (f.leaves) { f.control.conditional = true; }
+    }
+    fp.memory = effect.Accesses{at: p.accesses.data, len: p.accesses.len::u32};
+    fp.stack  = stack;
+    if (f.leaves) { fp.control = f.control; }
+    or (f.calls) {
+        fp.control             = FALLS;
+        fp.control.transfer    = effect.CALL;
+        fp.control.target      = f.call;
+        fp.control.conditional = branches(p);
+    }
+    ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].decided{fp}};
+}
+
+# a refusal of `message` that is about no label
+fun refused(message: str) err[build.Refusal] {
+    ret err[build.Refusal].err{build.Refusal{message: message, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
+}
+
+# whether location `v` lies within constraint `c`
+fun fits(c: *Constraint, v: *Location) bool {
+    if (sel c.class)  { ret sel v.register && register.class_of(v.register) == c.class; }
+    if (sel c.memory) { ret sel v.memory; }
+    if (sel c.immediate) {
+        if (sel v.symbol) { ret c.immediate.symbolic; }
+        if (sel v.immediate) {
+            if (!c.immediate.signed && c.immediate.bits >= 64) { ret true; }
+            val want: Bounds = constrained_bounds(?c.immediate);
+            val x:    i128   = v.immediate::i128;
+            ret want.low <= x && x <= want.high;
+        }
+    }
+    ret false;
+}
+
+# the labels one statement's operands bind at its place, operand.NO_SYMBOL until one is needed
+# ---
+# here: the label `.` names
+# own:  the label a sequence's part names at its first instruction, spelled by the syntax's own stem
+rec Places {
+    here: u32;
+    own:  u32;
+}
+
+# a label placed at the cursor, `stem` its spelling when it is not nil
+fun placed_label(b: *build.Builder, stem: str) res[u32, build.Refusal] {
+    var made: res[build.Label, build.Refusal] = res[build.Label, build.Refusal].err{build.Refusal{message: field.MEMORY, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
+    if (stem == nil)  { made = build.anonymous(b); }
+    or                { made = build.stemmed(b, stem); }
+    if (sel made.err) { ret res[u32, build.Refusal].err{made.err}; }
+    val placed: err[build.Refusal] = build.define(b, made.ok);
+    if (sel placed.err) { ret res[u32, build.Refusal].err{placed.err}; }
+    ret res[u32, build.Refusal].ok{made.ok.id};
+}
+
+# symbol `id` with `.` and a sequence's own label bound to labels at the cursor, each made the first time it is needed
+fun bound_at(g: *Reading, id: u32, places: *Places) res[u32, build.Refusal] {
+    if (id == core_syntax.HERE) {
+        if (places.here == operand.NO_SYMBOL) {
+            val l: res[u32, build.Refusal] = placed_label(g.b, nil);
+            if (sel l.err) { ret l; }
+            places.here = l.ok;
+        }
+        ret res[u32, build.Refusal].ok{places.here};
+    }
+    if (id == core_syntax.OWN) {
+        if (places.own == operand.NO_SYMBOL) {
+            val l: res[u32, build.Refusal] = placed_label(g.b, g.p.syntax.own);
+            if (sel l.err) { ret l; }
+            places.own = l.ok;
+        }
+        ret res[u32, build.Refusal].ok{places.own};
+    }
+    ret res[u32, build.Refusal].ok{id};
+}
+
+# a symbolic operand value, or one a list, group or enumerant params holds, with `.` and a sequence's own label bound
+fun claim(g: *Reading, v: *operand.Value, places: *Places) err[build.Refusal] {
+    if (sel v.symbol) {
+        val id: res[u32, build.Refusal] = bound_at(g, v.symbol.id, places);
+        if (sel id.err) { ret err[build.Refusal].err{id.err}; }
+        v.symbol.id = id.ok;
+        ret err[build.Refusal].ok{};
+    }
+    if (sel v.memory) {
+        if (v.memory.symbol.id != operand.NO_SYMBOL) {
+            val id: res[u32, build.Refusal] = bound_at(g, v.memory.symbol.id, places);
+            if (sel id.err) { ret err[build.Refusal].err{id.err}; }
+            v.memory.symbol.id = id.ok;
+        }
+        ret err[build.Refusal].ok{};
+    }
+    val inner: operand.Values = operand.inner(v);
+    var i:     u32            = 0;
+    for (i < inner.len) {
+        val done: err[build.Refusal] = claim(g, ?inner.at[i], places);
+        if (sel done.err) { ret done; }
+        i = i + 1;
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# numbered label statement `it` placed at the cursor, as the label a reference ahead of it made or a new one
+fun encode_label(g: *Reading, it: *Item) err[build.Refusal] {
+    val state: opt[*Numbered] = numbered_state(g, it.number);
+    if (sel state.none) { ret refused(field.MEMORY); }
+    val n: *Numbered = state.some;
+    var l: u32       = n.next;
+    if (l == operand.NO_SYMBOL) {
+        val made: res[build.Label, build.Refusal] = build.anonymous(g.b);
+        if (sel made.err) { ret err[build.Refusal].err{made.err}; }
+        l = made.ok.id;
+    }
+    val placed: err[build.Refusal] = build.define(g.b, build.Label{id: l});
+    if (sel placed.err) { ret placed; }
+    n.last = l;
+    n.next = operand.NO_SYMBOL;
+    ret err[build.Refusal].ok{};
+}
+
+# data directive `it` written at the cursor, each value at its width in the set's byte order
+fun encode_datum(g: *Reading, it: *Item) err[build.Refusal] {
+    var i: u32 = 0;
+    for (i < it.data.len) {
+        val done: err[build.Refusal] = build.integer(g.b, g.p.data.data[(it.data.first + i)::usize], it.width);
+        if (sel done.err) { ret done; }
+        i = i + 1;
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# instruction statement `it` read with every name its location and written at the cursor under the builder's context
+fun encode_instruction(g: *Reading, it: *Item) err[build.Refusal] {
+    var ex:    relax.Expansion;
+    val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(g, build.view(g.b), build.modes_of(g.b), ?ex);
+    if (sel read_.err) { ret refused(field.MEMORY); }
+    if (sel read_.ok.err) {
+        if (sel g.failed.some) { ret err[build.Refusal].err{g.failed.some}; }
+        ret refused(read_.ok.err.message);
+    }
+    var places: Places = Places{here: operand.NO_SYMBOL, own: operand.NO_SYMBOL};
+    var i:      u32    = 0;
+    for (i < ex.count) {
+        var k: u32 = 0;
+        for (k < ex.steps[i].row.operands.len) {
+            val claimed: err[build.Refusal] = claim(g, ?ex.steps[i].values[k], ?places);
+            if (sel claimed.err) { ret claimed; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret build.expansion(g.b, ?ex);
+}
+
+# block `blk` written through the builder at its cursor, under the context the builder writes under, each operand at
+# its location in `locations`: a location outside its operand's constraint is refused before anything is written, and
+# the block read again with each name its location, so a row, an alias or a sequence is chosen as the assembler chooses
+# it for that text. its numbered labels are labels of the builder no other block or function names, and a symbol a
+# location or the text names is relocated as any operand's
+pub fun encode(blk: *Block, locations: Locations, b: *build.Builder) err[build.Refusal] {
+    val p: *Parsed = blk.parsed::*Parsed;
+    if (locations.len != p.count) { ret refused(LOCATIONS); }
+    var k: u32 = 0;
+    for (k < p.count) {
+        if (!fits(?p.operands[k].constraint, ?locations.at[k])) { ret refused(UNFIT); }
+        k = k + 1;
+    }
+    var numbered: vector.Vector[Numbered] = vector.init[Numbered](p.a);
+    var spelled:  vector.Vector[u8]       = vector.init[u8](p.a);
+    var g:        Reading                 = Reading{p: p, item: nil, index: 0, locations: locations.at, b: b, numbered: ?numbered, spelled: ?spelled, failed: opt[build.Refusal].none{}};
+    var done:     err[build.Refusal]      = err[build.Refusal].ok{};
+    var i:        u32                     = 0;
+    for (i < p.items.len::u32 && sel done.ok) {
+        val it: *Item = ?p.items.data[i::usize];
+        g.item  = it;
+        g.index = i;
+        if (it.st.kind == source.LABEL)       { done = encode_label(?g, it); }
+        if (it.st.kind == source.DIRECTIVE)   { done = encode_datum(?g, it); }
+        if (it.st.kind == source.INSTRUCTION) { done = encode_instruction(?g, it); }
+        i = i + 1;
+    }
+    vector.dnit[Numbered](?numbered);
+    vector.dnit[u8](?spelled);
+    ret done;
+}
