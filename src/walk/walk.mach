@@ -13,6 +13,14 @@
 # unguaranteed (`ct.required`).
 #
 # secrecy is held per register row of the set's file and per memory extent.
+# a row is secret when some bit of it may hold a secret, so every row sharing
+# storage with a secret is: a seed or a write taints each row overlapping the
+# register it names, as the file's rows state the relation
+# (`register.overlapping`), and a read asks its own row alone. a write leaves
+# a row it overwrites holding what it writes, as eax's write zeroing the rest
+# of rax or w0's of x0, and adds its secret to a row it overlaps and leaves
+# part of, as al's within rax or a lane's within its vector register, whose
+# version of its value it moves either way.
 # an extent is named by the register its address is formed from, the version
 # of that register's value, an offset and a length: the walk states no
 # register values, so two extents are known apart only when both are of one
@@ -216,7 +224,8 @@ rec Held {
 
 # what is secret where an instruction starts
 # ---
-# taint:    the register rows holding a secret, one bit per row
+# taint:    the register rows that may hold a secret in some bit, one bit per row, every row overlapping one that does
+#           included
 # versions: the version of each register row's value
 # held:     the extents that may hold a secret
 # anywhere: whether a secret may be at any address
@@ -290,45 +299,47 @@ rec Block {
 
 # the walk's storage
 # ---
-# code:    the code walked
-# timed:   whether each row's latency is asked, false for a set whose timing is not guaranteed
-# ctx:     the context it runs under
-# file:    the set's register file, NO_FILE for a set that names no register
-# words:   the words a set over the file's rows spans
-# stream:  the set's typed stream hooks, nil for a machine set
-# points:  the state at each instruction start reached, by index into `states`, NO_POINT for none
-# states:  the states
-# work:    the instruction starts whose state changed and are not walked since
-# named:   the rows the operands of the instruction walked name, one bit per row
-# touches: the memory accesses of the instruction walked
-# shaped:  what the ordered read found of each instruction start of a typed stream, by index into `shapes`, NO_POINT
-#          for none
-# shapes:  what it found
-# counts:  the counts of the shapes' signatures
-# targets: the blocks the shapes' depths name, by index into `blocks`
-# blocks:  the blocks of a typed stream's code, the function's body first
-# carried: the values a branch of the instruction walked carries to its label, the deepest first
-# popped:  the values the instruction walked pops, the deepest first
+# code:     the code walked
+# timed:    whether each row's latency is asked, false for a set whose timing is not guaranteed
+# ctx:      the context it runs under
+# file:     the set's register file, NO_FILE for a set that names no register
+# words:    the words a set over the file's rows spans
+# stream:   the set's typed stream hooks, nil for a machine set
+# points:   the state at each instruction start reached, by index into `states`, NO_POINT for none
+# states:   the states
+# work:     the instruction starts whose state changed and are not walked since
+# named:    the rows the operands of the instruction walked name, one bit per row
+# touches:  the memory accesses of the instruction walked
+# shaped:   what the ordered read found of each instruction start of a typed stream, by index into `shapes`, NO_POINT
+#           for none
+# shapes:   what it found
+# counts:   the counts of the shapes' signatures
+# targets:  the blocks the shapes' depths name, by index into `blocks`
+# blocks:   the blocks of a typed stream's code, the function's body first
+# carried:  the values a branch of the instruction walked carries to its label, the deepest first
+# popped:   the values the instruction walked pops, the deepest first
+# overlaps: the rows each row of the file shares storage with
 rec Walk {
-    a:       *A.Allocator;
-    code:    *Code;
-    timed:   bool;
-    ctx:     *state.Context;
-    file:    *register.File;
-    words:   usize;
-    stream:  *stream.Hooks;
-    points:  vector.Vector[u32];
-    states:  vector.Vector[Point];
-    work:    vector.Vector[usize];
-    named:   vector.Vector[u64];
-    touches: vector.Vector[Touch];
-    shaped:  vector.Vector[u32];
-    shapes:  vector.Vector[Shape];
-    counts:  vector.Vector[u32];
-    targets: vector.Vector[u32];
-    blocks:  vector.Vector[Block];
-    carried: vector.Vector[bool];
-    popped:  vector.Vector[bool];
+    a:        *A.Allocator;
+    code:     *Code;
+    timed:    bool;
+    ctx:      *state.Context;
+    file:     *register.File;
+    words:    usize;
+    stream:   *stream.Hooks;
+    points:   vector.Vector[u32];
+    states:   vector.Vector[Point];
+    work:     vector.Vector[usize];
+    named:    vector.Vector[u64];
+    touches:  vector.Vector[Touch];
+    shaped:   vector.Vector[u32];
+    shapes:   vector.Vector[Shape];
+    counts:   vector.Vector[u32];
+    targets:  vector.Vector[u32];
+    blocks:   vector.Vector[Block];
+    carried:  vector.Vector[bool];
+    popped:   vector.Vector[bool];
+    overlaps: register.Overlaps;
 }
 
 val NO_POINT:  u32   = 0xFFFF_FFFF;
@@ -1115,19 +1126,29 @@ fun push_count(w: *Walk, s: *Shape, sig: *effect.Signature) usize {
     ret n;
 }
 
-# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, a write leaving part
-# of a register's old value keeping that part's, and its stores hold the extent they write. a call, whose callee the
-# walk does not read, leaves every register and every address secret when anything is
+# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, in every row overlapping
+# a register written, a row the write leaves part of keeping that part's old secret, and its stores hold the extent
+# they write. a call, whose callee the walk does not read, leaves every register and every address secret when
+# anything is
 fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Footprint, value: bool) err[A.Error] {
     val version: u64 = at::u64 * 2 + 1;
     var i:       u32 = 0;
     for (i < w.file.register_count) {
-        if (bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i)) {
-            val row: *register.Register = ?w.file.registers[i];
-            if ((row.flags & register.ZERO) == 0) {
-                if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, i, value); }
-                or (value)                                    { set_bit(p.taint.data, i, true); }
-                p.versions.data[i] = version;
+        val written: bool = bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i);
+        # a write through a register reading zero is discarded
+        if (written && (w.file.registers[i].flags & register.ZERO) == 0) {
+            val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, i);
+            if (sel span.err) { ret err[A.Error].err{span.err}; }
+            var k: u32 = 0;
+            for (k < span.ok.count) {
+                val o:   u32                = w.overlaps.rows.data[span.ok.first + k];
+                val row: *register.Register = ?w.file.registers[o];
+                if ((row.flags & register.ZERO) == 0) {
+                    if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, o, value); }
+                    or (value)                                    { set_bit(p.taint.data, o, true); }
+                    p.versions.data[o] = version;
+                }
+                k = k + 1;
             }
         }
         i = i + 1;
@@ -1342,7 +1363,8 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     ret successors(w, ?p, at, ?ins, ?c, shape);
 }
 
-# the entry state the seeds make, refused naming a register the file has no row of or an entry the stream does not hold
+# the entry state the seeds make, a register's secret in every row overlapping it but one reading zero, refused naming
+# a register the file has no row of or an entry the stream does not hold
 fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
     var i: u32 = 0;
     for (i < secrets.len) {
@@ -1350,7 +1372,14 @@ fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
         if (sel s.register) {
             val row: opt[u32] = row_index(w, s.register);
             if (sel row.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
-            set_bit(p.taint.data, row.some, true);
+            val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, row.some);
+            if (sel span.err) { ret failed[opt[Verdict]](span.err); }
+            var k: u32 = 0;
+            for (k < span.ok.count) {
+                val o: u32 = w.overlaps.rows.data[span.ok.first + k];
+                if ((w.file.registers[o].flags & register.ZERO) == 0) { set_bit(p.taint.data, o, true); }
+                k = k + 1;
+            }
         }
         if (sel s.memory) {
             var h: Held = Held{base: effect.NO_ROW, version: ENTRY, offset: s.memory.offset, length: s.memory.length};
@@ -1578,6 +1607,7 @@ fun release(w: *Walk) {
     vector.dnit[Block](?w.blocks);
     vector.dnit[bool](?w.carried);
     vector.dnit[bool](?w.popped);
+    register.release_overlaps(?w.overlaps);
 }
 
 fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
@@ -1643,26 +1673,29 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
     if (code.set.codec.stream != nil && sel answer.held) { ret res[Verdict, A.Error].ok{Verdict.unread{Unread{message: TIMED, offset: 0}}}; }
     var file: *register.File = code.set.codec.registers;
     if (file == nil) { file = ?NO_FILE; }
+    val overlaps: res[register.Overlaps, A.Error] = register.overlaps_of(a, file);
+    if (sel overlaps.err) { ret failed[Verdict](overlaps.err); }
     var w: Walk = Walk{
-        a:       a,
-        code:    code,
-        timed:   sel answer.held,
-        ctx:     ctx,
-        file:    file,
-        words:   effect.words(file)::usize,
-        stream:  code.set.codec.stream,
-        points:  vector.init[u32](a),
-        states:  vector.init[Point](a),
-        work:    vector.init[usize](a),
-        named:   vector.init[u64](a),
-        touches: vector.init[Touch](a),
-        shaped:  vector.init[u32](a),
-        shapes:  vector.init[Shape](a),
-        counts:  vector.init[u32](a),
-        targets: vector.init[u32](a),
-        blocks:  vector.init[Block](a),
-        carried: vector.init[bool](a),
-        popped:  vector.init[bool](a),
+        a:        a,
+        code:     code,
+        timed:    sel answer.held,
+        ctx:      ctx,
+        file:     file,
+        words:    effect.words(file)::usize,
+        stream:   code.set.codec.stream,
+        points:   vector.init[u32](a),
+        states:   vector.init[Point](a),
+        work:     vector.init[usize](a),
+        named:    vector.init[u64](a),
+        touches:  vector.init[Touch](a),
+        shaped:   vector.init[u32](a),
+        shapes:   vector.init[Shape](a),
+        counts:   vector.init[u32](a),
+        targets:  vector.init[u32](a),
+        blocks:   vector.init[Block](a),
+        carried:  vector.init[bool](a),
+        popped:   vector.init[bool](a),
+        overlaps: overlaps.ok,
     };
     val verdict: res[Verdict, A.Error] = walked(?w, secrets);
     release(?w);
