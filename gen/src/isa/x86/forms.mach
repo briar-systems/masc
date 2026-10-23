@@ -45,6 +45,7 @@ use A: std.allocator;
 use std.collections.map;
 use std.collections.vector;
 
+use masc.core.field;
 use masc.core.operand;
 
 use gen.diag;
@@ -348,17 +349,36 @@ pub rec Operand {
     address:   bool;
 }
 
-# a register no operand names that the instruction reads or writes
+# what an implied names
 # ---
-# register: the row, nil for the stack: STACKPUSH and STACKPOP
+# HELD:   a register
+# STACK:  the stack, STACKPUSH or STACKPOP
+# ACCESS: memory no operand names, at a fixed register or at the register an operand holds, as leave's load at rbp
+#         and movdir64b's store at its register operand
+pub def Implies: u8;
+
+pub val HELD:   Implies = 0;
+pub val STACK:  Implies = 1;
+pub val ACCESS: Implies = 2;
+
+# a register, the stack or memory no operand names that the instruction reads or writes
+# ---
+# what:     which of them
+# register: the register, or the fixed register an access is at, nil for the stack and for an access an operand's
+#           register holds the address of
 # role:     how the instruction uses it
-# width:    for the stack, the bits it pushes or pops
+# width:    for the stack, the bits it pushes or pops, and for an access the bits it covers
 # push:     for the stack, whether it pushes
+# operand:  for an access, the operand whose register holds the address, field.NO_OPERAND when a fixed register does
+# governor: for an access, the operand whose value decides which bytes it writes, field.NO_OPERAND when none
 pub rec Implied {
+    what:     Implies;
     register: *Named;
     role:     operand.Role;
     width:    u16;
     push:     bool;
+    operand:  u8;
+    governor: u8;
 }
 
 # a pattern evaluated under one configuration
@@ -1086,23 +1106,93 @@ fun seg_of(ins: *xed.instruction.Instruction, which: u8) *xed.operand.Operand {
     ret nil;
 }
 
+# the register `register` no operand names, used as `role` says
+fun held(register: *Named, role: operand.Role) Implied {
+    ret Implied{what: HELD, register: register, role: role, width: 0, push: false, operand: field.NO_OPERAND, governor: field.NO_OPERAND};
+}
+
+# the stack, pushed of `width` bits when `push` and popped otherwise
+fun stack(role: operand.Role, width: u16, push: bool) Implied {
+    ret Implied{what: STACK, register: nil, role: role, width: width, push: push, operand: field.NO_OPERAND, governor: field.NO_OPERAND};
+}
+
+# whether `ins` forms an address with an index register no operand names, as xlat's rbx plus al
+fun indexed(ins: *xed.instruction.Instruction) bool {
+    var i: usize = 0;
+    for (i < ins.operands.len) {
+        if (str_equals(ins.operands.data[i].name, "INDEX")) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the access of suppressed memory operand `op` of `ins` under `s`, into `f`, `at` holding the operand each of XED's
+# is in `f`. the access is at its base's fixed register, which the instruction reads and an advancing one writes, as
+# leave's load at rbp and xstore's store at rdi, or at the register an operand holds when that operand names the
+# base, as movdir64b's store. a masking row's access is governed by its last register operand, the byte mask (Intel
+# SDM 325462-093US Vol 2B MASKMOVDQU, MASKMOVQ). an address an index register forms too, as xlat's, is one no access
+# states, so the row states none
+fun access(r: *Reader, ins: *xed.instruction.Instruction, op: *xed.operand.Operand, s: *State, f: *Form, at: *vector.Vector[u8]) err[diag.Refusal] {
+    if (indexed(ins)) { ret err[diag.Refusal].ok{}; }
+    val base: *xed.operand.Operand = base_of(ins, (op.name[3] - '0')::u8);
+    if (base == nil || base.form != xed.operand.NONTERMINAL) { ret refuse(?ins.line, OPERAND, op.name); }
+    val w: res[u16, diag.Refusal] = width_bits(r, ins, op, f);
+    if (sel w.err) { ret err[diag.Refusal].err{w.err}; }
+    var m:   Implied           = Implied{what: ACCESS, register: nil, role: role_of(op.action), width: w.ok, push: false, operand: field.NO_OPERAND, governor: field.NO_OPERAND};
+    var b:   Operand           = blank();
+    val got: err[diag.Refusal] = register_nt(r, base.value, s, ?b, ?ins.line);
+    if (sel got.err) { ret got; }
+    if (b.place == FIXED) {
+        val n:   opt[*Named] = named_or_enclosing(r, b.fixed.name);
+        var row: *Named      = b.fixed;
+        if (sel n.some) { row = at_width(r, n.some, f); }
+        # an access of the stack segment no operand names is at the stack's address size, the width's own whatever an
+        # override, as leave's load at rbp (Intel SDM 325462-093US Vol 1 6.2.3, Vol 2A LEAVE), which XED's ArBP states
+        # at the override's
+        val seg: *xed.operand.Operand = seg_of(ins, (op.name[3] - '0')::u8);
+        if (seg != nil && str_starts_with(seg.value, "FINAL_SSEG")) {
+            val sized: res[*Named, diag.Refusal] = address_register(r, f.config.mode, 0, row.number);
+            if (sel sized.err) { ret err[diag.Refusal].err{sized.err}; }
+            row = sized.ok;
+        }
+        m.register = row;
+        if (!pushed(vector.push[Implied](?f.implied, held(row, role_of(base.action))))) { ret err[diag.Refusal].err{memory(op.name)}; }
+    }
+    or {
+        var i: usize = 0;
+        for (i < ins.operands.len && m.operand == field.NO_OPERAND) {
+            val o: *xed.operand.Operand = ?ins.operands.data[i];
+            if (o != base && o.form == xed.operand.NONTERMINAL && str_equals(o.value, base.value)) { m.operand = at.data[i]; }
+            i = i + 1;
+        }
+        if (m.operand == field.NO_OPERAND) { ret refuse(?ins.line, OPERAND, base.value); }
+    }
+    if (attributed(ins, "MASKOP")) {
+        var k: usize = 0;
+        for (k < f.operands.len) {
+            if (f.operands.data[k].what == REGISTER) { m.governor = k::u8; }
+            k = k + 1;
+        }
+    }
+    if (!pushed(vector.push[Implied](?f.implied, m))) { ret err[diag.Refusal].err{memory(op.name)}; }
+    ret err[diag.Refusal].ok{};
+}
+
 # a register or the stack no operand names, from operand `op` of `ins` under `s`, into `f`
 fun implied(r: *Reader, ins: *xed.instruction.Instruction, op: *xed.operand.Operand, s: *State, f: *Form) err[diag.Refusal] {
     # the segment, base, index and scale of a memory operand are its own parts
     if (str_starts_with(op.name, "SEG") || str_starts_with(op.name, "BASE") || str_equals(op.name, "INDEX") || str_equals(op.name, "SCALE")) { ret err[diag.Refusal].ok{}; }
-    # a suppressed memory operand no instruction of a string's names is an access its effect states, as xlat's
-    if (str_starts_with(op.name, "MEM")) { ret err[diag.Refusal].ok{}; }
     val role: operand.Role = role_of(op.action);
     if (op.form == xed.operand.REGISTER) {
         if (str_equals(op.value, "STACKPUSH") || str_equals(op.value, "STACKPOP")) {
             val w: res[u16, diag.Refusal] = width_bits(r, ins, op, f);
-            if (sel w.err)                                                                                                                           { ret err[diag.Refusal].err{w.err}; }
-            if (!pushed(vector.push[Implied](?f.implied, Implied{register: nil, role: role, width: w.ok, push: str_equals(op.value, "STACKPUSH")}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+            if (sel w.err)                                                                                       { ret err[diag.Refusal].err{w.err}; }
+            if (!pushed(vector.push[Implied](?f.implied, stack(role, w.ok, str_equals(op.value, "STACKPUSH"))))) { ret err[diag.Refusal].err{memory(op.name)}; }
             ret err[diag.Refusal].ok{};
         }
         val n: opt[*Named] = named_or_enclosing(r, op.value);
-        if (sel n.none)                                                                                                              { ret refuse(?ins.line, NO_NAMED, op.value); }
-        if (!pushed(vector.push[Implied](?f.implied, Implied{register: at_width(r, n.some, f), role: role, width: 0, push: false}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+        if (sel n.none)                                                                    { ret refuse(?ins.line, NO_NAMED, op.value); }
+        if (!pushed(vector.push[Implied](?f.implied, held(at_width(r, n.some, f), role)))) { ret err[diag.Refusal].err{memory(op.name)}; }
         ret err[diag.Refusal].ok{};
     }
     if (op.form == xed.operand.NONTERMINAL) {
@@ -1112,8 +1202,8 @@ fun implied(r: *Reader, ins: *xed.instruction.Instruction, op: *xed.operand.Oper
         if (o.place != FIXED) { ret refuse(?ins.line, OPERAND, op.name); }
         val n:   opt[*Named] = named_or_enclosing(r, o.fixed.name);
         var row: *Named      = o.fixed;
-        if (sel n.some)                                                                                           { row = at_width(r, n.some, f); }
-        if (!pushed(vector.push[Implied](?f.implied, Implied{register: row, role: role, width: 0, push: false}))) { ret err[diag.Refusal].err{memory(op.name)}; }
+        if (sel n.some)                                                 { row = at_width(r, n.some, f); }
+        if (!pushed(vector.push[Implied](?f.implied, held(row, role)))) { ret err[diag.Refusal].err{memory(op.name)}; }
         ret err[diag.Refusal].ok{};
     }
     # a flag XED states of the operation, as vbroadcastss's broadcast, which no operand is
@@ -1173,10 +1263,23 @@ fun operands_of(r: *Reader, ins: *xed.instruction.Instruction, s: *State, fx: *E
         val pd: err[diag.Refusal] = push_operand(f, d, ins.iclass);
         if (sel pd.err) { ret pd; }
     }
-    var i: usize = 0;
+    var at:    vector.Vector[u8]    = vector.init[u8](r.alloc);
+    var later: vector.Vector[usize] = vector.init[usize](r.alloc);
+    var i:     usize                = 0;
+    for (i < ins.operands.len) {
+        if (!pushed(vector.push[u8](?at, field.NO_OPERAND))) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
+        i = i + 1;
+    }
+    i = 0;
     for (i < ins.operands.len) {
         val op:         *xed.operand.Operand = ?ins.operands.data[i];
         val suppressed: bool                 = str_equals(op.visibility, "SUPP") || str_equals(op.visibility, "ECOND");
+        # an access no operand names follows every operand, which its address and mask may be
+        if (suppressed && !shown(ins, op) && str_starts_with(op.name, "MEM")) {
+            if (!pushed(vector.push[usize](?later, i))) { ret err[diag.Refusal].err{memory(op.name)}; }
+            i = i + 1;
+            cnt;
+        }
         if (suppressed && !shown(ins, op)) {
             val done: err[diag.Refusal] = implied(r, ins, op, s, f);
             if (sel done.err) { ret done; }
@@ -1278,6 +1381,7 @@ fun operands_of(r: *Reader, ins: *xed.instruction.Instruction, s: *State, fx: *E
             rc.what = ROUNDING;
             rc.sae  = has_conversion(op, "SAESTR");
         }
+        at.data[i] = f.operands.len::u8;
         val pushed_o: err[diag.Refusal] = push_operand(f, o, op.name);
         if (sel pushed_o.err) { ret pushed_o; }
         # evex's `{z}` follows the opmask it applies under
@@ -1292,6 +1396,12 @@ fun operands_of(r: *Reader, ins: *xed.instruction.Instruction, s: *State, fx: *E
     if (rounds) {
         val pr: err[diag.Refusal] = push_operand(f, rc, ins.iclass);
         if (sel pr.err) { ret pr; }
+    }
+    i = 0;
+    for (i < later.len) {
+        val done: err[diag.Refusal] = access(r, ins, ?ins.operands.data[later.data[i]], s, f, ?at);
+        if (sel done.err) { ret done; }
+        i = i + 1;
     }
     ret err[diag.Refusal].ok{};
 }
@@ -1539,6 +1649,12 @@ pub val NO_ADDRESS: str = "ASZ_NONTERM gives the code width no address size, or 
 # the general register class of the address size code of mode `mode` takes with an address-size override (`asz` 1) or
 # without, as XED's ASZ_NONTERM gives it: the class of the first general register XED states of that width
 pub fun address_class(r: *Reader, mode: u8, asz: u8) res[*Named, diag.Refusal] {
+    ret address_register(r, mode, asz, 0);
+}
+
+# the general register numbered `number` of the address size code of mode `mode` takes with an address-size override
+# (`asz` 1) or without, as XED's ASZ_NONTERM gives it
+pub fun address_register(r: *Reader, mode: u8, asz: u8, number: u32) res[*Named, diag.Refusal] {
     var facts: vector.Vector[Fact] = vector.init[Fact](r.alloc);
     var s:     State               = State{known: map.init[str, u64](r.alloc), facts: ?facts};
     if (!know(?s, "MODE", mode::u64) || !know(?s, "ASZ", asz::u64)) { ret res[*Named, diag.Refusal].err{memory(ASZ)}; }
@@ -1553,7 +1669,7 @@ pub fun address_class(r: *Reader, mode: u8, asz: u8) res[*Named, diag.Refusal] {
     var i:    usize                              = 0;
     for (i < regs.len) {
         val x: *xed.table.Register = ?regs.data[i];
-        if (str_equals(x.class, "gpr") && x.width == bits && x.ordinal == 0 && !x.high) {
+        if (str_equals(x.class, "gpr") && x.width == bits && x.ordinal == number && !x.high) {
             val n: opt[*Named] = named(r, x.name);
             if (sel n.some) { ret res[*Named, diag.Refusal].ok{n.some}; }
         }
