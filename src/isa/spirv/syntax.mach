@@ -8,11 +8,14 @@
 # within, an integer in decimal, after 0x or after a leading 0 in octal, and a float in decimal or as a hex float with
 # its `p` exponent, with no expressions, so `7 %5` is two operands. mnemonics and names read with their case.
 #
-# a float literal is rounded once to its type's ieee 754 format by `masc.asm.model.float_bits`, the one rounding every
-# float text of masc takes, a typed one's format the one its OpTypeFloat states and a LiteralFloat immediate binary32.
-# infinity and nan are spelled only as hex floats whose exponent is one past the format's largest, its field all
-# ones and the fraction the hex digits', so a decimal that rounds past the largest finite value is refused, as are
-# `inf` and `nan`. floats print a zero or a normal binary32 or binary64 by `%.9g` and `%.17g` of `std.format`, which
+# a float literal is rounded once to its type's encoding by `masc.asm.model.float_bits`, the one rounding every float
+# text of masc takes, a typed one's encoding the one its OpTypeFloat states, bfloat16 and ocp float8 e4m3 and e5m2 by
+# its FPEncoding, and a LiteralFloat immediate binary32. infinity and nan are spelled only as hex floats whose exponent
+# is one past the format's largest, its field all ones and the fraction the hex digits', so a decimal that rounds past
+# the largest finite value is refused, as are `inf` and `nan`. e4m3, which has no infinity, holds finite values at its
+# field of all ones, and a value that rounds past its largest finite one, a hex float past it included, is its one
+# nan, as ocp float8 rounds an overflow, which prints as a hex float one past the largest exponent of e4m3 widened
+# by an exponent bit. floats print a zero or a normal binary32 or binary64 by `%.9g` and `%.17g` of `std.format`, which
 # read back to their bits, and every other, binary16 always, as a hex float, a subnormal normalized and the fraction's
 # trailing zero digits left out.
 #
@@ -56,7 +59,7 @@ pub val UNCLOSED:   str = "string not closed";
 pub val NO_STRING:  str = "expected a string between double quotes";
 pub val TYPED:      str = "a literal of no type, which spir-v spells only as a string or by its type";
 pub val UNTYPED:    str = "a typed literal whose type is no scalar type the stream holds";
-pub val UNROUNDED:  str = "a float literal of a type of no ieee 754 binary16, binary32 or binary64 format";
+pub val UNROUNDED:  str = "a float literal of a type of no encoding masc rounds to: binary16, binary32, binary64, bfloat16, or float8 e4m3 or e5m2";
 pub val OVERFLOWED: str = "a decimal float past its type's largest finite value, which spir-v spells only as a hex float";
 pub val WIDE:       str = "a typed literal wider than 64 bits";
 pub val NEGATIVE:   str = "a negative number in an unsigned literal";
@@ -272,7 +275,7 @@ fun integer_parse(r: *core_syntax.Reader, t: spirv_stream.Scalar, out: *operand.
 # float with its `p` exponent as `masc.asm.model.float_literal` reads one, rounded once by `masc.asm.model.float_bits`.
 # a hex float whose exponent is one past the format's largest finite one is the field of all ones, an infinity or a nan
 # with the hex digits' fraction, and a decimal that rounds to infinity is refused
-fun float_read(r: *core_syntax.Reader, f: opt[ieee.Format], out: *u64) err[diagnostic.Diagnostic] {
+fun float_read(r: *core_syntax.Reader, f: opt[model.Encoding], out: *u64) err[diagnostic.Diagnostic] {
     val at:  usize = r.at;
     val len: usize = read.token(r, at);
     if (sel f.none) { ret err[diagnostic.Diagnostic].err{read.refuse(r, UNROUNDED, at, len)}; }
@@ -282,7 +285,15 @@ fun float_read(r: *core_syntax.Reader, f: opt[ieee.Format], out: *u64) err[diagn
     if (sel got.some.form.infinity || sel got.some.form.nan)           { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
     if (got.some.text.len != end - at)                                 { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
     if (end < r.end && (read.word(r.text[end]) || r.text[end] == '.')) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.MALFORMED, at, len)}; }
-    val fmt:  ieee.Format                  = f.some;
+    if (f.some.specials != model.IEEE) {
+        # an encoding of no infinity rounds a value past its largest as its specials state
+        val coded: res[u128, number.ParseError] = model.encoded_bits(got.some, f.some);
+        if (sel coded.err) { ret err[diagnostic.Diagnostic].err{read.refuse(r, OVERFLOWED, at, len)}; }
+        @out = coded.ok::u64;
+        r.at = end;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val fmt:  ieee.Format                  = f.some.format;
     var bits: res[u128, number.ParseError] = model.float_bits(got.some, fmt);
     if (sel got.some.form.hex) {
         # the format one exponent bit wider holds the binade past the largest exactly where the narrow one holds its own
@@ -444,9 +455,11 @@ fun hex_print(w: *core_syntax.Writer, f: ieee.Format, bits: u64) err[field.Refus
 
 # the float of bits `bits` in format `f` as written: a zero or a normal to its format's precision by
 # `std.format.write_float_g`, every other as a hex float
-fun float_print(w: *core_syntax.Writer, f: opt[ieee.Format], bits: u64) err[field.Refusal] {
+fun float_print(w: *core_syntax.Writer, f: opt[model.Encoding], pattern: u64) err[field.Refusal] {
     if (sel f.none) { ret write.refuse(w, UNROUNDED, field.NO_OPERAND); }
-    val fmt:       ieee.Format = f.some;
+    val as:        model.Read  = model.as_ieee(f.some, pattern::u128);
+    val fmt:       ieee.Format = as.format;
+    val bits:      u64         = as.bits::u64;
     val p:         ieee.Fields = ieee.fields(fmt, bits::u128);
     val precision: opt[usize]  = precision_of(fmt);
     if (sel precision.none)                                                  { ret hex_print(w, fmt, bits); }
@@ -496,11 +509,11 @@ val LITERAL: core_syntax.Hook = core_syntax.Hook{parse: literal_parse, print: li
 fun scalar_of(imm: *operand.Immediate) spirv_stream.Scalar {
     var class: spirv_stream.Class = spirv_stream.INTEGER;
     if (imm.sign == operand.SIGNED) { class = spirv_stream.SIGNED; }
-    ret spirv_stream.Scalar{bits: imm.bits::u32, class: class};
+    ret spirv_stream.Scalar{bits: imm.bits::u32, class: class, format: opt[model.Encoding].none{}};
 }
 
 # the ieee 754 format a float immediate of `bits` bits is, a LiteralFloat's binary32
-fun immediate_format(bits: u8) opt[ieee.Format] {
+fun immediate_format(bits: u8) opt[model.Encoding] {
     var none: operand.Value = operand.Value.none{};
     ret spirv_stream.float_format(bits::u32, ?none);
 }
