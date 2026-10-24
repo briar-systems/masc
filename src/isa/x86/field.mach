@@ -136,6 +136,7 @@ pub val ROUNDING_MEMORY: str = "embedded rounding on a memory form, where evex.b
 pub val BROADCAST_SPACE: str = "broadcast on a row of no evex encoding or no element";
 pub val NO_INDEX:        str = "vector-indexed address with no index";
 pub val STRING_SIZE:     str = "string memory of another address size than the row's";
+pub val UNPLACED:        str = "specifier names a relocation the address cannot take";
 
 # the longest instruction
 pub val MAX_LENGTH: usize = 15;
@@ -555,6 +556,11 @@ fun sib_of(scale: u64, x: i64, low: u8) u8 {
     ret ((scale::u8 & 3) << 6) | ((x::u8 & 7) << 3) | low;
 }
 
+# whether `p` holds a symbol whose stated kind is the tlsdesc call's marker, with no addend
+fun marked(p: *field.Parts) bool {
+    ret p.symbolic && p.symbol.fixup == x86_fixup.TLSCALL && p.symbol.addend == 0;
+}
+
 # the layout of memory operand `m` of row `op` holding `p` at address size `size` in code of width `w` under form `f`, a
 # disp8 scaled by 2^`scale`. a vector index and a row whose memory is SIB's (SIBMEM) take a SIB byte, which 16-bit
 # addressing has none of
@@ -609,8 +615,11 @@ pub fun layout(w: u8, size: u8, op: *Opcode, m: *operand.Memory, p: *field.Parts
     }
     l.base = true;
     val low: u8 = b::u8 & 7;
+    # a tlsdesc call's marker is no displacement where the base alone addresses, as llvm-mc 23.1.1 writes
+    # `call [rax + x@TLSCALL]` as ff 10 and its relocation at the instruction's start
+    val marks: bool = marked(p) && !listed && low != 4 && low != 5 && !sib_form;
     # rbp and r13 have no form of no displacement, which rm 101 is, and take a zero disp8
-    l.disp = disp_width(d, p.symbolic, low != 5, f, 4, scale);
+    l.disp = disp_width(d, p.symbolic && !marks, low != 5, f, 4, scale);
     l.mod  = mod_of(l.disp);
     if (l.disp == 1) { l.value = d >> scale::i64; }
     if (listed || low == 4 || sib_form) {
@@ -1568,20 +1577,70 @@ fun reg_bits(enc: *field.Encoder, op: *Opcode) u64 {
     ret enc.parts[op.reg].bits[field.NUMBER] & 7;
 }
 
-# the fixup kind a symbolic displacement takes when its symbol states none: pc-relative for a rip-relative address,
-# else absolute at the address size, a 32-bit one sign-extended in 64-bit code, under 32-bit addressing too, as llvm-mc
-# 23.1.1 writes R_X86_64_32S for `[ebx + ext]`
-fun disp_fixup(p: *field.Parts, w: u8, size: u8) {
-    if (p.symbol.fixup != operand.NO_FIXUP) { ret; }
-    if (p.bits[field.MODE] == operand.RELATIVE_PC::u64) {
-        p.fixup = x86_fixup.PC32;
-        ret;
+# the fixup kind a symbolic displacement of row `op` takes, at address size `size` in code of width `w`. a symbol
+# that states none takes pc-relative for a rip-relative address, else absolute at the address size, a 32-bit one
+# sign-extended in 64-bit code, under 32-bit addressing too, as llvm-mc 23.1.1 writes R_X86_64_32S for `[ebx + ext]`.
+# one a specifier states takes its placement's kind for the address (`x86_fixup.PLACEMENTS`), refined by the
+# instruction (refined), and is refused where the address takes no such relocation or holds no 32-bit displacement
+fun disp_fixup(enc: *field.Encoder, op: *Opcode, p: *field.Parts, w: u8, size: u8) err[field.Refusal] {
+    val pc: bool = p.bits[field.MODE] == operand.RELATIVE_PC::u64;
+    if (p.symbol.fixup != operand.NO_FIXUP) {
+        val placed: opt[*x86_fixup.Placement] = x86_fixup.placement(p.symbol.fixup);
+        if (sel placed.none) { ret err[field.Refusal].ok{}; }
+        var kind: operand.FixupKind = placed.some.absolute;
+        if (pc) { kind = placed.some.relative; }
+        if (kind == operand.NO_FIXUP || size == 16) { ret field_refused(UNPLACED, op.rm); }
+        val chosen: res[operand.FixupKind, field.Refusal] = refined(enc, op, p, w, kind);
+        if (sel chosen.err) { ret err[field.Refusal].err{chosen.err}; }
+        p.fixup = chosen.ok;
+        ret err[field.Refusal].ok{};
     }
-    if (size == 16) {
-        p.fixup = x86_fixup.ABS16;
-        ret;
+    if (pc) { p.fixup = x86_fixup.PC32; }
+    or (size == 16) { p.fixup = x86_fixup.ABS16; }
+    or { p.fixup = x86_fixup.absolute(32, w == 64); }
+    ret err[field.Refusal].ok{};
+}
+
+# whether row `op` is one whose `@GOTPCREL` load llvm-mc 23.1.1 marks relaxable (X86MCCodeEmitter): a 32-bit or 64-bit
+# mov, test, adc, add, and, cmp, or, sbb, sub or xor reading memory, a 64-bit lea, or an indirect call or jump
+fun relaxable(op: *Opcode) bool {
+    if (op.space != LEGACY || op.map != 0) { ret false; }
+    val b:    u8   = op.byte;
+    val wide: bool = op.size == O32 || op.size == O64;
+    if (b == 0x8B || b == 0x85 || b == 0x03 || b == 0x13 || b == 0x23 || b == 0x3B || b == 0x0B || b == 0x1B || b == 0x2B || b == 0x33) { ret wide; }
+    if (b == 0x8D) { ret op.size == O64; }
+    ret b == 0xFF && (op.digit == 2 || op.digit == 4) && op.size != O16;
+}
+
+# the kind placed kind `kind` of a displacement `p` of row `op` is written as, by the instruction the encoder wrote
+# so far, as llvm-mc 23.1.1 writes it: `@GOTPCREL` with no addend in a relaxable row as R_X86_64_CODE_4_GOTPCRELX under
+# rex2, REX_GOTPCRELX under rex and GOTPCRELX under neither, `@GOTTPOFF` as its CODE_4 form under rex2 and its CODE_6
+# form in apx's evex add of a new destination or no flags, `@TLSDESC` as its CODE_4 form in a lea under rex2, and
+# i386's `@GOT` as R_386_GOT32X in a 32-bit mov from a base register alone
+fun refined(enc: *field.Encoder, op: *Opcode, p: *field.Parts, w: u8, kind: operand.FixupKind) res[operand.FixupKind, field.Refusal] {
+    if (kind == x86_fixup.GOT) {
+        val alone: bool = field.has(p, field.NUMBER) && !field.has(p, field.INDEX);
+        if (w != 64 && alone && op.space == LEGACY && op.map == 0 && op.byte == 0x8B && op.size == O32) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.GOT32X}; }
+        ret res[operand.FixupKind, field.Refusal].ok{kind};
     }
-    p.fixup = x86_fixup.absolute(32, w == 64);
+    if (kind != x86_fixup.GOTPCREL && kind != x86_fixup.GOTTPOFF && kind != x86_fixup.TLSDESC) { ret res[operand.FixupKind, field.Refusal].ok{kind}; }
+    var s:   field.Stream                = field.Stream{data: enc.out.data, len: enc.out.len, order: field.LITTLE};
+    val got: res[Prefixes, field.Refusal] = scan(?s, enc.start, w);
+    if (sel got.err) { ret res[operand.FixupKind, field.Refusal].err{got.err}; }
+    val pre: Prefixes = got.ok;
+    if (kind == x86_fixup.GOTPCREL) {
+        if (p.symbol.addend != 0 || !relaxable(op)) { ret res[operand.FixupKind, field.Refusal].ok{kind}; }
+        if (pre.rex2)                              { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTPCRELX}; }
+        if (pre.rex)                               { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.REX_GOTPCRELX}; }
+        ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.GOTPCRELX};
+    }
+    if (kind == x86_fixup.GOTTPOFF) {
+        if (pre.rex2) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTTPOFF}; }
+        if (op.space == EVEX && op.map == x86_opcode.APX_MAP && op.byte == 0x03 && (op.flags & (ND | NF)) != 0) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_6_GOTTPOFF}; }
+        ret res[operand.FixupKind, field.Refusal].ok{kind};
+    }
+    if (pre.rex2 && op.space == LEGACY && op.map == 0 && op.byte == 0x8D) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_TLSDESC}; }
+    ret res[operand.FixupKind, field.Refusal].ok{kind};
 }
 
 # the displacement of the memory value of operand `op` held to the address size's range
@@ -1635,12 +1694,16 @@ fun modrm_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
         val sib: err[field.Refusal] = field.put(enc, l.scale::u64, 1);
         if (sel sib.err) { ret sib; }
     }
-    if (l.disp == 0) { ret err[field.Refusal].ok{}; }
     if (p.symbolic) {
-        disp_fixup(p, w, size.ok);
-        val noted: err[field.Refusal] = field.fixup(enc, op.rm, enc.out.len - enc.start);
+        val placed: err[field.Refusal] = disp_fixup(enc, op, p, w, size.ok);
+        if (sel placed.err) { ret placed; }
+        # a marker of no displacement is relocated at the instruction's start
+        var at: usize = enc.out.len - enc.start;
+        if (l.disp == 0) { at = 0; }
+        val noted: err[field.Refusal] = field.fixup(enc, op.rm, at);
         if (sel noted.err) { ret noted; }
     }
+    if (l.disp == 0) { ret err[field.Refusal].ok{}; }
     ret field.put(enc, l.value:~u64 & field.ones(l.disp * 8), l.disp);
 }
 
@@ -1832,6 +1895,10 @@ fun moffs_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     if (registered(p) || p.bits[field.MODE] != operand.OFFSET::u64) { ret field_refused(field.FORM, f.operand); }
     val size: u8             = moffs_size(opcode_of(f), width(enc.ctx), @enc.form);
     val v:    *operand.Value = ?enc.values[f.operand];
+    if (p.symbolic) {
+        val kind: res[operand.FixupKind, field.Refusal] = moffs_fixup(p, size, f.operand);
+        if (sel kind.err) { ret err[field.Refusal].err{kind.err}; }
+    }
     if (size == 64)    { ret err[field.Refusal].ok{}; }
     if (!sel v.memory) { ret err[field.Refusal].ok{}; }
     val d:    i64 = v.memory.disp;
@@ -1840,12 +1907,27 @@ fun moffs_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     ret err[field.Refusal].ok{};
 }
 
+# the fixup kind the symbolic absolute address `p` of an a0 to a3 move of `size` bits takes: absolute at the size
+# when its symbol states none, else its placement's kind at a 32-bit or 64-bit address
+fun moffs_fixup(p: *field.Parts, size: u8, k: u8) res[operand.FixupKind, field.Refusal] {
+    if (p.symbol.fixup == operand.NO_FIXUP) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.absolute(size, false)}; }
+    val placed: opt[*x86_fixup.Placement] = x86_fixup.placement(p.symbol.fixup);
+    if (sel placed.none) { ret res[operand.FixupKind, field.Refusal].ok{p.symbol.fixup}; }
+    var kind: operand.FixupKind = operand.NO_FIXUP;
+    if (size == 32) { kind = placed.some.absolute; }
+    if (size == 64) { kind = placed.some.wide; }
+    if (kind == operand.NO_FIXUP) { ret res[operand.FixupKind, field.Refusal].err{field.refusal(UNPLACED, k, 0)}; }
+    ret res[operand.FixupKind, field.Refusal].ok{kind};
+}
+
 fun moffs_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
     val p:     *field.Parts = ?enc.parts[f.operand];
     val size:  u8           = moffs_size(opcode_of(f), width(enc.ctx), @enc.form);
     val bytes: u8           = size / 8;
     if (p.symbolic) {
-        if (p.symbol.fixup == operand.NO_FIXUP) { p.fixup = x86_fixup.absolute(size, false); }
+        val kind: res[operand.FixupKind, field.Refusal] = moffs_fixup(p, size, f.operand);
+        if (sel kind.err) { ret err[field.Refusal].err{kind.err}; }
+        p.fixup = kind.ok;
         val noted: err[field.Refusal] = field.fixup(enc, f.operand, enc.out.len - enc.start);
         if (sel noted.err) { ret noted; }
     }
