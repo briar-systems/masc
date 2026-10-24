@@ -50,9 +50,8 @@ mach depend on masc.
 - **Instruction sets.** One module per set, each with its register file, its
   extension catalog and its generated catalog of rows. Adding a set is one
   registration and rows.
-- **Syntax, assembly and disassembly.** Each set's established assembly
-  syntax with the GNU assembler's directives, read into objects and printed
-  back from them.
+- **Syntax, assembly and disassembly.** masc's own assembly dialect for each
+  set, read into objects and printed back from them.
 - **The builder.** The instruction-level API a compiler emits through, one
   instruction at a time, with labels, relaxation, relocations and a listing of
   what was encoded.

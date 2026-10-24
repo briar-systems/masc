@@ -8,4 +8,4 @@ Closes #
 ## Checklist
 - [ ] Linked to an issue
 - [ ] Conventional Commit messages
-- [ ] Build and tests pass
+- [ ] Build passes
