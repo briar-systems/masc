@@ -43,6 +43,22 @@
 # offsets added, so a frame slot stays one extent however the prologue moves
 # sp and fp, and an access provably clear of every secret one is not aliased.
 # one through a register of no known offset falls back to its version.
+# an extent addressed by a symbol is named off the symbol's address, so a
+# global stays one extent wherever its address is formed. the walk reads the
+# address a symbol forms from the sites the caller gives, the fixups its
+# builder left in the code, never from a mnemonic: each site's fixup kind
+# states the part of the address its field holds (`fixup.Part`), and its
+# relocation kind whether it reaches the symbol through its got slot and
+# whether a low part names the instruction of its high part. a register a
+# row's relation forms from a site's operand holds that part, as auipc's
+# pcrel_hi20, adrp's page or x86 lea's rip-relative address, a low part added
+# to a register holding the matching high part completes the address, as
+# addi's pcrel_lo12 naming the auipc or a load's :lo12:, wherever in the code
+# the two are, a copy or an immediate added carries it, and a load of a got
+# slot leaves the symbol's address. paths joining with different addresses
+# leave none, and an address the sites do not place is placed as any other.
+# the caller's symbol handles name objects known apart, and an offset off one
+# stays within its object, as a compiler's code does.
 # a secret stored where the address is not known, or anything secret at a
 # call, whose callee the walk does not read, may be anywhere afterwards,
 # but in the memory the call's model keeps.
@@ -79,12 +95,15 @@
 # callee's return undoes what the call pushes, the registers it writes take
 # the join, and those it states neither are as with no model. with a secret
 # join every byte it does not keep may hold one after it, globals included,
-# and so does every extent it writes. a model of a callee not checked constant
-# time refuses the call when the join is secret, worded `ct.UNCHECKED`. a tail
-# call, a modeled jump, ends its path, its target not followed as no call's is.
-# a model at an offset where no call or tail call the walk reaches starts, or
-# one naming a register the file has no row of, writing one it preserves or
-# reading zero, or preserving no stack pointer, is answered unread.
+# and so does every extent it writes. a secret reaching the callee through an
+# argument register or a read extent the model does not state it accepts, or
+# through memory it does not keep and no accepted read holds, refuses the call,
+# worded `ct.UNCHECKED`, so a callee not checked constant time accepts none.
+# a tail call, a modeled jump, ends its path, its target not followed as no
+# call's is. a model at an offset where no call or tail call the walk reaches
+# starts, or one naming a register the file has no row of, writing one it
+# preserves or reading zero, preserving no stack pointer, or accepting what it
+# does not name read, is answered unread.
 #
 # code of a typed stream passes its values on an operand stack and in the
 # entries of its index spaces, as wasm's locals and globals, and nests its
@@ -119,12 +138,16 @@ use std.types.string.str;
 use A: std.allocator;
 use std.collections.vector;
 
+use mink_arch: mink.catalog.arch;
+use mink.model.reloc;
+
 use masc.codec.walk;
 use masc.core.config;
 use masc.core.ct;
 use masc.core.dispatch;
 use masc.core.effect;
 use masc.core.field;
+use masc.core.fixup;
 use masc.core.footprint;
 use masc.core.index;
 use masc.core.operand;
@@ -135,13 +158,27 @@ use masc.core.set;
 use masc.core.state;
 use masc.core.stream;
 
-# a memory extent from a register's value plus an offset
+# a memory extent from a register's value or a symbol's address plus an offset
 # ---
-# base:   the register holding the address
+# base:   the register holding the address, register.NONE for one off a symbol or an absolute address
+# symbol: the caller's handle of the symbol whose address it is off, as a site names it, operand.NO_SYMBOL for none. an
+#         extent names a base or a symbol, never both
 # offset: added to it
 # length: the bytes it covers
 pub rec Extent {
     base:   register.Id;
+    symbol: u32;
+    offset: i64;
+    length: u64;
+}
+
+# the bytes of a global, off a symbol's address
+# ---
+# symbol: the caller's handle of the symbol, as a site names it, never operand.NO_SYMBOL
+# offset: added to its address
+# length: the bytes it covers, 0 for a length the caller does not know
+pub rec Global {
+    symbol: u32;
     offset: i64;
     length: u64;
 }
@@ -168,14 +205,17 @@ pub rec Slot {
 # where a secret is when the code starts, or for a frame slot from where its instruction starts
 # ---
 # register: a register's value
-# memory:   the bytes of an extent off a register's value on entry
+# memory:   the bytes of an extent off a register's value on entry, or of an absolute address, never off a symbol
 # entry:    the value of an index space entry of a typed stream
 # frame:    the bytes of a frame slot, which hold a secret each time the walk reaches its instruction, before it runs
+# symbol:   the bytes of a global, secret for the whole function: a load overlapping them reads a secret, and a store of a
+#           public value never makes them public, as no store does
 pub tag Seed: u8 {
     register: register.Id;
     memory:   Extent;
     entry:    Entry;
     frame:    Slot;
+    symbol:   Global;
 }
 
 # seeds as a pointer to the caller's rows and a count
@@ -187,7 +227,8 @@ pub rec Secrets {
 # what a declassify point makes public
 # ---
 # register: the value of a register row of the set's file, a row as footprints name it, so x86's zf and not rflags
-# memory:   the bytes of an extent, of a known length, off the register an access of the instruction is formed from
+# memory:   the bytes of an extent, of a known length, off the register an access of the instruction is formed from, or
+#           off a symbol an access of it is placed by
 # entry:    the value of an index space entry of a typed stream
 # value:    a value of a typed stream's operand stack, by depth from its top, 0 the top
 # frame:    the bytes of a frame slot off a register's value where the instruction starts, of a known length, which an
@@ -252,34 +293,40 @@ pub rec Extents {
 pub val NO_EXTENTS: Extents = Extents{at: nil, len: 0};
 
 # what the caller states of the callee of one call site, a trusted claim the walk reads in place of the callee it does
-# not see. it is sound only of a callee that is itself checked constant time, or one the toolchain proves so, and the
-# walk refuses a call to one that is not when a secret reaches it. the join of a call is whether its arguments, the
-# extents it reads and any memory it does not keep may hold a secret, which is what the callee may compute from
+# not see. what it accepts a secret in is sound only of a callee checked constant time in those, or one the toolchain
+# proves so, and the walk refuses the call when a secret reaches the callee through anything else. the join of a call
+# is whether its arguments, the extents it reads and any memory it does not keep may hold a secret, which is what the
+# callee may compute from. a callee that takes a secret buffer through a pointer but no secret length accepts the
+# buffer's extent and not the length's register
 # ---
-# at:        where the call starts: a call, or a tail call, a jump whose target the walk does not follow, as it follows
-#            no call's, and after which the path ends
-# checked:   whether the callee is checked constant time
-# preserved: the registers holding after the call what they held once the call instruction ran, its link written,
-#            each with the rows lying within it. the stack pointer is one, holding what it held before the call
-#            instruction, as the callee's return undoes what the call pushes. a program counter's row, as x86's rip,
-#            holds what the call instruction left, the return point the walk goes on from
-# arguments: the registers the callee reads its arguments from
-# reads:     the memory the callee may read that the model keeps, as a buffer in the caller's frame a pointer argument
-#            reaches. memory it does not keep is read whatever this names
-# written:   the registers the callee leaves its results in or clobbers, which take the join. a register stated neither
-#            preserved nor written is secret after the call when anything is before it, as with no model
-# writes:    the memory the callee may write, which takes the join, the kept memory it writes included
-# kept:      the memory the callee leaves as it was but where `writes` names. every other byte may be written with the
-#            join, globals included
+# at:             where the call starts: a call, or a tail call, a jump whose target the walk does not follow, as it
+#                 follows no call's, and after which the path ends
+# accepted:       the argument registers the callee is checked to take a secret in, each one `arguments` names, none for
+#                 a callee not checked
+# accepted_reads: the extents of `reads` the callee is checked to take a secret in, each one `reads` names, none for a
+#                 callee not checked
+# preserved:      the registers holding after the call what they held once the call instruction ran, its link written,
+#                 each with the rows lying within it. the stack pointer is one, holding what it held before the call
+#                 instruction, as the callee's return undoes what the call pushes. a program counter's row, as x86's rip,
+#                 holds what the call instruction left, the return point the walk goes on from
+# arguments:      the registers the callee reads its arguments from
+# reads:          the memory the callee may read that the model keeps, as a buffer in the caller's frame a pointer argument
+#                 reaches. memory it does not keep is read whatever this names
+# written:        the registers the callee leaves its results in or clobbers, which take the join. a register stated neither
+#                 preserved nor written is secret after the call when anything is before it, as with no model
+# writes:         the memory the callee may write, which takes the join, the kept memory it writes included
+# kept:           the memory the callee leaves as it was but where `writes` names. every other byte may be written with the
+#                 join, globals included
 pub rec Call {
-    at:        u64;
-    checked:   bool;
-    preserved: Registers;
-    arguments: Registers;
-    reads:     Extents;
-    written:   Registers;
-    writes:    Extents;
-    kept:      Extents;
+    at:             u64;
+    accepted:       Registers;
+    accepted_reads: Extents;
+    preserved:      Registers;
+    arguments:      Registers;
+    reads:          Extents;
+    written:        Registers;
+    writes:         Extents;
+    kept:           Extents;
 }
 
 # call models as a pointer to the caller's rows and a count, in any order, one at an offset
@@ -291,16 +338,48 @@ pub rec Calls {
 # no call model, so every call leaves every register and every address secret when anything is
 pub val NO_CALLS: Calls = Calls{at: nil, len: 0};
 
+# a symbolic operand of the code the caller encoded, the fixup its builder left there, which the walk places a
+# symbol's address by
+# ---
+# at:      where its instruction starts
+# operand: the operand it fills
+# fixup:   the set-local fixup kind
+# symbol:  the caller's handle of its symbol. two handles name objects known apart, so a caller resolves a symbol an
+#          equate or an alias names to the handle of what it names
+# addend:  what the operand adds to the symbol, as `sym+8` states 8, before the builder measures it from where its
+#          relocation does
+# partner: for a kind whose relocation names a partner (`reloc.PARTNER`), where the instruction starts whose site's
+#          address it takes, as risc-v's pcrel_lo12 names the label of its auipc. 0 for any other
+pub rec Site {
+    at:      u64;
+    operand: u8;
+    fixup:   operand.FixupKind;
+    symbol:  u32;
+    addend:  i64;
+    partner: u64;
+}
+
+# sites as a pointer to the caller's rows and a count, in ascending order of offset
+pub rec Sites {
+    at:  *Site;
+    len: u32;
+}
+
+# no site, so no address is placed by a symbol
+pub val NO_SITES: Sites = Sites{at: nil, len: 0};
+
 # encoded code of one function, the bytes the caller encoded. code of a typed stream is the instructions of the
 # function's body, read under a context whose stream the caller has entered into that function
 # ---
-# set:  the instruction set it is encoded in
-# data: its bytes
-# len:  how many
+# set:   the instruction set it is encoded in
+# data:  its bytes
+# len:   how many
+# sites: the fixups the builder left in it, NO_SITES for none
 pub rec Code {
-    set:  *set.Set;
-    data: *u8;
-    len:  usize;
+    set:   *set.Set;
+    data:  *u8;
+    len:   usize;
+    sites: Sites;
 }
 
 # a secret the walk found where constant-time code may hold none
@@ -340,7 +419,7 @@ pub val UNDECODED:    str = "bytes no row decodes under the context";
 pub val UNDECIDED:    str = "an instruction whose footprint its values and the configuration in force do not decide";
 pub val NOWHERE:      str = "a transfer to where no code is";
 pub val INDIRECT:     str = "a jump to a target a register holds, which the walk cannot follow";
-pub val UNSEEDABLE:   str = "a seed names a register the set's file has no row of, an entry its stream does not hold, or a frame slot at an offset where no instruction the walk reaches starts";
+pub val UNSEEDABLE:   str = "a seed names a register the set's file has no row of, an entry its stream does not hold, a frame slot at an offset where no instruction the walk reaches starts, memory or a slot off a symbol, or a global of no symbol";
 pub val UNTYPED:      str = "a stack type of a signature the stream does not resolve to a count of values";
 pub val UNBALANCED:   str = "a value popped past the bottom of the operand stack or its block's, a popped value named past what the instruction pops, or control joining at two heights of the stack";
 pub val UNSTRUCTURED: str = "blocks the code does not close in order, a depth past every block open, or code past its body's block";
@@ -350,7 +429,9 @@ pub val MISPLACED:    str = "a declassify point at an offset where no instructio
 pub val UNTOUCHED:    str = "a declassify point naming a place the instruction at its offset does not read before it or write after it";
 pub val UNCALLED:     str = "a call model at an offset where no call or tail call of machine code the walk reaches starts, or a second model at one";
 pub val UNANCHORED:   str = "a call model whose preserved registers omit the stack pointer";
-pub val UNWRITTEN:    str = "a call model naming a register the set's file has no row of, or as written one reading zero or sharing storage with one it names preserved";
+pub val UNWRITTEN:    str = "a call model naming a register the set's file has no row of, an extent off both a register and a symbol, or as written one reading zero or sharing storage with one it names preserved";
+pub val UNACCEPTED:   str = "a call model accepting a secret in a register it names no argument, or in an extent it names no read";
+pub val UNSITED:      str = "a site out of ascending order, at one past the code, at an offset within an instruction, or naming an operand past its instruction's";
 
 # the version of a register's value on entry
 val ENTRY: u64 = 0;
@@ -377,13 +458,44 @@ val NO_FILE: register.File = register.File{
 # base:    the register row its address is formed from, the stack pointer's for one of a register of a known offset,
 #          effect.NO_ROW for an address no register forms
 # version: the version of that register's value, ENTRY for one of a register of a known offset
+# symbol:  with base effect.NO_ROW, the symbol whose address it is off, operand.NO_SYMBOL for an address the walk does
+#          not place
+# slot:    whether it is off the address of the symbol's got slot rather than the symbol's
 # offset:  added to it
 # length:  the bytes it covers, 0 for a length the walk does not know
 rec Held {
     base:    u32;
     version: u64;
+    symbol:  u32;
+    slot:    bool;
     offset:  i64;
     length:  u64;
+}
+
+# what a register row holds of a symbol's address, as the sites of the instructions writing it place it
+# ---
+# piece:     fixup.WHOLE for the address, fixup.HIGH for its high part a low part completes, fixup.NO_PIECE for none
+# symbol:    the symbol
+# offset:    added to its address
+# slot:      whether it is of the symbol's got slot rather than the symbol
+# partnered: for a high part, whether a low part completes it only by naming its instruction as its partner, as
+#            risc-v's pcrel_hi20, else by naming the same symbol and offset, as aarch64's page
+# site:      for a high part, where the instruction that formed it starts
+rec Formed {
+    piece:     fixup.Piece;
+    symbol:    u32;
+    offset:    i64;
+    slot:      bool;
+    partnered: bool;
+    site:      u64;
+}
+
+val UNFORMED: Formed = Formed{piece: fixup.NO_PIECE, symbol: operand.NO_SYMBOL, offset: 0, slot: false, partnered: false, site: 0};
+
+# a register row given a symbol's address or a part of one by the instruction walked
+rec Forming {
+    row:    u32;
+    formed: Formed;
 }
 
 # the value a register holds as an offset from the stack pointer's on entry
@@ -396,6 +508,9 @@ rec Frame {
 }
 
 val UNKNOWN: Frame = Frame{known: false, offset: 0};
+
+# an extent the walk does not place
+val UNPLACED: Held = Held{base: effect.NO_ROW, version: ENTRY, symbol: operand.NO_SYMBOL, slot: false, offset: 0, length: 0};
 
 # a register given a known offset by the instruction walked
 # ---
@@ -425,6 +540,7 @@ rec Saved {
 #           included
 # versions: the version of each register row's value
 # frames:   the offset of each register row's value from the stack pointer's on entry
+# formed:   what each register row's value holds of a symbol's address
 # held:     the extents that may hold a secret
 # public:   the extents a declassify point after an instruction made public, which hold no secret whatever `held` and
 #           `anywhere` say until a secret may be stored there
@@ -440,6 +556,7 @@ rec Point {
     taint:    vector.Vector[u64];
     versions: vector.Vector[u64];
     frames:   vector.Vector[Frame];
+    formed:   vector.Vector[Formed];
     held:     vector.Vector[Held];
     public:   vector.Vector[Held];
     anywhere: bool;
@@ -543,6 +660,10 @@ rec Block {
 # kept:     the extents it keeps, placed where the call starts
 # wrote:    the extents it writes, placed there
 # saved:    the stack pointer's rows as they were where the call starts
+# arch:     the architecture the context enters, whose bindings a site's relocation kind is read under, nil for none
+# sited:    the first site at each offset, by index into `code.sites`, NO_POINT for none
+# forming:  the registers the instruction walked gives a symbol's address or a part of one
+# at:       where the instruction walked starts
 rec Walk {
     a:        *A.Allocator;
     code:     *Code;
@@ -579,6 +700,10 @@ rec Walk {
     kept:     vector.Vector[Held];
     wrote:    vector.Vector[Held];
     saved:    vector.Vector[Saved];
+    arch:     *mink_arch.Arch;
+    sited:    vector.Vector[u32];
+    forming:  vector.Vector[Forming];
+    at:       usize;
 }
 
 val NO_POINT:  u32   = 0xFFFF_FFFF;
@@ -674,6 +799,7 @@ fun blank(w: *Walk) res[Point, A.Error] {
         taint:    vector.init[u64](w.a),
         versions: vector.init[u64](w.a),
         frames:   vector.init[Frame](w.a),
+        formed:   vector.init[Formed](w.a),
         held:     vector.init[Held](w.a),
         public:   vector.init[Held](w.a),
         anywhere: false,
@@ -697,6 +823,8 @@ fun blank(w: *Walk) res[Point, A.Error] {
         if (i == w.stack::usize) { f = Frame{known: true, offset: 0}; }
         val framed: res[usize, A.Error] = vector.push[Frame](?p.frames, f);
         if (sel framed.err) { ret failed[Point](framed.err); }
+        val formed: res[usize, A.Error] = vector.push[Formed](?p.formed, UNFORMED);
+        if (sel formed.err) { ret failed[Point](formed.err); }
         i = i + 1;
     }
     ret res[Point, A.Error].ok{p};
@@ -706,6 +834,7 @@ fun drop(p: *Point) {
     vector.dnit[u64](?p.taint);
     vector.dnit[u64](?p.versions);
     vector.dnit[Frame](?p.frames);
+    vector.dnit[Formed](?p.formed);
     vector.dnit[Held](?p.held);
     vector.dnit[Held](?p.public);
     vector.dnit[Held](?p.spared);
@@ -727,6 +856,7 @@ fun copy(w: *Walk, from: *Point) res[Point, A.Error] {
     for (i < p.versions.len) {
         p.versions.data[i] = from.versions.data[i];
         p.frames.data[i]   = from.frames.data[i];
+        p.formed.data[i]   = from.formed.data[i];
         i                  = i + 1;
     }
     i = 0;
@@ -781,7 +911,17 @@ fun copy(w: *Walk, from: *Point) res[Point, A.Error] {
 }
 
 fun same(x: *Held, y: *Held) bool {
-    ret x.base == y.base && x.version == y.version && x.offset == y.offset && x.length == y.length;
+    ret x.base == y.base && x.version == y.version && x.symbol == y.symbol && x.slot == y.slot && x.offset == y.offset && x.length == y.length;
+}
+
+# whether `h` is off a symbol's address
+fun symbolic(h: *Held) bool {
+    ret h.base == effect.NO_ROW && h.symbol != operand.NO_SYMBOL;
+}
+
+# whether the walk places `h`: off a register's value or a symbol's address
+fun located(h: *Held) bool {
+    ret h.base != effect.NO_ROW || h.symbol != operand.NO_SYMBOL;
 }
 
 # `h` added to what `p` holds unless it holds it
@@ -796,16 +936,28 @@ fun hold(p: *Point, h: Held) err[A.Error] {
     ret err[A.Error].ok{};
 }
 
-# whether `held` and `at` may share a byte: only extents of one version of one register, both of known length, are
-# known apart, when they do not overlap
+# whether `held` and `at` may share a byte: only extents of one version of one register, or off one symbol, both of
+# known length, are known apart, when they do not overlap, and extents off two symbols or a symbol and its got slot
+# always are
 fun may_alias(held: *Held, at: *Held) bool {
+    if (symbolic(held) && symbolic(at)) {
+        if (held.symbol != at.symbol || held.slot != at.slot) { ret false; }
+        if (held.length == 0 || at.length == 0)               { ret true; }
+        ret held.offset < at.offset + at.length::i64 && at.offset < held.offset + held.length::i64;
+    }
     if (held.base != at.base || held.version != at.version || held.base == effect.NO_ROW) { ret true; }
     if (held.length == 0 || at.length == 0)                                               { ret true; }
     ret held.offset < at.offset + at.length::i64 && at.offset < held.offset + held.length::i64;
 }
 
-# whether every byte of `inner` is one of `outer`: both of one version of one register and of known length
+# whether every byte of `inner` is one of `outer`: both of one version of one register, or off one symbol, and of known
+# length
 fun inside(inner: *Held, outer: *Held) bool {
+    if (symbolic(inner) || symbolic(outer)) {
+        if (!symbolic(inner) || !symbolic(outer) || inner.symbol != outer.symbol || inner.slot != outer.slot) { ret false; }
+        if (inner.length == 0 || outer.length == 0)                                                           { ret false; }
+        ret inner.offset >= outer.offset && inner.offset + inner.length::i64 <= outer.offset + outer.length::i64;
+    }
     if (inner.base != outer.base || inner.version != outer.version || inner.base == effect.NO_ROW) { ret false; }
     if (inner.length == 0 || outer.length == 0)                                                    { ret false; }
     ret inner.offset >= outer.offset && inner.offset + inner.length::i64 <= outer.offset + outer.length::i64;
@@ -817,7 +969,7 @@ fun unpublish(p: *Point, at: *Held) {
     var kept: usize = 0;
     var i:    usize = 0;
     for (i < p.public.len) {
-        if (at.base != effect.NO_ROW && !may_alias(?p.public.data[i], at)) {
+        if (located(at) && !may_alias(?p.public.data[i], at)) {
             p.public.data[kept] = p.public.data[i];
             kept                = kept + 1;
         }
@@ -986,6 +1138,11 @@ fun merge(w: *Walk, into: *Point, from: *Point, to: usize) res[opt[bool], A.Erro
             @f      = UNKNOWN;
             changed = true;
         }
+        val fo: *Formed = ?into.formed.data[i];
+        if (fo.piece != fixup.NO_PIECE && !same_form(fo, ?from.formed.data[i])) {
+            @fo     = UNFORMED;
+            changed = true;
+        }
         i = i + 1;
     }
     i = 0;
@@ -1124,6 +1281,17 @@ fun stack_row(file: *register.File, code: *Code, ctx: *state.Context) u32 {
     ret effect.NO_ROW;
 }
 
+# the architecture of the code's set the context enters, its first, nil for none
+fun arch_of(code: *Code, ctx: *state.Context) *mink_arch.Arch {
+    var i: u32 = 0;
+    for (i < code.set.arches.len) {
+        val a: *set.Arch = ?code.set.arches.at[i];
+        if (state.admits(ctx, a.enters)) { ret a.arch; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
 # whether register row `row` holds storage of its own as wide as the stack pointer's, so the value it holds may be a
 # known offset from it
 fun wide(w: *Walk, row: u32) bool {
@@ -1139,12 +1307,13 @@ fun wide(w: *Walk, row: u32) bool {
 # value on entry when the walk knows the row's offset from it, else off that version of the row's value
 fun rebase(w: *Walk, p: *Point, row: u32, offset: i64, length: u64) Held {
     val f: Frame = p.frames.data[row];
-    if (f.known) { ret Held{base: w.stack, version: ENTRY, offset: f.offset + offset, length: length}; }
-    ret Held{base: row, version: p.versions.data[row], offset: offset, length: length};
+    if (f.known) { ret Held{base: w.stack, version: ENTRY, symbol: operand.NO_SYMBOL, slot: false, offset: f.offset + offset, length: length}; }
+    ret Held{base: row, version: p.versions.data[row], symbol: operand.NO_SYMBOL, slot: false, offset: offset, length: length};
 }
 
 # the registers `ins` gives a known offset under `p` into `w.moved`: each relation of its row writing a register as wide
-# as the stack pointer from one of a known offset, and the stack pointer's own change its effect states
+# as the stack pointer from one of a known offset by a number no site fills, and the stack pointer's own change its
+# effect states
 fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err[A.Error] {
     vector.truncate[Moved](?w.moved, 0);
     if (w.stack == effect.NO_ROW) { ret err[A.Error].ok{}; }
@@ -1152,7 +1321,9 @@ fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err
     val values: operand.Values = operand.Values{at: ins.inst.values, len: ins.inst.count};
     var i:      u32            = 0;
     for (i < e.relations.len) {
-        val got: opt[effect.Affine] = effect.affine(w.file, ?e.relations.at[i], values);
+        var got: opt[effect.Affine] = effect.affine(w.file, ?e.relations.at[i], values);
+        # a number a site fills is no value until the link
+        if (relation_sited(w, ?e.relations.at[i])) { got = opt[effect.Affine].none{}; }
         if (sel got.some) {
             val to:   opt[u32] = row_index(w, got.some.to);
             val from: opt[u32] = row_index(w, got.some.from);
@@ -1277,41 +1448,308 @@ fun bytes_of(width: *effect.Width) u64 {
 
 # the extent an address of `ins` touches, from the operand that is or holds it plus the immediates of the further
 # operands `forming` names, or the register row `base` when none, plus the access's own `offset`, named off the stack
-# pointer when the walk knows that register's offset from it. an address a further operand forms that is no immediate,
-# as a risc-v stride, is placed nowhere
+# pointer when the walk knows that register's offset from it, or off a symbol's address when the sites place it there
+# (`address_formed`). an address a further operand forms that is no immediate, as a risc-v stride, is placed nowhere, and
+# so is one a site fills that the sites do not place, whose number is no address until the link
 fun placed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8, base: u32, forming: operand.Positions, offset: i64, length: u64, touch: *Touch) {
-    touch.operand = field.NO_OPERAND;
-    touch.at      = Held{base: effect.NO_ROW, version: ENTRY, offset: offset, length: length};
+    touch.operand   = field.NO_OPERAND;
+    touch.at        = UNPLACED;
+    touch.at.offset = offset;
+    touch.at.length = length;
+    var formed: Formed = UNFORMED;
+    var sited:  bool   = false;
+    var added:  i64    = 0;
     if (op != field.NO_OPERAND && op::u32 < ins.inst.count) {
         val v: operand.Value = ins.inst.values[op];
+        sited = has_site(w, op);
         if (sel v.memory) {
             touch.operand   = op;
             touch.at.offset = touch.at.offset + v.memory.disp;
             val row: opt[u32] = row_index(w, v.memory.base);
             if (sel row.some) { touch.at.base = row.some; }
+            formed = address_formed(w, p, ins, op);
         }
         or (sel v.register) {
             val row: opt[u32] = row_index(w, v.register);
-            if (sel row.some) { touch.at.base = row.some; }
+            if (sel row.some) {
+                touch.at.base = row.some;
+                formed        = whole_of(p.formed.data[row.some]);
+            }
         }
+        or (sel v.relative) { formed = address_formed(w, p, ins, op); }
         var k: u32 = 0;
         for (k < ins.inst.count && k < 32) {
             if ((forming & (1::u32 << k)) != 0) {
                 val f: operand.Value = ins.inst.values[k];
-                if (sel f.immediate) { touch.at.offset = touch.at.offset + f.immediate; }
-                or                   { touch.at.base = effect.NO_ROW; }
+                if (has_site(w, k::u8)) {
+                    sited  = true;
+                    formed = UNFORMED;
+                }
+                if (sel f.immediate) {
+                    touch.at.offset = touch.at.offset + f.immediate;
+                    added           = added + f.immediate;
+                }
+                or {
+                    touch.at.base = effect.NO_ROW;
+                    formed        = UNFORMED;
+                }
             }
             k = k + 1;
         }
     }
-    or { touch.at.base = base; }
+    or {
+        touch.at.base = base;
+        if (base != effect.NO_ROW) { formed = whole_of(p.formed.data[base]); }
+    }
     touch.row     = touch.at.base;
     touch.rebased = 0;
+    if (formed.piece == fixup.WHOLE) {
+        touch.at  = Held{base: effect.NO_ROW, version: ENTRY, symbol: formed.symbol, slot: formed.slot, offset: formed.offset + offset + added, length: length};
+        touch.row = effect.NO_ROW;
+        ret;
+    }
+    if (sited) {
+        touch.at.base = effect.NO_ROW;
+        touch.row     = effect.NO_ROW;
+    }
     if (touch.at.base != effect.NO_ROW) {
         val h: Held = rebase(w, p, touch.at.base, touch.at.offset, touch.at.length);
         touch.rebased = h.offset - touch.at.offset;
         touch.at      = h;
     }
+}
+
+# the site the caller states for operand `op` of the instruction starting at `at`, none for none
+fun site_at(w: *Walk, at: usize, op: u8) opt[*Site] {
+    if (at >= w.sited.len) { ret opt[*Site].none{}; }
+    var i: u32 = w.sited.data[at];
+    for (i != NO_POINT && i < w.code.sites.len) {
+        val st: *Site = ?w.code.sites.at[i];
+        if (st.at != at::u64) { ret opt[*Site].none{}; }
+        if (st.operand == op) { ret opt[*Site].some{st}; }
+        i = i + 1;
+    }
+    ret opt[*Site].none{};
+}
+
+# whether a site fills operand `op` of the instruction walked
+fun has_site(w: *Walk, op: u8) bool {
+    val st: opt[*Site] = site_at(w, w.at, op);
+    ret sel st.some;
+}
+
+# the capabilities of the relocation kind site `st`'s fixup kind is bound to on the architecture the walk runs under,
+# none for a kind bound to none there, as a local kind
+fun site_caps(w: *Walk, st: *Site) opt[reloc.Caps] {
+    if (w.arch == nil) { ret opt[reloc.Caps].none{}; }
+    val all: fixup.Bindings = w.code.set.bindings;
+    var i:   u32            = 0;
+    for (i < all.len) {
+        val b: *fixup.Binding = ?all.at[i];
+        if (b.fixup == st.fixup && fixup.binds(b, w.arch)) { ret opt[reloc.Caps].some{reloc.caps(b.kind)}; }
+        i = i + 1;
+    }
+    ret opt[reloc.Caps].none{};
+}
+
+# `f` when it is a symbol's address, else UNFORMED
+fun whole_of(f: Formed) Formed {
+    if (f.piece == fixup.WHOLE) { ret f; }
+    ret UNFORMED;
+}
+
+# whether `x` and `y` hold one part of one address
+fun same_form(x: *Formed, y: *Formed) bool {
+    ret x.piece == y.piece && x.symbol == y.symbol && x.offset == y.offset && x.slot == y.slot && x.partnered == y.partnered && x.site == y.site;
+}
+
+# what the operand site `st` fills holds of its symbol's address alone, by the part its fixup kind holds: the address,
+# a high part, or UNFORMED for a low part, which completes a high one, or a kind the set states no part of
+fun site_formed(w: *Walk, st: *Site) Formed {
+    if (st.symbol == operand.NO_SYMBOL) { ret UNFORMED; }
+    val piece: fixup.Piece     = fixup.piece_of(w.code.set.parts, st.fixup);
+    val caps:  opt[reloc.Caps] = site_caps(w, st);
+    if (sel caps.none) { ret UNFORMED; }
+    val slot: bool = (caps.some & reloc.GOT) != 0;
+    if (piece == fixup.WHOLE) { ret Formed{piece: fixup.WHOLE, symbol: st.symbol, offset: st.addend, slot: slot, partnered: false, site: 0}; }
+    if (piece == fixup.HIGH) {
+        val partnered: bool = (caps.some & reloc.PC) != 0 && (caps.some & reloc.PAGE) == 0;
+        ret Formed{piece: fixup.HIGH, symbol: st.symbol, offset: st.addend, slot: slot, partnered: partnered, site: st.at};
+    }
+    ret UNFORMED;
+}
+
+# the address high part `high` and the low part site `st` fills make, UNFORMED unless they are of one address: a low
+# part naming a partner completes the high part its partner's instruction formed, and any other one of the same symbol,
+# addend and slot that no partner completes
+fun completed(w: *Walk, high: Formed, st: *Site) Formed {
+    if (high.piece != fixup.HIGH || fixup.piece_of(w.code.set.parts, st.fixup) != fixup.LOW) { ret UNFORMED; }
+    val caps: opt[reloc.Caps] = site_caps(w, st);
+    if (sel caps.none) { ret UNFORMED; }
+    if ((caps.some & reloc.PARTNER) != 0) {
+        if (!high.partnered || high.site != st.partner) { ret UNFORMED; }
+    }
+    or {
+        val slot: bool = (caps.some & reloc.GOT) != 0;
+        if (high.partnered || high.symbol != st.symbol || high.offset != st.addend || high.slot != slot) { ret UNFORMED; }
+    }
+    ret Formed{piece: fixup.WHOLE, symbol: high.symbol, offset: high.offset, slot: high.slot, partnered: false, site: 0};
+}
+
+# the symbol's address the address operand `op` of `ins` forms under `p`, UNFORMED for none the sites place: a site of
+# the address whole in a relative operand or an address of no base, as a rip-relative or absolute one, a site of a
+# low part added to a base register holding its high part, or a base register holding an address plus a displacement
+# no site fills. an address with an index or written back after the access is placed by no symbol
+fun address_formed(w: *Walk, p: *Point, ins: *walk.Decoded, op: u8) Formed {
+    if (op == field.NO_OPERAND || op::u32 >= ins.inst.count) { ret UNFORMED; }
+    val v:  operand.Value = ins.inst.values[op];
+    val st: opt[*Site]    = site_at(w, w.at, op);
+    if (sel v.relative) {
+        if (sel st.some) { ret whole_of(site_formed(w, st.some)); }
+        ret UNFORMED;
+    }
+    if (!sel v.memory) { ret UNFORMED; }
+    val m: operand.Address = v.memory;
+    if (m.index != register.NONE)                                                                { ret UNFORMED; }
+    if (m.mode != operand.OFFSET && m.mode != operand.PREINDEX && m.mode != operand.RELATIVE_PC) { ret UNFORMED; }
+    if (m.base == register.NONE || m.mode == operand.RELATIVE_PC) {
+        if (sel st.some) { ret whole_of(site_formed(w, st.some)); }
+        ret UNFORMED;
+    }
+    val row: opt[u32] = row_index(w, m.base);
+    if (sel row.none) { ret UNFORMED; }
+    var f: Formed = p.formed.data[row.some];
+    if (sel st.some)            { ret completed(w, f, st.some); }
+    if (f.piece != fixup.WHOLE) { ret UNFORMED; }
+    f.offset = f.offset + m.disp;
+    ret f;
+}
+
+# the register a relation of `ins` writes, register.NONE for none it names
+fun related_to(w: *Walk, ins: *walk.Decoded, rel: *effect.Relation) register.Id {
+    if (sel rel.to.operand) {
+        if (rel.to.operand::u32 >= ins.inst.count) { ret register.NONE; }
+        val v: operand.Value = ins.inst.values[rel.to.operand];
+        if (sel v.register) { ret v.register; }
+        ret register.NONE;
+    }
+    if (sel rel.to.row) {
+        if (rel.to.row >= w.file.register_count) { ret register.NONE; }
+        ret register.id_of(?w.file.registers[rel.to.row]);
+    }
+    ret register.NONE;
+}
+
+# what relation `rel` of `ins` leaves its register holding of a symbol's address under `p`: what a site of the operand
+# it forms its value from holds, the address a lea's operand forms, a low part a site fills added to the high part its
+# register holds, or an address its register holds plus a number no site fills, as a copy or an add of an immediate
+fun relation_formed(w: *Walk, p: *Point, ins: *walk.Decoded, rel: *effect.Relation) Formed {
+    if (sel rel.holds.formed) {
+        val st: opt[*Site] = site_at(w, w.at, rel.holds.formed);
+        if (sel st.some) { ret site_formed(w, st.some); }
+        ret UNFORMED;
+    }
+    if (!sel rel.holds.offset) { ret UNFORMED; }
+    val o: effect.Offset = rel.holds.offset;
+    if (sel o.from.base) { ret whole_of(address_formed(w, p, ins, o.from.base)); }
+    var from: register.Id = register.NONE;
+    if (sel o.from.operand) {
+        if (o.from.operand::u32 < ins.inst.count) {
+            val v: operand.Value = ins.inst.values[o.from.operand];
+            if (sel v.register) { from = v.register; }
+        }
+    }
+    or (sel o.from.row) {
+        if (o.from.row < w.file.register_count) { from = register.id_of(?w.file.registers[o.from.row]); }
+    }
+    val src: opt[u32] = row_index(w, from);
+    if (sel src.none) { ret UNFORMED; }
+    var f: Formed = p.formed.data[src.some];
+    if (sel o.by.immediate) {
+        val st: opt[*Site] = site_at(w, w.at, o.by.immediate);
+        if (sel st.some) {
+            if (o.negated || o.shift != field.NO_OPERAND || o.constant != 0) { ret UNFORMED; }
+            ret completed(w, f, st.some);
+        }
+    }
+    if (f.piece != fixup.WHOLE) { ret UNFORMED; }
+    val values: operand.Values     = operand.Values{at: ins.inst.values, len: ins.inst.count};
+    val got:    opt[effect.Affine] = effect.affine(w.file, rel, values);
+    if (sel got.none) { ret UNFORMED; }
+    f.offset = f.offset + got.some.by;
+    ret f;
+}
+
+# whether a site fills an operand relation `rel` adds or starts from, whose number is no value until the link
+fun relation_sited(w: *Walk, rel: *effect.Relation) bool {
+    if (!sel rel.holds.offset) { ret false; }
+    val o: effect.Offset = rel.holds.offset;
+    if (sel o.by.immediate) {
+        if (has_site(w, o.by.immediate)) { ret true; }
+    }
+    if (sel o.by.displacement) {
+        if (has_site(w, o.by.displacement)) { ret true; }
+    }
+    if (sel o.from.base) {
+        if (has_site(w, o.from.base)) { ret true; }
+    }
+    ret false;
+}
+
+# the row of the one register operand `ins` writes, none for none or more than one
+fun written_row(w: *Walk, ins: *walk.Decoded) opt[u32] {
+    val r:     *operand.Operand = ins.inst.row.operands.at;
+    var found: u32              = effect.NO_ROW;
+    var count: u32              = 0;
+    var op:    u32              = 0;
+    for (op < ins.inst.count) {
+        val v: operand.Value = ins.inst.values[op];
+        if (sel v.register) {
+            if ((r[op].role & operand.WRITE) != 0) {
+                count = count + 1;
+                found = row_or_none(w, v.register);
+            }
+        }
+        op = op + 1;
+    }
+    if (count != 1 || found == effect.NO_ROW) { ret opt[u32].none{}; }
+    ret opt[u32].some{found};
+}
+
+# the registers `ins` gives a symbol's address or a part of one under `p` into `w.forming`: each its row's relations
+# write as wide as the stack pointer, and the one register a load of a got slot alone writes, which takes the slot's
+# symbol's address. read where the instruction starts, once `w.touches` holds its touches
+fun formings(w: *Walk, p: *Point, ins: *walk.Decoded) err[A.Error] {
+    vector.truncate[Forming](?w.forming, 0);
+    if (w.code.sites.len == 0) { ret err[A.Error].ok{}; }
+    val e: *effect.Effect = ins.inst.row.effect;
+    var i: u32            = 0;
+    for (i < e.relations.len) {
+        val rel: *effect.Relation = ?e.relations.at[i];
+        val row: opt[u32]         = row_index(w, related_to(w, ins, rel));
+        if (sel row.some) {
+            if (wide(w, row.some)) {
+                val f: Formed = relation_formed(w, p, ins, rel);
+                if (f.piece != fixup.NO_PIECE) {
+                    val pushed: res[usize, A.Error] = vector.push[Forming](?w.forming, Forming{row: row.some, formed: f});
+                    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (w.forming.len != 0 || w.touches.len != 1) { ret err[A.Error].ok{}; }
+    val t: *Touch = ?w.touches.data[0];
+    if (!t.reads || t.writes || !symbolic(?t.at) || !t.at.slot || t.at.offset != 0) { ret err[A.Error].ok{}; }
+    val row: opt[u32] = written_row(w, ins);
+    if (sel row.some) {
+        if (wide(w, row.some)) {
+            val f:      Formed              = Formed{piece: fixup.WHOLE, symbol: t.at.symbol, offset: 0, slot: false, partnered: false, site: 0};
+            val pushed: res[usize, A.Error] = vector.push[Forming](?w.forming, Forming{row: row.some, formed: f});
+            if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        }
+    }
+    ret err[A.Error].ok{};
 }
 
 # the bytes the access of memory operand `o` holding address `m` covers, its width of one value, 0 when the walk does
@@ -1351,7 +1789,7 @@ fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) r
         val acc:  *effect.Access = ?fp.memory.at[i];
         var role: operand.Role   = acc.role;
         if (role == operand.NONE && acc.operand != field.NO_OPERAND && acc.operand::u32 < ins.inst.count) { role = r[acc.operand].role; }
-        var t: Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}, row: effect.NO_ROW, rebased: 0};
+        var t: Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: UNPLACED, row: effect.NO_ROW, rebased: 0};
         placed(w, p, ins, acc.operand, acc.base, acc.forming, acc.offset, bytes_of(?acc.width), ?t);
         if (names_secret(w, p, ins, acc.operand))                                      { ret found(ct.refusal(ct.MEMORY, acc.operand)); }
         if (acc.base != effect.NO_ROW && bit_of(p.taint.data, acc.base))               { ret found(ct.refusal(ct.MEMORY, field.NO_OPERAND)); }
@@ -1381,7 +1819,7 @@ fun touches(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) r
             if (names_secret(w, p, ins, op::u8)) { ret found(ct.refusal(ct.MEMORY, op::u8)); }
             if (!stated) {
                 val role: operand.Role = r[op].role;
-                var t:    Touch        = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: Held{base: effect.NO_ROW, version: ENTRY, offset: 0, length: 0}, row: effect.NO_ROW, rebased: 0};
+                var t:    Touch        = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: UNPLACED, row: effect.NO_ROW, rebased: 0};
                 placed(w, p, ins, op::u8, effect.NO_ROW, 0, 0, operand_bytes(?r[op], v.memory), ?t);
                 val pushed: res[usize, A.Error] = vector.push[Touch](?w.touches, t);
                 if (sel pushed.err) { ret failed[opt[ct.Refusal]](pushed.err); }
@@ -1681,6 +2119,8 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
     val version: u64          = at::u64 * 2 + 1;
     val moved:   err[A.Error] = moves(w, p, ins, fp);
     if (sel moved.err) { ret moved; }
+    val formed: err[A.Error] = formings(w, p, ins);
+    if (sel formed.err) { ret formed; }
     if (model != nil) {
         val saving: err[A.Error] = save_stack(w, p);
         if (sel saving.err) { ret saving; }
@@ -1701,6 +2141,7 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
                     or (value)                                    { set_bit(p.taint.data, o, true); }
                     p.versions.data[o] = version;
                     p.frames.data[o]   = UNKNOWN;
+                    p.formed.data[o]   = UNFORMED;
                 }
                 k = k + 1;
             }
@@ -1712,12 +2153,17 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
         p.frames.data[w.moved.data[m].row] = Frame{known: true, offset: w.moved.data[m].offset};
         m                                  = m + 1;
     }
+    m = 0;
+    for (m < w.forming.len) {
+        p.formed.data[w.forming.data[m].row] = w.forming.data[m].formed;
+        m                                    = m + 1;
+    }
     var k: usize = 0;
     for (k < w.touches.len) {
         val t: *Touch = ?w.touches.data[k];
         if (t.writes && value) {
             unpublish(p, ?t.at);
-            if (t.at.base == effect.NO_ROW) { everywhere(p); }
+            if (!located(?t.at)) { everywhere(p); }
             or {
                 val held: err[A.Error] = hold(p, t.at);
                 if (sel held.err) { ret held; }
@@ -1742,6 +2188,7 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
                 if (secret) { set_bit(p.taint.data, i, true); }
                 p.versions.data[i] = version;
                 p.frames.data[i]   = UNKNOWN;
+                p.formed.data[i]   = UNFORMED;
             }
             i = i + 1;
         }
@@ -1810,14 +2257,18 @@ fun place_extents(w: *Walk, p: *Point, e: *Extents, into: *vector.Vector[Held]) 
     vector.truncate[Held](into, 0);
     var i: u32 = 0;
     for (i < e.len) {
-        val x: Extent = e.at[i];
-        var h: Held   = Held{base: effect.NO_ROW, version: ENTRY, offset: x.offset, length: x.length};
-        if (x.base != register.NONE) { h = rebase(w, p, row_or_none(w, x.base), x.offset, x.length); }
-        val pushed: res[usize, A.Error] = vector.push[Held](into, h);
+        val pushed: res[usize, A.Error] = vector.push[Held](into, extent_held(w, p, ?e.at[i]));
         if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
         i = i + 1;
     }
     ret err[A.Error].ok{};
+}
+
+# extent `x` placed under `p`, where a call starts: off its base register's value, its symbol's address, or an absolute
+# address the walk does not place
+fun extent_held(w: *Walk, p: *Point, x: *Extent) Held {
+    if (x.base != register.NONE) { ret rebase(w, p, row_or_none(w, x.base), x.offset, x.length); }
+    ret Held{base: effect.NO_ROW, version: ENTRY, symbol: x.symbol, slot: false, offset: x.offset, length: x.length};
 }
 
 # whether every byte of `at` is one of an extent `w.kept` holds
@@ -1830,33 +2281,90 @@ fun in_kept(w: *Walk, at: *Held) bool {
     ret false;
 }
 
-# the join of the call modeled by `c` under `r`, where it starts, its kept and written extents placed into `w.kept`
-# and `w.wrote`: whether an argument register, an extent it reads, or any memory it does not keep may hold a secret
-fun join(w: *Walk, r: *Point, c: *Call) res[bool, A.Error] {
-    val placed_kept: err[A.Error] = place_extents(w, r, ?c.kept, ?w.kept);
-    if (sel placed_kept.err) { ret failed[bool](placed_kept.err); }
-    val placed_wrote: err[A.Error] = place_extents(w, r, ?c.writes, ?w.wrote);
-    if (sel placed_wrote.err) { ret failed[bool](placed_wrote.err); }
+# the join of a call and what it accepts
+# ---
+# secret:     whether an argument register, an extent it reads, or any memory it does not keep may hold a secret
+# unaccepted: whether one of those the model does not state the callee accepts a secret in may: an argument register
+#             or a read extent it does not accept, or memory it does not keep that no accepted read holds whole
+rec Joined {
+    secret:     bool;
+    unaccepted: bool;
+}
+
+# whether model `c` accepts a secret in register `reg`
+fun accepts(c: *Call, reg: register.Id) bool {
     var i: u32 = 0;
+    for (i < c.accepted.len) {
+        if (c.accepted.at[i] == reg) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether extents `x` and `y` are stated alike
+fun same_extent(x: *Extent, y: *Extent) bool {
+    ret x.base == y.base && x.symbol == y.symbol && x.offset == y.offset && x.length == y.length;
+}
+
+# whether model `c` accepts a secret in its read extent `x`
+fun accepts_read(c: *Call, x: *Extent) bool {
+    var i: u32 = 0;
+    for (i < c.accepted_reads.len) {
+        if (same_extent(?c.accepted_reads.at[i], x)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether an extent model `c` accepts a secret in holds every byte of `h` under `r`, where the call starts
+fun accepted_whole(w: *Walk, r: *Point, c: *Call, h: *Held) bool {
+    var i: u32 = 0;
+    for (i < c.accepted_reads.len) {
+        val a: Held = extent_held(w, r, ?c.accepted_reads.at[i]);
+        if (inside(h, ?a)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the join of the call modeled by `c` under `r`, where it starts, and whether a secret reaches it through what it does
+# not accept, its kept and written extents placed into `w.kept` and `w.wrote`
+fun join(w: *Walk, r: *Point, c: *Call) res[Joined, A.Error] {
+    val placed_kept: err[A.Error] = place_extents(w, r, ?c.kept, ?w.kept);
+    if (sel placed_kept.err) { ret failed[Joined](placed_kept.err); }
+    val placed_wrote: err[A.Error] = place_extents(w, r, ?c.writes, ?w.wrote);
+    if (sel placed_wrote.err) { ret failed[Joined](placed_wrote.err); }
+    var j: Joined = Joined{secret: false, unaccepted: false};
+    var i: u32    = 0;
     for (i < c.arguments.len) {
-        if (tainted(w, r, c.arguments.at[i])) { ret touched(true); }
+        if (tainted(w, r, c.arguments.at[i])) {
+            j.secret = true;
+            if (!accepts(c, c.arguments.at[i])) { j.unaccepted = true; }
+        }
         i = i + 1;
     }
     i = 0;
     for (i < c.reads.len) {
-        val x: Extent = c.reads.at[i];
-        var h: Held   = Held{base: effect.NO_ROW, version: ENTRY, offset: x.offset, length: x.length};
-        if (x.base != register.NONE) { h = rebase(w, r, row_or_none(w, x.base), x.offset, x.length); }
-        if (secret_at(r, ?h))        { ret touched(true); }
+        val h: Held = extent_held(w, r, ?c.reads.at[i]);
+        if (secret_at(r, ?h)) {
+            j.secret = true;
+            if (!accepts_read(c, ?c.reads.at[i])) { j.unaccepted = true; }
+        }
         i = i + 1;
     }
-    if (r.anywhere) { ret touched(true); }
+    if (r.anywhere) {
+        j.secret     = true;
+        j.unaccepted = true;
+    }
     var k: usize = 0;
     for (k < r.held.len) {
-        if (!in_kept(w, ?r.held.data[k])) { ret touched(true); }
+        if (!in_kept(w, ?r.held.data[k])) {
+            j.secret = true;
+            if (!accepted_whole(w, r, c, ?r.held.data[k])) { j.unaccepted = true; }
+        }
         k = k + 1;
     }
-    ret touched(false);
+    ret res[Joined, A.Error].ok{j};
 }
 
 # the call modeled by `c`, whose own instruction `apply` has applied to `p`, leaving its callee's effects at `version`:
@@ -1883,6 +2391,7 @@ fun modeled(w: *Walk, p: *Point, version: u64, c: *Call, joined: bool) err[A.Err
             or (secret)                    { set_bit(p.taint.data, i, true); }
             p.versions.data[i] = version;
             p.frames.data[i]   = UNKNOWN;
+            p.formed.data[i]   = UNFORMED;
         }
         i = i + 1;
     }
@@ -1923,7 +2432,7 @@ fun modeled(w: *Walk, p: *Point, version: u64, c: *Call, joined: bool) err[A.Err
     for (k < w.wrote.len) {
         val h: Held = w.wrote.data[k];
         unpublish(p, ?h);
-        if (h.base == effect.NO_ROW) { everywhere(p); }
+        if (!located(?h)) { everywhere(p); }
         or {
             val held: err[A.Error] = hold(p, h);
             if (sel held.err) { ret held; }
@@ -2042,16 +2551,27 @@ fun publish(p: *Point, h: Held) err[A.Error] {
 }
 
 # the extent `e` of the memory a declassify point names as the touch of the instruction walked formed from its base
-# register and holding it whole would name it, a touch that writes for `writes` and else one that reads. none when no
-# touch does, or `e` is of no register row or of no length
+# register and holding it whole would name it, or off its symbol as a touch the sites place holding it whole names it,
+# a touch that writes for `writes` and else one that reads. none when no touch does, or `e` is of no register row or
+# symbol or of no length
 fun held_by_touch(w: *Walk, e: *Extent, writes: bool) opt[Held] {
+    if (e.symbol != operand.NO_SYMBOL && e.base == register.NONE && e.length != 0) {
+        val g: Held  = Held{base: effect.NO_ROW, version: ENTRY, symbol: e.symbol, slot: false, offset: e.offset, length: e.length};
+        var n: usize = 0;
+        for (n < w.touches.len) {
+            val t: *Touch = ?w.touches.data[n];
+            if (((writes && t.writes) || (!writes && t.reads)) && inside(?g, ?t.at)) { ret opt[Held].some{g}; }
+            n = n + 1;
+        }
+        ret opt[Held].none{};
+    }
     val row: opt[u32] = row_index(w, e.base);
     if (sel row.none)  { ret opt[Held].none{}; }
     if (e.length == 0) { ret opt[Held].none{}; }
     var k: usize = 0;
     for (k < w.touches.len) {
         val t: *Touch = ?w.touches.data[k];
-        val h: Held   = Held{base: t.at.base, version: t.at.version, offset: e.offset + t.rebased, length: e.length};
+        val h: Held   = Held{base: t.at.base, version: t.at.version, symbol: operand.NO_SYMBOL, slot: false, offset: e.offset + t.rebased, length: e.length};
         if (t.row == row.some && ((writes && t.writes) || (!writes && t.reads)) && inside(?h, ?t.at)) { ret opt[Held].some{h}; }
         k = k + 1;
     }
@@ -2244,7 +2764,8 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
         if (sel got.err.cause.memory) { ret failed[opt[Verdict]](got.err.cause.memory); }
         ret res[opt[Verdict], A.Error].ok{unread(UNDECODED, at)};
     }
-    var ins:    walk.Decoded                                      = got.ok;
+    var ins: walk.Decoded = got.ok;
+    w.at = at;
     val cfg:    config.Configured                                 = config.Configured{hooks: w.code.set.config, state: p.config};
     val values: operand.Values                                    = operand.Values{at: ins.inst.values, len: ins.inst.count};
     val foot:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(fp, ins.inst.row, values, w.ctx, cfg);
@@ -2254,7 +2775,13 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     for (k < at + ins.len && k < w.code.len) {
         if (w.declared.data[k] != NO_POINT) { ret res[opt[Verdict], A.Error].ok{unread(MISPLACED, k)}; }
         if (w.called.data[k] != NO_POINT)   { ret res[opt[Verdict], A.Error].ok{unread(UNCALLED, k)}; }
+        if (w.sited.data[k] != NO_POINT)    { ret res[opt[Verdict], A.Error].ok{unread(UNSITED, k)}; }
         k = k + 1;
+    }
+    var n: u32 = w.sited.data[at];
+    for (n != NO_POINT && n < w.code.sites.len && w.code.sites.at[n].at == at::u64) {
+        if (w.code.sites.at[n].operand::u32 >= ins.inst.count) { ret res[opt[Verdict], A.Error].ok{unread(UNSITED, at)}; }
+        n = n + 1;
     }
     var model: *Call = nil;
     var tail:  bool  = false;
@@ -2337,11 +2864,11 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     }
     var joined: bool = false;
     if (model != nil) {
-        val j: res[bool, A.Error] = join(w, r, model);
+        val j: res[Joined, A.Error] = join(w, r, model);
         if (sel j.err) { ret failed[opt[Verdict]](j.err); }
-        joined = j.ok;
-        if (!model.checked && joined) { ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(ct.UNCHECKED, field.NO_OPERAND), at)}; }
-        if (tail)                     { model = nil; }
+        joined = j.ok.secret;
+        if (j.ok.unaccepted) { ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(ct.UNCHECKED, field.NO_OPERAND), at)}; }
+        if (tail)            { model = nil; }
     }
     val value: bool = read || stacked;
     if (shape != nil && c.target == effect.DEPTH) {
@@ -2368,9 +2895,10 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
     ret successors(w, ?p, at, ?ins, ?c, shape, tail);
 }
 
-# the entry state the seeds make, a register's secret in every row overlapping it but one reading zero, and the frame
-# seeds indexed by offset into `w.sown` and `w.sowing`, refused naming a register the file has no row of, an entry the
-# stream does not hold or a frame slot at one past the code
+# the entry state the seeds make, a register's secret in every row overlapping it but one reading zero, a global's off
+# its symbol, and the frame seeds indexed by offset into `w.sown` and `w.sowing`, refused naming a register the file
+# has no row of, an entry the stream does not hold, a frame slot at one past the code, memory or a slot off a symbol,
+# or a global of no symbol
 fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
     var i: u32 = 0;
     for (i < secrets.len) {
@@ -2388,7 +2916,8 @@ fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
             }
         }
         if (sel s.memory) {
-            var h: Held = Held{base: effect.NO_ROW, version: ENTRY, offset: s.memory.offset, length: s.memory.length};
+            if (s.memory.symbol != operand.NO_SYMBOL) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+            var h: Held = Held{base: effect.NO_ROW, version: ENTRY, symbol: operand.NO_SYMBOL, slot: false, offset: s.memory.offset, length: s.memory.length};
             if (s.memory.base != register.NONE) {
                 val row: opt[u32] = row_index(w, s.memory.base);
                 if (sel row.none) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
@@ -2397,8 +2926,14 @@ fun seed(w: *Walk, secrets: *Secrets, p: *Point) res[opt[Verdict], A.Error] {
             val held: err[A.Error] = hold(p, h);
             if (sel held.err) { ret failed[opt[Verdict]](held.err); }
         }
+        if (sel s.symbol) {
+            if (s.symbol.symbol == operand.NO_SYMBOL) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
+            val held: err[A.Error] = hold(p, Held{base: effect.NO_ROW, version: ENTRY, symbol: s.symbol.symbol, slot: false, offset: s.symbol.offset, length: s.symbol.length});
+            if (sel held.err) { ret failed[opt[Verdict]](held.err); }
+        }
         var next: u32 = NO_POINT;
         if (sel s.frame) {
+            if (s.frame.extent.symbol != operand.NO_SYMBOL) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
             val row: opt[u32] = row_index(w, s.frame.extent.base);
             if (sel row.none)                  { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, 0)}; }
             if (s.frame.at >= w.code.len::u64) { ret res[opt[Verdict], A.Error].ok{unread(UNSEEDABLE, s.frame.at::usize)}; }
@@ -2654,6 +3189,8 @@ fun release(w: *Walk) {
     vector.dnit[Held](?w.kept);
     vector.dnit[Held](?w.wrote);
     vector.dnit[Saved](?w.saved);
+    vector.dnit[u32](?w.sited);
+    vector.dnit[Forming](?w.forming);
 }
 
 # the declassify points indexed by offset into `w.declared` and `w.chain`, refused at one past the code
@@ -2681,10 +3218,12 @@ fun rowed(w: *Walk, regs: *Registers) bool {
     ret true;
 }
 
-# whether every extent `e` names is off no register or one with a row of the file
+# whether every extent `e` names is off no register or one with a row of the file, and none off both a register and a
+# symbol
 fun based(w: *Walk, e: *Extents) bool {
     var i: u32 = 0;
     for (i < e.len) {
+        if (e.at[i].base != register.NONE && e.at[i].symbol != operand.NO_SYMBOL) { ret false; }
         if (e.at[i].base != register.NONE) {
             val row: opt[u32] = row_index(w, e.at[i].base);
             if (sel row.none) { ret false; }
@@ -2717,12 +3256,35 @@ fun naming(message: str) res[opt[str], A.Error] {
     ret res[opt[str], A.Error].ok{opt[str].some{message}};
 }
 
-# the refusal of call model `c` by what it names alone, none when it may model a call: a register of no row, a
-# written register reading zero or sharing storage with a preserved one, and a preserved set without the stack pointer
+# the refusal of call model `c` by what it names alone, none when it may model a call: a register of no row, an extent
+# off both a register and a symbol, a written register reading zero or sharing storage with a preserved one, an
+# accepted register or read it does not name an argument or a read, and a preserved set without the stack pointer
 fun malformed(w: *Walk, c: *Call) res[opt[str], A.Error] {
     if (!rowed(w, ?c.preserved) || !rowed(w, ?c.arguments) || !rowed(w, ?c.written)) { ret naming(UNWRITTEN); }
     if (!based(w, ?c.reads) || !based(w, ?c.writes) || !based(w, ?c.kept))           { ret naming(UNWRITTEN); }
     var i: u32 = 0;
+    for (i < c.accepted.len) {
+        var named: bool = false;
+        var k:     u32  = 0;
+        for (k < c.arguments.len) {
+            if (c.arguments.at[k] == c.accepted.at[i]) { named = true; }
+            k = k + 1;
+        }
+        if (!named) { ret naming(UNACCEPTED); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < c.accepted_reads.len) {
+        var named: bool = false;
+        var k:     u32  = 0;
+        for (k < c.reads.len) {
+            if (same_extent(?c.reads.at[k], ?c.accepted_reads.at[i])) { named = true; }
+            k = k + 1;
+        }
+        if (!named) { ret naming(UNACCEPTED); }
+        i = i + 1;
+    }
+    i = 0;
     for (i < c.written.len) {
         val row: u32 = row_or_none(w, c.written.at[i]);
         if ((w.file.registers[row].flags & register.ZERO) != 0) { ret naming(UNWRITTEN); }
@@ -2762,6 +3324,19 @@ fun index_calls(w: *Walk) res[opt[Verdict], A.Error] {
     ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
 }
 
+# the sites indexed by offset into `w.sited`, refused out of ascending order or at one past the code
+fun index_sites(w: *Walk) res[opt[Verdict], A.Error] {
+    var i: u32 = 0;
+    for (i < w.code.sites.len) {
+        val at: u64 = w.code.sites.at[i].at;
+        if (at >= w.code.len::u64)                   { ret res[opt[Verdict], A.Error].ok{unread(UNSITED, at::usize)}; }
+        if (i > 0 && w.code.sites.at[i - 1].at > at) { ret res[opt[Verdict], A.Error].ok{unread(UNSITED, at::usize)}; }
+        if (w.sited.data[at::usize] == NO_POINT)     { w.sited.data[at::usize] = i; }
+        i = i + 1;
+    }
+    ret res[opt[Verdict], A.Error].ok{opt[Verdict].none{}};
+}
+
 fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     var i: usize = 0;
     for (i < w.code.len) {
@@ -2773,6 +3348,8 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
         if (sel sown.err) { ret failed[Verdict](sown.err); }
         val called: res[usize, A.Error] = vector.push[u32](?w.called, NO_POINT);
         if (sel called.err) { ret failed[Verdict](called.err); }
+        val sited: res[usize, A.Error] = vector.push[u32](?w.sited, NO_POINT);
+        if (sel sited.err) { ret failed[Verdict](sited.err); }
         if (w.stream != nil) {
             val shaped: res[usize, A.Error] = vector.push[u32](?w.shaped, NO_POINT);
             if (sel shaped.err) { ret failed[Verdict](shaped.err); }
@@ -2806,7 +3383,10 @@ fun walked(w: *Walk, secrets: *Secrets) res[Verdict, A.Error] {
     val models: res[opt[Verdict], A.Error] = index_calls(w);
     if (sel models.err)     { ret failed[Verdict](models.err); }
     if (sel models.ok.some) { ret res[Verdict, A.Error].ok{models.ok.some}; }
-    if (w.code.len == 0)    { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
+    val sites: res[opt[Verdict], A.Error] = index_sites(w);
+    if (sel sites.err)     { ret failed[Verdict](sites.err); }
+    if (sel sites.ok.some) { ret res[Verdict, A.Error].ok{sites.ok.some}; }
+    if (w.code.len == 0)   { ret res[Verdict, A.Error].ok{Verdict.clear{}}; }
     if (w.stream != nil) {
         val read: res[opt[Verdict], A.Error] = scan(w, ?store, ?alts);
         if (sel read.err)     { ret failed[Verdict](read.err); }
@@ -2904,6 +3484,10 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
         kept:     vector.init[Held](a),
         wrote:    vector.init[Held](a),
         saved:    vector.init[Saved](a),
+        arch:     arch_of(code, ctx),
+        sited:    vector.init[u32](a),
+        forming:  vector.init[Forming](a),
+        at:       0,
     };
     val verdict: res[Verdict, A.Error] = walked(?w, secrets);
     release(?w);
