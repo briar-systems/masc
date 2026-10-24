@@ -74,7 +74,6 @@ git clone https://github.com/briar-systems/masc.git
 cd masc
 mach dep pull .
 mach build .
-mach test .
 ```
 
 

@@ -71,26 +71,16 @@ with mink's and each `gen/dep/<x>` with `dep/<x>`. Check them locally with
 `git ls-files -s dep gen/dep`.
 
 
-## Testing and formatting
+## Formatting
 
 ```bash
-mach test .
 mach fmt --check .
-mach test gen
 mach fmt --check gen
 ```
 
 The tree is canonical: `mach fmt .` and `mach fmt gen` must leave it
-unchanged before a pull request is opened.
-
-Unit tests cover the pieces that can be tested directly, each once, at the
-layer that owns it. A table is checked by one test that walks its rows. There
-are no regression tests: a defect is fixed in the code, and a test is added
-only when the behaviour had no coverage. Checks that need outside tools, such
-as byte agreement with llvm-mc and the GNU assembler, decode agreement with
-llvm-objdump, and spirv-val and wasm-validate, run locally through the
-`harness` program and never in CI. CI builds every target and runs the unit
-tests.
+unchanged before a pull request is opened. masc carries no tests and no
+comparison against another toolchain. CI builds masc and gen.
 
 
 ## Branching
