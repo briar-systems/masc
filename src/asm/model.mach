@@ -695,7 +695,7 @@ fun facts_of(m: *Assembler, l: build.Label) res[*Facts, Refusal] {
         if (!held(vector.reserve[Facts](?m.facts, need - m.facts.len))) { ret res[*Facts, Refusal].err{nowhere(field.MEMORY)}; }
         for (m.facts.len < need) {
             m.facts.data[m.facts.len] = Facts{};
-            m.facts.len               = m.facts.len + 1;
+            vector.commit[Facts](?m.facts, 1);
         }
     }
     ret res[*Facts, Refusal].ok{?m.facts.data[need - 1]};
@@ -709,7 +709,7 @@ fun declared(m: *Assembler, id: u32) Facts {
 
 # `v` with a nul after it, as the builder takes a name
 fun spelled(m: *Assembler, v: View) res[str, str] {
-    m.spelled.len = 0;
+    vector.truncate[u8](?m.spelled, 0);
     if (!held(vector.reserve[u8](?m.spelled, v.len + 1))) { ret res[str, str].err{field.MEMORY}; }
     var i: usize = 0;
     for (i < v.len) {
@@ -717,7 +717,8 @@ fun spelled(m: *Assembler, v: View) res[str, str] {
         i                 = i + 1;
     }
     m.spelled.data[v.len] = 0;
-    m.spelled.len         = v.len + 1;
+    vector.truncate[u8](?m.spelled, 0);
+    vector.commit[u8](?m.spelled, v.len + 1);
     ret res[str, str].ok{m.spelled.data};
 }
 
@@ -1523,7 +1524,7 @@ fun popped(m: *Assembler, rd: *syntax.Reader, at: usize, len: usize) err[diagnos
     if (sel restored.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, restored.err, at, len)}; }
     val back: err[str] = written_in(m, saved.syntax);
     if (sel back.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, back.err, at, len)}; }
-    m.pushed.len = m.pushed.len - 1;
+    vector.truncate[Saved](?m.pushed, m.pushed.len - 1);
     ret err[diagnostic.Diagnostic].ok{};
 }
 
@@ -1668,7 +1669,7 @@ fun selection_value(m: *Assembler, rd: *syntax.Reader) res[View, diagnostic.Diag
     val same: bool = extension.within(?named.ok, m.object.selection) && extension.within(m.object.selection, ?named.ok);
     extension.release(?named.ok);
     if (!same) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, OTHER_SELECTION, at, rd.at - at)}; }
-    m.spelled.len = 0;
+    vector.truncate[u8](?m.spelled, 0);
     val written: err[A.Error] = extension.spell_versioned(m.object.selection, ?m.spelled);
     if (sel written.err) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, field.MEMORY, at, rd.at - at)}; }
     ret res[View, diagnostic.Diagnostic].ok{View{data: m.spelled.data, len: m.spelled.len}};
@@ -1925,7 +1926,7 @@ pub fun string(m: *Assembler, rd: *syntax.Reader) res[View, diagnostic.Diagnosti
             or { c = e; }
         }
         m.strings.data[m.strings.len] = c;
-        m.strings.len                 = m.strings.len + 1;
+        vector.commit[u8](?m.strings, 1);
     }
     rd.at = rd.at + 1;
     ret res[View, diagnostic.Diagnostic].ok{View{data: ?m.strings.data[start], len: m.strings.len - start}};
@@ -1938,7 +1939,7 @@ pub fun unquoted(m: *Assembler, text: *u8, len: usize) res[View, str] {
     val start: usize      = m.strings.len;
     val n:     opt[usize] = spell.unquote(text, len, ?m.strings.data[start]);
     if (sel n.none) { ret res[View, str].err{expr.ESCAPE}; }
-    m.strings.len = start + n.some;
+    vector.commit[u8](?m.strings, n.some);
     ret res[View, str].ok{View{data: ?m.strings.data[start], len: n.some}};
 }
 
@@ -2064,6 +2065,87 @@ pub fun float_bits(v: Float, f: ieee.Format) res[u128, number.ParseError] {
     ret number.parse_float(f, radix, v.text.data, v.text.len, true, ?work[0]);
 }
 
+# how a float encoding spends the patterns ieee 754 gives its exponent field of all ones
+# ---
+# IEEE:    infinities and nans, as ieee 754's interchange formats, bfloat16 and ocp float8 e5m2
+# ONE_NAN: finite values, but for the one nan of every exponent and fraction bit set, and no infinity, as ocp float8
+#          e4m3: a value that rounds past the largest finite one, and an infinity, is that nan
+# FINITE:  finite values only, as the ocp mx fp6 and fp4 formats: a value that rounds past the largest finite one is
+#          refused
+pub def Specials: u8;
+
+pub val IEEE:    Specials = 0;
+pub val ONE_NAN: Specials = 1;
+pub val FINITE:  Specials = 2;
+
+# a float encoding: the fields of its format and how it spends their patterns of an exponent field of all ones
+pub rec Encoding {
+    format:   ieee.Format;
+    specials: Specials;
+}
+
+# the encoding of an ieee 754 format
+pub fun ieee_encoding(f: ieee.Format) Encoding {
+    ret Encoding{format: f, specials: IEEE};
+}
+
+# the format of one more exponent bit and the same bias as `e`'s, which holds every finite value of `e` at the same
+# fields, its exponent field of all ones too
+pub fun extended(e: Encoding) ieee.Format {
+    ret ieee.Format{mant_bits: e.format.mant_bits, exp_bits: e.format.exp_bits + 1, bias: e.format.bias};
+}
+
+# the one nan of a ONE_NAN encoding's format `f`, its sign clear
+fun only_nan(f: ieee.Format) u128 {
+    ret ieee.inf_bits(f) | (ieee.hidden(f) - 1);
+}
+
+# the pattern of `v` in encoding `e`, low bits first, rounded once as `float_bits` rounds: an ieee encoding's as
+# `float_bits` makes it, and another's rounded into its extended format, where every finite value it holds sits at its
+# own fields, then past its largest finite value its nan or a refusal as its specials state
+pub fun encoded_bits(v: Float, e: Encoding) res[u128, number.ParseError] {
+    if (e.specials == IEEE) { ret float_bits(v, e.format); }
+    val f:    ieee.Format = e.format;
+    var sign: u128        = 0;
+    if (v.negative) { sign = ieee.sign_bit(f); }
+    if (sel v.form.infinity || sel v.form.nan) {
+        if (e.specials == ONE_NAN) { ret res[u128, number.ParseError].ok{sign | only_nan(f)}; }
+        ret res[u128, number.ParseError].err{number.ParseError.overflow{0}};
+    }
+    val wide: ieee.Format                  = extended(e);
+    val got:  res[u128, number.ParseError] = float_bits(v, wide);
+    if (sel got.err) { ret got; }
+    val p:   ieee.Fields = ieee.fields(wide, got.ok);
+    val top: i64         = ieee.exp_field_max(f);
+    if (p.field > top || (e.specials == ONE_NAN && p.field == top && p.frac == ieee.hidden(f) - 1)) {
+        if (e.specials == ONE_NAN) { ret res[u128, number.ParseError].ok{sign | only_nan(f)}; }
+        ret res[u128, number.ParseError].err{number.ParseError.overflow{0}};
+    }
+    ret res[u128, number.ParseError].ok{sign | (p.field::u128 << f.mant_bits::u128) | p.frac};
+}
+
+# a pattern of an encoding as the ieee format whose fields mean what its fields mean
+# ---
+# format: the format, the encoding's own for an ieee one, its extended format for another
+# bits:   the pattern in that format, a ONE_NAN encoding's nan the extended format's nan of the same fraction
+pub rec Read {
+    format: ieee.Format;
+    bits:   u128;
+}
+
+# the pattern `bits` of encoding `e` as the ieee format whose fields mean what its fields mean, so a printer of ieee
+# formats writes it, and its text rounds back to it by `encoded_bits`
+pub fun as_ieee(e: Encoding, bits: u128) Read {
+    if (e.specials == IEEE) { ret Read{format: e.format, bits: bits}; }
+    val f:    ieee.Format = e.format;
+    val wide: ieee.Format = extended(e);
+    val p:    ieee.Fields = ieee.fields(f, bits);
+    var sign: u128        = 0;
+    if (p.neg)                                                              { sign = ieee.sign_bit(wide); }
+    if (e.specials == ONE_NAN && (bits & ~ieee.sign_bit(f)) == only_nan(f)) { ret Read{format: wide, bits: sign | ieee.inf_bits(wide) | p.frac}; }
+    ret Read{format: wide, bits: sign | (p.field::u128 << f.mant_bits::u128) | p.frac};
+}
+
 # one operand of kind `kind` read at the reader's position, for a row that reads its operands itself
 pub fun read_item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
     ret item(m, rd, kind);
@@ -2109,7 +2191,7 @@ fun item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic
 
 # the operands of `shape` read over the reader into the assembler's items, an empty one absent where it is optional
 fun operands(m: *Assembler, rd: *syntax.Reader, shape: *Shape) err[diagnostic.Diagnostic] {
-    m.items.len = 0;
+    vector.truncate[Operand](?m.items, 0);
     read.skip(rd);
     if (shape.text)     { ret err[diagnostic.Diagnostic].ok{}; }
     if (shape.len == 0) { ret ended(rd); }
@@ -2163,7 +2245,7 @@ fun label_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnos
     var name: View = source.bytes(st, st.head);
     # a quoted name is the name it spells, never a numbered label
     if (name.len >= 2 && name.data[0] == '"') {
-        m.strings.len = 0;
+        vector.truncate[u8](?m.strings, 0);
         val v: res[View, str] = unquoted(m, ?name.data[1], name.len - 2);
         if (sel v.err) { ret stop_at(st, v.err, st.head); }
         ret placed_label(m, st, v.ok);
@@ -2274,7 +2356,7 @@ fun directive_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Dia
     val found: opt[*Entry] = find(m, source.bytes(st, st.head));
     if (sel found.none) { ret stop_at(st, UNKNOWN_DIRECTIVE, st.head); }
     val row: *Directive = found.some.directive;
-    m.strings.len = 0;
+    vector.truncate[u8](?m.strings, 0);
     if (!held(vector.reserve[u8](?m.strings, st.body.len))) { ret stop_at(st, field.MEMORY, st.head); }
     # a quoted name's escapes read into the literal bytes, which never hold more than the body, so no read of a
     # directive's operands finds them short
