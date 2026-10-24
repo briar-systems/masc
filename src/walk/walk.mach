@@ -521,6 +521,16 @@ rec Moved {
     offset: i64;
 }
 
+# a register the instruction walked writes as a stated function of what it reads, so its secrecy is its inputs' and
+# not all the instruction reads
+# ---
+# row:    its row
+# secret: whether any input of its value may hold a secret
+rec Derived {
+    row:    u32;
+    secret: bool;
+}
+
 # a register row as it was where a call starts
 # ---
 # row:     its row
@@ -650,6 +660,7 @@ rec Block {
 # overlaps: the rows each row of the file shares storage with
 # stack:    the stack pointer's row, effect.NO_ROW for a set whose code has no call frames
 # moved:    the registers the instruction walked gives a known offset
+# derived:  the registers it writes as a stated function of what it reads, with their inputs' secrecy
 # secrets:  the caller's seeds
 # sown:     the first frame seed at each offset, by index into `secrets`, NO_POINT for none
 # sowing:   the next frame seed at the offset of each seed, NO_POINT for none
@@ -690,6 +701,7 @@ rec Walk {
     overlaps: register.Overlaps;
     stack:    u32;
     moved:    vector.Vector[Moved];
+    derived:  vector.Vector[Derived];
     secrets:  *Secrets;
     sown:     vector.Vector[u32];
     sowing:   vector.Vector[u32];
@@ -1311,12 +1323,14 @@ fun rebase(w: *Walk, p: *Point, row: u32, offset: i64, length: u64) Held {
     ret Held{base: row, version: p.versions.data[row], symbol: operand.NO_SYMBOL, slot: false, offset: offset, length: length};
 }
 
-# the registers `ins` gives a known offset under `p` into `w.moved`: each relation of its row writing a register as wide
-# as the stack pointer from one of a known offset by a number no site fills, and the stack pointer's own change its
-# effect states
+# the registers `ins` writes as a stated function of what it reads into `w.derived`, with their inputs' secrecy under
+# `p`, and those it gives a known offset into `w.moved`: each relation of its row, whose register written holds the one
+# it reads plus a number no secret decides and no site fills, of a known offset where that one has one and both are as
+# wide as the stack pointer, and the stack pointer's own change its effect states, its value before plus the delta's
+# operand, but where an operand names the stack pointer
 fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err[A.Error] {
     vector.truncate[Moved](?w.moved, 0);
-    if (w.stack == effect.NO_ROW) { ret err[A.Error].ok{}; }
+    vector.truncate[Derived](?w.derived, 0);
     val e:      *effect.Effect = ins.inst.row.effect;
     val values: operand.Values = operand.Values{at: ins.inst.values, len: ins.inst.count};
     var i:      u32            = 0;
@@ -1329,8 +1343,10 @@ fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err
             val from: opt[u32] = row_index(w, got.some.from);
             if (sel to.some) {
                 if (sel from.some) {
+                    val derived: err[A.Error] = derive(w, to.some, secret_row(w, p, from.some));
+                    if (sel derived.err) { ret derived; }
                     val f: Frame = p.frames.data[from.some];
-                    if (f.known && wide(w, to.some) && wide(w, from.some)) {
+                    if (w.stack != effect.NO_ROW && f.known && wide(w, to.some) && wide(w, from.some)) {
                         val pushed: res[usize, A.Error] = vector.push[Moved](?w.moved, Moved{row: to.some, offset: f.offset + got.some.by});
                         if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
                     }
@@ -1339,20 +1355,47 @@ fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err
         }
         i = i + 1;
     }
+    if (w.stack == effect.NO_ROW) { ret err[A.Error].ok{}; }
     val st: effect.Stack = fp.stack;
     if (sel st.delta) {
-        val f:     Frame = p.frames.data[w.stack];
-        var bytes: i64   = st.delta.bytes::i64;
-        var known: bool  = f.known;
+        val f:      Frame = p.frames.data[w.stack];
+        var bytes:  i64   = st.delta.bytes::i64;
+        var known:  bool  = f.known;
+        var stated: bool  = true;
+        var secret: bool  = secret_row(w, p, w.stack);
         if (st.delta.operand != field.NO_OPERAND) {
-            known = false;
+            known  = false;
+            stated = false;
             if (st.delta.operand::u32 < ins.inst.count) {
                 val v: operand.Value = ins.inst.values[st.delta.operand];
                 if (sel v.immediate) {
-                    bytes = bytes + v.immediate;
-                    known = f.known;
+                    bytes  = bytes + v.immediate;
+                    known  = f.known;
+                    stated = true;
+                }
+                or (sel v.register) {
+                    secret = secret || tainted(w, p, v.register);
+                    stated = true;
                 }
             }
+        }
+        # an operand naming the stack pointer may write it from data, as x86 `pop rsp`
+        var op: u32 = 0;
+        for (stated && op < ins.inst.count) {
+            val v: operand.Value = ins.inst.values[op];
+            if (sel v.register) {
+                val at: opt[u32] = row_index(w, v.register);
+                if (sel at.some) {
+                    val sharing: res[bool, A.Error] = shares(w, at.some, w.stack);
+                    if (sel sharing.err) { ret err[A.Error].err{sharing.err}; }
+                    if (sharing.ok)      { stated = false; }
+                }
+            }
+            op = op + 1;
+        }
+        if (stated) {
+            val derived: err[A.Error] = derive(w, w.stack, secret);
+            if (sel derived.err) { ret derived; }
         }
         if (known) {
             val pushed: res[usize, A.Error] = vector.push[Moved](?w.moved, Moved{row: w.stack, offset: f.offset + bytes});
@@ -1360,6 +1403,33 @@ fun moves(w: *Walk, p: *Point, ins: *walk.Decoded, fp: *footprint.Footprint) err
         }
     }
     ret err[A.Error].ok{};
+}
+
+# row `row` into `w.derived` as written from inputs of which any is secret when `secret` is, one a relation and the
+# stack's delta both write taking either's
+fun derive(w: *Walk, row: u32, secret: bool) err[A.Error] {
+    var k: usize = 0;
+    for (k < w.derived.len) {
+        if (w.derived.data[k].row == row) {
+            w.derived.data[k].secret = w.derived.data[k].secret || secret;
+            ret err[A.Error].ok{};
+        }
+        k = k + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Derived](?w.derived, Derived{row: row, secret: secret});
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# whether register row `row` the instruction walked writes takes secrecy of its own: its inputs' where `w.derived`
+# holds it, else `value`, whether anything the instruction reads is secret
+fun written_secret(w: *Walk, row: u32, value: bool) bool {
+    var k: usize = 0;
+    for (k < w.derived.len) {
+        if (w.derived.data[k].row == row) { ret w.derived.data[k].secret; }
+        k = k + 1;
+    }
+    ret value;
 }
 
 # the rows a register value of operand `op` covers marked in `into`, and whether any of them is secret under `p`. a
@@ -2134,11 +2204,12 @@ fun push_count(w: *Walk, s: *Shape, sig: *effect.Signature) usize {
     ret n;
 }
 
-# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, in every row overlapping
-# a register written, a row the write leaves part of keeping that part's old secret, and its stores hold the extent
-# they write. a register written holds no known offset from the stack pointer after it but where `moves` gives one. a
-# call, whose callee the walk does not read, leaves every register and every address secret when anything is, and no
-# register of a known offset, unless `model` states its callee, as `modeled` applies with `joined` its join
+# what `ins` leaves secret, applied to `p`: its writes take whether anything it reads is secret, but a register `moves`
+# derives, which takes its inputs', in every row overlapping a register written, a row the write leaves part of keeping
+# that part's old secret, and its stores hold the extent they write. a register written holds no known offset from the
+# stack pointer after it but where `moves` gives one. a call, whose callee the walk does not read, leaves every register
+# and every address secret when anything is, and no register of a known offset, unless `model` states its callee, as
+# `modeled` applies with `joined` its join
 fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Footprint, value: bool, model: *Call, joined: bool) err[A.Error] {
     val version: u64          = at::u64 * 2 + 1;
     val moved:   err[A.Error] = moves(w, p, ins, fp);
@@ -2154,15 +2225,16 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *walk.Decoded, fp: *footprint.Foo
         val written: bool = bit_of(fp.written.data, i) || bit_of(fp.clobbers.data, i);
         # a write through a register reading zero is discarded
         if (written && (w.file.registers[i].flags & register.ZERO) == 0) {
-            val span: res[register.Span, A.Error] = register.overlapping(?w.overlaps, i);
+            val secret: bool                        = written_secret(w, i, value);
+            val span:   res[register.Span, A.Error] = register.overlapping(?w.overlaps, i);
             if (sel span.err) { ret err[A.Error].err{span.err}; }
             var k: u32 = 0;
             for (k < span.ok.count) {
                 val o:   u32                = w.overlaps.rows.data[span.ok.first + k];
                 val row: *register.Register = ?w.file.registers[o];
                 if (stored(w, o)) {
-                    if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, o, value); }
-                    or (value)                                    { set_bit(p.taint.data, o, true); }
+                    if (footprint.kills(fp, register.id_of(row))) { set_bit(p.taint.data, o, secret); }
+                    or (secret)                                   { set_bit(p.taint.data, o, true); }
                     p.versions.data[o] = version;
                     p.frames.data[o]   = UNKNOWN;
                     p.formed.data[o]   = UNFORMED;
@@ -3203,6 +3275,7 @@ fun release(w: *Walk) {
     vector.dnit[bool](?w.popped);
     register.release_overlaps(?w.overlaps);
     vector.dnit[Moved](?w.moved);
+    vector.dnit[Derived](?w.derived);
     vector.dnit[u32](?w.sown);
     vector.dnit[u32](?w.sowing);
     vector.dnit[u32](?w.declared);
@@ -3498,6 +3571,7 @@ pub fun check(a: *A.Allocator, code: *Code, ctx: *state.Context, secrets: *Secre
         overlaps: overlaps.ok,
         stack:    stack_row(file, code, ctx),
         moved:    vector.init[Moved](a),
+        derived:  vector.init[Derived](a),
         secrets:  secrets,
         sown:     vector.init[u32](a),
         sowing:   vector.init[u32](a),
