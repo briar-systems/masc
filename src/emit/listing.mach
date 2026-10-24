@@ -62,7 +62,16 @@
 # in. the tables the source named are restated by `.cfi_sections`. a rule
 # that scales or marks a prologue or an epilogue, which no call frame
 # directive states, is refused, as is a frame on a format whose table no
-# call frame directive states.
+# directive the listing writes states.
+#
+# a windows table is stated by the `.seh_` directives instead
+# (`masc.emit.seh`): `.seh_proc` follows the function's label and
+# `.seh_endproc` stands where the frame ends, each prologue step is the
+# unwind codes that state its rules, before the statement it takes effect
+# at, `.seh_endprologue` stands where the prologue ends, and the
+# personality routine is its `.seh_handler`. on arm64 every prologue
+# instruction whose step states no code is a `.seh_nop`. a frame no unwind
+# code states is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -127,6 +136,7 @@ use masc.core.trait;
 use masc.emit.cfi;
 use masc.emit.emit;
 use masc.emit.line;
+use masc.emit.seh;
 use masc.format.dialect;
 use spell: masc.syntax.name;
 use masc.syntax.parse;
@@ -180,6 +190,7 @@ pub val VIEW:             str = "view that no directive of the dialect states";
 pub val MODES:            str = "assembler mode value that no directive of the dialect states";
 pub val FRAMES:           str = "frame on a format whose unwind table no call frame directive the listing writes states";
 pub val FRAME_RULE:       str = "frame rule no call frame directive states: an offset that scales or a prologue or epilogue mark";
+pub val UNEVEN:           str = "arm64 prologue whose instructions are not four bytes each, which its unwind codes count";
 pub val FRAME_FUNCTION:   str = "frame whose function's label is not placed where it begins, which .cfi_startproc names it by";
 pub val FRAME_ORDER:      str = "frames out of the order of their sections and starts, in which the text begins them";
 pub val ATTRIBUTE:        str = "trait stated by an attribute tag, which the dialect has no directive to state";
@@ -265,6 +276,19 @@ rec Codes {
     lsda:        opt[u8];
 }
 
+# how the listing writes a windows table's frames
+# ---
+# on:      whether the format's table is a windows one, its frames written as unwind codes
+# written: the open frame's codes
+# si:      the next step of them to write
+# last:    the offset of the last step written, from which arm64's prologue instructions with no code are counted
+rec Windows {
+    on:      bool;
+    written: seh.Written;
+    si:      u32;
+    last:    u64;
+}
+
 # the state of one listing
 # ---
 # names:   the spelling of every label, interned once
@@ -290,6 +314,7 @@ rec Codes {
 # current: that frame
 # ri:      the next rule of the open frame to write
 # codes:   the pointer encodings the format's unwind table writes a frame's pointers in
+# windows: the unwind codes of a windows table's frames
 rec Lister {
     a:       *A.Allocator;
     b:       *build.Builder;
@@ -318,6 +343,7 @@ rec Lister {
     current: build.Frame;
     ri:      usize;
     codes:   Codes;
+    windows: Windows;
     held:    [relax.MAX_STEPS]Held;
     steps:   [relax.MAX_STEPS]inst.Inst;
     markers: [relax.MAX_STEPS]operand.FixupKind;
@@ -1153,8 +1179,8 @@ fun field_code(field: opt[pointer.Field]) opt[u8] {
 }
 
 # how the format's runtime unwind table writes a frame, read from mink's lowering row: as the dwarf table call frame
-# directives state, its personality and language data pointers in the table's encodings, or by no directive the listing
-# writes. a compact table states the dwarf table it falls back to
+# directives state, its personality and language data pointers in the table's encodings, as the windows table unwind
+# codes state, or by no directive the listing writes. a compact table states the dwarf table it falls back to
 fun frame_spelling(l: *Lister) err[Refusal] {
     val known: res[*registration.Registration, fail.Fail] = registry.by_format(l.b.formats, l.b.format);
     if (sel known.err) { ret whole(FRAMES); }
@@ -1170,6 +1196,12 @@ fun frame_spelling(l: *Lister) err[Refusal] {
         val fallback: lower.FrameForm = @form.compact.fallback;
         if (!sel fallback.dwarf_eh) { ret whole(FRAMES); }
         row = fallback.dwarf_eh;
+    }
+    or (sel form.windows || sel form.win64 || sel form.arm64_xdata) {
+        val machine: opt[seh.Machine] = seh.machine_of(l.b.arch);
+        if (sel machine.none) { ret whole(seh.NO_UNWIND); }
+        l.windows.on = true;
+        ret err[Refusal].ok{};
     }
     or { ret whole(FRAMES); }
     l.codes.personality = field_code(row.personality);
@@ -1190,6 +1222,10 @@ fun frames_read(l: *Lister) err[Refusal] {
         if (i > 0) {
             val p: build.Frame = build.frame_at(l.b, i - 1);
             if (p.section.index > f.section.index || (p.section.index == f.section.index && p.end > f.start)) { ret refusal(FRAME_ORDER, f.section.index, 0); }
+        }
+        if (l.windows.on) {
+            i = i + 1;
+            cnt;
         }
         if (sel f.personality.some) {
             if (sel l.codes.personality.none) { ret about(FRAMES, f.personality.some.label.id); }
@@ -1319,10 +1355,80 @@ fun frame_rules(l: *Lister, j: u32, s: u32, at: u64) err[Refusal] {
     for (l.ri < f.rules + f.count) {
         val r: build.Rule = build.rule_at(l.b, l.ri);
         if (r.at != j) { brk; }
-        val wrote: err[Refusal] = frame_rule(l, r.rule, s, at);
-        if (sel wrote.err) { ret wrote; }
+        if (!l.windows.on) {
+            val wrote: err[Refusal] = frame_rule(l, r.rule, s, at);
+            if (sel wrote.err) { ret wrote; }
+        }
         l.ri = l.ri + 1;
     }
+    if (l.windows.on) { ret unwind_step(l, j, s, at); }
+    ret err[Refusal].ok{};
+}
+
+# the open frame's unwind codes of the step before statement `j`, at `at` of section `s`, when one is there: on arm64
+# first a `.seh_nop` for each prologue instruction since the last step that states none, then its codes, then the end
+# of the prologue when it ends there
+fun unwind_step(l: *Lister, j: u32, s: u32, at: u64) err[Refusal] {
+    val w: *seh.Written = ?l.windows.written;
+    if (l.windows.si >= w.count) { ret err[Refusal].ok{}; }
+    val step: *seh.Step = ?w.steps[l.windows.si::usize];
+    if (step.at != j) { ret err[Refusal].ok{}; }
+    l.windows.si = l.windows.si + 1;
+    if (sel w.machine.arm64) {
+        val gap: u64 = at - l.windows.last;
+        if (gap % 4 != 0) { ret refusal(UNEVEN, s, at); }
+        var nops: u64 = gap / 4;
+        if (step.codes.len > 0 && nops > 0) { nops = nops - 1; }
+        for (nops > 0) {
+            put(l, "\t.seh_nop\n");
+            nops = nops - 1;
+        }
+    }
+    l.windows.last = at;
+    var c: u32 = 0;
+    for (c < step.codes.len) {
+        val wrote: err[Refusal] = unwind_code(l, w.machine, step.codes.at[c::usize], s, at);
+        if (sel wrote.err) { ret wrote; }
+        c = c + 1;
+    }
+    if (step.end) { put(l, "\t.seh_endprologue\n"); }
+    ret err[Refusal].ok{};
+}
+
+# dwarf register `n` by its name in the set's syntax, an arm64 floating point register's by its d register, the low half
+# its unwind codes save
+fun put_named_register(l: *Lister, m: seh.Machine, n: u16, s: u32, at: u64) err[Refusal] {
+    var reg: res[rf.Id, build.Refusal] = cfi.numbered(l.b, n::u32);
+    if (sel m.arm64 && n >= seh.A64_FLOAT) { reg = cfi.low_view(l.b, n, 64); }
+    if (sel reg.err)                       { ret refusal(reg.err.message, s, at); }
+    var w:     core_syntax.Writer = writer(l, build.object_of(l.b), ?l.modes);
+    val wrote: err[field.Refusal] = syntax_write.register_name(?w, reg.ok, field.NO_OPERAND);
+    if (sel wrote.err) { ret refusal(seh.UNCODED, s, at); }
+    ret err[Refusal].ok{};
+}
+
+# unwind code `c` as the first `.seh_` directive of machine `m` that spells it
+fun unwind_code(l: *Lister, m: seh.Machine, c: seh.Code, s: u32, at: u64) err[Refusal] {
+    val spelled: opt[seh.Spelled] = seh.spelling(m, c);
+    if (sel spelled.none) { ret refusal(seh.UNCODED, s, at); }
+    val d: *seh.Directive = spelled.some.directive;
+    put_char(l, '\t');
+    put(l, d.name);
+    val shape: seh.Operands = d.operands;
+    if (sel shape.register || sel shape.both) {
+        put_char(l, ' ');
+        val r: err[Refusal] = put_named_register(l, m, spelled.some.reg, s, at);
+        if (sel r.err) { ret r; }
+    }
+    if (sel shape.both)                    { put(l, ", "); }
+    or (sel shape.bytes)                   { put_char(l, ' '); }
+    if (sel shape.bytes || sel shape.both) { put_signed(l, spelled.some.bytes); }
+    if (sel shape.code) {
+        if (sel c.machframe) {
+            if (c.machframe) { put(l, " @code"); }
+        }
+    }
+    put_char(l, '\n');
     ret err[Refusal].ok{};
 }
 
@@ -1334,7 +1440,11 @@ fun frame_end(l: *Lister, s: u32, j: u32, at: u64) err[Refusal] {
     val rules: err[Refusal] = frame_rules(l, j, s, at);
     if (sel rules.err)             { ret rules; }
     if (l.ri != f.rules + f.count) { ret refusal(FRAMES, s, at); }
-    put(l, "\t.cfi_endproc\n");
+    if (l.windows.on) {
+        if (l.windows.si != l.windows.written.count) { ret refusal(FRAMES, s, at); }
+        put(l, "\t.seh_endproc\n");
+    }
+    or { put(l, "\t.cfi_endproc\n"); }
     l.open = false;
     ret err[Refusal].ok{};
 }
@@ -1350,6 +1460,7 @@ fun frame_begins(l: *Lister, s: u32, j: u32) opt[build.Frame] {
 # frame `f` begun after its function's label, which `.cfi_startproc` names it by, with its pointers and its rules
 # before statement `j`, and ended there when it ends there
 fun frame_start(l: *Lister, f: build.Frame, s: u32, j: u32, at: u64) err[Refusal] {
+    if (l.windows.on) { ret unwind_start(l, f, s, at); }
     put(l, "\t.cfi_startproc\n");
     if (sel f.personality.some) {
         if (sel l.codes.personality.none) { ret refusal(FRAMES, s, at); }
@@ -1366,6 +1477,28 @@ fun frame_start(l: *Lister, f: build.Frame, s: u32, j: u32, at: u64) err[Refusal
     l.current = f;
     l.ri      = f.rules;
     l.fi      = l.fi + 1;
+    ret err[Refusal].ok{};
+}
+
+# frame `f` begun as `.seh_proc` names it after its function's label, with its handler, its unwind codes found
+fun unwind_start(l: *Lister, f: build.Frame, s: u32, at: u64) err[Refusal] {
+    val found: res[*seh.Written, seh.Uncoded] = seh.codes(l.b, f, ?l.windows.written);
+    if (sel found.err) { ret refusal(found.err.message, s, at); }
+    put(l, "\t.seh_proc ");
+    put_name(l, f.function.id);
+    put_char(l, '\n');
+    if (sel f.personality.some) {
+        if (!spelled(l, f.personality.some.label.id)) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: at, label: f.personality.some.label.id}}; }
+        put(l, "\t.seh_handler ");
+        put_name(l, f.personality.some.label.id);
+        put(l, ", @unwind, @except\n");
+    }
+    l.windows.si   = 0;
+    l.windows.last = at;
+    l.open         = true;
+    l.current      = f;
+    l.ri           = f.rules;
+    l.fi           = l.fi + 1;
     ret err[Refusal].ok{};
 }
 
@@ -1610,17 +1743,18 @@ fun again(l: *Lister, rd: *core_syntax.Reader) bool {
     ret grown.ok;
 }
 
-# the fixup kind a symbol in operand `desc` stands under, its default when it states none
-fun kind_in(desc: *operand.Operand, kind: operand.FixupKind) operand.FixupKind {
+# the fixup kind a symbol stating `kind` stands under, `default` when it states none
+fun kind_in(kind: operand.FixupKind, default: operand.FixupKind) operand.FixupKind {
     if (kind != operand.NO_FIXUP) { ret kind; }
-    ret operand.default_fixup(desc);
+    ret default;
 }
 
 # `v` with the fixup kind of its symbol stated as the one it stands under in operand `desc`
 fun stated_kind(desc: *operand.Operand, v: *operand.Value) operand.Value {
-    var out: operand.Value = @v;
-    if (sel out.symbol) { out.symbol.fixup = kind_in(desc, out.symbol.fixup); }
-    if (sel out.memory) { out.memory.symbol.fixup = kind_in(desc, out.memory.symbol.fixup); }
+    var out:     operand.Value     = @v;
+    val default: operand.FixupKind = operand.value_fixup(desc, v);
+    if (sel out.symbol) { out.symbol.fixup = kind_in(out.symbol.fixup, default); }
+    if (sel out.memory) { out.memory.symbol.fixup = kind_in(out.memory.symbol.fixup, default); }
     ret out;
 }
 
@@ -1685,17 +1819,41 @@ fun writer(l: *Lister, v: *state.Context, m: *mode.State) core_syntax.Writer {
 }
 
 # instruction `k` of `l.steps` written alone under view `v` and modes `m`, by the first spelling that states it: its
-# preferred alias, then its row's own form
+# preferred alias, then its row's own form, in its own form and else in it with one marked choice the form leaves at
+# the preference that the builder encodes the instruction alike under, so the marker pins the row the text reads back
+# to, as x86's `{disp32} jmp l` reads to the rel32 row a plain `jmp l` reads past
 fun one(l: *Lister, k: u32, v: *state.Context, m: *mode.State, s: u32, at: u64) err[Refusal] {
+    val own:   inst.Inst    = l.steps[k];
+    val first: err[Refusal] = attempt(l, k, own.form, v, m, s, at);
+    if (sel first.ok) { ret first; }
+    val forms: *core_form.FormFields = ?l.b.set.codec.forms;
+    var i:     u32                   = 0;
+    for (i < forms.len) {
+        val f: *core_form.FormField = ?forms.at[i];
+        i = i + 1;
+        if (f.marker == nil || (f.mask & core_form.EXACT) != 0 || (own.form.bits & f.mask) != 0) { cnt; }
+        val pinned: core_form.Form = core_form.with(own.form, f);
+        if (!build.alike(l.b, v, ?own, pinned)) { cnt; }
+        val again: err[Refusal] = attempt(l, k, pinned, v, m, s, at);
+        if (sel again.ok) { ret again; }
+    }
+    ret first;
+}
+
+# instruction `k` of `l.steps` in form `fm` written alone under view `v` and modes `m`, by the first spelling that
+# states it: its preferred alias, then its row's own form. refused with the output as it was when neither does
+fun attempt(l: *Lister, k: u32, fm: core_form.Form, v: *state.Context, m: *mode.State, s: u32, at: u64) err[Refusal] {
     var w:     core_syntax.Writer = writer(l, v, m);
+    var step:  inst.Inst          = l.steps[k];
     var why:   str                = UNREAD;
     var tried: u32                = 0;
+    step.form = fm;
     for (tried < 2) {
         put_char(l, '\t');
         val start:   usize              = l.out.len;
         var spelled: err[field.Refusal] = err[field.Refusal].ok{};
-        if (tried == 0) { spelled = print.instruction(?w, ?l.steps[k]); }
-        or              { spelled = print.form(?w, ?l.steps[k]); }
+        if (tried == 0) { spelled = print.instruction(?w, ?step); }
+        or              { spelled = print.form(?w, ?step); }
         tried = tried + 1;
         if (sel spelled.err) {
             l.out.len = start - 1;
@@ -1703,7 +1861,7 @@ fun one(l: *Lister, k: u32, v: *state.Context, m: *mode.State, s: u32, at: u64) 
             cnt;
         }
         # a statement of one instruction is read back as one, wherever its sequence runs on
-        l.steps[0]   = l.steps[k];
+        l.steps[0]   = step;
         l.markers[0] = l.markers[k];
         val wrong: opt[str] = unstated(l, start, v, m, 1, operand.NO_SYMBOL);
         if (sel wrong.none) {
@@ -1851,7 +2009,9 @@ fun data(l: *Lister, s: u32, st: build.Statement) err[Refusal] {
     }
     if (!sel stated.difference) { ret err[Refusal].ok{}; }
     val g: build.Measure = stated.difference;
-    val d: opt[str]      = width_directive(l, g.width);
+    var d: opt[str]      = width_directive(l, g.width);
+    if (g.encoding == fixup.ULEB)    { d = opt[str].some{".uleb128"}; }
+    if (g.encoding == fixup.SLEB)    { d = opt[str].some{".sleb128"}; }
     if (sel d.none)                  { ret refusal(NO_WIDTH, s, st.offset); }
     if (!spells_difference(l, g.of)) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: st.offset, label: g.of.plus.id}}; }
     put_char(l, '\t');
@@ -2026,6 +2186,7 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
         open:    false,
         ri:      0,
         codes:   Codes{personality: opt[u8].none{}, lsda: opt[u8].none{}},
+        windows: Windows{on: false, si: 0, last: 0},
         stores:  core_syntax.stores(out.a),
     };
     l.symbols = core_syntax.Symbols{context: (?l)::ptr, resolve: resolved, name: named};

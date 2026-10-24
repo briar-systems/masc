@@ -137,6 +137,7 @@ pub val BROADCAST_SPACE: str = "broadcast on a row of no evex encoding or no ele
 pub val NO_INDEX:        str = "vector-indexed address with no index";
 pub val STRING_SIZE:     str = "string memory of another address size than the row's";
 pub val UNPLACED:        str = "specifier names a relocation the address cannot take";
+pub val REFINEMENT:      str = "symbol states a kind the encoder writes in place of another, which it states instead";
 
 # the longest instruction
 pub val MAX_LENGTH: usize = 15;
@@ -1019,6 +1020,21 @@ fun other_row(fm: u32, op: *Opcode) bool {
     ret (fm & x86_form.ENCODING) != 0 && !named_space(fm, op);
 }
 
+# whether the encoder's instruction is a branch to an 8-bit target under {disp32}, which selects the row of a wider
+# target, as llvm-mc 23.1.1 reads `{disp32} jmp l` as e9 and `{disp32} jle l` as 0f 8e
+fun narrow_branch(enc: *field.Encoder) bool {
+    if ((enc.form.bits & x86_form.DISP) != x86_form.DISP32) { ret false; }
+    var k: u32 = 0;
+    for (k < enc.count) {
+        val desc: *operand.Operand = ?enc.operands[k];
+        if (sel desc.shape.relative) {
+            if (desc.shape.relative.offset.bits == 8) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
 # whether row `op`, holding operands that need `n`, gives way to its twin: it has one, which reaches every register the
 # operands name and holds all they give, and the form does not name the row's space
 fun gives_way(fm: u32, op: *Opcode, n: *Needs) bool {
@@ -1121,7 +1137,7 @@ fun plan(enc: *field.Encoder, f: *field.Field) res[Plan, field.Refusal] {
     val op: *Opcode = opcode_of(f);
     val w:  u8      = width(enc.ctx);
     val fm: u32     = enc.form.bits;
-    if (other_row(fm, op)) { ret refused[Plan](OTHER_ROW, 0); }
+    if (other_row(fm, op) || narrow_branch(enc)) { ret refused[Plan](OTHER_ROW, 0); }
     val got: res[Needs, field.Refusal] = needs(w, op, enc.operands, enc.parts, @enc.form);
     if (sel got.err) { ret res[Plan, field.Refusal].err{got.err}; }
     var n: Needs = got.ok;
@@ -1577,27 +1593,28 @@ fun reg_bits(enc: *field.Encoder, op: *Opcode) u64 {
     ret enc.parts[op.reg].bits[field.NUMBER] & 7;
 }
 
-# the fixup kind a symbolic displacement of row `op` takes, at address size `size` in code of width `w`. a symbol
-# that states none takes pc-relative for a rip-relative address, else absolute at the address size, a 32-bit one
+# the fixup kind a symbolic displacement of memory operand `m` of row `op` takes, at address size `size` in code of
+# width `w`. a symbol that states none takes the operand's pc-relative kind for a rip-relative address, else absolute at the address size, a 32-bit one
 # sign-extended in 64-bit code, under 32-bit addressing too, as llvm-mc 23.1.1 writes R_X86_64_32S for `[ebx + ext]`.
 # one a specifier states takes its placement's kind for the address (`x86_fixup.PLACEMENTS`), refined by the
 # instruction (refined), and is refused where the address takes no such relocation or holds no 32-bit displacement
-fun disp_fixup(enc: *field.Encoder, op: *Opcode, p: *field.Parts, w: u8, size: u8) err[field.Refusal] {
+fun disp_fixup(enc: *field.Encoder, op: *Opcode, m: *operand.Memory, p: *field.Parts, w: u8, size: u8) err[field.Refusal] {
     val pc: bool = p.bits[field.MODE] == operand.RELATIVE_PC::u64;
     if (p.symbol.fixup != operand.NO_FIXUP) {
+        if (x86_fixup.refinement(p.symbol.fixup)) { ret field_refused(REFINEMENT, op.rm); }
         val placed: opt[*x86_fixup.Placement] = x86_fixup.placement(p.symbol.fixup);
         if (sel placed.none) { ret err[field.Refusal].ok{}; }
         var kind: operand.FixupKind = placed.some.absolute;
-        if (pc) { kind = placed.some.relative; }
+        if (pc)                                     { kind = placed.some.relative; }
         if (kind == operand.NO_FIXUP || size == 16) { ret field_refused(UNPLACED, op.rm); }
         val chosen: res[operand.FixupKind, field.Refusal] = refined(enc, op, p, w, kind);
         if (sel chosen.err) { ret err[field.Refusal].err{chosen.err}; }
         p.fixup = chosen.ok;
         ret err[field.Refusal].ok{};
     }
-    if (pc) { p.fixup = x86_fixup.PC32; }
+    if (pc)         { p.fixup = m.relative; }
     or (size == 16) { p.fixup = x86_fixup.ABS16; }
-    or { p.fixup = x86_fixup.absolute(32, w == 64); }
+    or              { p.fixup = x86_fixup.absolute(32, w == 64); }
     ret err[field.Refusal].ok{};
 }
 
@@ -1608,34 +1625,39 @@ fun relaxable(op: *Opcode) bool {
     val b:    u8   = op.byte;
     val wide: bool = op.size == O32 || op.size == O64;
     if (b == 0x8B || b == 0x85 || b == 0x03 || b == 0x13 || b == 0x23 || b == 0x3B || b == 0x0B || b == 0x1B || b == 0x2B || b == 0x33) { ret wide; }
-    if (b == 0x8D) { ret op.size == O64; }
+    if (b == 0x8D)                                                                                                                      { ret op.size == O64; }
     ret b == 0xFF && (op.digit == 2 || op.digit == 4) && op.size != O16;
 }
 
 # the kind placed kind `kind` of a displacement `p` of row `op` is written as, by the instruction the encoder wrote
 # so far, as llvm-mc 23.1.1 writes it: `@GOTPCREL` with no addend in a relaxable row as R_X86_64_CODE_4_GOTPCRELX under
 # rex2, REX_GOTPCRELX under rex and GOTPCRELX under neither, `@GOTTPOFF` as its CODE_4 form under rex2 and its CODE_6
-# form in apx's evex add of a new destination or no flags, `@TLSDESC` as its CODE_4 form in a lea under rex2, and
-# i386's `@GOT` as R_386_GOT32X in a 32-bit mov from a base register alone
+# form in apx's evex add of a new destination or no flags, `@TLSDESC` as its CODE_4 form in a lea under rex2,
+# i386's `@GOT` as R_386_GOT32X in a 32-bit mov from a base register alone, and mach-o's `@GOTPCREL` as
+# X86_64_RELOC_GOT_LOAD in a 64-bit mov with no addend
 fun refined(enc: *field.Encoder, op: *Opcode, p: *field.Parts, w: u8, kind: operand.FixupKind) res[operand.FixupKind, field.Refusal] {
     if (kind == x86_fixup.GOT) {
         val alone: bool = field.has(p, field.NUMBER) && !field.has(p, field.INDEX);
         if (w != 64 && alone && op.space == LEGACY && op.map == 0 && op.byte == 0x8B && op.size == O32) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.GOT32X}; }
         ret res[operand.FixupKind, field.Refusal].ok{kind};
     }
+    if (kind == x86_fixup.GOT_PC32) {
+        if (p.symbol.addend == 0 && op.space == LEGACY && op.map == 0 && op.byte == 0x8B && op.size == O64) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.GOT_LOAD_PC32}; }
+        ret res[operand.FixupKind, field.Refusal].ok{kind};
+    }
     if (kind != x86_fixup.GOTPCREL && kind != x86_fixup.GOTTPOFF && kind != x86_fixup.TLSDESC) { ret res[operand.FixupKind, field.Refusal].ok{kind}; }
-    var s:   field.Stream                = field.Stream{data: enc.out.data, len: enc.out.len, order: field.LITTLE};
+    var s:   field.Stream                 = field.Stream{data: enc.out.data, len: enc.out.len, order: field.LITTLE};
     val got: res[Prefixes, field.Refusal] = scan(?s, enc.start, w);
     if (sel got.err) { ret res[operand.FixupKind, field.Refusal].err{got.err}; }
     val pre: Prefixes = got.ok;
     if (kind == x86_fixup.GOTPCREL) {
         if (p.symbol.addend != 0 || !relaxable(op)) { ret res[operand.FixupKind, field.Refusal].ok{kind}; }
-        if (pre.rex2)                              { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTPCRELX}; }
-        if (pre.rex)                               { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.REX_GOTPCRELX}; }
+        if (pre.rex2)                               { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTPCRELX}; }
+        if (pre.rex)                                { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.REX_GOTPCRELX}; }
         ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.GOTPCRELX};
     }
     if (kind == x86_fixup.GOTTPOFF) {
-        if (pre.rex2) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTTPOFF}; }
+        if (pre.rex2)                                                                                           { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_4_GOTTPOFF}; }
         if (op.space == EVEX && op.map == x86_opcode.APX_MAP && op.byte == 0x03 && (op.flags & (ND | NF)) != 0) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.CODE_6_GOTTPOFF}; }
         ret res[operand.FixupKind, field.Refusal].ok{kind};
     }
@@ -1695,7 +1717,7 @@ fun modrm_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
         if (sel sib.err) { ret sib; }
     }
     if (p.symbolic) {
-        val placed: err[field.Refusal] = disp_fixup(enc, op, p, w, size.ok);
+        val placed: err[field.Refusal] = disp_fixup(enc, op, ?desc.shape.memory, p, w, size.ok);
         if (sel placed.err) { ret placed; }
         # a marker of no displacement is relocated at the instruction's start
         var at: usize = enc.out.len - enc.start;
@@ -1910,12 +1932,13 @@ fun moffs_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
 # the fixup kind the symbolic absolute address `p` of an a0 to a3 move of `size` bits takes: absolute at the size
 # when its symbol states none, else its placement's kind at a 32-bit or 64-bit address
 fun moffs_fixup(p: *field.Parts, size: u8, k: u8) res[operand.FixupKind, field.Refusal] {
-    if (p.symbol.fixup == operand.NO_FIXUP) { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.absolute(size, false)}; }
+    if (p.symbol.fixup == operand.NO_FIXUP)   { ret res[operand.FixupKind, field.Refusal].ok{x86_fixup.absolute(size, false)}; }
+    if (x86_fixup.refinement(p.symbol.fixup)) { ret res[operand.FixupKind, field.Refusal].err{field.refusal(REFINEMENT, k, 0)}; }
     val placed: opt[*x86_fixup.Placement] = x86_fixup.placement(p.symbol.fixup);
     if (sel placed.none) { ret res[operand.FixupKind, field.Refusal].ok{p.symbol.fixup}; }
     var kind: operand.FixupKind = operand.NO_FIXUP;
-    if (size == 32) { kind = placed.some.absolute; }
-    if (size == 64) { kind = placed.some.wide; }
+    if (size == 32)               { kind = placed.some.absolute; }
+    if (size == 64)               { kind = placed.some.wide; }
     if (kind == operand.NO_FIXUP) { ret res[operand.FixupKind, field.Refusal].err{field.refusal(UNPLACED, k, 0)}; }
     ret res[operand.FixupKind, field.Refusal].ok{kind};
 }

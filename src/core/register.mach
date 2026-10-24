@@ -27,6 +27,16 @@
 # as x86 vex does for a vector register. `overwrites` derives what a write
 # overwrites from those facts and the footprints, so a reader ending the values
 # a write kills asks it alone.
+#
+# a register of a tuple class is a tuple of other rows, its members, and holds
+# no storage of its own: its storage is theirs, laid end to end in its class's
+# order, so each member is a view of it as al is of rax. overlap, within,
+# overwrites and the overlap index read a tuple through its members, so a
+# reader that follows storage gets each member of a tuple for free. a pair is
+# a tuple of two, as risc-v amocas.q's even pair, aarch64 casp's or x86
+# cmpxchg16b's rdx:rax, and a group of n, as a risc-v vector group at lmul n
+# or a segment of its fields, is a tuple of n. an allocator takes one virtual
+# of a tuple class and reads each member through `member`.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -67,18 +77,50 @@ pub val FLAGS:     Kind = 4;
 pub val TILE:      Kind = 5;
 pub val SYSTEM:    Kind = 6;
 
+# how the members of a tuple make up its value
+# ---
+# UNSTATED:     no order, the value of a class of single registers, which check refuses of a tuple class
+# SIGNIFICANCE: one value its first member holds the least significant bits of and each next member the bits above,
+#               whatever the byte order, as risc-v amocas.q's even register holds the low half (src/unpriv/zacas.adoc)
+#               and x86 rax the low half of rdx:rax. memory holds the value in the byte order, so the first member lies
+#               at the lowest address little-endian and at the highest big-endian
+# ADDRESS:      one value its first member is loaded from and stored to the lowest address of and each next member the
+#               address above, so which member is least significant follows the byte order, as aarch64 casp's <Xs> is
+#               the low half little-endian and the high half big-endian (DDI 0487, CASP: "if BigEndian then s1:s2 else
+#               s2:s1")
+# APART:        no one value, each member holding its own, as an aarch64 ld4 list or an sve tuple
+pub def Order: u8;
+
+pub val UNSTATED_ORDER: Order = 0;
+pub val SIGNIFICANCE:   Order = 1;
+pub val ADDRESS:        Order = 2;
+pub val APART:          Order = 3;
+
 # a class of registers an operand can name
 # ---
 # name:  its name, unique within the file and stable: a saved text names the class by it, so it never depends on the class's place
 # kind:  what its members hold
-# width: the bits of each member, or of one row of a tile
+# width: the bits of each member, or of one row of a tile. a tuple's are its members' bits together
 # count: the hardware numbers its encoding spans, 0 to count - 1, which may scale with the slot of its width, as the
 #        slices of an sme tile number svl / esize. a member past the count a context resolves does not exist there
+# arity: the registers each member is a tuple of, 0 for a class of single registers. a tuple is numbered by its first
+#        member's number, so an aligned pair is encoded as its first register is, and is spelled by its members
+# order: how a tuple's members make up its value, UNSTATED_ORDER for a class of single registers
+# fixed: whether its members are fixed tuples an instruction names without an operand, as x86 cmpxchg16b's rdx:rax and
+#        rcx:rbx, so no operand admits the class and an allocator never chooses one. false for a class of single registers
+# step:  the alignment of a chosen tuple class: each tuple's first member is numbered a multiple of it, but a tuple of
+#        the zero register `arity` times, numbered as that register wherever it is, as aarch64 sysp's xzr, xzr at 31. a
+#        risc-v pair's is 2, an lmul 4 vector group's 4, and a segment of 3 fields at emul 2 is 6 registers at a step of
+#        2. 0 for a class of single registers or of fixed tuples
 pub rec Class {
     name:  str;
     kind:  Kind;
     width: quantity.Scaled;
     count: quantity.Scaled;
+    arity: u8;
+    order: Order;
+    fixed: bool;
+    step:  u8;
 }
 
 # fixed architectural roles, as bits of a register's flags
@@ -162,6 +204,14 @@ pub tag Reach: u8 {
     part: Part;
 }
 
+# rows of a register file as a pointer to static row indices and a count
+pub rec Rows {
+    at:  *u32;
+    len: u32;
+}
+
+pub val NO_ROWS: Rows = Rows{at: nil, len: 0};
+
 # one register
 # ---
 # name:     the spelling the printer writes
@@ -176,6 +226,11 @@ pub tag Reach: u8 {
 # requires: what a selection and its state must hold for it to exist, over extensions and state values, none for every one
 # extend:   what a write through it leaves in the part of its bank `reach` names, unless the write states otherwise. never UNSTATED
 # reach:    the part of its bank past its footprint a write's extension reaches
+# members:  the rows a tuple is of, as many as its class's arity, in its class's order, NO_ROWS for a register of storage
+#           of its own. a tuple's own bank, offset, stride, pieces, places, extend and reach state nothing: it has no
+#           pieces and no extension, and a write through it is a write through each member as that member's row states.
+#           only a register reading zero is a member twice, as risc-v amocas's pair named x0 is x0 twice, both halves
+#           reading zero and a write of either discarded (src/unpriv/zacas.adoc)
 pub rec Register {
     name:     str;
     class:    u16;
@@ -189,6 +244,7 @@ pub rec Register {
     requires: requirement.Requirement;
     extend:   Extend;
     reach:    Reach;
+    members:  Rows;
 }
 
 # a further spelling of a register the parser accepts
@@ -339,6 +395,48 @@ pub fun row_of(file: *File, reg: Id) opt[*Register] {
     val at: opt[u32] = index_of(file, reg);
     if (!sel at.some) { ret opt[*Register].none{}; }
     ret opt[*Register].some{?file.registers[at.some]};
+}
+
+# whether `row` is a tuple of other rows, holding no storage of its own
+pub fun tuple(row: *Register) bool {
+    ret row.members.len > 0;
+}
+
+# member `k` of the tuple `reg` of `file` in its class's order, none when reg is no tuple of the file or has no member k
+pub fun member(file: *File, reg: Id, k: u32) opt[Id] {
+    val row: opt[*Register] = row_of(file, reg);
+    if (sel row.none)              { ret opt[Id].none{}; }
+    if (k >= row.some.members.len) { ret opt[Id].none{}; }
+    ret opt[Id].some{id_of(?file.registers[row.some.members.at[k]])};
+}
+
+# the tuple of class `class` of `file` whose first member is `first`, none where no tuple of the class starts there, as
+# no risc-v pair starts at an odd x register. a tuple is numbered by its first member's number, so this is the one row
+# it can be
+pub fun tuple_of(file: *File, class: u16, first: Id) opt[Id] {
+    if (first == NONE) { ret opt[Id].none{}; }
+    val at: opt[u32] = index_of(file, make(class, number_of(first)));
+    if (sel at.none) { ret opt[Id].none{}; }
+    val row: *Register = ?file.registers[at.some];
+    if (!tuple(row) || id_of(?file.registers[row.members.at[0]]) != first) { ret opt[Id].none{}; }
+    ret opt[Id].some{id_of(row)};
+}
+
+# the class of `file` an operand may admit whose members are tuples of `arity` registers starting in class `of` at a
+# step of `step` in order `order`, none when the file has none, as the risc-v pairs of x registers at 2 by
+# significance, an lmul 4 vector group at 4 or a segment of 4 fields at emul 1 at 1 apart, and aarch64 casp's x pairs
+# by address beside msrr's by significance. check holds a file to one class of each, and a fixed class is no operand's
+pub fun tuple_class(file: *File, of: u16, arity: u8, step: u8, order: Order) opt[u16] {
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        val r: *Register = ?file.registers[i];
+        if (tuple(r)) {
+            val c: *Class = ?file.classes[r.class];
+            if (c.arity == arity && c.step == step && c.order == order && !c.fixed && file.registers[r.members.at[0]].class == of) { ret opt[u16].some{r.class}; }
+        }
+        i = i + 1;
+    }
+    ret opt[u16].none{};
 }
 
 # the class row of `reg` in `file`
@@ -556,7 +654,8 @@ pub fun width(v: *Available, reg: Id) res[opt[u64], Absent] {
     ret res[opt[u64], Absent].ok{opt[u64].some{quantity.at(q, m.some::u64)}};
 }
 
-# the scale a row's footprint varies with, none when it is fixed: its class width, pieces, places and reach take one
+# the scale a row's footprint varies with, none when it is fixed: its class width, pieces, places and reach take one, and
+# a tuple's class width the one its members take
 pub fun scale_of(file: *File, row: *Register) opt[u8] {
     val width: quantity.Scaled = file.classes[row.class].width;
     if (width.per != 0)            { ret opt[u8].some{width.scale}; }
@@ -732,8 +831,20 @@ fun meets(file: *File, a: *Register, b: *Register, part: opt[Part]) bool {
 # is what an allocator must assume when the scale or the place is unknown. a may-alias pair, as x87 st0 and mm3,
 # overlaps
 pub fun overlap(file: *File, a: *Register, b: *Register) bool {
+    if (tuple(a))         { ret some_member(file, a, b); }
+    if (tuple(b))         { ret some_member(file, b, a); }
     if (a.bank != b.bank) { ret false; }
     ret meets(file, a, b, opt[Part].none{});
+}
+
+# whether some member of tuple `t` of `file` overlaps `b`
+fun some_member(file: *File, t: *Register, b: *Register) bool {
+    var k: u32 = 0;
+    for (k < t.members.len) {
+        if (overlap(file, ?file.registers[t.members.at[k]], b)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 # the first index of a row's overlapping rows before they are built
@@ -747,10 +858,12 @@ pub rec Span {
 
 # the rows of a register file each row shares storage with, as `overlap` decides, the row itself first. rows of a bank
 # are indexed once, and a row's own list is built the first time it is asked, so a reader pays only for the rows it
-# touches, as a walk over code naming a few general registers of a file holding hundreds of tile slices
+# touches, as a walk over code naming a few general registers of a file holding hundreds of tile slices. a tuple is
+# indexed under the bank of each of its members, so a member's list holds every tuple it is in and a tuple's every row
+# its members share storage with
 # ---
 # file:   the file
-# banked: the rows by bank, ascending bank and within one ascending row
+# banked: the rows by bank, ascending bank and within one ascending row, a tuple once under each of its members' banks
 # banks:  where each bank's rows start in `banked`, by bank, and one past them where the last ends
 # first:  where each row's overlapping rows start in `rows`, by row, NOT_BUILT before it is asked
 # count:  how many there are, by row
@@ -793,18 +906,64 @@ fun fill(into: *vector.Vector[u32], n: u32, v: u32) err[A.Error] {
     ret err[A.Error].ok{};
 }
 
-# the rows of `o`'s file placed by bank into `o.banked`, each bank's start into `o.banks`, and every row's list unbuilt
+# how many banks row `r` of `file` is indexed under: its own, or each distinct bank of a tuple's members
+fun bank_count(file: *File, r: *Register) u32 {
+    if (!tuple(r)) { ret 1; }
+    var n: u32 = 0;
+    var k: u32 = 0;
+    for (k < r.members.len) {
+        if (fresh_bank(file, r, k)) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
+# whether member `k` of tuple `t` of `file` is in a bank no member before it is in
+fun fresh_bank(file: *File, t: *Register, k: u32) bool {
+    val bank: u16 = file.registers[t.members.at[k]].bank;
+    var j:    u32 = 0;
+    for (j < k) {
+        if (file.registers[t.members.at[j]].bank == bank) { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+# bank `n` of those row `r` of `file` is indexed under, in the order `bank_count` counts them
+fun bank_at(file: *File, r: *Register, n: u32) u16 {
+    if (!tuple(r)) { ret r.bank; }
+    var seen: u32 = 0;
+    var k:    u32 = 0;
+    for (k < r.members.len) {
+        if (fresh_bank(file, r, k)) {
+            if (seen == n) { ret file.registers[r.members.at[k]].bank; }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# the rows of `o`'s file placed by bank into `o.banked`, a tuple under each of its members' banks, each bank's start
+# into `o.banks`, and every row's list unbuilt
 fun index_banks(a: *A.Allocator, o: *Overlaps) err[A.Error] {
     val file: *File = o.file;
     var most: u32   = 0;
+    var held: u32   = 0;
     var i:    u32   = 0;
     for (i < file.register_count) {
-        if (file.registers[i].bank::u32 + 1 > most) { most = file.registers[i].bank::u32 + 1; }
+        val r: *Register = ?file.registers[i];
+        var n: u32       = 0;
+        for (n < bank_count(file, r)) {
+            if (bank_at(file, r, n)::u32 + 1 > most) { most = bank_at(file, r, n)::u32 + 1; }
+            held = held + 1;
+            n    = n + 1;
+        }
         i = i + 1;
     }
     val banks: err[A.Error] = fill(?o.banks, most + 1, 0);
     if (sel banks.err) { ret banks; }
-    val banked: err[A.Error] = fill(?o.banked, file.register_count, 0);
+    val banked: err[A.Error] = fill(?o.banked, held, 0);
     if (sel banked.err) { ret banked; }
     val first: err[A.Error] = fill(?o.first, file.register_count, NOT_BUILT);
     if (sel first.err) { ret first; }
@@ -812,9 +971,14 @@ fun index_banks(a: *A.Allocator, o: *Overlaps) err[A.Error] {
     if (sel count.err) { ret count; }
     i = 0;
     for (i < file.register_count) {
-        val b: usize = file.registers[i].bank::usize + 1;
-        o.banks.data[b] = o.banks.data[b] + 1;
-        i               = i + 1;
+        val r: *Register = ?file.registers[i];
+        var n: u32       = 0;
+        for (n < bank_count(file, r)) {
+            val b: usize = bank_at(file, r, n)::usize + 1;
+            o.banks.data[b] = o.banks.data[b] + 1;
+            n               = n + 1;
+        }
+        i = i + 1;
     }
     i = 1;
     for (i <= most) {
@@ -831,15 +995,31 @@ fun index_banks(a: *A.Allocator, o: *Overlaps) err[A.Error] {
     }
     i = 0;
     for (i < file.register_count) {
-        val b: usize = file.registers[i].bank::usize;
-        o.banked.data[next.data[b]] = i;
-        next.data[b]                = next.data[b] + 1;
-        i                           = i + 1;
+        val r: *Register = ?file.registers[i];
+        var n: u32       = 0;
+        for (n < bank_count(file, r)) {
+            val b: usize = bank_at(file, r, n)::usize;
+            o.banked.data[next.data[b]] = i;
+            next.data[b]                = next.data[b] + 1;
+            n                           = n + 1;
+        }
+        i = i + 1;
     }
     ret err[A.Error].ok{};
 }
 
-# the rows row `row` of `o`'s file shares storage with, itself first, built and kept when first asked
+# whether `o.rows` holds `y` from `start` on
+fun listed(o: *Overlaps, start: usize, y: u32) bool {
+    var k: usize = start;
+    for (k < o.rows.len) {
+        if (o.rows.data[k] == y) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the rows row `row` of `o`'s file shares storage with, itself first, built and kept when first asked. a tuple's are
+# those of the banks of its members, each once
 # ---
 # ret: where they are in `o.rows`, or the allocator's refusal, which leaves `o` as it was
 pub fun overlapping(o: *Overlaps, row: u32) res[Span, A.Error] {
@@ -848,17 +1028,22 @@ pub fun overlapping(o: *Overlaps, row: u32) res[Span, A.Error] {
     val r:      *Register           = ?o.file.registers[row];
     val pushed: res[usize, A.Error] = vector.push[u32](?o.rows, row);
     if (sel pushed.err) { ret res[Span, A.Error].err{pushed.err}; }
-    var k: u32 = o.banks.data[r.bank::usize];
-    for (k < o.banks.data[r.bank::usize + 1]) {
-        val y: u32 = o.banked.data[k];
-        if (y != row && overlap(o.file, r, ?o.file.registers[y])) {
-            val kept: res[usize, A.Error] = vector.push[u32](?o.rows, y);
-            if (sel kept.err) {
-                o.rows.len = start;
-                ret res[Span, A.Error].err{kept.err};
+    var n: u32 = 0;
+    for (n < bank_count(o.file, r)) {
+        val b: usize = bank_at(o.file, r, n)::usize;
+        var k: u32   = o.banks.data[b];
+        for (k < o.banks.data[b + 1]) {
+            val y: u32 = o.banked.data[k];
+            if (y != row && overlap(o.file, r, ?o.file.registers[y]) && (n == 0 || !listed(o, start, y))) {
+                val kept: res[usize, A.Error] = vector.push[u32](?o.rows, y);
+                if (sel kept.err) {
+                    o.rows.len = start;
+                    ret res[Span, A.Error].err{kept.err};
+                }
             }
+            k = k + 1;
         }
-        k = k + 1;
+        n = n + 1;
     }
     o.first.data[row] = start::u32;
     o.count.data[row] = (o.rows.len - start)::u32;
@@ -891,8 +1076,25 @@ pub rec Placement {
 # ---
 # ret: the placement, none when the rows share no bank, a piece of part is not wholly inside one piece of container at
 #      some place of each, or the placement differs between places, so a register with more than one place lies within
-#      none and has none within it
+#      none and has none within it. a tuple's storage is its members' laid end to end in its class's order, so what lies
+#      within a member lies within the tuple past the members before it, and a tuple lies within itself alone
 pub fun within(file: *File, part: *Register, container: *Register, multiplier: u64) opt[Placement] {
+    if (tuple(part)) {
+        if (part != container) { ret opt[Placement].none{}; }
+        ret opt[Placement].some{Placement{offset: 0, width: extent(file, part, multiplier), stride: 0, count: 1}};
+    }
+    if (tuple(container)) {
+        var before: u64 = 0;
+        var k:      u32 = 0;
+        for (k < container.members.len) {
+            val m: *Register      = ?file.registers[container.members.at[k]];
+            val p: opt[Placement] = within(file, part, m, multiplier);
+            if (sel p.some) { ret opt[Placement].some{Placement{offset: before + p.some.offset, width: p.some.width, stride: p.some.stride, count: p.some.count}}; }
+            before = before + extent(file, m, multiplier);
+            k      = k + 1;
+        }
+        ret opt[Placement].none{};
+    }
     if (part.bank != container.bank) { ret opt[Placement].none{}; }
     var found: opt[Placement] = opt[Placement].none{};
     var kp:    u64            = 0;
@@ -911,6 +1113,23 @@ pub fun within(file: *File, part: *Register, container: *Register, multiplier: u
         kp = kp + 1;
     }
     ret found;
+}
+
+# the bits from the start of row `r`'s first piece to the end of its last at multiplier `m` and its first place, a
+# tuple's its members' together
+fun extent(file: *File, r: *Register, m: u64) u64 {
+    if (tuple(r)) {
+        var all: u64 = 0;
+        var k:   u32 = 0;
+        for (k < r.members.len) {
+            all = all + extent(file, ?file.registers[r.members.at[k]], m);
+            k   = k + 1;
+        }
+        ret all;
+    }
+    val p: Pieces = pieces(file, r, m, 0);
+    if (p.count == 0) { ret 0; }
+    ret (p.count - 1) * p.stride + p.width;
 }
 
 # where pieces `p` lie within pieces `c`, every bit of each piece of p in a piece of c, so a piece of p may span
@@ -1014,8 +1233,25 @@ pub fun extend_of(row: *Register, stated: opt[Extend]) Extend {
 # it, zeroes or sets it. a reach of the whole bank overwrites every row of it. a write through a register flagged ZERO
 # is discarded and overwrites nothing. the one rule of what a register write kills, so a write of a register with more
 # than one place kills nothing it does not reach from every place, and nothing else with more than one place unless it
-# reaches every one
+# reaches every one. a write through a tuple is a write through each member, each extending as `stated` or its own row
+# states, and a tuple is overwritten when each of its members is
 pub fun overwrites(file: *File, written: *Register, other: *Register, stated: opt[Extend]) bool {
+    if (tuple(other)) {
+        var k: u32 = 0;
+        for (k < other.members.len) {
+            if (!overwrites(file, written, ?file.registers[other.members.at[k]], stated)) { ret false; }
+            k = k + 1;
+        }
+        ret true;
+    }
+    if (tuple(written)) {
+        var k: u32 = 0;
+        for (k < written.members.len) {
+            if (overwrites(file, ?file.registers[written.members.at[k]], other, stated)) { ret true; }
+            k = k + 1;
+        }
+        ret false;
+    }
     if ((written.flags & ZERO) != 0 || written.bank != other.bank) { ret false; }
     val extend: Extend = extend_of(written, stated);
     if (extend == ZEROES || extend == ONES) {
@@ -1027,12 +1263,13 @@ pub fun overwrites(file: *File, written: *Register, other: *Register, stated: op
 
 # whether a write through row `row` of `file` extending past its footprint reaches storage of another row of its bank,
 # a row not lying within it where the reach is the whole bank and a row sharing storage with the reach's part else, so
-# that a write through it has a rest to extend into. it scans the file's rows, and only the registration check asks it
+# that a write through it has a rest to extend into, a tuple holding no storage of its own to reach. it scans the file's
+# rows, and only the registration check asks it
 pub fun contained(file: *File, row: *Register) bool {
     var i: u32 = 0;
     for (i < file.register_count) {
         val y: *Register = ?file.registers[i];
-        if (y.bank == row.bank) {
+        if (y.bank == row.bank && !tuple(y)) {
             if (sel row.reach.part) {
                 if (meets(file, y, row, opt[Part].some{row.reach.part})) { ret true; }
             }
@@ -1041,6 +1278,40 @@ pub fun contained(file: *File, row: *Register) bool {
         i = i + 1;
     }
     ret false;
+}
+
+# whether tuple `row` of `file` holds its members whole: each a row of storage of its own at one place, its class's width
+# at every legal multiplier their bits together, and no two sharing storage but a register reading zero named twice.
+# only the registration check asks it
+pub fun tuple_whole(file: *File, row: *Register) bool {
+    val slot: opt[u8] = scale_of(file, row);
+    var k:    u32     = 0;
+    for (k < row.members.len) {
+        if (row.members.at[k] >= file.register_count) { ret false; }
+        val m: *Register = ?file.registers[row.members.at[k]];
+        if (tuple(m) || m.places.count.fixed != 1 || m.places.count.per != 0) { ret false; }
+        # a member scales with the tuple's slot or with none, so one multiplier sizes them all
+        val own: opt[u8] = scale_of(file, m);
+        if (sel own.some) {
+            if (sel slot.none)         { ret false; }
+            if (slot.some != own.some) { ret false; }
+        }
+        var j: u32 = 0;
+        for (j < k) {
+            val other: *Register = ?file.registers[row.members.at[j]];
+            if (other == m && (m.flags & ZERO) == 0)   { ret false; }
+            if (other != m && overlap(file, other, m)) { ret false; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    val width: quantity.Scaled = file.classes[row.class].width;
+    var mult:  u64             = slot_next(file, slot, 0);
+    for (mult != 0) {
+        if (quantity.at(width, mult) != extent(file, row, mult)) { ret false; }
+        mult = slot_next(file, slot, mult);
+    }
+    ret true;
 }
 
 # whether row `row` of `file` has at least one place at every legal multiplier, and its places lie apart wherever it has
