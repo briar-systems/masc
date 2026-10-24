@@ -50,9 +50,8 @@ mach depend on masc.
 - **Instruction sets.** One module per set, each with its register file, its
   extension catalog and its generated catalog of rows. Adding a set is one
   registration and rows.
-- **Syntax, assembly and disassembly.** Each set's established assembly
-  syntax with the GNU assembler's directives, read into objects and printed
-  back from them.
+- **Syntax, assembly and disassembly.** masc's own assembly dialect for each
+  set, read into objects and printed back from them.
 - **The builder.** The instruction-level API a compiler emits through, one
   instruction at a time, with labels, relaxation, relocations and a listing of
   what was encoded.
@@ -60,10 +59,9 @@ mach depend on masc.
   analysis, and encoding with real registers after register allocation.
 - **Walks.** Checks over encoded code driven by instruction effects, such as
   secret-dependent timing.
-- **Generators and harness.** The `gen` program, its own project under
-  `gen/`, builds catalogs from the sources vendored under `gen/vendor`, and the
-  `harness` program checks masc against external tools. Both run locally and
-  are never linked into the library.
+- **Generators.** The `gen` program, its own project under `gen/`, builds
+  catalogs from the sources vendored under `gen/vendor`. It runs locally and is
+  never linked into the library.
 
 
 ## Building
@@ -75,7 +73,6 @@ git clone https://github.com/briar-systems/masc.git
 cd masc
 mach dep pull .
 mach build .
-mach test .
 ```
 
 
