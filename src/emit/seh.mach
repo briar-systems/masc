@@ -1,0 +1,893 @@
+# windows unwind codes as call frame facts on the builder, and the builder's frames as those codes
+#
+# a coff object's frames are mink's frame records, which mink lowers to the
+# machine's function table and unwind data: Win64 UNWIND_INFO on x86-64 and
+# ARM64 .xdata on arm64. an assembler states them by `.seh_` directives, each
+# one unwind operation. a code here is one such operation, and its meaning is
+# the call frame rules it states at the cursor, from the canonical frame
+# address the rules so far leave, as mink's lowering reads them back
+# (`mink.lower.unwind.win64` and `arm64`): a push moves the stack by eight
+# bytes and saves a register at its new top, an allocation moves the stack, a
+# frame register takes the canonical frame address from the stack pointer, a
+# save from x86-64's frame base or arm64's stack pointer saves a register
+# there, an arm64 pre-indexed save moves the stack and saves at its new top,
+# and the end of the prologue is mink's prologue end mark. so `.seh_`
+# directives read through these codes give mink the same records it lowers
+# to the same unwind data.
+#
+# the builder's frames are written back as codes the same way: the rules of
+# each step of a frame's prologue are walked from the state the step began
+# in, the codes that take that state to the next are found as mink's
+# lowering classifies the step, and those codes are applied to the step's
+# first state by their own meaning, so a step whose codes do not state what
+# its rules state is refused. a rule past the prologue that changes the
+# state, which no code states, is refused, and so is a step at the
+# function's start, which Win64 states only as a machine frame. on arm64 every
+# prologue instruction states one code, a nop where it states none.
+#
+# the directives of each code are rows (`DIRECTIVES`), which the assembler's
+# `.seh_` layer reads and the listing writes, one table for both.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use mink_arch:    mink.catalog.arch;
+use arch_aarch64: mink.catalog.arch.aarch64;
+use arch_x86:     mink.catalog.arch.x86;
+use mink.model.frame;
+
+use masc.build.build;
+use masc.core.operand;
+use rf: masc.core.register;
+use masc.core.set;
+use core_state: masc.core.state;
+
+pub val NO_UNWIND:  str = "frame on an architecture whose windows unwind codes masc states none of";
+pub val NOT_SP:     str = "unwind code that moves the stack once the canonical frame address is no longer the stack pointer";
+pub val FRAMED:     str = "unwind code that sets the frame register twice";
+pub val UNCODED:    str = "frame step whose rules no windows unwind code states";
+pub val AT_START:   str = "frame rule at the function's start, which windows states only as a machine frame";
+pub val PAST:       str = "frame rule past the prologue that changes the frame, which no windows unwind code states";
+pub val PROLOGUE:   str = "frame rule in the prologue other than a move of the stack, a save or a frame register";
+pub val BASE_MOVES: str = "register saved before the prologue moves the base its offset is from";
+pub val LSDA:       str = "frame with language specific data, which .seh_handlerdata states as data masc does not read";
+pub val INDIRECT:   str = "personality routine through a slot, which no windows handler names";
+pub val TWO_ENDS:   str = "prologue ended twice";
+pub val LONG:       str = "frame whose prologue states more steps than the listing writes";
+pub val PAIRED:     str = "registers saved together that no arm64 unwind code saves together";
+
+# the windows unwind codes of an architecture
+# ---
+# x64:   Win64 UNWIND_INFO, x86-64's
+# arm64: ARM64 .xdata, arm64's
+pub tag Machine: u8 {
+    x64;
+    arm64;
+}
+
+# the machine whose unwind codes state the frames of `a`, none for one that has none
+pub fun machine_of(a: *mink_arch.Arch) opt[Machine] {
+    if (a == ?arch_x86.X86_64)      { ret opt[Machine].some{Machine.x64{}}; }
+    if (a == ?arch_aarch64.AARCH64) { ret opt[Machine].some{Machine.arm64{}}; }
+    ret opt[Machine].none{};
+}
+
+# the dwarf numbers the codes name: x86-64's stack pointer and return address, and arm64's stack pointer, frame
+# pointer and link register
+val X64_SP: u16 = 7;
+val X64_RA: u16 = 16;
+val A64_SP: u16 = 31;
+val A64_FP: u16 = 29;
+val A64_LR: u16 = 30;
+
+# the bytes a machine frame pushes, and an error code past it
+val MACHFRAME: i64 = 40;
+
+# a register saved by an arm64 code, one or a pair
+# ---
+# first:  the register, its dwarf number
+# second: the second of a pair, NONE for one alone
+# at:     where the first is saved above the stack pointer, for a save that moves no stack
+# pre:    the bytes the stack moves before it saves at its new top, 0 for none
+pub rec Saved {
+    first:  u16;
+    second: u16;
+    at:     i64;
+    pre:    i64;
+}
+
+# no register
+pub val NONE: u16 = 0xFFFF;
+
+# a register and an offset
+pub rec Placed {
+    reg:    u16;
+    offset: i64;
+}
+
+# one windows unwind operation
+# ---
+# push:      x86-64's register pushed
+# alloc:     the bytes the stack moves
+# frame:     the frame register set the offset above the stack pointer, x86-64's register or arm64's frame pointer
+# based:     x86-64's register saved the offset above its frame base, a general or an xmm register
+# saved:     arm64's register or pair saved
+# machframe: x86-64's machine frame, with an error code past it when true
+# end:       the end of the prologue
+# nop:       an arm64 prologue instruction that states nothing
+pub tag Code: u8 {
+    push:      u16;
+    alloc:     i64;
+    frame:     Placed;
+    based:     Placed;
+    saved:     Saved;
+    machframe: bool;
+    end;
+    nop;
+}
+
+# what a procedure's codes keep that its rules do not: x86-64's frame base, the canonical frame address's offset
+# from the stack pointer where the frame register is set
+# ---
+# machine: whose codes
+# base:    the frame base, none before the frame register is set
+# loose:   whether a register is saved from the stack pointer before the frame register is set, which the base the
+#          prologue's end leaves must then be
+# ended:   whether the prologue has ended
+pub rec Proc {
+    machine: Machine;
+    base:    opt[i64];
+    loose:   bool;
+    ended:   bool;
+}
+
+# a procedure begun of `m`'s codes
+pub fun begin(m: Machine) Proc {
+    ret Proc{machine: m, base: opt[i64].none{}, loose: false, ended: false};
+}
+
+# the rules a code states, at most four
+pub rec Rules {
+    at:  [4]frame.Rule;
+    len: u32;
+}
+
+fun one(r: frame.Rule) Rules {
+    var out: Rules = Rules{len: 1};
+    out.at[0] = r;
+    ret out;
+}
+
+fun push_rule(out: *Rules, r: frame.Rule) {
+    out.at[out.len::usize] = r;
+    out.len                = out.len + 1;
+}
+
+fun sp_of(m: Machine) u16 {
+    if (sel m.arm64) { ret A64_SP; }
+    ret X64_SP;
+}
+
+# whether code `c` moves the stack
+fun moves(c: Code) bool {
+    if (sel c.alloc || sel c.push || sel c.machframe) { ret true; }
+    if (sel c.saved)                                  { ret c.saved.pre != 0; }
+    ret false;
+}
+
+# the rules code `c` states of a procedure `p` whose canonical frame address is `reg` plus `off`, and what it leaves
+# in `p`
+pub fun rules_of(c: Code, reg: u16, off: i64, p: *Proc) res[Rules, str] {
+    val sp: u16 = sp_of(p.machine);
+    if (moves(c) && p.loose && sel p.base.none) { ret res[Rules, str].err{BASE_MOVES}; }
+    if (sel c.end) {
+        if (p.ended) { ret res[Rules, str].err{TWO_ENDS}; }
+        p.ended = true;
+        ret res[Rules, str].ok{one(frame.Rule.prologue_end{})};
+    }
+    if (sel c.nop) { ret res[Rules, str].ok{Rules{len: 0}}; }
+    if (sel c.alloc) {
+        if (reg != sp) { ret res[Rules, str].err{NOT_SP}; }
+        ret res[Rules, str].ok{one(frame.Rule.cfa_offset{off + c.alloc})};
+    }
+    if (sel c.push) {
+        if (reg != sp) { ret res[Rules, str].err{NOT_SP}; }
+        var out: Rules = Rules{len: 0};
+        push_rule(?out, frame.Rule.cfa_offset{off + 8});
+        push_rule(?out, frame.Rule.offset{frame.Offset{reg: c.push, offset: -(off + 8)}});
+        ret res[Rules, str].ok{out};
+    }
+    if (sel c.frame) {
+        if (reg != sp) { ret res[Rules, str].err{NOT_SP}; }
+        val twice: bool = sel p.base.some;
+        if (twice) { ret res[Rules, str].err{FRAMED}; }
+        p.base = opt[i64].some{off};
+        ret res[Rules, str].ok{one(frame.Rule.def_cfa{frame.Offset{reg: c.frame.reg, offset: off - c.frame.offset}})};
+    }
+    if (sel c.based) {
+        var base: i64 = off;
+        if (sel p.base.some) { base = p.base.some; }
+        or                   { p.loose = true; }
+        ret res[Rules, str].ok{one(frame.Rule.offset{frame.Offset{reg: c.based.reg, offset: c.based.offset - base}})};
+    }
+    if (sel c.machframe) {
+        var at: i64 = MACHFRAME;
+        if (c.machframe) { at = MACHFRAME + 8; }
+        var out: Rules = Rules{len: 0};
+        push_rule(?out, frame.Rule.cfa_offset{at});
+        push_rule(?out, frame.Rule.offset{frame.Offset{reg: X64_RA, offset: -MACHFRAME}});
+        ret res[Rules, str].ok{out};
+    }
+    if (!sel c.saved) { ret res[Rules, str].err{UNCODED}; }
+    val v: Saved = c.saved;
+    if (reg != sp) { ret res[Rules, str].err{NOT_SP}; }
+    var out:  Rules = Rules{len: 0};
+    var top:  i64   = off;
+    var from: i64   = v.at;
+    if (v.pre != 0) {
+        top  = off + v.pre;
+        from = 0;
+        push_rule(?out, frame.Rule.cfa_offset{top});
+    }
+    push_rule(?out, frame.Rule.offset{frame.Offset{reg: v.first, offset: from - top}});
+    if (v.second != NONE) { push_rule(?out, frame.Rule.offset{frame.Offset{reg: v.second, offset: from + 8 - top}}); }
+    ret res[Rules, str].ok{out};
+}
+
+# code `c` stated at the cursor of builder `b`, in procedure `p`, as the rules it states
+pub fun state(b: *build.Builder, p: *Proc, c: Code) err[build.Refusal] {
+    val cfa: opt[build.Cfa] = build.cfa(b);
+    if (sel cfa.none)        { ret err[build.Refusal].err{build.Refusal{message: build.FRAME_OPEN, label: operand.NO_SYMBOL}}; }
+    if (cfa.some.scale != 0) { ret err[build.Refusal].err{build.Refusal{message: NOT_SP, label: operand.NO_SYMBOL}}; }
+    val made: res[Rules, str] = rules_of(c, cfa.some.reg, cfa.some.fixed, p);
+    if (sel made.err) { ret err[build.Refusal].err{build.Refusal{message: made.err, label: operand.NO_SYMBOL}}; }
+    # a machine frame is the frame of a signal handler, which mink's lowering begins with one
+    if (sel c.machframe) {
+        val signal: err[build.Refusal] = build.cfi_signal(b);
+        if (sel signal.err) { ret signal; }
+    }
+    var i: u32 = 0;
+    for (i < made.ok.len) {
+        val stated: err[build.Refusal] = build.cfi(b, made.ok.at[i::usize]);
+        if (sel stated.err) { ret stated; }
+        i = i + 1;
+    }
+    ret err[build.Refusal].ok{};
+}
+
+# where a register is saved
+pub rec Slot {
+    saved: bool;
+    at:    i64;
+}
+
+# the registers a state follows
+pub val REGISTERS: usize = 128;
+
+# the rules in effect at one statement: the canonical frame address and, per dwarf register, where it is saved
+pub rec Walked {
+    reg:   u16;
+    off:   i64;
+    slots: [REGISTERS]Slot;
+}
+
+fun same_walked(a: *Walked, b: *Walked) bool {
+    if (a.reg != b.reg || a.off != b.off) { ret false; }
+    var i: usize = 0;
+    for (i < REGISTERS) {
+        if (a.slots[i].saved != b.slots[i].saved)               { ret false; }
+        if (a.slots[i].saved && a.slots[i].at != b.slots[i].at) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# rule `r` put in effect in `w`, `initial` the state the frame began in, false for a rule no code's walk follows
+fun follow(w: *Walked, initial: *Walked, r: frame.Rule) bool {
+    if (sel r.def_cfa) {
+        w.reg = r.def_cfa.reg;
+        w.off = r.def_cfa.offset;
+        ret true;
+    }
+    or (sel r.cfa_offset) {
+        w.off = r.cfa_offset;
+        ret true;
+    }
+    or (sel r.cfa_register) {
+        w.reg = r.cfa_register;
+        ret true;
+    }
+    or (sel r.offset) {
+        if (r.offset.reg::usize >= REGISTERS) { ret false; }
+        w.slots[r.offset.reg::usize] = Slot{saved: true, at: r.offset.offset};
+        ret true;
+    }
+    or (sel r.restore) {
+        if (r.restore::usize >= REGISTERS) { ret false; }
+        w.slots[r.restore::usize] = initial.slots[r.restore::usize];
+        ret true;
+    }
+    or (sel r.same) {
+        if (r.same::usize >= REGISTERS) { ret false; }
+        w.slots[r.same::usize] = Slot{saved: false, at: 0};
+        ret true;
+    }
+    ret sel r.prologue_end;
+}
+
+# the codes of one frame step, at most eight
+# ---
+# at:   the codes
+# len:  how many
+# full: whether the step needs more
+pub rec Codes {
+    at:   [8]Code;
+    len:  u32;
+    full: bool;
+}
+
+fun add(out: *Codes, c: Code) {
+    if (out.len == 8) {
+        out.full = true;
+        ret;
+    }
+    out.at[out.len::usize] = c;
+    out.len                = out.len + 1;
+}
+
+# the state a frame of builder `b` begins in: its set's starting canonical frame address, the return address where the
+# set states it is saved, and the set's other starting rules
+fun starting(b: *build.Builder, w: *Walked) bool {
+    val row: opt[*set.Arch] = set.arch_of(b.set, b.arch);
+    if (sel row.none)          { ret false; }
+    if (row.some.frame == nil) { ret false; }
+    val start: *set.Frame          = row.some.frame;
+    val ctx:   *core_state.Context = build.object_of(b);
+    val cfa:   opt[u32]            = core_state.debug_number(ctx.view.file, start.cfa_register, rf.DWARF, ctx);
+    if (sel cfa.none) { ret false; }
+    w.reg = cfa.some::u16;
+    w.off = start.cfa_offset;
+    var i: usize = 0;
+    for (i < REGISTERS) {
+        w.slots[i] = Slot{saved: false, at: 0};
+        i          = i + 1;
+    }
+    val unwind: opt[mink_arch.Unwind] = b.arch.unwind;
+    val saved:  opt[i64]              = start.return_saved_at;
+    if (sel unwind.some) {
+        if (sel saved.some) {
+            if (unwind.some.ra::usize < REGISTERS) { w.slots[unwind.some.ra::usize] = Slot{saved: true, at: saved.some}; }
+        }
+    }
+    var k: u32 = 0;
+    for (k < start.initial.len) {
+        val copy: Walked = @w;
+        if (!follow(w, ?copy, start.initial.at[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the codes of machine `m` that take `s0` to `s1`, as mink's lowering classifies one prologue step, the frame base
+# `base` the procedure's saves are from on x86-64. the move of the stack comes first, then the saves, then the frame
+# register, as mink orders the operations of one step
+fun classify(m: Machine, s0: *Walked, s1: *Walked, base: i64, out: *Codes) opt[str] {
+    val sp: u16  = sp_of(m);
+    var d:  i64  = 0;
+    var fp: bool = false;
+    if (s0.reg == sp && s1.reg == sp)         { d = s1.off - s0.off; }
+    or (s0.reg == sp)                         { fp = true; }
+    or (s0.reg != s1.reg || s0.off != s1.off) { ret opt[str].some{UNCODED}; }
+    if (d < 0)                                { ret opt[str].some{UNCODED}; }
+    var first: u16   = NONE;
+    var other: u16   = NONE;
+    var n:     u32   = 0;
+    var i:     usize = 0;
+    for (i < REGISTERS) {
+        val a: *Slot = ?s0.slots[i];
+        val c: *Slot = ?s1.slots[i];
+        i = i + 1;
+        if (a.saved == c.saved && (!a.saved || a.at == c.at)) { cnt; }
+        if (a.saved)                                          { ret opt[str].some{UNCODED}; }
+        if (n == 0)                                           { first = (i - 1)::u16; }
+        or                                                    { other = (i - 1)::u16; }
+        n = n + 1;
+    }
+    if (sel m.arm64) { ret arm64_codes(s1, d, fp, first, other, n, s0.off - s1.off, out); }
+    var pushed: u16 = NONE;
+    if (d == 8 && n >= 1) {
+        var k: usize = 0;
+        for (k < REGISTERS && pushed == NONE) {
+            val c: *Slot = ?s1.slots[k];
+            if (c.saved && !s0.slots[k].saved && c.at == -s1.off && k::u16 != X64_RA && k::u16 != X64_SP && k < 17) { pushed = k::u16; }
+            k = k + 1;
+        }
+    }
+    if (pushed != NONE) { add(out, Code.push{pushed}); }
+    or (d > 0)          { add(out, Code.alloc{d}); }
+    var k: usize = 0;
+    for (k < REGISTERS) {
+        val a: *Slot = ?s0.slots[k];
+        val c: *Slot = ?s1.slots[k];
+        k = k + 1;
+        if (a.saved == c.saved && (!a.saved || a.at == c.at)) { cnt; }
+        if ((k - 1)::u16 == pushed)                           { cnt; }
+        add(out, Code.based{Placed{reg: (k - 1)::u16, offset: base + c.at}});
+    }
+    if (fp) { add(out, Code.frame{Placed{reg: s1.reg, offset: s0.off - s1.off}}); }
+    ret opt[str].none{};
+}
+
+# the arm64 code of one instruction's step: an allocation, a save of one or two registers, pre-indexed when the stack
+# moves with it, or the frame pointer set `k` bytes above the stack pointer
+fun arm64_codes(s1: *Walked, d: i64, fp: bool, first: u16, other: u16, n: u32, k: i64, out: *Codes) opt[str] {
+    if (n > 2) { ret opt[str].some{PAIRED}; }
+    if (fp) {
+        if (n != 0 || s1.reg != A64_FP) { ret opt[str].some{UNCODED}; }
+        add(out, Code.frame{Placed{reg: A64_FP, offset: k}});
+        ret opt[str].none{};
+    }
+    if (n == 0) {
+        if (d == 0) { add(out, Code.nop{}); }
+        or          { add(out, Code.alloc{d}); }
+        ret opt[str].none{};
+    }
+    var a:  u16 = first;
+    var lo: i64 = s1.off + s1.slots[first::usize].at;
+    var hi: u16 = other;
+    if (n == 2) {
+        val at: i64 = s1.off + s1.slots[other::usize].at;
+        if (at < lo) {
+            hi = first;
+            a  = other;
+            lo = at;
+        }
+        if (s1.off + s1.slots[hi::usize].at != lo + 8) { ret opt[str].some{PAIRED}; }
+    }
+    if (d > 0) {
+        if (lo != 0) { ret opt[str].some{UNCODED}; }
+        add(out, Code.saved{Saved{first: a, second: hi, at: 0, pre: d}});
+        ret opt[str].none{};
+    }
+    add(out, Code.saved{Saved{first: a, second: hi, at: lo, pre: 0}});
+    ret opt[str].none{};
+}
+
+# `s` with code `c`'s rules put in effect, its procedure `p`, false when one is no rule the walk follows
+fun applied(s: *Walked, initial: *Walked, p: *Proc, c: Code) res[bool, str] {
+    val made: res[Rules, str] = rules_of(c, s.reg, s.off, p);
+    if (sel made.err) { ret res[bool, str].err{made.err}; }
+    var i: u32 = 0;
+    for (i < made.ok.len) {
+        if (!follow(s, initial, made.ok.at[i::usize])) { ret res[bool, str].ok{false}; }
+        i = i + 1;
+    }
+    ret res[bool, str].ok{true};
+}
+
+# a step of a frame's codes, before statement `at` of its section
+# ---
+# at:    the statement
+# codes: its codes, in the order written
+# end:   whether the prologue ends there, after its codes
+pub rec Step {
+    at:    u32;
+    codes: Codes;
+    end:   bool;
+}
+
+# a frame's codes, step by step
+# ---
+# machine: whose codes
+# steps:   each step that states a code, in statement order
+# count:   how many
+# end:     the statement the prologue ends before
+pub rec Written {
+    machine: Machine;
+    steps:   [64]Step;
+    count:   u32;
+    end:     u32;
+}
+
+# the most steps a frame's prologue is written in
+pub val MAX_STEPS: u32 = 64;
+
+# why a frame's codes were not found, and the statement of its section the step was before
+pub rec Uncoded {
+    message: str;
+    at:      u32;
+}
+
+fun uncoded(message: str, at: u32) res[*Written, Uncoded] {
+    ret res[*Written, Uncoded].err{Uncoded{message: message, at: at}};
+}
+
+# the codes of frame `f` of builder `b`, written into `out`: each step of its prologue the codes that state it, as
+# mink's lowering classifies the step and as their own rules state it again, the prologue's end where it is marked,
+# and on arm64 a nop for each prologue instruction whose step states none. the frame base x86-64's saves are from is
+# the canonical frame address's offset where the frame register is set, or where the prologue ends with none, and a
+# save before that base moves is refused, as its code would read back from another base
+pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Uncoded] {
+    val machine: opt[Machine] = machine_of(b.arch);
+    if (sel machine.none) { ret uncoded(NO_UNWIND, f.start); }
+    if (sel f.lsda.some)  { ret uncoded(LSDA, f.start); }
+    if (sel f.personality.some) {
+        if (f.personality.some.indirect) { ret uncoded(INDIRECT, f.start); }
+    }
+    out.machine = machine.some;
+    out.count   = 0;
+    var initial: Walked = Walked{reg: 0, off: 0};
+    if (!starting(b, ?initial)) { ret uncoded(NO_UNWIND, f.start); }
+    # the prologue's end, which a frame with no rule past its start need not mark
+    var end:   u32   = f.start;
+    var ended: bool  = false;
+    var k:     usize = 0;
+    for (k < f.count) {
+        val r:    build.Rule = build.rule_at(b, f.rules + k);
+        val rule: frame.Rule = r.rule;
+        if (sel rule.prologue_end) {
+            if (ended) { ret uncoded(TWO_ENDS, r.at); }
+            end   = r.at;
+            ended = true;
+        }
+        k = k + 1;
+    }
+    out.end = end;
+    # the frame base: the offset where the frame register is set, else at the prologue's end
+    var base:   i64    = 0;
+    var walk:   Walked = initial;
+    var sp:     u16    = sp_of(machine.some);
+    var framed: bool   = false;
+    k = 0;
+    for (k < f.count) {
+        val r: build.Rule = build.rule_at(b, f.rules + k);
+        if (r.at > end) { brk; }
+        val before: i64 = walk.off;
+        val was:    u16 = walk.reg;
+        if (!follow(?walk, ?initial, r.rule)) { ret uncoded(PROLOGUE, r.at); }
+        if (!framed && was == sp && walk.reg != sp) {
+            base   = before;
+            framed = true;
+        }
+        k = k + 1;
+    }
+    if (!framed) { base = walk.off; }
+    # each step of the prologue, then the body that must hold past it
+    var s0:   Walked = initial;
+    var proc: Proc   = begin(machine.some);
+    var at:   u32    = f.start;
+    k = 0;
+    for {
+        if (k >= f.count) { brk; }
+        val first: build.Rule = build.rule_at(b, f.rules + k);
+        at = first.at;
+        var s1:     Walked = s0;
+        var marked: bool   = false;
+        for (k < f.count) {
+            val r: build.Rule = build.rule_at(b, f.rules + k);
+            if (r.at != at) { brk; }
+            val rule: frame.Rule = r.rule;
+            if (sel rule.prologue_end) { marked = true; }
+            if (sel rule.remember || sel rule.restore_state) {
+                if (at <= end) { ret uncoded(PROLOGUE, at); }
+            }
+            or (!follow(?s1, ?initial, rule)) { ret uncoded(PROLOGUE, at); }
+            k = k + 1;
+        }
+        if (at > end) {
+            if (!same_walked(?s0, ?s1)) { ret uncoded(PAST, at); }
+            cnt;
+        }
+        if (!ended && at == f.start) { marked = true; }
+        var step: Step = Step{at: at, codes: Codes{len: 0, full: false}, end: marked};
+        if (!same_walked(?s0, ?s1)) {
+            if (at == f.start) {
+                val signal: opt[str] = machine_frame(machine.some, f.signal, ?s0, ?s1, ?step.codes);
+                if (sel signal.some) { ret uncoded(signal.some, at); }
+            }
+            or {
+                val found: opt[str] = classify(machine.some, ?s0, ?s1, base, ?step.codes);
+                if (sel found.some) { ret uncoded(found.some, at); }
+            }
+            if (step.codes.full) { ret uncoded(LONG, at); }
+            # the codes read back to the state the rules state, and saves read back from the base mink reads them from
+            var again: Walked = s0;
+            var c:     u32    = 0;
+            for (c < step.codes.len) {
+                val code: Code = step.codes.at[c::usize];
+                if (sel code.based) {
+                    var from: i64 = again.off;
+                    if (sel proc.base.some) { from = proc.base.some; }
+                    if (from != base)       { ret uncoded(BASE_MOVES, at); }
+                }
+                val ok: res[bool, str] = applied(?again, ?initial, ?proc, code);
+                if (sel ok.err) { ret uncoded(ok.err, at); }
+                if (!ok.ok)     { ret uncoded(UNCODED, at); }
+                c = c + 1;
+            }
+            if (!same_walked(?again, ?s1)) { ret uncoded(UNCODED, at); }
+        }
+        or (at == f.start && f.signal) { ret uncoded(UNCODED, at); }
+        if (step.codes.len > 0 || step.end) {
+            if (out.count == MAX_STEPS) { ret uncoded(LONG, at); }
+            out.steps[out.count::usize] = step;
+            out.count                   = out.count + 1;
+        }
+        s0 = s1;
+    }
+    # a prologue that marks no end ends at the function's start
+    var starts: bool = out.count > 0;
+    if (starts) { starts = out.steps[0].at == f.start; }
+    if (!ended && !starts) {
+        if (out.count == MAX_STEPS) { ret uncoded(LONG, f.start); }
+        var i: u32 = out.count;
+        for (i > 0) {
+            out.steps[i::usize] = out.steps[(i - 1)::usize];
+            i                   = i - 1;
+        }
+        out.steps[0] = Step{at: f.start, codes: Codes{len: 0, full: false}, end: true};
+        out.count    = out.count + 1;
+    }
+    if (f.signal) {
+        var first_signal: bool = out.count > 0;
+        if (first_signal)  { first_signal = out.steps[0].at == f.start; }
+        if (!first_signal) { ret uncoded(UNCODED, f.start); }
+    }
+    ret res[*Written, Uncoded].ok{out};
+}
+
+# the machine frame a signal frame begins with, the only step Win64 states at a function's start
+fun machine_frame(m: Machine, signal: bool, s0: *Walked, s1: *Walked, out: *Codes) opt[str] {
+    if (!signal || sel m.arm64)  { ret opt[str].some{AT_START}; }
+    if (s1.off == MACHFRAME)     { add(out, Code.machframe{false}); }
+    or (s1.off == MACHFRAME + 8) { add(out, Code.machframe{true}); }
+    or                           { ret opt[str].some{AT_START}; }
+    ret opt[str].none{};
+}
+
+# how a directive's operands spell its code
+# ---
+# none:     no operand
+# register: a register
+# bytes:    a number of bytes
+# both:     a register, then a number of bytes
+# code:     an optional `@code`
+pub tag Operands: u8 {
+    none;
+    register;
+    bytes;
+    both;
+    code;
+}
+
+# what an arm64 save directive names of its pair: none, the next register, the link register, or a fixed one
+# ---
+# alone: one register
+# next:  the register after the first
+# link:  the link register
+pub tag Second: u8 {
+    alone;
+    next;
+    link;
+}
+
+# a `.seh_` directive and the code it spells (llvm X86AsmParser.cpp and AArch64AsmParser.cpp, the `.seh_` directives
+# of llvm-mc 23.1.1)
+# ---
+# name:     the directive
+# machine:  whose code
+# operands: how its operands spell the code
+# kind:     which code: 0 push, 1 alloc, 2 frame, 3 based, 4 saved, 5 machframe, 6 end, 7 nop
+# fixed:    for an arm64 save, the first register it saves when the directive names none, NONE for one it names; for a
+#           frame, the frame register when it names none
+# second:   for an arm64 save, what it saves with the first
+# pre:      for an arm64 save, whether it moves the stack first
+# float:    for an arm64 save, whether its registers are floating point
+# limit:    for an arm64 save that moves the stack and fixes its first register, the most bytes it moves, 0 for none
+pub rec Directive {
+    name:     str;
+    machine:  u8;
+    operands: Operands;
+    kind:     u8;
+    fixed:    u16;
+    second:   Second;
+    pre:      bool;
+    float:    bool;
+    limit:    i64;
+}
+
+pub val X64:   u8 = 0;
+pub val ARM64: u8 = 1;
+
+pub val PUSH:    u8 = 0;
+pub val ALLOC:   u8 = 1;
+pub val FRAME:   u8 = 2;
+pub val BASED:   u8 = 3;
+pub val SAVED:   u8 = 4;
+pub val MACHINE: u8 = 5;
+pub val END:     u8 = 6;
+pub val NOP:     u8 = 7;
+
+# the dwarf numbers of arm64's floating point registers, d0 at 64
+pub val A64_FLOAT: u16 = 64;
+
+# the directives, an arm64 save's rows in the order mink's lowering prefers its codes (`mink.lower.unwind.arm64`,
+# `save_code`), so the first row that spells a save is the code mink writes
+pub val DIRECTIVE_COUNT: usize                      = 24;
+pub val DIRECTIVES:      [DIRECTIVE_COUNT]Directive = [DIRECTIVE_COUNT]Directive{
+    Directive{name: ".seh_pushreg", machine: X64, operands: Operands.register{}, kind: PUSH, fixed: NONE},
+    Directive{name: ".seh_stackalloc", machine: X64, operands: Operands.bytes{}, kind: ALLOC, fixed: NONE},
+    Directive{name: ".seh_setframe", machine: X64, operands: Operands.both{}, kind: FRAME, fixed: NONE},
+    Directive{name: ".seh_savereg", machine: X64, operands: Operands.both{}, kind: BASED, fixed: NONE},
+    Directive{name: ".seh_savexmm", machine: X64, operands: Operands.both{}, kind: BASED, fixed: NONE, float: true},
+    Directive{name: ".seh_pushframe", machine: X64, operands: Operands.code{}, kind: MACHINE, fixed: NONE},
+    Directive{name: ".seh_endprologue", machine: X64, operands: Operands.none{}, kind: END, fixed: NONE},
+    Directive{name: ".seh_stackalloc", machine: ARM64, operands: Operands.bytes{}, kind: ALLOC, fixed: NONE},
+    Directive{name: ".seh_save_r19r20_x", machine: ARM64, operands: Operands.bytes{}, kind: SAVED, fixed: 19, second: Second.next{}, pre: true, limit: 248},
+    Directive{name: ".seh_save_fplr_x", machine: ARM64, operands: Operands.bytes{}, kind: SAVED, fixed: A64_FP, second: Second.link{}, pre: true},
+    Directive{name: ".seh_save_fplr", machine: ARM64, operands: Operands.bytes{}, kind: SAVED, fixed: A64_FP, second: Second.link{}},
+    Directive{name: ".seh_save_lrpair", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, second: Second.link{}},
+    Directive{name: ".seh_save_regp_x", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, second: Second.next{}, pre: true},
+    Directive{name: ".seh_save_regp", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, second: Second.next{}},
+    Directive{name: ".seh_save_fregp_x", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, second: Second.next{}, pre: true, float: true},
+    Directive{name: ".seh_save_fregp", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, second: Second.next{}, float: true},
+    Directive{name: ".seh_save_reg_x", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, pre: true},
+    Directive{name: ".seh_save_reg", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE},
+    Directive{name: ".seh_save_freg_x", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, pre: true, float: true},
+    Directive{name: ".seh_save_freg", machine: ARM64, operands: Operands.both{}, kind: SAVED, fixed: NONE, float: true},
+    Directive{name: ".seh_set_fp", machine: ARM64, operands: Operands.none{}, kind: FRAME, fixed: A64_FP},
+    Directive{name: ".seh_add_fp", machine: ARM64, operands: Operands.bytes{}, kind: FRAME, fixed: A64_FP},
+    Directive{name: ".seh_nop", machine: ARM64, operands: Operands.none{}, kind: NOP, fixed: NONE},
+    Directive{name: ".seh_endprologue", machine: ARM64, operands: Operands.none{}, kind: END, fixed: NONE},
+};
+
+# the dwarf numbers of x86-64's xmm registers
+val X64_XMM0:  u16 = 17;
+val X64_XMM15: u16 = 32;
+
+fun xmm(reg: u16) bool {
+    ret reg >= X64_XMM0 && reg <= X64_XMM15;
+}
+
+fun machine_index(m: Machine) u8 {
+    if (sel m.arm64) { ret ARM64; }
+    ret X64;
+}
+
+# whether `d` is a directive of machine `m`
+pub fun of_machine(d: *Directive, m: Machine) bool {
+    ret d.machine == machine_index(m);
+}
+
+# the directive of machine `m` named `name`, none when it has none of that name
+pub fun named(m: Machine, name: str) opt[*Directive] {
+    var i: usize = 0;
+    for (i < DIRECTIVE_COUNT) {
+        val d: *Directive = ?DIRECTIVES[i];
+        i = i + 1;
+        if (of_machine(d, m) && str_equals(d.name, name)) { ret opt[*Directive].some{d}; }
+    }
+    ret opt[*Directive].none{};
+}
+
+# the code directive `d` spells with register `reg`, its dwarf number, NONE for none, and `n` bytes, none when they do
+# not fit it: a register of another class than it saves, a fixed register named, or a stack move past its limit
+pub fun code_of(d: *Directive, reg: u16, n: i64, at_code: bool) opt[Code] {
+    val o: Operands = d.operands;
+    if ((sel o.register || sel o.both) && reg == NONE) { ret opt[Code].none{}; }
+    if (d.kind == PUSH) {
+        if (reg >= X64_RA || reg == X64_SP) { ret opt[Code].none{}; }
+        ret opt[Code].some{Code.push{reg}};
+    }
+    if (d.kind == ALLOC)   { ret opt[Code].some{Code.alloc{n}}; }
+    if (d.kind == END)     { ret opt[Code].some{Code.end{}}; }
+    if (d.kind == NOP)     { ret opt[Code].some{Code.nop{}}; }
+    if (d.kind == MACHINE) { ret opt[Code].some{Code.machframe{at_code}}; }
+    if (d.kind == BASED) {
+        if (d.float != xmm(reg)) { ret opt[Code].none{}; }
+        ret opt[Code].some{Code.based{Placed{reg: reg, offset: n}}};
+    }
+    if (d.kind == FRAME) {
+        var r: u16 = reg;
+        if (d.fixed != NONE) { r = d.fixed; }
+        ret opt[Code].some{Code.frame{Placed{reg: r, offset: n}}};
+    }
+    var first: u16 = reg;
+    if (d.fixed != NONE)                 { first = d.fixed; }
+    if (first == NONE)                   { ret opt[Code].none{}; }
+    if (d.float != (first >= A64_FLOAT)) { ret opt[Code].none{}; }
+    var second: u16    = NONE;
+    val s:      Second = d.second;
+    if (sel s.next) { second = first + 1; }
+    if (sel s.link) { second = A64_LR; }
+    if (d.pre) {
+        if (d.limit != 0 && n > d.limit) { ret opt[Code].none{}; }
+        ret opt[Code].some{Code.saved{Saved{first: first, second: second, at: 0, pre: n}}};
+    }
+    ret opt[Code].some{Code.saved{Saved{first: first, second: second, at: n, pre: 0}}};
+}
+
+# the first directive of machine `m` that spells code `c`, with the register and bytes it names, none when none does
+pub rec Spelled {
+    directive: *Directive;
+    reg:       u16;
+    bytes:     i64;
+}
+
+fun same_code(a: Code, b: Code) bool {
+    if (sel a.push) {
+        if (sel b.push) { ret a.push == b.push; }
+        ret false;
+    }
+    if (sel a.alloc) {
+        if (sel b.alloc) { ret a.alloc == b.alloc; }
+        ret false;
+    }
+    if (sel a.end) { ret sel b.end; }
+    if (sel a.nop) { ret sel b.nop; }
+    if (sel a.machframe) {
+        if (sel b.machframe) { ret a.machframe == b.machframe; }
+        ret false;
+    }
+    if (sel a.frame) {
+        if (sel b.frame) { ret a.frame.reg == b.frame.reg && a.frame.offset == b.frame.offset; }
+        ret false;
+    }
+    if (sel a.based) {
+        if (sel b.based) { ret a.based.reg == b.based.reg && a.based.offset == b.based.offset; }
+        ret false;
+    }
+    if (sel a.saved) {
+        if (sel b.saved) {
+            val x: Saved = a.saved;
+            val y: Saved = b.saved;
+            ret x.first == y.first && x.second == y.second && x.at == y.at && x.pre == y.pre;
+        }
+    }
+    ret false;
+}
+
+# the directive of machine `m` that spells code `c`, the first whose code it is, none when none does
+pub fun spelling(m: Machine, c: Code) opt[Spelled] {
+    var reg:   u16  = NONE;
+    var bytes: i64  = 0;
+    var flag:  bool = false;
+    if (sel c.push)  { reg = c.push; }
+    if (sel c.alloc) { bytes = c.alloc; }
+    if (sel c.frame) {
+        reg   = c.frame.reg;
+        bytes = c.frame.offset;
+    }
+    if (sel c.based) {
+        reg   = c.based.reg;
+        bytes = c.based.offset;
+    }
+    if (sel c.machframe) { flag = c.machframe; }
+    if (sel c.saved) {
+        reg   = c.saved.first;
+        bytes = c.saved.at;
+        if (c.saved.pre != 0) { bytes = c.saved.pre; }
+    }
+    var i: usize = 0;
+    for (i < DIRECTIVE_COUNT) {
+        val d: *Directive = ?DIRECTIVES[i];
+        i = i + 1;
+        if (!of_machine(d, m))                                    { cnt; }
+        if (d.fixed != NONE && d.kind == SAVED && d.fixed != reg) { cnt; }
+        if (d.kind == FRAME && sel m.arm64) {
+            val bare: bool = sel d.operands.none;
+            if ((bytes == 0) != bare) { cnt; }
+        }
+        val made: opt[Code] = code_of(d, reg, bytes, flag);
+        if (sel made.none)           { cnt; }
+        if (same_code(made.some, c)) { ret opt[Spelled].some{Spelled{directive: d, reg: reg, bytes: bytes}}; }
+    }
+    ret opt[Spelled].none{};
+}
