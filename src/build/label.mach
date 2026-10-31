@@ -1,0 +1,435 @@
+# labels: naming, stemming, defining, exposing and equating them, and the relocations a source states by hand
+
+use masc.core.operand;
+use masc.core.syntax;
+use masc.format.dialect;
+use mink.base.fail;
+use mink.base.intern;
+use mink.base.store;
+use mink.base.table;
+use mink_arch:   mink.catalog.arch;
+use mink_format: mink.catalog.format;
+use mink.format.registry;
+use mink_object: mink.model.object;
+use mink.model.reloc;
+use mink_row: mink.reloc.row;
+use std.collections.sort;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use masc.build.refusal.BOUNDARY;
+use masc.build.refusal.CYCLE;
+use masc.build.refusal.FINISHED;
+use masc.build.refusal.NAMELESS;
+use masc.build.refusal.NOT_A_LABEL;
+use masc.build.refusal.NO_INSTRUCTION;
+use masc.build.refusal.NO_STEM;
+use masc.build.refusal.NO_SUCH;
+use masc.build.refusal.REDEFINED;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.SEALED;
+use masc.build.refusal.UNBOUND;
+use masc.build.refusal.about;
+use masc.build.refusal.failed;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refuse;
+use masc.build.refusal.refused;
+use masc.build.section.at_cursor;
+use masc.build.state.Builder;
+use masc.build.state.Counter;
+use masc.build.state.Direct;
+use masc.build.state.Equate;
+use masc.build.state.Exposure;
+use masc.build.state.Label;
+use masc.build.state.Mark;
+use masc.build.state.Order;
+use masc.build.state.Value;
+use masc.build.state.Waiting;
+use masc.build.state.Writer;
+use masc.build.state.kind_of;
+use masc.build.state.mark_of;
+use masc.build.state.name_bytes;
+use masc.build.state.name_of;
+use masc.build.state.names_label;
+
+# how many labels the builder has made, named or not
+pub fun label_count(b: *Builder) usize {
+    ret b.labels.len;
+}
+
+# whether a label is named exactly `name`, by the interner's lookup
+pub fun spells(b: *Builder, name: View) bool {
+    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, name.data::*u8, name.len);
+    if (sel known.none) { ret false; }
+    ret b.named.data[known.some.index::usize] != operand.NO_SYMBOL;
+}
+
+# the dialect of format `f` for `a`, nil for none
+pub fun spoken_of(f: *mink_format.Format, a: *mink_arch.Arch) *dialect.Dialect {
+    val d: opt[*dialect.Dialect] = dialect.of(f, a);
+    if (sel d.some) { ret d.some; }
+    ret nil;
+}
+
+# a new label with no name, local until exposed, spelled in the object, when it is a symbol, by the dialect's temporary
+# stem and a number, as `.Ltmp0` on elf and `Ltmp0` on mach-o, numbered as `stemmed` numbers
+pub fun anonymous(b: *Builder) res[Label, Refusal] {
+    if (b.finished)                                  { ret res[Label, Refusal].err{refuse(FINISHED)}; }
+    if (!held(vector.push[Mark](?b.labels, Mark{}))) { ret res[Label, Refusal].err{memory()}; }
+    ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# a new label with no name of its own, spelled in the object as `stem` and a number, as risc-v's `.Lpcrel_hi0`: the next number for the stem that no named label spells, in the order such labels are placed
+pub fun stemmed(b: *Builder, stem: str) res[Label, Refusal] {
+    if (b.finished)                                            { ret res[Label, Refusal].err{refuse(FINISHED)}; }
+    if (stem == nil || stem[0] == 0)                           { ret res[Label, Refusal].err{refuse(NO_STEM)}; }
+    if (str_len(stem) > syntax.MAX_ANONYMOUS)                  { ret res[Label, Refusal].err{refuse(NO_STEM)}; }
+    if (!held(vector.push[Mark](?b.labels, Mark{stem: stem}))) { ret res[Label, Refusal].err{memory()}; }
+    ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# `stem` and `n` in decimal written into `out`, how many bytes
+pub fun stem_spelling(stem: str, n: u32, out: *u8) usize {
+    var len: usize = 0;
+    for (stem[len] != 0) {
+        out[len] = stem[len];
+        len      = len + 1;
+    }
+    var digits: [10]u8;
+    var count:  usize = 0;
+    var m:      u32   = n;
+    for {
+        digits[count] = '0' + (m % 10)::u8;
+        count         = count + 1;
+        m             = m / 10;
+        if (m == 0) { brk; }
+    }
+    for (count > 0) {
+        count    = count - 1;
+        out[len] = digits[count];
+        len      = len + 1;
+    }
+    ret len;
+}
+
+# the stem label `m` is spelled by in the object when it has no name of its own: the one it was made with, else the
+# dialect's temporary stem, or the anonymous stem of the set's established syntax for a format with no dialect, nil for
+# a named label
+pub fun stem_for(b: *Builder, m: *Mark) str {
+    if (sel m.name.some)  { ret nil; }
+    if (m.stem != nil)    { ret m.stem; }
+    if (b.dialect != nil) { ret b.dialect.temporary; }
+    ret b.set.syntaxes.at[0].anonymous;
+}
+
+val NO_PLACE: u32 = 0xFFFF_FFFF;
+
+fun by_order(x: *Order, y: *Order) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.fragment != y.fragment) {
+        if (x.fragment < y.fragment) { ret -1; }
+        ret 1;
+    }
+    if (x.id < y.id) { ret -1; }
+    if (x.id > y.id) { ret 1; }
+    ret 0;
+}
+
+# every label with no name of its own numbered after its stem: each the next number of its stem that no named label
+# spells, in place order, by section, then statement, then the order made, and then the labels never placed in the
+# order made. a text that lists the labels in place order, naming some and leaving others to the assembler, so reads
+# back to the same numbers
+pub fun number_stems(b: *Builder) err[Refusal] {
+    var order: vector.Vector[Order]   = vector.init[Order](b.a);
+    var stems: vector.Vector[Counter] = vector.init[Counter](b.a);
+    if (!held(vector.reserve[Order](?order, b.labels.len))) { ret err[Refusal].err{memory()}; }
+    var i: usize = 0;
+    for (i < b.labels.len) {
+        val m: *Mark = ?b.labels.data[i];
+        if (stem_for(b, m) != nil) {
+            var at: Order = Order{section: NO_PLACE, fragment: 0, id: (i + 1)::u32};
+            if (m.defined) {
+                at.section  = m.section;
+                at.fragment = m.fragment;
+            }
+            vector.push[Order](?order, at);
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Order](order.data, order.len, by_order);
+    var room: [syntax.MAX_ANONYMOUS + 10]u8;
+    var ok:   bool = true;
+    i = 0;
+    for (i < order.len && ok) {
+        val m:    *Mark = ?b.labels.data[order.data[i].id::usize - 1];
+        val stem: str   = stem_for(b, m);
+        var k:    usize = 0;
+        for (k < stems.len && !str_equals(stems.data[k].stem, stem)) { k = k + 1; }
+        if (k == stems.len) { ok = held(vector.push[Counter](?stems, Counter{stem: stem, next: 0})); }
+        if (ok) {
+            var next: u32 = stems.data[k].next;
+            for (spells(b, View{data: ?room[0], len: stem_spelling(stem, next, ?room[0])})) { next = next + 1; }
+            m.number           = next;
+            stems.data[k].next = next + 1;
+        }
+        i = i + 1;
+    }
+    vector.dnit[Order](?order);
+    vector.dnit[Counter](?stems);
+    if (!ok) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# a new label placed at the cursor of the current section, which is how a fact is attached to a place: the label is
+# the place, and once the layout is settled `place_of` states where it finally lies, after relaxation and compression
+pub fun position(b: *Builder) res[Label, Refusal] {
+    val made: res[Label, Refusal] = anonymous(b);
+    if (sel made.err) { ret made; }
+    val placed: err[Refusal] = define(b, made.ok);
+    if (sel placed.err) { ret res[Label, Refusal].err{placed.err}; }
+    ret made;
+}
+
+# a new label for the start of the next instruction emitted into the current section, which is where a fact about that
+# instruction belongs: alignment or data between are not part of it. with `end` set, a section that gets no instruction
+# after it places the label at its end, and without it the layout refuses
+pub fun next_position(b: *Builder, end: bool) res[Label, Refusal] {
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err)                                    { ret res[Label, Refusal].err{at.err}; }
+    if (!held(vector.reserve[Waiting](?b.waiting, 1))) { ret res[Label, Refusal].err{memory()}; }
+    val made: res[Label, Refusal] = anonymous(b);
+    if (sel made.err) { ret made; }
+    vector.push[Waiting](?b.waiting, Waiting{label: made.ok.id, section: at.ok::u32, end: end});
+    ret made;
+}
+
+# the places waiting in section `s` placed at fragment `at`
+pub fun bind_waiting(b: *Builder, s: u32, at: u32) {
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < b.waiting.len) {
+        val w: Waiting = b.waiting.data[i];
+        if (w.section == s) {
+            put_at(b, ?b.labels.data[w.label::usize - 1], s, at);
+        }
+        or {
+            b.waiting.data[kept] = w;
+            kept                 = kept + 1;
+        }
+        i = i + 1;
+    }
+    vector.truncate[Waiting](?b.waiting, kept);
+}
+
+# the places still waiting settled: those allowed to end the section are placed at its end, and one that is not is refused.
+# they keep waiting, so a layout that is not the last is undone by emitting more, which binds them to what follows
+pub fun settle_waiting(b: *Builder) err[Refusal] {
+    var i: usize = 0;
+    for (i < b.waiting.len) {
+        if (!b.waiting.data[i].end) { ret about(NO_INSTRUCTION, b.waiting.data[i].label); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.waiting.len) {
+        val w: Waiting = b.waiting.data[i];
+        put_at(b, ?b.labels.data[w.label::usize - 1], w.section, b.areas.data[w.section::usize].fragments.len::u32);
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# `w` added to what writes after the layout is settled, run once by `finish`
+pub fun writer(b: *Builder, w: Writer) err[Refusal] {
+    if (b.finished)                                { ret refused(FINISHED); }
+    if (!held(vector.push[Writer](?b.writers, w))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# a source file the object names, stated as a local symbol of the source kind, as an ELF `STT_FILE` symbol. it is no
+# label, so its name is not one that a label can be found by
+pub fun source(b: *Builder, name: View) err[Refusal] {
+    if (b.finished)                                                  { ret refused(FINISHED); }
+    if (name.len == 0)                                               { ret refused(NAMELESS); }
+    if (!held(vector.reserve[table.Id[intern.Name]](?b.sources, 1))) { ret err[Refusal].err{memory()}; }
+    val id: res[table.Id[intern.Name], Refusal] = name_bytes(b, name.data::*u8, name.len);
+    if (sel id.err) { ret err[Refusal].err{id.err}; }
+    vector.push[table.Id[intern.Name]](?b.sources, id.ok);
+    ret err[Refusal].ok{};
+}
+
+# the label named `name`, made local when it is new
+pub fun label(b: *Builder, name: str) res[Label, Refusal] {
+    if (b.finished) { ret res[Label, Refusal].err{refuse(FINISHED)}; }
+    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, name::*u8, str_len(name));
+    if (sel known.some) {
+        val slot: u32 = b.named.data[known.some.index::usize];
+        if (slot != operand.NO_SYMBOL) { ret res[Label, Refusal].ok{Label{id: slot}}; }
+    }
+    if (!held(vector.reserve[Mark](?b.labels, 1))) { ret res[Label, Refusal].err{memory()}; }
+    val id: res[table.Id[intern.Name], Refusal] = name_of(b, name);
+    if (sel id.err) { ret res[Label, Refusal].err{id.err}; }
+    vector.push[Mark](?b.labels, Mark{name: opt[table.Id[intern.Name]].some{id.ok}});
+    b.named.data[id.ok.index::usize] = b.labels.len::u32;
+    ret res[Label, Refusal].ok{Label{id: b.labels.len::u32}};
+}
+
+# whether `l` existed when the layout was settled, so a writer running now may not restate it
+fun sealed_label(b: *Builder, l: Label) bool {
+    ret sel b.taken.some && l.id::usize <= b.taken.some.labels;
+}
+
+# make `l` a symbol of the object, or restate how it is one
+pub fun expose(b: *Builder, l: Label, e: Exposure) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none)         { ret refused(NO_SUCH); }
+    if (sealed_label(b, l)) { ret refused(SEALED); }
+    m.some.exposure = opt[Exposure].some{e};
+    ret err[Refusal].ok{};
+}
+
+# place `l` at the cursor of the current section
+pub fun define(b: *Builder, l: Label) err[Refusal] {
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err) { ret err[Refusal].err{at.err}; }
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none)                              { ret refused(NO_SUCH); }
+    if (sealed_label(b, l))                      { ret refused(SEALED); }
+    if (m.some.defined || sel m.some.value.some) { ret about(REDEFINED, l.id); }
+    put_at(b, m.some, at.ok::u32, b.areas.data[at.ok].fragments.len::u32);
+    b.defined = opt[Label].some{l};
+    ret err[Refusal].ok{};
+}
+
+# label `m` placed before fragment `fragment` of section `s`, after every label placed so far
+fun put_at(b: *Builder, m: *Mark, s: u32, fragment: u32) {
+    m.defined  = true;
+    m.section  = s;
+    m.fragment = fragment;
+    m.order    = b.placings;
+    b.placings = b.placings + 1;
+}
+
+# the label placed last when it is at the cursor of the current section, nothing written after it, as a function's
+# label is where `.cfi_startproc` begins its frame. none when no label is there
+pub fun placed_here(b: *Builder) opt[Label] {
+    if (sel b.defined.none) { ret opt[Label].none{}; }
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err) { ret opt[Label].none{}; }
+    val m: *Mark = ?b.labels.data[b.defined.some.id::usize - 1];
+    if (m.section != at.ok::u32 || m.fragment != b.areas.data[at.ok].fragments.len::u32) { ret opt[Label].none{}; }
+    ret b.defined;
+}
+
+# whether `l` is placed or given a value
+pub fun bound(b: *Builder, l: Label) bool {
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none) { ret false; }
+    ret m.some.defined || sel m.some.value.some;
+}
+
+# `l` given the value `v` in place of a place, refused for a label placed or given one already
+fun valued(b: *Builder, l: Label, v: Value) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none)                              { ret refused(NO_SUCH); }
+    if (sealed_label(b, l))                      { ret refused(SEALED); }
+    if (m.some.defined || sel m.some.value.some) { ret about(REDEFINED, l.id); }
+    m.some.value = opt[Value].some{v};
+    ret err[Refusal].ok{};
+}
+
+# `l` made the number `value`, as `.set` makes a symbol of a constant
+pub fun absolute(b: *Builder, l: Label, value: u64) err[Refusal] {
+    ret valued(b, l, Value.absolute{value});
+}
+
+# `l` made common storage of `size` bytes at a boundary of `align`, a power of two, which the linker allocates. the
+# label must be exposed with a binding other objects see by the time the builder finishes
+pub fun common(b: *Builder, l: Label, size: u64, align: u64) err[Refusal] {
+    if (align == 0 || (align & (align - 1)) != 0) { ret refused(BOUNDARY); }
+    ret valued(b, l, Value.common{mink_object.Common{size: size, align: align}});
+}
+
+# `l` made to stand for `target` plus `addend`, wherever `target` comes to be
+pub fun equate(b: *Builder, l: Label, target: Label, addend: i64) err[Refusal] {
+    if (!names_label(b, target.id)) { ret refused(NOT_A_LABEL); }
+    if (target.id == l.id)          { ret about(CYCLE, l.id); }
+    ret valued(b, l, Value.equate{Equate{target: target.id, addend: addend}});
+}
+
+# the relocation `d` stated by itself in the current section
+pub fun relocate(b: *Builder, d: Direct) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err)                                             { ret err[Refusal].err{at.err}; }
+    if (sel d.at.some && !names_label(b, d.at.some.id))         { ret refused(NOT_A_LABEL); }
+    if (sel d.target.some && !names_label(b, d.target.some.id)) { ret refused(NOT_A_LABEL); }
+    if (sel b.relocs.err)                                       { ret err[Refusal].err{failed(b.relocs.err)}; }
+    val row_: res[*mink_row.Row, fail.Fail] = registry.relocation_by_kind(?b.relocs.ok, d.kind);
+    if (sel row_.err) { ret err[Refusal].err{failed(row_.err)}; }
+    val takes: err[fail.Fail] = reloc.allows_target(d.kind, sel d.target.none);
+    if (sel takes.err) { ret err[Refusal].err{failed(takes.err)}; }
+    var placed: Direct = d;
+    placed.section = at.ok::u32;
+    if (!held(vector.push[Direct](?b.direct, placed))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# a relocation of the set's fixup kind `fixup` at the cursor of the current section, naming `target`, as aarch64's
+# `.tlsdesccall` marks the blr after it: a marker no bits hold, at the cursor, before any alignment between, and kept as `relocate` keeps one stated by itself, so one past every byte of its section is refused
+pub fun mark(b: *Builder, fixup: operand.FixupKind, target: Label) err[Refusal] {
+    val kind: *reloc.Kind = kind_of(b, fixup);
+    if (kind == nil) { ret refused(UNBOUND); }
+    val at: res[Label, Refusal] = position(b);
+    if (sel at.err) { ret err[Refusal].err{at.err}; }
+    ret relocate(b, Direct{at: opt[Label].some{at.ok}, offset: 0, kind: kind, target: opt[Label].some{target}, addend: 0});
+}
+
+# how many relocations were stated by themselves (`relocate`)
+pub fun direct_count(b: *Builder) usize {
+    ret b.direct.len;
+}
+
+# the `k`-th relocation stated by itself, its section the one it was stated in
+pub fun direct_at(b: *Builder, k: usize) Direct {
+    ret b.direct.data[k];
+}
+
+# the name the object's format gives relocation kind `kind` for the architecture, the one `relocation_named` reads,
+# none for a kind it maps no row to
+pub fun relocation_name(b: *Builder, kind: *reloc.Kind) opt[str] {
+    if (sel b.relocs.err) { ret opt[str].none{}; }
+    val row_: res[*mink_row.Row, fail.Fail] = registry.relocation_by_kind(?b.relocs.ok, kind);
+    if (sel row_.err) { ret opt[str].none{}; }
+    ret opt[str].some{row_.ok.name};
+}
+
+# the relocation kind the object's format names `name` for the architecture, as elf's `R_RISCV_32`, none when no row
+# of its is so named
+pub fun relocation_named(b: *Builder, name: View) opt[*reloc.Kind] {
+    if (sel b.relocs.err) { ret opt[*reloc.Kind].none{}; }
+    val l: *mink_row.Lookup = b.relocs.ok.rows;
+    val n: usize            = table.count[*mink_row.Row](?l.keys);
+    var i: usize            = 0;
+    for (i < n) {
+        val r: *mink_row.Row = table.items[*mink_row.Row](?l.keys)[i];
+        i = i + 1;
+        if (str_len(r.name) == name.len && store.same_bytes(store.Bytes{data: r.name, len: name.len}, store.Bytes{data: name.data, len: name.len})) { ret opt[*reloc.Kind].some{r.kind}; }
+    }
+    ret opt[*reloc.Kind].none{};
+}

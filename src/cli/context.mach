@@ -1,0 +1,176 @@
+# what every command of the masc command line shares: its run context, the
+# flag rows several commands take, the target its flags name, and the
+# refusals it renders
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.args;
+
+use mink.base.fail;
+use mink_registry: mink.format.registry;
+
+use masc.asm.model;
+use masc.core.extension;
+use masc.core.register;
+use masc.core.state;
+use masc.tool.help;
+use masc.tool.object;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+
+pub val F_HELP:    args.Flag = args.Flag{name: "--help", short: "-h", kind: args.SWITCH, negatable: false, occurs: args.Occurs.once{}, value: "", doc: "show the overview, or a command's page in place of running it"};
+pub val F_TARGET:  args.Flag = args.Flag{name: "--target", short: "-t", kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "arch", doc: "the architecture, by its name in mink's catalog"};
+pub val F_ISA:     args.Flag = args.Flag{name: "--isa", short: nil, kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "selection", doc: "the extensions, in the set's selection syntax, as rv64gc_zba"};
+pub val F_SYNTAX:  args.Flag = args.Flag{name: "--syntax", short: nil, kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "name", doc: "the assembly syntax, the set's established one by default"};
+pub val F_ABI:     args.Flag = args.Flag{name: "--abi", short: nil, kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "name", doc: "the abi, by the name of its row in mink's catalog, as -mabi names it"};
+pub val F_OUTPUT:  args.Flag = args.Flag{name: "--output", short: "-o", kind: args.VALUE, negatable: false, occurs: args.Occurs.once{}, value: "path", doc: "write the output here"};
+pub val F_VERBOSE: args.Flag = args.Flag{name: "--verbose", short: "-v", kind: args.SWITCH, negatable: false, occurs: args.Occurs.once{}, value: "", doc: "report what was written"};
+
+# the most mode flags the registered sets declare, the most flags a command reads and the most operands it takes
+pub val MAX_MODE_FLAGS: usize = 16;
+pub val MAX_FLAGS:      usize = 8 + MAX_MODE_FLAGS;
+pub val MAX_OPERANDS:   usize = 1;
+
+# a command line being run
+# ---
+# a:        the allocator everything lives in
+# args:     the arguments
+# page:     its help with its flag rows, the page's own and its mode flags
+# rows:     the flag rows the reader reads
+# moding:   a flag row per distinct mode flag of the registered sets, the first `moded` of them, for a command that
+#           takes them
+# moded:    how many
+# chosen:   the mode flags given, the first `chose` of them
+# chose:    how many
+# reader:   the reader of its flags, which points at settings
+# settings: one per flag row
+# operands: the operands, in order
+# count:    how many
+# out:      what goes to stdout
+# err:      what goes to stderr
+pub rec Run {
+    a:        *A.Allocator;
+    args:     args.Args;
+    page:     help.Page;
+    rows:     [MAX_FLAGS]*args.Flag;
+    moding:   [MAX_MODE_FLAGS]args.Flag;
+    moded:    usize;
+    chosen:   [MAX_MODE_FLAGS]str;
+    chose:    u32;
+    reader:   args.Reader;
+    settings: [MAX_FLAGS]args.Setting;
+    operands: [MAX_OPERANDS]str;
+    count:    usize;
+    out:      text.Text;
+    err:      text.Text;
+}
+
+# the end of a command whose register view or selection storage was refused
+pub fun memory(r: *Run) render.Exit {
+    render.headline(?r.err, "cli.memory", "out of memory");
+    ret render.INTERNAL;
+}
+
+pub fun refuse(r: *Run, code: str, message: str, subject: str) render.Exit {
+    render.quoted(?r.err, code, message, subject);
+    ret render.USER;
+}
+
+pub fun failed(r: *Run, code: str, f: fail.Fail) render.Exit {
+    render.failure(?r.err, code, f);
+    ret render.exit_of(f);
+}
+
+# the end of a command that read a flag outside its table, or one that collects: a bug of the command's flag table
+pub fun misread(r: *Run, why: args.Misread) render.Exit {
+    if (sel why.unlisted)  { render.quoted(?r.err, "cli.flag_unlisted", "flag is not in the command's table", why.unlisted.name); }
+    if (sel why.repeating) { render.quoted(?r.err, "cli.flag_collects", "flag collects and has no single value", why.repeating.name); }
+    ret render.INTERNAL;
+}
+
+# the target the flags name, with the mode flags given in the run's storage, and its abi when the command reads `--abi`
+pub fun request_of(r: *Run, reads_abi: bool) res[target.Request, args.Misread] {
+    val arch:      res[str, args.Misread] = args.value(r.reader, ?F_TARGET);
+    val selection: res[str, args.Misread] = args.value(r.reader, ?F_ISA);
+    val syntax:    res[str, args.Misread] = args.value(r.reader, ?F_SYNTAX);
+    var abi:       res[str, args.Misread] = res[str, args.Misread].ok{nil};
+    if (reads_abi)         { abi = args.value(r.reader, ?F_ABI); }
+    if (sel arch.err)      { ret res[target.Request, args.Misread].err{arch.err}; }
+    if (sel selection.err) { ret res[target.Request, args.Misread].err{selection.err}; }
+    if (sel syntax.err)    { ret res[target.Request, args.Misread].err{syntax.err}; }
+    if (sel abi.err)       { ret res[target.Request, args.Misread].err{abi.err}; }
+    var q: target.Request = target.Request{arch: arch.ok, selection: selection.ok, syntax: syntax.ok, abi: abi.ok, modes: target.NO_FLAGS};
+    r.chose = 0;
+    var i: usize = 0;
+    for (i < r.moded) {
+        if (args.given(r.reader, ?r.moding[i])) {
+            r.chosen[r.chose] = r.moding[i].name;
+            r.chose           = r.chose + 1;
+        }
+        i = i + 1;
+    }
+    q.modes = target.Flags{at: ?r.chosen[0], len: r.chose};
+    if (q.selection == nil) { q.selection = ""; }
+    ret res[target.Request, args.Misread].ok{q};
+}
+
+pub fun refuse_target(r: *Run, why: target.Refusal, spelling: str) render.Exit {
+    if (sel why.arch)      { ret refuse(r, "target.arch", "unknown architecture", why.arch); }
+    if (sel why.unserved)  { ret refuse(r, "target.unserved", "no instruction set serves the architecture", why.unserved.name); }
+    if (sel why.syntax)    { ret refuse(r, "target.syntax", "the set has no syntax", why.syntax); }
+    if (sel why.abi)       { ret refuse(r, "target.abi", "the architecture has no abi of the name", why.abi); }
+    if (sel why.mode)      { ret refuse(r, "target.mode", "the set has no assembler mode the flag chooses", why.mode); }
+    if (sel why.twice)     { ret refuse(r, "target.mode", "another flag chooses a value of the same mode as", why.twice); }
+    if (sel why.selection) { ret refuse_selection(r, why.selection, spelling); }
+    if (sel why.context)   { ret refuse_context(r, why.context, spelling); }
+    if (sel why.unhosted)  { ret refuse(r, "target.abi", "the freestanding system states no default abi for the architecture, give one with --abi", why.unhosted.name); }
+    if (sel why.defaulted) { ret failed(r, "target.abi", why.defaulted); }
+    ret memory(r);
+}
+
+fun refuse_selection(r: *Run, why: extension.Error, spelling: str) render.Exit {
+    if (sel why.refused) {
+        render.headline(?r.err, "target.selection", why.refused.message);
+        render.place(?r.err, "--isa", spelling, str_len(spelling), why.refused.span);
+        ret render.USER;
+    }
+    if (sel why.conflict) { ret refuse(r, "target.selection", "the selection holds extensions that conflict", spelling); }
+    ret memory(r);
+}
+
+fun refuse_context(r: *Run, why: state.Opened, spelling: str) render.Exit {
+    if (sel why.state) { ret refuse(r, "target.selection", "the selection states two values of one state axis, or one no axis takes", spelling); }
+    val e: register.Error = why.view;
+    if (sel e.empty) { ret refuse(r, "target.selection", "the selection bounds a quantity of the register file to no value", spelling); }
+    ret memory(r);
+}
+
+pub fun refuse_object(r: *Run, why: object.Refusal) render.Exit {
+    if (sel why.format)    { ret refuse(r, "object.format", "unknown object format", why.format); }
+    if (sel why.unnamed)   { ret refuse(r, "object.format", "the format names no code for the architecture", why.unnamed.format.name); }
+    if (sel why.ambiguous) { ret refuse(r, "object.format", "choose the object format with --format, several name the architecture", why.ambiguous.name); }
+    if (sel why.dialect)   { ret refuse(r, "object.format", "masc states no assembly dialect of the format for the architecture", why.dialect.format.name); }
+    ret render.INTERNAL;
+}
+
+# the command `run` runs with mink's built in format registry, given back once it has run
+pub fun with_formats(r: *Run, run: fun(*Run, *mink_registry.Registry) render.Exit) render.Exit {
+    val made: res[mink_registry.Registry, fail.Fail] = mink_registry.builtin(r.a);
+    if (sel made.err) { ret failed(r, "object.formats", made.err); }
+
+    var formats:  mink_registry.Registry = made.ok;
+    val exit:     render.Exit            = run(r, ?formats);
+    val released: err[fail.Fail]         = mink_registry.release(?formats);
+    if (exit != render.SUCCESS) { ret exit; }
+    if (sel released.err)       { ret failed(r, "object.formats", released.err); }
+
+    ret exit;
+}

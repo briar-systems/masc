@@ -1,0 +1,321 @@
+# the builder's sections: opening, grouping, ordering and switching them, and the cursor each keeps
+
+use masc.core.index;
+use masc.core.trait;
+use mink.base.fail;
+use mink.base.intern;
+use mink.base.table;
+use mink_group:   mink.model.group;
+use mink_section: mink.model.section;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use masc.build.refusal.FINISHED;
+use masc.build.refusal.NO_SECTION;
+use masc.build.refusal.NO_SUCH;
+use masc.build.refusal.ORDER;
+use masc.build.refusal.RAISED;
+use masc.build.refusal.REGROUPED;
+use masc.build.refusal.REORDERED;
+use masc.build.refusal.RULED;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.SEALED;
+use masc.build.refusal.SIGNATURE;
+use masc.build.refusal.STARTED;
+use masc.build.refusal.TRAIT_SECTION;
+use masc.build.refusal.failed;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refuse;
+use masc.build.refusal.refused;
+use masc.build.state.Area;
+use masc.build.state.Builder;
+use masc.build.state.Fragment;
+use masc.build.state.Label;
+use masc.build.state.Mark;
+use masc.build.state.RAISED_BASE;
+use masc.build.state.Raised;
+use masc.build.state.STARTING;
+use masc.build.state.Section;
+use masc.build.state.Spec;
+use masc.build.state.mark_of;
+use masc.build.state.name_bytes;
+use masc.build.state.name_of;
+
+# the section the format holds the traits in named `name`, its handle, opened once
+fun open_raised(b: *Builder, name: str) res[Section, Refusal] {
+    val named: res[table.Id[intern.Name], Refusal] = name_of(b, name);
+    if (sel named.err) { ret res[Section, Refusal].err{named.err}; }
+    var k: usize = 0;
+    for (k < b.raised.len) {
+        if (b.raised.data[k].name.index == named.ok.index) { ret res[Section, Refusal].ok{Section{index: RAISED_BASE + k::u32}}; }
+        k = k + 1;
+    }
+    if (!held(vector.push[Raised](?b.raised, Raised{name: named.ok, bytes: vector.init[u8](b.a)}))) { ret res[Section, Refusal].err{memory()}; }
+    ret res[Section, Refusal].ok{Section{index: RAISED_BASE + k::u32}};
+}
+
+# the section the format holds the traits in that the current section is, none for another
+pub fun raising(b: *Builder) opt[*Raised] {
+    if (b.finished)         { ret opt[*Raised].none{}; }
+    if (sel b.current.none) { ret opt[*Raised].none{}; }
+    val at: usize = b.current.some;
+    if (at < RAISED_BASE::usize || at == STARTING::usize) { ret opt[*Raised].none{}; }
+    ret opt[*Raised].some{?b.raised.data[at - RAISED_BASE::usize]};
+}
+
+# a new section, which is current once switched to. a nameless one, or one opened apart, is a section of its own each
+# time. a section the format holds the traits in, as elf's `.note.gnu.property`, is no section of the object: its data
+# is raised into the object's traits at finish (`raise_all`), so it takes data alone and is one section however often
+# it is opened, and one opened apart is refused
+pub fun open(b: *Builder, spec: Spec) res[Section, Refusal] {
+    if (b.finished)                               { ret res[Section, Refusal].err{refuse(FINISHED)}; }
+    if (!held(vector.reserve[Area](?b.areas, 1))) { ret res[Section, Refusal].err{memory()}; }
+    var name: opt[table.Id[intern.Name]] = opt[table.Id[intern.Name]].none{};
+    if (sel spec.name.some) {
+        val holds: res[bool, fail.Fail] = trait.holds_traits(b.formats, b.format, b.arch, spec.name.some);
+        if (sel holds.err) { ret res[Section, Refusal].err{failed(holds.err)}; }
+        if (holds.ok) {
+            if (spec.apart) { ret res[Section, Refusal].err{refuse(TRAIT_SECTION)}; }
+            ret open_raised(b, spec.name.some);
+        }
+        val named: res[table.Id[intern.Name], Refusal] = name_of(b, spec.name.some);
+        if (sel named.err) { ret res[Section, Refusal].err{named.err}; }
+        name = opt[table.Id[intern.Name]].some{named.ok};
+    }
+    val index: u32  = b.areas.len::u32;
+    var area:  Area = Area{
+        name:        name,
+        kind:        spec.kind,
+        flags:       spec.flags,
+        disposition: spec.disposition,
+        entsize:     spec.entsize,
+        align:       1,
+        bits:        mink_section.has(spec.kind, mink_section.BITS),
+        code:        (spec.flags & mink_section.EXEC) != 0,
+        fragments:   vector.init[Fragment](b.a),
+        marks:       vector.init[u32](b.a),
+        bytes:       vector.init[u8](b.a),
+    };
+    vector.push[Area](?b.areas, area);
+    if (sel name.some) {
+        if (!spec.apart && b.titled.data[name.some.index::usize] == 0) { b.titled.data[name.some.index::usize] = index + 1; }
+    }
+    # a section of the starting section's name is the starting section, which then stands for it
+    if (sel b.started.none && !spec.apart && pending_name(b, spec.name)) { b.started = opt[u32].some{index}; }
+    ret res[Section, Refusal].ok{Section{index: index}};
+}
+
+# section `s` put in the comdat group of signature `signature`, the group of each section of that signature, which keeps
+# any one copy of it across the objects linked (mink's `group.ANY`). the object names the group by the signature's
+# name, which a symbol of that name stands for, or which the format writes as a symbol of its own when the object holds
+# none, as assemblers sign a group no label exposes. a section joins one group at most
+pub fun join(b: *Builder, s: Section, signature: View) err[Refusal] {
+    ret join_by(b, s, signature, ?mink_group.ANY);
+}
+
+# section `s` put in the comdat group of signature `signature`, which keeps a copy by `rule`, as coff's selections
+# state one, every section of the signature's group stating the same rule. a rule that names a leader section, as
+# coff's associative selection does, is `associate`'s, and refused here
+pub fun join_by(b: *Builder, s: Section, signature: View, rule: *mink_group.Rule) err[Refusal] {
+    if (b.finished)                                { ret refused(FINISHED); }
+    if ((rule.caps & mink_group.ASSOCIATIVE) != 0) { ret refused(RULED); }
+    if (s.index::usize >= b.areas.len)             { ret refused(NO_SUCH); }
+    val area: *Area = ?b.areas.data[s.index::usize];
+    if (sel area.group.some || area.rule == ?mink_group.ASSOCIATE) { ret refused(REGROUPED); }
+    if (signature.len == 0)                                        { ret refused(SIGNATURE); }
+    val named: res[table.Id[intern.Name], Refusal] = name_bytes(b, signature.data, signature.len);
+    if (sel named.err) { ret err[Refusal].err{named.err}; }
+    var k: usize = 0;
+    for (k < b.areas.len) {
+        val other: *Area = ?b.areas.data[k];
+        k = k + 1;
+        if (sel other.group.some) {
+            if (other.group.some.index == named.ok.index && other.rule != rule) { ret refused(RULED); }
+        }
+    }
+    val into: *Area = ?b.areas.data[s.index::usize];
+    into.group = opt[table.Id[intern.Name]].some{named.ok};
+    into.rule  = rule;
+    ret err[Refusal].ok{};
+}
+
+# section `s` ordered after section `owner` when linked, as an elf link-order section is ordered after the section it
+# names (mink's `Section.owner`). a section takes one order at most, and a section the format holds the traits in is
+# neither ordered nor an owner, since the object holds no section for it
+pub fun order(b: *Builder, s: Section, owner: Section) err[Refusal] {
+    if (b.finished)                                                         { ret refused(FINISHED); }
+    if (s.index::usize >= b.areas.len || owner.index::usize >= b.areas.len) { ret refused(ORDER); }
+    if (s.index == owner.index)                                             { ret refused(ORDER); }
+    val area: *Area = ?b.areas.data[s.index::usize];
+    if (sel area.owner.some) { ret refused(REORDERED); }
+    val into: *Area = ?b.areas.data[s.index::usize];
+    into.owner = opt[u32].some{owner.index};
+    ret err[Refusal].ok{};
+}
+
+# section `s` kept with section `leader` when linked, as a coff associative selection keeps a section with the leader
+# it names: the object puts it in an associative group of its own whose leader is `leader`, and orders it after
+# `leader` (mink's `Group.leader` and `Section.owner`). a section takes one group or order at most, and a section the
+# format holds the traits in is neither kept nor a leader, since the object holds no section for it
+pub fun associate(b: *Builder, s: Section, leader: Section) err[Refusal] {
+    if (b.finished)                                                          { ret refused(FINISHED); }
+    if (s.index::usize >= b.areas.len || leader.index::usize >= b.areas.len) { ret refused(ORDER); }
+    if (s.index == leader.index)                                             { ret refused(ORDER); }
+    val area: *Area = ?b.areas.data[s.index::usize];
+    if (sel area.owner.some)                                       { ret refused(REORDERED); }
+    if (sel area.group.some || area.rule == ?mink_group.ASSOCIATE) { ret refused(REGROUPED); }
+    val into: *Area = ?b.areas.data[s.index::usize];
+    into.owner = opt[u32].some{leader.index};
+    into.rule  = ?mink_group.ASSOCIATE;
+    ret err[Refusal].ok{};
+}
+
+# whether section `s` is kept with the section it is ordered after, by `associate`
+pub fun associated(b: *Builder, s: Section) bool {
+    if (s.index::usize >= b.areas.len) { ret false; }
+    val area: *Area = ?b.areas.data[s.index::usize];
+    ret sel area.group.none && sel area.owner.some && area.rule == ?mink_group.ASSOCIATE;
+}
+
+# the section the label named `name` is placed in, none for a name no label placed so far has
+pub fun placed_in(b: *Builder, name: View) opt[Section] {
+    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, name.data::*u8, name.len);
+    if (sel known.none) { ret opt[Section].none{}; }
+    val m: opt[*Mark] = mark_of(b, Label{id: b.named.data[known.some.index::usize]});
+    if (sel m.none)      { ret opt[Section].none{}; }
+    if (!m.some.defined) { ret opt[Section].none{}; }
+    ret opt[Section].some{Section{index: m.some.section}};
+}
+
+# the section `s` is ordered after, none for a section of no link order
+pub fun owner_of(b: *Builder, s: Section) opt[Section] {
+    if (s.index::usize >= b.areas.len) { ret opt[Section].none{}; }
+    val o: opt[u32] = b.areas.data[s.index::usize].owner;
+    if (sel o.none) { ret opt[Section].none{}; }
+    ret opt[Section].some{Section{index: o.some}};
+}
+
+# the signature of the comdat group section `s` is in, none for a section in none
+pub fun group_of(b: *Builder, s: Section) opt[View] {
+    if (s.index::usize >= b.areas.len) { ret opt[View].none{}; }
+    val g: opt[table.Id[intern.Name]] = b.areas.data[s.index::usize].group;
+    if (sel g.none) { ret opt[View].none{}; }
+    ret opt[View].some{intern.bytes_of(?b.names, g.some)};
+}
+
+# the rule the comdat group section `s` is in keeps a copy by, the associative rule for a section `associate` keeps,
+# nil for a section in none
+pub fun group_rule(b: *Builder, s: Section) *mink_group.Rule {
+    if (s.index::usize >= b.areas.len) { ret nil; }
+    ret b.areas.data[s.index::usize].rule;
+}
+
+# the first section opened with the name `name` and not apart, none when no section is. a nameless section has none
+pub fun section_named(b: *Builder, name: View) opt[Section] {
+    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, name.data::*u8, name.len);
+    if (sel known.none) { ret opt[Section].none{}; }
+    var k: usize = 0;
+    for (k < b.raised.len) {
+        if (b.raised.data[k].name.index == known.some.index) { ret opt[Section].some{Section{index: RAISED_BASE + k::u32}}; }
+        k = k + 1;
+    }
+    val slot: u32 = b.titled.data[known.some.index::usize];
+    if (slot == 0) { ret opt[Section].none{}; }
+    ret opt[Section].some{Section{index: slot - 1}};
+}
+
+# whether section `s` was opened as `spec` states, its name aside
+pub fun matches(b: *Builder, s: Section, spec: *Spec) bool {
+    # a section raised into traits keeps no attributes of its own
+    if (s.index >= RAISED_BASE)        { ret s.index - RAISED_BASE < b.raised.len::u32; }
+    if (s.index::usize >= b.areas.len) { ret false; }
+    val area: *Area = ?b.areas.data[s.index::usize];
+    ret area.kind == spec.kind && area.flags == spec.flags && area.disposition == spec.disposition && area.entsize == spec.entsize;
+}
+
+# the current section, none before one is switched to, STARTING while it is the starting section not yet opened
+pub fun current(b: *Builder) opt[Section] {
+    if (sel b.current.none) { ret opt[Section].none{}; }
+    ret opt[Section].some{Section{index: b.current.some::u32}};
+}
+
+# the section emission goes to until another is switched to, the one an assembly starts in, as `.text` on elf. it is opened as `open` opens `spec` only when something is written to it or a label is placed in it, or
+# when a section of its name is opened, so a source that writes nothing before its first `.section` holds no empty one.
+# until then its handle is STARTING, which `switch` takes
+pub fun begin(b: *Builder, spec: Spec) err[Refusal] {
+    if (b.finished)                     { ret refused(FINISHED); }
+    if (sel b.start.some || spec.apart) { ret refused(STARTED); }
+    b.start   = opt[Spec].some{spec};
+    b.current = opt[usize].some{STARTING::usize};
+    ret err[Refusal].ok{};
+}
+
+# make `s` the current section, its cursor where it was left. STARTING is the starting section, opened or not
+pub fun switch(b: *Builder, s: Section) err[Refusal] {
+    if (s.index == STARTING) {
+        if (sel b.start.none)   { ret refused(NO_SUCH); }
+        if (sel b.started.some) { b.current = opt[usize].some{b.started.some::usize}; }
+        or                      { b.current = opt[usize].some{STARTING::usize}; }
+        ret err[Refusal].ok{};
+    }
+    if (s.index >= RAISED_BASE) {
+        if (s.index - RAISED_BASE >= b.raised.len::u32) { ret refused(NO_SUCH); }
+    }
+    or (s.index::usize >= b.areas.len) { ret refused(NO_SUCH); }
+    b.current = opt[usize].some{s.index::usize};
+    ret err[Refusal].ok{};
+}
+
+# whether `name` is the starting section's
+fun pending_name(b: *Builder, name: opt[str]) bool {
+    if (sel b.start.none) { ret false; }
+    val start: Spec = b.start.some;
+    if (sel start.name.none) { ret false; }
+    if (sel name.none)       { ret false; }
+    ret str_equals(start.name.some, name.some);
+}
+
+# the starting section opened, or found where a section of its name took its place, and made current
+fun open_start(b: *Builder) res[usize, Refusal] {
+    var at: u32 = 0;
+    if (sel b.started.some) { at = b.started.some; }
+    or {
+        if (sel b.start.none) { ret res[usize, Refusal].err{refuse(NO_SECTION)}; }
+        val opened: res[Section, Refusal] = open(b, b.start.some);
+        if (sel opened.err) { ret res[usize, Refusal].err{opened.err}; }
+        at = opened.ok.index;
+    }
+    b.started = opt[u32].some{at};
+    b.current = opt[usize].some{at::usize};
+    ret res[usize, Refusal].ok{at::usize};
+}
+
+# the current section's index, refused before one is switched to. the starting section is opened here, as this is what
+# writing to it or placing a label in it asks first
+pub fun at_cursor(b: *Builder) res[usize, Refusal] {
+    if (b.finished)         { ret res[usize, Refusal].err{refuse(FINISHED)}; }
+    if (sel b.current.none) { ret res[usize, Refusal].err{refuse(NO_SECTION)}; }
+    if (b.current.some == STARTING::usize) {
+        val opened: res[usize, Refusal] = open_start(b);
+        if (sel opened.err) { ret opened; }
+    }
+    if (b.current.some >= RAISED_BASE::usize)                    { ret res[usize, Refusal].err{refuse(RAISED)}; }
+    if (sel b.taken.some && b.current.some < b.taken.some.areas) { ret res[usize, Refusal].err{refuse(SEALED)}; }
+    ret res[usize, Refusal].ok{b.current.some};
+}
+
+# the current section, refused before one is switched to
+pub fun here(b: *Builder) res[*Area, Refusal] {
+    val at: res[usize, Refusal] = at_cursor(b);
+    if (sel at.err) { ret res[*Area, Refusal].err{at.err}; }
+    ret res[*Area, Refusal].ok{?b.areas.data[at.ok]};
+}

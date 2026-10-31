@@ -1,0 +1,430 @@
+# the encoding of a settled layout: every fragment's bytes, the relocations it needs and the differences it measures
+#
+# a datum, a symbol's address or distance as data, folds or relocates
+# by the rule an instruction's fixup does. a difference of labels is a
+# deferred value: whatever the source has placed when it is written, the
+# layout measures it once both labels are placed, and it folds, relocates by
+# the set's pair for its encoding or is refused at finish naming its label. a
+# fixed-width one is its width long, and a leb128 starts empty and is as
+# long as its value needs, measured each pass.
+# a leb128 only grows, padded with continuation bytes when its value shrinks,
+# so it settles with the instructions and adds at most a leb128's longest to
+# the bound of passes. code alignment after an
+# instruction the linker may resize pads its worst case and carries the set's
+# realign marker, so the linker can shrink it back. a fixup whose relocation
+# covers instructions after its own, as a call pair's, is written only in a
+# sequence that holds them, with the marker the set's span states beside it.
+use masc.codec.walk;
+use masc.core.field;
+use masc.core.fill;
+use core_fixup: masc.core.fixup;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.relax;
+use masc.core.row;
+use mink.base.fail;
+use mink.format.registry;
+use mink.model.reloc;
+use mink_row: mink.reloc.row;
+use std.collections.vector;
+use std.encoding.leb128;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use masc.build.layout.distance;
+use masc.build.layout.form;
+use masc.build.layout.leb_size;
+use masc.build.layout.pad;
+use masc.build.layout.realigned;
+use masc.build.layout.spread;
+use masc.build.refusal.CYCLE;
+use masc.build.refusal.DATUM_RANGE;
+use masc.build.refusal.LOCAL_ONLY;
+use masc.build.refusal.NO_PAIR;
+use masc.build.refusal.NO_RELOCATION;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.SHRANK;
+use masc.build.refusal.UNBOUND;
+use masc.build.refusal.UNRESOLVED;
+use masc.build.refusal.UNSETTLED;
+use masc.build.refusal.UNSITED;
+use masc.build.refusal.about;
+use masc.build.refusal.encoding;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refused;
+use masc.build.state.Aim;
+use masc.build.state.Aimed;
+use masc.build.state.Align;
+use masc.build.state.Area;
+use masc.build.state.Builder;
+use masc.build.state.Coded;
+use masc.build.state.Datum;
+use masc.build.state.Entry;
+use masc.build.state.Formed;
+use masc.build.state.Fragment;
+use masc.build.state.Gap;
+use masc.build.state.Pending;
+use masc.build.state.Spread;
+use masc.build.state.datum_slot;
+use masc.build.state.fits;
+use masc.build.state.kind_of;
+use masc.build.state.known;
+use masc.build.state.offset_at;
+use masc.build.state.ordered;
+use masc.build.state.pair_slot;
+use masc.build.state.preemptible;
+use masc.build.state.settled;
+use masc.build.state.through;
+use masc.build.state.written_kind;
+
+# what a relocation of kind `kind` adds to the symbol's addend for the field `offset` bytes into a step of row `r` and
+# `length` bytes that operand `k` fixes: for a distance from the program counter the field's offset from the operand's
+# anchor, since the relocation's place is the field, as R_X86_64_PC32 `ext - 4` for a field two bytes into a six byte
+# instruction, else nothing
+pub fun bias(r: *row.Row, length: usize, k: usize, offset: usize, kind: *reloc.Kind) i64 {
+    if (!reloc.has(kind, reloc.PC)) { ret 0; }
+    var from: i64 = offset::i64;
+    if (operand.anchor_of(?r.operands.at[k]) == operand.END) { from = from - length::i64; }
+    ret from;
+}
+
+# the relocations of the fixups of one step of row `r` and `length` bytes, encoded at `at` of section `s`
+fun relocations(b: *Builder, s: u32, at: u64, r: *row.Row, length: usize, marks: usize, marker: operand.FixupKind) err[Refusal] {
+    var i: usize = marks;
+    for (i < b.fixups.len) {
+        val fx:   *field.Fixup = ?b.fixups.data[i];
+        val kind: *reloc.Kind  = kind_of(b, written_kind(b, fx.kind, fx.addend));
+        if (kind == nil && core_fixup.local(b.set.locals, fx.kind)) { ret about(LOCAL_ONLY, fx.symbol); }
+        if (kind == nil)                                            { ret about(UNBOUND, fx.symbol); }
+        val aimed: opt[Aimed] = through(b, fx.symbol, fx.addend, false);
+        if (sel aimed.none)                                   { ret about(CYCLE, fx.symbol); }
+        if (!known(?b.labels.data[aimed.some.id::usize - 1])) { ret about(UNRESOLVED, fx.symbol); }
+        val pended: err[Refusal] = pend(b, Pending{section: s, offset: at + fx.offset::u64, kind: kind, aim: Aim.label{aimed.some.id}, addend: aimed.some.addend + bias(r, length, fx.operand::usize, fx.offset, kind)}, fx.symbol);
+        if (sel pended.err) { ret pended; }
+        i = i + 1;
+    }
+    vector.truncate[field.Fixup](?b.fixups, marks);
+    if (marker != operand.NO_FIXUP) {
+        val kind: *reloc.Kind = kind_of(b, marker);
+        if (kind == nil) { ret refused(UNBOUND); }
+        val pended: err[Refusal] = pend(b, Pending{section: s, offset: at, kind: kind, aim: Aim.nothing{}, addend: 0}, operand.NO_SYMBOL);
+        if (sel pended.err) { ret pended; }
+    }
+    ret err[Refusal].ok{};
+}
+
+# datum `d` at `offset` of section `s`, its value written when it folds, else zeros and a relocation
+fun encode_datum(b: *Builder, s: u32, j: u32, area: *Area, d: *Datum, offset: u64) err[Refusal] {
+    val width: usize = d.ref.width::usize;
+    if (!held(vector.reserve[u8](?area.bytes, width))) { ret err[Refusal].err{memory()}; }
+    var value:  u64      = 0;
+    val folded: opt[i64] = distance(b, s, j, d.ref.target.id, d.ref.addend, d.fixup);
+    if (sel folded.some) {
+        if (width < 8) {
+            val half: i64 = 1::i64 << (width * 8 - 1)::i64;
+            if (folded.some < -half || folded.some >= half) { ret about(DATUM_RANGE, d.ref.target.id); }
+        }
+        value = folded.some:~u64;
+    }
+    or {
+        val kind: *reloc.Kind = kind_of(b, d.fixup);
+        if (kind == nil) { ret about(UNBOUND, d.ref.target.id); }
+        val pushed: err[Refusal] = aim(b, s, offset, kind, d.ref.target.id, d.ref.addend);
+        if (sel pushed.err) { ret pushed; }
+    }
+    ordered(b, value, width, ?area.bytes.data[area.bytes.len]);
+    vector.commit[u8](?area.bytes, width);
+    ret err[Refusal].ok{};
+}
+
+# a relocation of kind `kind` at `offset` of section `s` naming what label `id` plus `addend` stands for
+pub fun aim(b: *Builder, s: u32, offset: u64, kind: *reloc.Kind, id: u32, addend: i64) err[Refusal] {
+    val aimed: opt[Aimed] = through(b, id, addend, false);
+    if (sel aimed.none)                                   { ret about(CYCLE, id); }
+    if (!known(?b.labels.data[aimed.some.id::usize - 1])) { ret about(UNRESOLVED, id); }
+    ret pend(b, Pending{section: s, offset: offset, kind: kind, aim: Aim.label{aimed.some.id}, addend: aimed.some.addend}, id);
+}
+
+# relocation `p` of the last encode, refused naming `label`, the kind and the format where the object's format maps no
+# relocation of its kind for the architecture, as coff has no 8-bit absolute relocation for x86_64
+fun pend(b: *Builder, p: Pending, label: u32) err[Refusal] {
+    var why: opt[fail.Fail] = opt[fail.Fail].none{};
+    if (sel b.relocs.ok) {
+        var rows: registry.Relocations = b.relocs.ok;
+        if (p.minus != 0) {
+            val pairing: res[*mink_row.Pairing, fail.Fail] = mink_row.difference_of(rows.rows, p.kind);
+            if (sel pairing.err) { why = opt[fail.Fail].some{fail.about(fail.in_record(fail.unsupported(pairing.err.text), b.format.name), p.kind.name)}; }
+        }
+        or {
+            val row_: res[*registry.Row, fail.Fail] = registry.relocation_by_kind(?rows, p.kind);
+            if (sel row_.err) { why = opt[fail.Fail].some{fail.about(fail.in_record(fail.unsupported(row_.err.text), b.format.name), p.kind.name)}; }
+        }
+    }
+    or (sel b.relocs.err)                           { why = opt[fail.Fail].some{b.relocs.err}; }
+    if (sel why.some)                               { ret err[Refusal].err{Refusal{message: NO_RELOCATION, label: label, object: why}}; }
+    if (!held(vector.push[Pending](?b.pending, p))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# whether fixup kind `fixup` is bound on the architecture to a relocation kind the object's format maps, any bound one
+# for a format of no relocation rows, which `pend` refuses as it refuses every other
+fun maps(b: *Builder, fixup: operand.FixupKind) bool {
+    if (fixup == operand.NO_FIXUP) { ret false; }
+    val kind: *reloc.Kind = kind_of(b, fixup);
+    if (kind == nil)      { ret false; }
+    if (sel b.relocs.err) { ret true; }
+    var rows: registry.Relocations          = b.relocs.ok;
+    val row_: res[*registry.Row, fail.Fail] = registry.relocation_by_kind(?rows, kind);
+    ret sel row_.ok;
+}
+
+# the neutral difference kind of `width` bytes the object's format writes by a difference row of its own, as mach-o's
+# subtractor pair, nil for none
+fun difference_kind(b: *Builder, width: u8) *reloc.Kind {
+    if (sel b.relocs.err) { ret nil; }
+    var k: *reloc.Kind = nil;
+    if (width == 1) { k = ?reloc.DIFF8; }
+    if (width == 2) { k = ?reloc.DIFF16; }
+    if (width == 4) { k = ?reloc.DIFF32; }
+    if (width == 8) { k = ?reloc.DIFF64; }
+    if (k == nil)   { ret nil; }
+    var rows:  registry.Relocations              = b.relocs.ok;
+    val found: res[*mink_row.Pairing, fail.Fail] = mink_row.difference_of(rows.rows, k);
+    if (sel found.err) { ret nil; }
+    ret k;
+}
+
+# a relocation of difference kind `kind` at `offset` of section `s` naming what label `id` plus `addend` stands for less
+# what label `minus` stands for
+fun aim_less(b: *Builder, s: u32, offset: u64, kind: *reloc.Kind, id: u32, addend: i64, minus: u32) err[Refusal] {
+    val aimed: opt[Aimed] = through(b, id, addend, false);
+    val less:  opt[Aimed] = through(b, minus, 0, false);
+    if (sel aimed.none)                                   { ret about(CYCLE, id); }
+    if (sel less.none)                                    { ret about(CYCLE, minus); }
+    if (!known(?b.labels.data[aimed.some.id::usize - 1])) { ret about(UNRESOLVED, id); }
+    if (!known(?b.labels.data[less.some.id::usize - 1]))  { ret about(UNRESOLVED, minus); }
+    ret pend(b, Pending{section: s, offset: offset, kind: kind, aim: Aim.label{aimed.some.id}, addend: aimed.some.addend - less.some.addend, minus: less.some.id}, id);
+}
+
+# difference `g` at `offset` of section `s`, measured as `d`, as the relocations of the set's pair of its encoding and
+# width, the added label's then the subtracted one's
+fun pair_of(b: *Builder, s: u32, offset: u64, g: *Gap, d: *Spread) err[Refusal] {
+    val slot: usize       = pair_slot(g.encoding, g.width);
+    val add:  *reloc.Kind = kind_of(b, b.adds[slot]);
+    val sub:  *reloc.Kind = kind_of(b, b.subs[slot]);
+    if (b.adds[slot] == operand.NO_FIXUP || b.subs[slot] == operand.NO_FIXUP || add == nil || sub == nil) { ret about(NO_PAIR, g.of.plus.id); }
+    val added: err[Refusal] = aim(b, s, offset, add, d.plus.id, d.plus.addend);
+    if (sel added.err) { ret added; }
+    ret aim(b, s, offset, sub, d.minus.id, 0);
+}
+
+# `value` appended to `area` as a leb128 of `size` bytes, signed when `how` is SLEB, padded past its shortest
+# with continuation bytes when an earlier pass grew it: 0x80 then 0x00 for an unsigned or
+# nonnegative value, 0xff then 0x7f for a negative one
+fun put_leb(area: *Area, how: core_fixup.Encoding, value: i64, size: u64) {
+    var bytes: [10]u8;
+    var n:     usize = 0;
+    if (how == core_fixup.SLEB) { n = leb128.put_signed(?bytes[0], value); }
+    or                          { n = leb128.put_unsigned(?bytes[0], value:~u64); }
+    if (n::u64 < size) {
+        var pad: u8 = 0x00;
+        if (how == core_fixup.SLEB && value < 0) { pad = 0x7f; }
+        bytes[n - 1] = bytes[n - 1] | 0x80;
+        for (n::u64 < size - 1) {
+            bytes[n] = pad | 0x80;
+            n        = n + 1;
+        }
+        bytes[n] = pad;
+        n        = n + 1;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        area.bytes.data[area.bytes.len] = bytes[i];
+        vector.commit[u8](?area.bytes, 1);
+        i = i + 1;
+    }
+}
+
+# difference `g` of `size` bytes at `offset`, fragment `j` of section `s`: its value when it folds, else its
+# relocations, and zeros in a fixed width or the value the layout measured in a leb128 the linker sets. a difference
+# whose subtracted label lies in the datum's own section and whose added label lies in another is the added label less
+# a place of the datum's section: the set's pair of the encoding and width where it has one, which the linker resolves
+# wherever the labels are, else its place-relative datum of the width against the added label, its addend the
+# distance from the subtracted label to the datum, which no instruction the linker may resize lies within
+fun encode_difference(b: *Builder, s: u32, j: u32, area: *Area, g: *Gap, offset: u64, size: u64) err[Refusal] {
+    if (!held(vector.reserve[u8](?area.bytes, size::usize))) { ret err[Refusal].err{memory()}; }
+    val m: res[Spread, Refusal] = spread(b, g);
+    if (sel m.err) { ret err[Refusal].err{m.err}; }
+    val d:      *Spread = ?m.ok;
+    val leb:    bool    = g.encoding != core_fixup.FIXED;
+    val own:    bool    = d.q.defined && d.q.section == s && d.q.fragment == j;
+    var value:  i64     = 0;
+    var folded: bool    = false;
+    # a distance from the datum's own place to a symbol other objects may preempt is the linker's
+    if (d.shared && (leb || !(own && preemptible(d.p)))) {
+        if (settled(?b.areas.data[d.p.section::usize], d.p.fragment, d.q.fragment)) {
+            if (!leb && !fits(d.value, g.width::usize)) { ret about(DATUM_RANGE, g.of.plus.id); }
+            value  = d.value;
+            folded = true;
+        }
+    }
+    if (!folded) {
+        val relative: operand.FixupKind = b.data_kind[datum_slot(core_fixup.RELATIVE, g.width)];
+        val mapped:   bool              = maps(b, relative);
+        if (!leb && own && mapped) {
+            val kind: *reloc.Kind = kind_of(b, relative);
+            if (kind == nil) { ret about(UNBOUND, g.of.plus.id); }
+            val pushed: err[Refusal] = aim(b, s, offset, kind, d.plus.id, d.plus.addend);
+            if (sel pushed.err) { ret pushed; }
+        }
+        or (d.shared) {
+            val paired: err[Refusal] = pair_of(b, s, offset, g, d);
+            if (sel paired.err) { ret paired; }
+            if (leb)            { value = d.value; }
+        }
+        or (!leb && d.q.defined && d.q.section == s) {
+            val slot:  usize       = pair_slot(g.encoding, g.width);
+            val diff_: *reloc.Kind = difference_kind(b, g.width);
+            if (b.adds[slot] != operand.NO_FIXUP && b.subs[slot] != operand.NO_FIXUP) {
+                val paired: err[Refusal] = pair_of(b, s, offset, g, d);
+                if (sel paired.err) { ret paired; }
+            }
+            or (diff_ != nil) {
+                val pushed: err[Refusal] = aim_less(b, s, offset, diff_, d.plus.id, d.plus.addend, d.minus.id);
+                if (sel pushed.err) { ret pushed; }
+            }
+            or {
+                if (!mapped || !settled(area, d.q.fragment, j)) { ret about(UNSITED, g.of.plus.id); }
+                val kind: *reloc.Kind = kind_of(b, relative);
+                if (kind == nil) { ret about(UNBOUND, g.of.plus.id); }
+                val from:   i64          = offset:~i64 - offset_at(area, d.q.fragment):~i64;
+                val pushed: err[Refusal] = aim(b, s, offset, kind, d.plus.id, d.plus.addend + from);
+                if (sel pushed.err) { ret pushed; }
+            }
+        }
+        or { ret about(UNSITED, g.of.plus.id); }
+    }
+    if (leb) {
+        if (leb_size(g.encoding, value) > size) { ret about(UNSETTLED, g.of.plus.id); }
+        put_leb(area, g.encoding, value, size);
+        ret err[Refusal].ok{};
+    }
+    ordered(b, value:~u64, g.width::usize, ?area.bytes.data[area.bytes.len]);
+    vector.commit[u8](?area.bytes, g.width::usize);
+    ret err[Refusal].ok{};
+}
+
+# every section's bytes, relocations and encoded instructions from the settled layout
+pub fun encode_all(b: *Builder) err[Refusal] {
+    var out:   relax.Expansion;
+    var lead:  usize = 0;
+    var group: u32   = 1;
+    var left:  u32   = 0;
+    vector.truncate[Pending](?b.pending, 0);
+    vector.truncate[Entry](?b.entries, 0);
+    vector.truncate[operand.Value](?b.listed, 0);
+    var s: usize = 0;
+    for (s < b.areas.len) {
+        val area: *Area = ?b.areas.data[s];
+        vector.truncate[u8](?area.bytes, 0);
+        var j: usize = 0;
+        for (j < area.fragments.len) {
+            val f: *Fragment = ?area.fragments.data[j];
+            if (sel f.body.code) {
+                val formed: res[Formed, Refusal] = form(b, s::u32, j::u32, ?f.body.code, ?out);
+                if (sel formed.err) { ret err[Refusal].err{formed.err}; }
+                if (f.body.code.run > 0) {
+                    lead  = b.entries.len;
+                    group = f.body.code.run;
+                    left  = group;
+                }
+                var run: u32 = 0;
+                if (group == 1) { run = 1; }
+                val start: usize = area.bytes.len;
+                var i:     u32   = 0;
+                for (i < out.count) {
+                    val n:     u32                       = out.steps[i].row.operands.len;
+                    var step:  inst.Inst                 = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: n, form: out.steps[i].form};
+                    val begin: usize                     = area.bytes.len;
+                    val marks: usize                     = b.fixups.len;
+                    val done:  res[usize, field.Refusal] = walk.encode(b.set.codec, f.view, ?step, ?area.bytes, ?b.fixups);
+                    if (sel done.err) { ret err[Refusal].err{encoding(done.err)}; }
+                    val at:   u64          = f.offset + (begin - start)::u64;
+                    val rels: err[Refusal] = relocations(b, s::u32, at, out.steps[i].row, done.ok, marks, out.steps[i].marker);
+                    if (sel rels.err)                                              { ret rels; }
+                    if (!held(vector.reserve[operand.Value](?b.listed, n::usize))) { ret err[Refusal].err{memory()}; }
+                    val first: usize = b.listed.len;
+                    var k:     u32   = 0;
+                    for (k < n) {
+                        b.listed.data[b.listed.len] = out.steps[i].values[k];
+                        vector.commit[operand.Value](?b.listed, 1);
+                        k = k + 1;
+                    }
+                    var of: Coded = Coded.catalog{out.steps[i].row};
+                    if (sel f.body.code.of.format) { of = f.body.code.of; }
+                    val entry: Entry = Entry{section: s::u32, offset: at, length: done.ok::u64, of: of, values: first, count: n, run: run, form: out.steps[i].form};
+                    if (!held(vector.push[Entry](?b.entries, entry))) { ret err[Refusal].err{memory()}; }
+                    i = i + 1;
+                }
+                if ((area.bytes.len - start)::u64 != f.size) { ret refused(SHRANK); }
+                # the first line of a sequence counts the lines its instructions wrote
+                left = left - 1;
+                if (left == 0 && group > 1) { b.entries.data[lead].run = (b.entries.len - lead)::u32; }
+            }
+            or (sel f.body.data) {
+                if (!held(vector.reserve[u8](?area.bytes, f.body.data.len))) { ret err[Refusal].err{memory()}; }
+                var i: usize = 0;
+                for (i < f.body.data.len) {
+                    area.bytes.data[area.bytes.len] = b.data.data[f.body.data.start + i];
+                    vector.commit[u8](?area.bytes, 1);
+                    i = i + 1;
+                }
+            }
+            or (sel f.body.zero) {
+                if (area.bits) {
+                    if (!held(vector.reserve[u8](?area.bytes, f.body.zero::usize))) { ret err[Refusal].err{memory()}; }
+                    var i: u64 = 0;
+                    for (i < f.body.zero) {
+                        area.bytes.data[area.bytes.len] = 0;
+                        vector.commit[u8](?area.bytes, 1);
+                        i = i + 1;
+                    }
+                }
+            }
+            or (sel f.body.align) {
+                if (area.bits) {
+                    var al: Align = f.body.align;
+                    if (realigned(area, j, ?al)) {
+                        # the padding is the code fill whatever the alignment asked, and the marker tells the linker its length
+                        al.fill = opt[u8].none{};
+                        if (f.size > 0) {
+                            val kind: *reloc.Kind = kind_of(b, b.set.realign);
+                            if (kind == nil) { ret refused(UNBOUND); }
+                            val pended: err[Refusal] = pend(b, Pending{section: s::u32, offset: f.offset, kind: kind, aim: Aim.nothing{}, addend: f.size:~i64}, operand.NO_SYMBOL);
+                            if (sel pended.err) { ret pended; }
+                        }
+                    }
+                    val padded: err[Refusal] = pad(b, area, ?al, f.view, f.size);
+                    if (sel padded.err) { ret padded; }
+                }
+            }
+            or (sel f.body.datum) {
+                val put_: err[Refusal] = encode_datum(b, s::u32, j::u32, area, ?f.body.datum, f.offset);
+                if (sel put_.err) { ret put_; }
+            }
+            or (sel f.body.difference) {
+                val put_: err[Refusal] = encode_difference(b, s::u32, j::u32, area, ?f.body.difference, f.offset, f.size);
+                if (sel put_.err) { ret put_; }
+            }
+            j = j + 1;
+        }
+        s = s + 1;
+    }
+    ret err[Refusal].ok{};
+}
