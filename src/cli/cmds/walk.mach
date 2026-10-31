@@ -1,0 +1,238 @@
+# `masc walk`: check that a function of an object file keeps its secrets constant time
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.args;
+
+use mink.base.fail;
+use mink.base.store;
+use mink.base.table;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.core.ct;
+use masc.core.register;
+use masc.disasm.disasm;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+use masc.walk.walk;
+
+val F_SYMBOL: args.FlagSpec = args.FlagSpec{name: "--symbol", value: "name", arity: args.ARITY_VALUE, doc: "the function to walk, by its symbol, which states its section, offset and size", default: "", negatable: false, occurs: args.Occurs.once{}, alias_of: nil};
+val F_SECRET: args.FlagSpec = args.FlagSpec{name: "--secret", value: "register", arity: args.ARITY_VALUE, doc: "a register holding a secret when the function starts, by its name in the set's register file", default: "", negatable: false, occurs: args.Occurs.collect{}, alias_of: nil};
+
+val ROWS:   [6]*args.FlagSpec = [6]*args.FlagSpec{?context.F_ARCH, ?context.A_ARCH, ?context.F_ISA, ?context.F_SYNTAX, ?F_SYMBOL, ?F_SECRET};
+val TABLES: [1]args.TableRef  = [1]args.TableRef{args.TableRef{rows: ?ROWS[0], n: 6, accepted: nil, docs: nil}};
+
+pub val SPEC: args.CommandSpec = args.CommandSpec{
+    name:            "walk",
+    id:              0,
+    aliases:         nil,
+    alias_n:         0,
+    grammar:         " <input> --arch <arch> --symbol <name>",
+    summary:         "check that a function of an object file keeps its secrets constant time",
+    effect:          "walk the function the symbol names under the target from the secrets --secret seeds, and report the first secret that reaches a control transfer, an address or an input an instruction's timing depends on",
+    exits:           nil,
+    exit_n:          0,
+    terminator:      "",
+    tables:          ?TABLES[0],
+    table_n:         1,
+    refused:         nil,
+    refused_n:       0,
+    refusal:         "",
+    relations:       nil,
+    relation_n:      0,
+    constraints:     nil,
+    constraint_n:    0,
+    operand_min:     1,
+    operand_max:     1,
+    truncate_at_sep: false,
+    actions:         nil,
+    action_n:        0,
+    examples:        nil,
+    example_n:       0,
+};
+
+# the most secrets a walk is seeded with
+val MAX_SECRETS: usize = 32;
+
+pub fun run(r: *Run) render.Exit {
+    ret context.with_formats(r, walk_with);
+}
+
+# whether the view `v` holds the bytes of `s`
+fun named(v: View, s: str) bool {
+    if (v.len != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+
+    ret true;
+}
+
+# the code of the function `s`, placed at `at`, names in `o`, a refusal rendered as none
+fun placed_code(r: *Run, o: *mink_object.Object, t: *target.Target, s: *mink_object.Symbol, at: mink_object.Place, name: str) opt[walk.Code] {
+    if (sel s.size.none) {
+        render.quoted(?r.err, "walk.symbol", "the symbol states no size", name);
+        ret opt[walk.Code].none{};
+    }
+
+    val size:  u64                  = s.size.some;
+    val sec:   *mink_object.Section = table.at[mink_object.Section](?o.sections, at.section);
+    val bytes: store.Bytes          = mink_object.bytes(o, ?sec.contents);
+    if (bytes.data == nil || at.offset + size > bytes.len::u64) {
+        render.quoted(?r.err, "walk.symbol", "the symbol's code lies outside its section's bytes", name);
+        ret opt[walk.Code].none{};
+    }
+
+    ret opt[walk.Code].some{walk.Code{set: t.set, data: ?bytes.data[at.offset::usize], len: size::usize, sites: walk.NO_SITES}};
+}
+
+# the code of the function `name` defines in `o`, a refusal rendered as none
+fun code_of(r: *Run, o: *mink_object.Object, t: *target.Target, name: str) opt[walk.Code] {
+    val count: usize = table.count[mink_object.Symbol](?o.symbols);
+    var i:     usize = 0;
+    for (i < count) {
+        val s: *mink_object.Symbol = table.at[mink_object.Symbol](?o.symbols, table.nth[mink_object.Symbol](i));
+        i = i + 1;
+        if (!named(mink_object.name_of(o, s.name), name)) { cnt; }
+        if (sel s.def.placed)                             { ret placed_code(r, o, t, s, s.def.placed, name); }
+
+        render.quoted(?r.err, "walk.symbol", "the symbol is placed in no section", name);
+        ret opt[walk.Code].none{};
+    }
+
+    render.quoted(?r.err, "walk.symbol", "the object defines no symbol", name);
+    ret opt[walk.Code].none{};
+}
+
+fun walk_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
+    val path:    str                            = context.operand(r, 0);
+    val symbol:  res[str, args.Misread]         = args.value(?r.line, ?F_SYMBOL);
+    val secrets: res[args.Values, args.Misread] = args.values(?r.line, ?F_SECRET);
+    if (sel symbol.err)   { ret context.misread(r, symbol.err); }
+    if (sel secrets.err)  { ret context.misread(r, secrets.err); }
+    if (symbol.ok == nil) { ret context.refuse(r, "cli.flag_missing", "the command needs the flag", "--symbol"); }
+
+    var t:      target.Target;
+    val opened: opt[render.Exit] = context.open_target(r, false, ?t);
+    if (sel opened.some) { ret opened.some; }
+
+    var seeds: [MAX_SECRETS]walk.Seed;
+    var n:     usize       = 0;
+    var each:  args.Values = secrets.ok;
+    for {
+        val hit: opt[args.Hit] = args.next_value(?each);
+        if (sel hit.none) { brk; }
+        if (n == MAX_SECRETS) {
+            target.release(?t);
+            ret context.refuse(r, "walk.secret", "the walk is seeded with more secrets than masc reads, at", hit.some.value);
+        }
+
+        val reg: opt[register.Id] = context.register_named(r, ?t, hit.some.value);
+        if (sel reg.none) {
+            target.release(?t);
+            ret render.USER;
+        }
+
+        seeds[n] = walk.Seed.register{reg.some};
+        n        = n + 1;
+    }
+
+    val got: res[disasm.File, fail.Fail] = disasm.open(formats, r.a, path);
+    if (sel got.err) {
+        target.release(?t);
+        ret context.failed(r, "object.read", got.err);
+    }
+
+    var f:    disasm.File    = got.ok;
+    var exit: render.Exit    = render.USER;
+    val code: opt[walk.Code] = code_of(r, ?f.object, ?t, symbol.ok);
+    if (sel code.some) {
+        var c:      walk.Code                  = code.some;
+        var seeded: walk.Secrets               = walk.Secrets{at: ?seeds[0], len: n::u32};
+        var public: walk.Declassified          = walk.NO_DECLASSIFIED;
+        var calls:  walk.Calls                 = walk.NO_CALLS;
+        val walked: res[walk.Verdict, A.Error] = walk.check(r.a, ?c, ?t.context, ?seeded, ?public, ?calls);
+        if (sel walked.err) { exit = context.memory(r); }
+        or                  { exit = verdict(r, path, symbol.ok, walked.ok); }
+    }
+
+    val closed: err[fail.Fail] = disasm.close(?f);
+    target.release(?t);
+    if (sel closed.err) {
+        if (exit == render.SUCCESS) { ret context.failed(r, "object.read", closed.err); }
+    }
+
+    ret exit;
+}
+
+# `path: symbol: ` before what the walk found
+fun head(t: *text.Text, path: str, symbol: str) {
+    text.put(t, path);
+    text.put(t, ": ");
+    text.put(t, symbol);
+    text.put(t, ": ");
+}
+
+# what the walk found of `symbol` in the file `path`
+fun verdict(r: *Run, path: str, symbol: str, v: walk.Verdict) render.Exit {
+    if (sel v.clear) {
+        head(?r.out, path, symbol);
+        text.put(?r.out, "constant time\n");
+        ret render.SUCCESS;
+    }
+    if (sel v.unguaranteed) {
+        head(?r.out, path, symbol);
+        text.put(?r.out, "constant time but for the timing of its instructions\n");
+        text.put(?r.err, "warning[walk.unguaranteed]: ");
+        text.put(?r.err, ct.UNGUARANTEED);
+        text.byte(?r.err, '\n');
+        ret render.SUCCESS;
+    }
+    if (sel v.unread) {
+        render.begin(?r.err, "walk.unread");
+        text.put(?r.err, v.unread.message);
+        at(r, path, symbol, v.unread.offset);
+        ret render.USER;
+    }
+
+    if (sel v.refused) {
+        var found: walk.Finding = v.refused;
+        render.begin(?r.err, "walk.refused");
+        if (!r.err.failed) {
+            val spelled: err[A.Error] = ct.spell(?found.refusal, ?r.err.out);
+            if (sel spelled.err) { r.err.failed = true; }
+        }
+        at(r, path, symbol, found.offset);
+        ret render.USER;
+    }
+
+    ret render.INTERNAL;
+}
+
+# the end of a walk diagnostic: where in the function it is
+fun at(r: *Run, path: str, symbol: str, offset: u64) {
+    text.byte(?r.err, '\n');
+    text.put(?r.err, " --> ");
+    text.put(?r.err, path);
+    text.put(?r.err, ", ");
+    text.put(?r.err, symbol);
+    text.put(?r.err, " + ");
+    text.decimal(?r.err, offset::i64);
+    text.byte(?r.err, '\n');
+}

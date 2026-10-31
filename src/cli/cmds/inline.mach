@@ -1,0 +1,218 @@
+# `masc inline`: read a file as one inline assembly block and write it as an object file
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.args;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.asm.asm;
+use masc.asm.model;
+use masc.build.build;
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.core.diagnostic;
+use masc.core.operand;
+use masc.core.register;
+use masc.emit.emit;
+use masc.inline.inline;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+
+val F_OPERAND: args.FlagSpec = args.FlagSpec{name: "--operand", value: "name=register", arity: args.ARITY_VALUE, doc: "declare the operand the block names {name}, of the class of the register and placed in it, which the block reads and writes", default: "", negatable: false, occurs: args.Occurs.collect{}, alias_of: nil};
+
+val ROWS:   [11]*args.FlagSpec = [11]*args.FlagSpec{?context.F_ARCH, ?context.A_ARCH, ?context.F_ISA, ?context.F_SYNTAX, ?context.F_ABI, ?context.F_FORMAT, ?F_OPERAND, ?context.F_OUTPUT, ?context.A_OUTPUT, ?context.F_VERBOSE, ?context.A_VERBOSE};
+val TABLES: [1]args.TableRef   = [1]args.TableRef{args.TableRef{rows: ?ROWS[0], n: 11, accepted: nil, docs: nil}};
+
+pub val SPEC: args.CommandSpec = args.CommandSpec{
+    name:            "inline",
+    id:              0,
+    aliases:         nil,
+    alias_n:         0,
+    grammar:         " <input> --arch <arch> -o <path>",
+    summary:         "read a file as one inline assembly block and write it as an object file",
+    effect:          "read the file as one inline assembly block under the target, as a compiler hands masc one, encode it with each operand in its register and write the object in the target's object format",
+    exits:           nil,
+    exit_n:          0,
+    terminator:      "",
+    tables:          ?TABLES[0],
+    table_n:         1,
+    refused:         nil,
+    refused_n:       0,
+    refusal:         "",
+    relations:       nil,
+    relation_n:      0,
+    constraints:     nil,
+    constraint_n:    0,
+    operand_min:     1,
+    operand_max:     1,
+    truncate_at_sep: false,
+    actions:         nil,
+    action_n:        0,
+    examples:        nil,
+    example_n:       0,
+};
+
+# the most operands a block declares, and the longest name one has
+val MAX_OPERANDS: usize = 16;
+val MAX_NAME:     usize = 32;
+
+# the operands `--operand` declares
+# ---
+# names:     each operand's name, terminated
+# operands:  each operand, its name in `names`
+# locations: where each lies, the register it names
+# count:     how many
+rec Declared {
+    names:     [MAX_OPERANDS][MAX_NAME]u8;
+    operands:  [MAX_OPERANDS]inline.Operand;
+    locations: [MAX_OPERANDS]inline.Location;
+    count:     usize;
+}
+
+pub fun run(r: *Run) render.Exit {
+    ret context.with_formats(r, inline_with);
+}
+
+# the declaration `spelled`, `name=register`, read into `d` under the target `t`, a refusal rendered as false
+fun declared(r: *Run, t: *target.Target, spelled: str, d: *Declared) bool {
+    if (d.count == MAX_OPERANDS) {
+        render.quoted(?r.err, "inline.operand", "the block declares more operands than masc reads, at", spelled);
+        ret false;
+    }
+
+    var n: usize = 0;
+    for (spelled[n] != 0 && spelled[n] != '=') { n = n + 1; }
+    if (spelled[n] != '=' || n == 0 || spelled[n + 1] == 0) {
+        render.quoted(?r.err, "inline.operand", "an operand is declared as name=register, not", spelled);
+        ret false;
+    }
+    if (n >= MAX_NAME) {
+        render.quoted(?r.err, "inline.operand", "the operand's name is longer than masc reads", spelled);
+        ret false;
+    }
+
+    val reg: opt[register.Id] = context.register_named(r, t, ?spelled[n + 1]);
+    if (sel reg.none) { ret false; }
+
+    val k: usize = d.count;
+    var i: usize = 0;
+    for (i < n) {
+        d.names[k][i] = spelled[i];
+        i             = i + 1;
+    }
+    d.names[k][n]  = 0;
+    d.operands[k]  = inline.Operand{name: ?d.names[k][0], constraint: inline.Constraint.class{register.class_of(reg.some)}, role: operand.READ_WRITE};
+    d.locations[k] = operand.Value.register{reg.some};
+    d.count        = k + 1;
+    ret true;
+}
+
+fun inline_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
+    val path:    str                            = context.operand(r, 0);
+    val output:  res[str, args.Misread]         = args.value(?r.line, ?context.F_OUTPUT);
+    val verbose: res[bool, args.Misread]        = args.on(?r.line, ?context.F_VERBOSE);
+    val given:   res[args.Values, args.Misread] = args.values(?r.line, ?F_OPERAND);
+    if (sel output.err)  { ret context.misread(r, output.err); }
+    if (sel verbose.err) { ret context.misread(r, verbose.err); }
+    if (sel given.err)   { ret context.misread(r, given.err); }
+
+    val out: str = output.ok;
+    if (out == nil) { ret context.refuse(r, "cli.flag_missing", "the command needs the flag", "--output"); }
+
+    var o:      context.Output;
+    val opened: opt[render.Exit] = context.open_output(r, formats, ?o);
+    if (sel opened.some) { ret opened.some; }
+
+    var d:    Declared;
+    var each: args.Values = given.ok;
+    d.count = 0;
+    for {
+        val hit: opt[args.Hit] = args.next_value(?each);
+        if (sel hit.none) { brk; }
+        if (!declared(r, ?o.t, hit.some.value, ?d)) {
+            context.release_output(?o);
+            ret render.USER;
+        }
+    }
+
+    var source: vector.Vector[u8];
+    if (!context.load(r, path, ?source)) {
+        context.release_output(?o);
+        ret render.ENVIRONMENT;
+    }
+
+    val exit: render.Exit = encoded(r, formats, ?o, path, ?source, ?d, out, verbose.ok);
+    vector.dnit[u8](?source);
+    context.release_output(?o);
+    ret exit;
+}
+
+# the block the file `path` holds, its bytes `source`, parsed with the operands `d` and encoded at the start of the
+# object's first section, the object written at `out`
+fun encoded(r: *Run, formats: *mink_registry.Registry, o: *context.Output, path: str, source: *vector.Vector[u8], d: *Declared, out: str, verbose: bool) render.Exit {
+    val text_of: View                                  = View{data: source.data, len: source.len};
+    val parsed:  res[inline.Block, inline.Diagnostics] = inline.parse(r.a, text_of, diagnostic.START, o.t.set, ?o.t.context, inline.Operands{at: ?d.operands[0], len: d.count::u32});
+    if (sel parsed.err) {
+        var i: u32 = 0;
+        for (i < parsed.err.len) {
+            context.diagnosed(r, "inline.refused", path, source.data, source.len, ?o.t.context, ?parsed.err.at[i]);
+            i = i + 1;
+        }
+        inline.release_diagnostics(r.a, parsed.err);
+        ret render.USER;
+    }
+
+    var block: inline.Block                        = parsed.ok;
+    val made:  res[model.Assembler, model.Refusal] = asm.make(r.a, o.t.set, ?o.t.context, target.assembler(?o.t, formats, o.dialect, model.NO_LAYERS));
+    if (sel made.err) {
+        inline.release(?block);
+        context.refused_source(r, path, source.data, source.len, ?made.err);
+        ret render.USER;
+    }
+
+    var m:    model.Assembler    = made.ok;
+    val b:    *build.Builder     = model.builder(?m);
+    val done: err[build.Refusal] = inline.encode(?block, inline.Locations{at: ?d.locations[0], len: d.count::u32}, b);
+    inline.release(?block);
+    if (sel done.err) {
+        unencoded(r, b, path, ?done.err);
+        model.release(?m);
+        ret render.USER;
+    }
+
+    val finished: res[mink_object.Object, model.Refusal] = model.finish(?m);
+    model.release(?m);
+    if (sel finished.err) {
+        context.refused_source(r, path, source.data, source.len, ?finished.err);
+        ret render.USER;
+    }
+
+    var object: mink_object.Object = finished.ok;
+    ret context.saved_object(r, formats, ?object, o.format, path, out, verbose);
+}
+
+# the builder's refusal `why` to encode the block of the file `path`, worded by the emit api
+fun unencoded(r: *Run, b: *build.Builder, path: str, why: *build.Refusal) {
+    render.begin(?r.err, "inline.encode");
+    if (!r.err.failed) {
+        val spelled: err[A.Error] = emit.spell(b, why, ?r.err.out);
+        if (sel spelled.err) { r.err.failed = true; }
+    }
+    text.put(?r.err, " in '");
+    text.put(?r.err, path);
+    text.put(?r.err, "'\n");
+}
