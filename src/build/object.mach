@@ -1,0 +1,730 @@
+# mink's neutral object made from a settled builder: its sections, symbols, relocations, groups, frames and ranges
+
+use masc.core.extension;
+use masc.core.index;
+use masc.core.register;
+use masc.core.row;
+use masc.core.set;
+use core_state: masc.core.state;
+use masc.core.syntax;
+use mink.base.fail;
+use mink.base.intern;
+use mink.base.store;
+use mink.base.table;
+use mink_arch: mink.catalog.arch;
+use mink_pair: mink.format.pair;
+use mink.model.frame;
+use mink_group:  mink.model.group;
+use mink_object: mink.model.object;
+use mink.model.reloc;
+use mink_section: mink.model.section;
+use mink_symbol:  mink.model.symbol;
+use A:            std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use masc.build.label.stem_for;
+use masc.build.label.stem_spelling;
+use masc.build.layout.aligned;
+use masc.build.layout.atom_of;
+use masc.build.refusal.ACROSS;
+use masc.build.refusal.CT_SPLIT;
+use masc.build.refusal.CYCLE;
+use masc.build.refusal.FRAME_SPLIT;
+use masc.build.refusal.FRAME_SYMBOL;
+use masc.build.refusal.LOCAL_COMMON;
+use masc.build.refusal.NEGATIVE;
+use masc.build.refusal.NOT_THREAD;
+use masc.build.refusal.NO_FRAME;
+use masc.build.refusal.RELOCATED_PAST;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.UNPLACED;
+use masc.build.refusal.about;
+use masc.build.refusal.failed;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refused;
+use masc.build.section.associated;
+use masc.build.state.Aim;
+use masc.build.state.Aimed;
+use masc.build.state.Area;
+use masc.build.state.Based;
+use masc.build.state.Builder;
+use masc.build.state.Ct;
+use masc.build.state.Direct;
+use masc.build.state.Exposure;
+use masc.build.state.Fragment;
+use masc.build.state.Framed;
+use masc.build.state.Label;
+use masc.build.state.Mark;
+use masc.build.state.Marked;
+use masc.build.state.Pending;
+use masc.build.state.Placing;
+use masc.build.state.Pointed;
+use masc.build.state.Ruled;
+use masc.build.state.Section;
+use masc.build.state.Size;
+use masc.build.state.Value;
+use masc.build.state.offset_at;
+use masc.build.state.preemptible;
+use masc.build.state.through;
+
+# every constant-time range marked on `o`, at the offsets the layout placed its statements at
+pub fun record_cts(b: *Builder, o: *mink_object.Object) err[Refusal] {
+    var i: usize = 0;
+    for (i < b.cts.len) {
+        val c:    *Ct   = ?b.cts.data[i];
+        val area: *Area = ?b.areas.data[c.section::usize];
+        if (c.open) { ret refused(CT_SPLIT); }
+        val marked: res[table.Id[mink_object.CtRange], fail.Fail] = mink_object.mark_ct(o, mink_object.CtRange{section: table.Id[mink_object.Section]{index: c.section}, start: offset_at(area, c.start), end: offset_at(area, c.end)});
+        if (sel marked.err) { ret err[Refusal].err{failed(marked.err)}; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the symbol of `o` a frame names label `l` by, as a relocation names it: an exposed label's own symbol, else the
+# symbol `local_symbol` gives a local one, the label's offset then added to `addend`
+fun frame_symbol(b: *Builder, o: *mink_object.Object, l: Label, addend: *i64) res[table.Id[mink_object.Symbol], Refusal] {
+    val m: *Mark = ?b.labels.data[l.id::usize - 1];
+    if (sel m.exposure.some) {
+        val got: opt[table.Id[mink_object.Symbol]] = m.symbol;
+        if (sel got.none) { ret res[table.Id[mink_object.Symbol], Refusal].err{Refusal{message: FRAME_SYMBOL, label: l.id}}; }
+        ret res[table.Id[mink_object.Symbol], Refusal].ok{got.some};
+    }
+    val found: res[table.Id[mink_object.Symbol], fail.Fail] = local_symbol(b, o, m, false, false, addend);
+    if (sel found.err) { ret res[table.Id[mink_object.Symbol], Refusal].err{failed(found.err)}; }
+    ret res[table.Id[mink_object.Symbol], Refusal].ok{found.ok};
+}
+
+# the rules a frame of the object's architecture starts from: its canonical frame address, the return address where
+# the set states it is saved, by mink's return address column, then the set's other starting rules
+fun starting(b: *Builder, o: *mink_object.Object, f: table.Id[mink_object.Frame], start: *set.Frame) err[Refusal] {
+    val unwind: opt[mink_arch.Unwind] = b.arch.unwind;
+    if (sel unwind.none) { ret refused(NO_FRAME); }
+    val cfa: opt[u32] = core_state.debug_number(b.object.view.file, start.cfa_register, register.DWARF, b.object);
+    if (sel cfa.none) { ret refused(NO_FRAME); }
+    val added: err[fail.Fail] = mink_object.add_initial(o, f, frame.Rule.def_cfa{frame.Offset{reg: cfa.some::u16, offset: start.cfa_offset}});
+    if (sel added.err) { ret err[Refusal].err{failed(added.err)}; }
+    val saved: opt[i64] = start.return_saved_at;
+    if (sel saved.some) {
+        val ra: err[fail.Fail] = mink_object.add_initial(o, f, frame.Rule.offset{frame.Offset{reg: unwind.some.ra, offset: saved.some}});
+        if (sel ra.err) { ret err[Refusal].err{failed(ra.err)}; }
+    }
+    var i: u32 = 0;
+    for (i < start.initial.len) {
+        val more: err[fail.Fail] = mink_object.add_initial(o, f, start.initial.at[i]);
+        if (sel more.err) { ret err[Refusal].err{failed(more.err)}; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the frame pointer `p` names in `o`, its label's symbol plus the addend `frame_symbol` gives
+fun frame_pointer(b: *Builder, o: *mink_object.Object, p: Pointed) res[mink_object.Pointer, Refusal] {
+    var addend: i64                                        = 0;
+    val s:      res[table.Id[mink_object.Symbol], Refusal] = frame_symbol(b, o, p.label, ?addend);
+    if (sel s.err) { ret res[mink_object.Pointer, Refusal].err{s.err}; }
+    ret res[mink_object.Pointer, Refusal].ok{mink_object.Pointer{symbol: s.ok, addend: addend, indirect: p.indirect}};
+}
+
+# every frame stated handed to `o` as mink's frame records, its rules at the offsets the layout placed their statements
+# at, an expression's bytes borrowed from the builder's texts
+pub fun record_frames(b: *Builder, o: *mink_object.Object) err[Refusal] {
+    o.frame_to = b.frame_to;
+    if (b.frames.len == 0) { ret err[Refusal].ok{}; }
+    val row: opt[*set.Arch] = set.arch_of(b.set, b.arch);
+    if (sel row.none)          { ret refused(NO_FRAME); }
+    if (row.some.frame == nil) { ret refused(NO_FRAME); }
+    val start: *set.Frame = row.some.frame;
+    var i:     usize      = 0;
+    for (i < b.frames.len) {
+        val fr: *Framed = ?b.frames.data[i];
+        if (fr.open) { ret refused(FRAME_SPLIT); }
+        val area: *Area = ?b.areas.data[fr.section::usize];
+        # the frame's offsets place it, so a local function label's offset in its section's symbol is not kept
+        var unkept:   i64                                        = 0;
+        val function: res[table.Id[mink_object.Symbol], Refusal] = frame_symbol(b, o, fr.function, ?unkept);
+        if (sel function.err) { ret err[Refusal].err{function.err}; }
+        val made: res[table.Id[mink_object.Frame], fail.Fail] = mink_object.add_frame(o, function.ok, offset_at(area, fr.start), offset_at(area, fr.end), start.code_align, start.data_align);
+        if (sel made.err) { ret err[Refusal].err{failed(made.err)}; }
+        val began: err[Refusal] = starting(b, o, made.ok, start);
+        if (sel began.err) { ret began; }
+        var k: usize = 0;
+        for (k < fr.count) {
+            val r:    *Ruled     = ?b.rules.data[fr.rules + k];
+            val kept: frame.Rule = r.rule;
+            var rule: frame.Rule = kept;
+            if (sel kept.expression) { rule = frame.Rule.expression{store.Held.borrowed{store.Bytes{data: ?b.texts.data[r.expression.start], len: r.expression.len}}}; }
+            val stepped: err[fail.Fail] = mink_object.add_step(o, made.ok, frame.Step{at: offset_at(area, r.at), rule: rule});
+            if (sel stepped.err) { ret err[Refusal].err{failed(stepped.err)}; }
+            k = k + 1;
+        }
+        val f: *mink_object.Frame = table.at[mink_object.Frame](?o.frames, made.ok);
+        f.signal = fr.signal;
+        if (sel fr.personality.some) {
+            val p: res[mink_object.Pointer, Refusal] = frame_pointer(b, o, fr.personality.some);
+            if (sel p.err) { ret err[Refusal].err{p.err}; }
+            f.personality = opt[mink_object.Pointer].some{p.ok};
+        }
+        if (sel fr.lsda.some) {
+            val l: res[mink_object.Pointer, Refusal] = frame_pointer(b, o, fr.lsda.some);
+            if (sel l.err) { ret err[Refusal].err{l.err}; }
+            f.lsda = opt[mink_object.Pointer].some{l.ok};
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+fun interned(o: *mink_object.Object, v: View) res[table.Id[intern.Name], fail.Fail] {
+    ret mink_object.name(o, v.data, v.len);
+}
+
+fun no_name(o: *mink_object.Object) res[table.Id[intern.Name], fail.Fail] {
+    ret mink_object.name_str(o, "");
+}
+
+# the name label `m` has in the object: its own, or its stem and number
+fun mark_name(b: *Builder, o: *mink_object.Object, m: *Mark) res[table.Id[intern.Name], fail.Fail] {
+    if (sel m.name.some) { ret interned(o, intern.bytes_of(?b.names, m.name.some)); }
+    var room: [syntax.MAX_ANONYMOUS + 10]u8;
+    ret interned(o, View{data: ?room[0], len: stem_spelling(stem_for(b, m), m.number, ?room[0])});
+}
+
+fun keep(slot: *opt[table.Id[mink_object.Symbol]], id: table.Id[mink_object.Symbol]) {
+    @slot = opt[table.Id[mink_object.Symbol]].some{id};
+}
+
+# the object's symbol a reference to local label `m` names: one at the label when the label must keep its own place
+# through the link, its section holding an instruction the linker may resize, `pinned` as for a relocation kind needing
+# a partner there or naming an index, as wasm's function index, which has no offset to add, or the label thread-local,
+# which a section symbol never is, else the atom's symbol `atom_of` names it by, `debug` whether a debugging section
+# holds the relocation, else its section's, the label's offset added to the addend
+fun local_symbol(b: *Builder, o: *mink_object.Object, m: *Mark, pinned: bool, debug: bool, addend: *i64) res[table.Id[mink_object.Symbol], fail.Fail] {
+    if (!m.defined) {
+        # a number has no section to stand for it, so it is a symbol of its own
+        if (sel m.symbol.some) { ret res[table.Id[mink_object.Symbol], fail.Fail].ok{m.symbol.some}; }
+        val name: res[table.Id[intern.Name], fail.Fail] = mark_name(b, o, m);
+        if (sel name.err) { ret res[table.Id[mink_object.Symbol], fail.Fail].err{name.err}; }
+        val made: res[table.Id[mink_object.Symbol], fail.Fail] = mink_object.add_symbol(o, mink_object.Symbol{
+            name:       name.ok,
+            binding:    ?mink_symbol.LOCAL,
+            visibility: ?mink_symbol.DEFAULT,
+            kind:       kind_for(m, ?mink_symbol.NOTYPE),
+            def:        definition(b, m),
+        });
+        if (sel made.ok) { keep(?m.symbol, made.ok); }
+        ret made;
+    }
+    val area:   *Area = ?b.areas.data[m.section::usize];
+    val offset: u64   = offset_at(area, m.fragment);
+    val own:    bool  = area.marks.data[area.fragments.len] > 0 || pinned || m.thread;
+    if (own) {
+        if (sel m.symbol.some) { ret res[table.Id[mink_object.Symbol], fail.Fail].ok{m.symbol.some}; }
+        val name: res[table.Id[intern.Name], fail.Fail] = mark_name(b, o, m);
+        if (sel name.err) { ret res[table.Id[mink_object.Symbol], fail.Fail].err{name.err}; }
+        val made: res[table.Id[mink_object.Symbol], fail.Fail] = mink_object.add_symbol(o, mink_object.Symbol{
+            name:       name.ok,
+            binding:    ?mink_symbol.LOCAL,
+            visibility: ?mink_symbol.DEFAULT,
+            kind:       kind_for(m, ?mink_symbol.NOTYPE),
+            def:        mink_object.Definition.placed{mink_object.Place{section: table.Id[mink_object.Section]{index: m.section}, offset: offset}},
+        });
+        if (sel made.ok) { keep(?m.symbol, made.ok); }
+        ret made;
+    }
+    val base: opt[Based] = atom_of(b, m, debug);
+    if (sel base.some) {
+        @addend = @addend + offset:~i64 - offset_at(area, base.some.fragment):~i64;
+        ret res[table.Id[mink_object.Symbol], fail.Fail].ok{base.some.symbol};
+    }
+    @addend = @addend + offset:~i64;
+    if (sel area.symbol.some) { ret res[table.Id[mink_object.Symbol], fail.Fail].ok{area.symbol.some}; }
+    val name: res[table.Id[intern.Name], fail.Fail] = no_name(o);
+    if (sel name.err) { ret res[table.Id[mink_object.Symbol], fail.Fail].err{name.err}; }
+    val made: res[table.Id[mink_object.Symbol], fail.Fail] = mink_object.add_symbol(o, mink_object.Symbol{
+        name:       name.ok,
+        binding:    ?mink_symbol.LOCAL,
+        visibility: ?mink_symbol.DEFAULT,
+        kind:       ?mink_symbol.SECTIONS,
+        def:        mink_object.Definition.placed{mink_object.Place{section: table.Id[mink_object.Section]{index: m.section}, offset: 0}},
+    });
+    if (sel made.ok) { keep(?area.symbol, made.ok); }
+    ret made;
+}
+
+# where label `m` is in the object, its equates followed to a place or a number, which `checked_labels` has checked they reach
+fun definition(b: *Builder, m: *Mark) mink_object.Definition {
+    if (m.defined) {
+        ret mink_object.Definition.placed{mink_object.Place{section: table.Id[mink_object.Section]{index: m.section}, offset: offset_at(?b.areas.data[m.section::usize], m.fragment)}};
+    }
+    if (sel m.value.none) { ret mink_object.Definition.undefined{}; }
+    val v: Value = m.value.some;
+    if (sel v.absolute) { ret mink_object.Definition.absolute{v.absolute}; }
+    if (sel v.common)   { ret mink_object.Definition.common{v.common}; }
+    if (sel v.equate) {
+        val root: opt[Aimed] = through(b, v.equate.target, v.equate.addend, true);
+        if (sel root.some) {
+            val r: *Mark = ?b.labels.data[root.some.id::usize - 1];
+            if (r.defined) {
+                val at: i64 = offset_at(?b.areas.data[r.section::usize], r.fragment):~i64 + root.some.addend;
+                ret mink_object.Definition.placed{mink_object.Place{section: table.Id[mink_object.Section]{index: r.section}, offset: at:~u64}};
+            }
+            if (sel r.value.some) {
+                if (sel r.value.some.absolute) { ret mink_object.Definition.absolute{(r.value.some.absolute:~i64 + root.some.addend):~u64}; }
+            }
+        }
+    }
+    ret mink_object.Definition.undefined{};
+}
+
+# every label checked against the layout, and each symbol's size measured: common storage is exposed, an exposed
+# equate reaches a place or a number, and a measured size spans two labels of one section in order
+pub fun checked_labels(b: *Builder) err[Refusal] {
+    var i: usize = 0;
+    for (i < b.labels.len) {
+        val m:  *Mark = ?b.labels.data[i];
+        val id: u32   = (i + 1)::u32;
+        m.size   = opt[u64].none{};
+        m.thread = false;
+        if (sel m.value.some) {
+            val v: Value = m.value.some;
+            if (sel v.common && !preemptible(m)) { ret about(LOCAL_COMMON, id); }
+            if (sel v.equate && sel m.exposure.some) {
+                val root: opt[Aimed] = through(b, id, 0, true);
+                if (sel root.none) { ret about(CYCLE, id); }
+                val r:       *Mark = ?b.labels.data[root.some.id::usize - 1];
+                var reached: bool  = r.defined;
+                if (sel r.value.some) { reached = reached || sel r.value.some.absolute; }
+                if (!reached)         { ret about(UNPLACED, id); }
+            }
+        }
+        if (sel m.exposure.some) {
+            val size: Size = m.exposure.some.size;
+            if (sel size.fixed) { m.size = mink_object.sized(size.fixed); }
+            if (sel size.measured) {
+                val plus:  opt[Aimed] = through(b, size.measured.plus.id, size.measured.addend, true);
+                val minus: opt[Aimed] = through(b, size.measured.minus.id, 0, true);
+                if (sel plus.none)  { ret about(CYCLE, id); }
+                if (sel minus.none) { ret about(CYCLE, id); }
+                val p: *Mark = ?b.labels.data[plus.some.id::usize - 1];
+                val q: *Mark = ?b.labels.data[minus.some.id::usize - 1];
+                if (!p.defined || !q.defined || p.section != q.section) { ret about(ACROSS, id); }
+                val home: *Area = ?b.areas.data[p.section::usize];
+                val v:    i64   = offset_at(home, p.fragment):~i64 - offset_at(home, q.fragment):~i64 + plus.some.addend - minus.some.addend;
+                if (v < 0) { ret about(NEGATIVE, id); }
+                m.size = mink_object.sized(v:~u64);
+            }
+        }
+        i = i + 1;
+    }
+    val placed: err[Refusal] = direct_places(b);
+    if (sel placed.err) { ret placed; }
+    ret threaded(b);
+}
+
+# whether label `m` has a value, placed or given one, rather than another object's
+fun defined(b: *Builder, m: *Mark) bool {
+    val def: mink_object.Definition = definition(b, m);
+    ret !sel def.undefined;
+}
+
+# each relocation stated by itself placed in its section, refused when its label is in another section or its place
+# is past the section's end
+fun direct_places(b: *Builder) err[Refusal] {
+    var i: usize = 0;
+    for (i < b.direct.len) {
+        val d:    *Direct = ?b.direct.data[i];
+        val area: *Area   = ?b.areas.data[d.section::usize];
+        i = i + 1;
+        var base: u64 = 0;
+        if (sel d.at.some) {
+            val root: opt[Aimed] = through(b, d.at.some.id, 0, true);
+            if (sel root.none) { ret about(CYCLE, d.at.some.id); }
+            val r: *Mark = ?b.labels.data[root.some.id::usize - 1];
+            if (!r.defined || r.section != d.section) { ret about(RELOCATED_PAST, d.at.some.id); }
+            val at: i64 = offset_at(area, r.fragment):~i64 + root.some.addend;
+            if (at < 0) { ret refused(RELOCATED_PAST); }
+            base = at:~u64;
+        }
+        d.place = base + d.offset;
+        if (d.place >= area.size) { ret refused(RELOCATED_PAST); }
+    }
+    ret err[Refusal].ok{};
+}
+
+# whether relocation kind `k` makes the symbol it names thread-local: a thread-local value of the symbol itself, not the
+# partner a second half of a pair names, as `%tlsdesc_load_lo` names the label at its `%tlsdesc_hi`
+fun threads(k: *reloc.Kind) bool {
+    ret reloc.has(k, reloc.TLS) && !reloc.has(k, reloc.PARTNER);
+}
+
+# every label a thread-local relocation names marked thread-local, an elf symbol of type STT_TLS, and refused when its exposure states another type
+fun threaded(b: *Builder) err[Refusal] {
+    var i: usize = 0;
+    for (i < b.pending.len) {
+        val p: *Pending = ?b.pending.data[i];
+        if (sel p.aim.label) {
+            if (threads(p.kind)) {
+                val m: *Mark = ?b.labels.data[p.aim.label::usize - 1];
+                m.thread = true;
+                if (sel m.exposure.some) {
+                    val k: *mink_symbol.Kind = m.exposure.some.kind;
+                    if (k != ?mink_symbol.NOTYPE && !mink_symbol.names(k, mink_symbol.THREAD)) { ret about(NOT_THREAD, p.aim.label); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the type label `m` has in the object: its stated one, or thread-local when untyped and named by a thread-local
+# relocation
+fun kind_for(m: *Mark, stated: *mink_symbol.Kind) *mink_symbol.Kind {
+    if (m.thread && stated == ?mink_symbol.NOTYPE) { ret ?mink_symbol.TLS; }
+    ret stated;
+}
+
+# the section of the object `area` is ordered after, whose index is its area's
+fun owned(area: *Area) opt[table.Id[mink_object.Section]] {
+    if (sel area.owner.none) { ret opt[table.Id[mink_object.Section]].none{}; }
+    ret opt[table.Id[mink_object.Section]].some{table.Id[mink_object.Section]{index: area.owner.some}};
+}
+
+# the sections, symbols and relocations of the encoded builder added to `o`
+pub fun build_object(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
+    var i: usize = 0;
+    i = 0;
+    for (i < b.areas.len) {
+        val area: *Area                      = ?b.areas.data[i];
+        var name: opt[table.Id[intern.Name]] = opt[table.Id[intern.Name]].none{};
+        if (sel area.name.some) {
+            val named: res[table.Id[intern.Name], fail.Fail] = interned(o, intern.bytes_of(?b.names, area.name.some));
+            if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+            name = opt[table.Id[intern.Name]].some{named.ok};
+        }
+        var contents: mink_object.Contents = mink_object.Contents.zero{area.size};
+        if (area.bits) {
+            val owned: res[mink_object.Contents, fail.Fail] = mink_object.own(o, area.bytes.data, area.bytes.len);
+            if (sel owned.err) { ret err[fail.Fail].err{owned.err}; }
+            contents = owned.ok;
+        }
+        val added: res[table.Id[mink_object.Section], fail.Fail] = mink_object.add_section(o, mink_object.Section{
+            name:        name,
+            kind:        area.kind,
+            flags:       area.flags,
+            align:       aligned(b, area),
+            entsize:     area.entsize,
+            contents:    contents,
+            owner:       owned(area),
+            disposition: area.disposition,
+        });
+        if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+        i = i + 1;
+    }
+    val grouped: err[fail.Fail] = groups_out(b, o);
+    if (sel grouped.err) { ret grouped; }
+    # the source files come before the symbols, as the locals they name the file of follow them
+    i = 0;
+    for (i < b.sources.len) {
+        val name: res[table.Id[intern.Name], fail.Fail] = interned(o, intern.bytes_of(?b.names, b.sources.data[i]));
+        if (sel name.err) { ret err[fail.Fail].err{name.err}; }
+        val made: res[table.Id[mink_object.Symbol], fail.Fail] = mink_object.add_symbol(o, mink_object.Symbol{
+            name:       name.ok,
+            binding:    ?mink_symbol.LOCAL,
+            visibility: ?mink_symbol.DEFAULT,
+            kind:       ?mink_symbol.SOURCE,
+            def:        mink_object.Definition.absolute{0},
+        });
+        if (sel made.err) { ret err[fail.Fail].err{made.err}; }
+        i = i + 1;
+    }
+    val named: err[fail.Fail] = label_symbols(b, o);
+    if (sel named.err) { ret named; }
+    ret relocs_out(b, o);
+}
+
+fun by_placing(x: *Placing, y: *Placing) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.offset < y.offset) { ret -1; }
+    if (x.offset > y.offset) { ret 1; }
+    ret 0;
+}
+
+# every relocation added to `o`, each section's in offset order whatever stated them, those at one place in the order
+# stated: the statements' first, a pair's halves together, then those stated by themselves
+fun relocs_out(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
+    val total: usize                  = b.pending.len + b.direct.len;
+    var order: vector.Vector[Placing] = vector.init[Placing](b.a);
+    var spare: vector.Vector[Placing] = vector.init[Placing](b.a);
+    val room:  res[usize, A.Error]    = vector.reserve[Placing](?order, total);
+    val half:  res[usize, A.Error]    = vector.reserve[Placing](?spare, total / 2 + 1);
+    var short: opt[A.Error]           = opt[A.Error].none{};
+    if (sel room.err) { short = opt[A.Error].some{room.err}; }
+    if (sel half.err) { short = opt[A.Error].some{half.err}; }
+    if (sel short.some) {
+        vector.dnit[Placing](?order);
+        vector.dnit[Placing](?spare);
+        ret err[fail.Fail].err{fail.refused(short.some)};
+    }
+    var i: usize = 0;
+    for (i < b.pending.len) {
+        vector.push[Placing](?order, Placing{section: b.pending.data[i].section, offset: b.pending.data[i].offset, direct: false, index: i});
+        i = i + 1;
+    }
+    i = 0;
+    for (i < b.direct.len) {
+        vector.push[Placing](?order, Placing{section: b.direct.data[i].section, offset: b.direct.data[i].place, direct: true, index: i});
+        i = i + 1;
+    }
+    sort.sort_stable_by[Placing](order.data, order.len, spare.data, by_placing);
+    var done: err[fail.Fail] = err[fail.Fail].ok{};
+    i = 0;
+    for (i < order.len && sel done.ok) {
+        val at:    *Placing                          = ?order.data[i];
+        var aimed: res[mink_object.Reloc, fail.Fail] = res[mink_object.Reloc, fail.Fail].err{fail.internal("no relocation")};
+        if (at.direct) {
+            val d:   *Direct = ?b.direct.data[at.index];
+            var aim: Aim     = Aim.nothing{};
+            if (sel d.target.some) { aim = Aim.label{d.target.some.id}; }
+            aimed = aimed_at(b, o, d.kind, aim, d.addend, d.section, 0);
+        }
+        or {
+            val p: *Pending = ?b.pending.data[at.index];
+            aimed = aimed_at(b, o, p.kind, p.aim, p.addend, p.section, p.minus);
+        }
+        if (sel aimed.err) { done = err[fail.Fail].err{aimed.err}; }
+        if (sel aimed.ok) {
+            aimed.ok.section = table.Id[mink_object.Section]{index: at.section};
+            aimed.ok.offset  = at.offset;
+            val added: res[table.Id[mink_object.Reloc], fail.Fail] = mink_object.add_reloc(o, aimed.ok);
+            if (sel added.err) { done = err[fail.Fail].err{added.err}; }
+        }
+        i = i + 1;
+    }
+    vector.dnit[Placing](?order);
+    vector.dnit[Placing](?spare);
+    ret done;
+}
+
+# a relocation of `kind` naming `aim` plus `addend` in `o`, less label `minus` for a difference kind, 0 for none, held
+# by section `from`, its place left for the caller: an exposed label's symbol, else the symbol `local_symbol` gives a
+# local one, the label's offset then in the addend, added for the target and taken away for `minus`
+fun aimed_at(b: *Builder, o: *mink_object.Object, kind: *reloc.Kind, aim: Aim, addend: i64, from: u32, minus: u32) res[mink_object.Reloc, fail.Fail] {
+    var plus:   i64                               = addend;
+    var target: mink_object.Target                = mink_object.Target.none{};
+    var less:   opt[table.Id[mink_object.Symbol]] = opt[table.Id[mink_object.Symbol]].none{};
+    val debug:  bool                              = (b.areas.data[from::usize].kind.roles & mink_section.DEBUG) != 0;
+    if (sel aim.label) {
+        val found: res[table.Id[mink_object.Symbol], fail.Fail] = symbol_for(b, o, aim.label, reloc.has(kind, reloc.PARTNER) || reloc.has(kind, reloc.INDEX), debug, ?plus);
+        if (sel found.err)                      { ret res[mink_object.Reloc, fail.Fail].err{found.err}; }
+        if (found.ok.index != NO_OBJECT_SYMBOL) { target = mink_object.Target.symbol{found.ok}; }
+    }
+    if (minus != 0) {
+        var off:   i64                                          = 0;
+        val found: res[table.Id[mink_object.Symbol], fail.Fail] = symbol_for(b, o, minus, false, debug, ?off);
+        if (sel found.err) { ret res[mink_object.Reloc, fail.Fail].err{found.err}; }
+        less = opt[table.Id[mink_object.Symbol]].some{found.ok};
+        plus = plus - off;
+    }
+    ret res[mink_object.Reloc, fail.Fail].ok{mink_object.Reloc{section: table.Id[mink_object.Section]{index: 0}, offset: 0, kind: kind, target: target, addend: plus, minus: less}};
+}
+
+# no symbol of the object, as an exposed label's before its symbol is made
+val NO_OBJECT_SYMBOL: u32 = 0xFFFF_FFFF;
+
+# the object's symbol a relocation names label `id` by: an exposed label's own, NO_OBJECT_SYMBOL while it has none,
+# else the one `local_symbol` gives, the label's offset from it added to `addend`
+fun symbol_for(b: *Builder, o: *mink_object.Object, id: u32, pinned: bool, debug: bool, addend: *i64) res[table.Id[mink_object.Symbol], fail.Fail] {
+    val m: *Mark = ?b.labels.data[id::usize - 1];
+    if (sel m.exposure.some) {
+        if (sel m.symbol.some) { ret res[table.Id[mink_object.Symbol], fail.Fail].ok{m.symbol.some}; }
+        ret res[table.Id[mink_object.Symbol], fail.Fail].ok{table.Id[mink_object.Symbol]{index: NO_OBJECT_SYMBOL}};
+    }
+    ret local_symbol(b, o, m, pinned, debug, addend);
+}
+
+# every exposed label's symbol added to `o`
+fun label_symbols(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < b.labels.len) {
+        val m: *Mark = ?b.labels.data[i];
+        i = i + 1;
+        if (sel m.exposure.none) { cnt; }
+        val named: res[table.Id[intern.Name], fail.Fail] = mark_name(b, o, m);
+        if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+        val made: res[table.Id[mink_object.Symbol], fail.Fail] = add_label_symbol(b, o, m, m.exposure.some, named.ok);
+        if (sel made.err) { ret err[fail.Fail].err{made.err}; }
+        m.symbol = opt[table.Id[mink_object.Symbol]].some{made.ok};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the symbol of exposed label `m` named `name` added to `o`
+fun add_label_symbol(b: *Builder, o: *mink_object.Object, m: *Mark, e: Exposure, name: table.Id[intern.Name]) res[table.Id[mink_object.Symbol], fail.Fail] {
+    ret mink_object.add_symbol(o, mink_object.Symbol{
+        name:       name,
+        binding:    e.binding,
+        visibility: e.visibility,
+        kind:       kind_for(m, e.kind),
+        def:        definition(b, m),
+        size:       m.size,
+    });
+}
+
+# the comdat groups of the sections, one per signature in the order its first section was opened, each section in its
+# signature's group, and an associative group of its own per section kept with a leader, signed by its own name as an
+# object read names one
+fun groups_out(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
+    # per builder name, the object's group of that signature plus one, 0 for none yet
+    var made: vector.Vector[u32]  = vector.init[u32](b.a);
+    val room: res[usize, A.Error] = vector.reserve[u32](?made, b.named.len);
+    if (sel room.err) { ret err[fail.Fail].err{fail.refused(room.err)}; }
+    var k: usize = 0;
+    for (k < b.named.len) {
+        made.data[k] = 0;
+        k            = k + 1;
+    }
+    vector.truncate[u32](?made, 0);
+    vector.commit[u32](?made, b.named.len);
+    var done: err[fail.Fail] = err[fail.Fail].ok{};
+    var i:    usize          = 0;
+    for (i < b.areas.len && sel done.ok) {
+        val g: opt[table.Id[intern.Name]] = b.areas.data[i].group;
+        if (associated(b, Section{index: i::u32})) { done = associated_out(b, o, i); }
+        if (sel g.some) {
+            val at: usize = g.some.index::usize;
+            if (made.data[at] == 0) {
+                val sig: res[table.Id[intern.Name], fail.Fail] = interned(o, intern.bytes_of(?b.names, g.some));
+                if (sel sig.err) { done = err[fail.Fail].err{sig.err}; }
+                if (sel sig.ok) {
+                    val added: res[table.Id[mink_object.Group], fail.Fail] = mink_object.add_group(o, mink_object.Group{signature: sig.ok, rule: b.areas.data[i].rule});
+                    if (sel added.err) { done = err[fail.Fail].err{added.err}; }
+                    if (sel added.ok)  { made.data[at] = added.ok.index + 1; }
+                }
+            }
+            if (sel done.ok) { mink_object.section_at(o, table.Id[mink_object.Section]{index: i::u32}).group = opt[table.Id[mink_object.Group]].some{table.Id[mink_object.Group]{index: made.data[at] - 1}}; }
+        }
+        i = i + 1;
+    }
+    vector.dnit[u32](?made);
+    ret done;
+}
+
+# the associative group of section `i`, kept with its owner, added to `o` with the section in it
+fun associated_out(b: *Builder, o: *mink_object.Object, i: usize) err[fail.Fail] {
+    val area: *Area                 = ?b.areas.data[i];
+    var sig:  table.Id[intern.Name] = table.Id[intern.Name]{};
+    if (sel area.owner.none) { ret err[fail.Fail].ok{}; }
+    if (sel area.name.some) {
+        val named: res[table.Id[intern.Name], fail.Fail] = interned(o, intern.bytes_of(?b.names, area.name.some));
+        if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+        sig = named.ok;
+    }
+    val leader: table.Id[mink_object.Section]               = table.Id[mink_object.Section]{index: area.owner.some};
+    val added:  res[table.Id[mink_object.Group], fail.Fail] = mink_object.add_group(o, mink_object.Group{signature: sig, rule: ?mink_group.ASSOCIATE, leader: opt[table.Id[mink_object.Section]].some{leader}});
+    if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+    mink_object.section_at(o, table.Id[mink_object.Section]{index: i::u32}).group = opt[table.Id[mink_object.Group]].some{added.ok};
+    ret err[fail.Fail].ok{};
+}
+
+val UNMARKED: Marked = 0;
+
+val CODE: Marked = 1;
+
+val DATA: Marked = 2;
+
+# a mapping symbol named `name` at `offset` of section `s`, a local symbol of no type
+fun mark_place(b: *Builder, o: *mink_object.Object, s: usize, offset: u64, name: *u8, len: usize) err[Refusal] {
+    val named: res[table.Id[intern.Name], fail.Fail] = mink_object.name(o, name, len);
+    if (sel named.err) { ret err[Refusal].err{failed(named.err)}; }
+    val made: res[table.Id[mink_object.Symbol], fail.Fail] = mink_object.add_symbol(o, mink_object.Symbol{
+        name:       named.ok,
+        binding:    ?mink_symbol.LOCAL,
+        visibility: ?mink_symbol.DEFAULT,
+        kind:       ?mink_symbol.NOTYPE,
+        def:        mink_object.Definition.placed{mink_object.Place{section: table.Id[mink_object.Section]{index: s::u32}, offset: offset}},
+    });
+    if (sel made.err) { ret err[Refusal].err{failed(made.err)}; }
+    ret err[Refusal].ok{};
+}
+
+# the code mark of view `v` into `out`: the mapping's code stem, followed by the view's versioned selection when the
+# mapping names the view
+fun code_mark(b: *Builder, m: *mink_pair.Mapping, v: *core_state.Context, out: *vector.Vector[u8]) bool {
+    vector.truncate[u8](out, 0);
+    val stem: err[A.Error] = extension.append(out, m.code);
+    if (sel stem.err) { ret false; }
+    if (!m.per_view)  { ret true; }
+    val spelled: err[A.Error] = extension.spell_versioned(v.selection, out);
+    ret sel spelled.ok;
+}
+
+# the mapping symbols of every section: a code mark where code starts, at a section's start, after data, or under a
+# view whose code mark is another, and a data mark where data starts, as `$x` and `$d` (aaelf64 and the risc-v psabi,
+# "Mapping Symbols"). an alignment starts neither, so its padding
+# reads as what came before it, and a section holding only labels holds no mark
+pub fun map_sections(b: *Builder, o: *mink_object.Object) err[Refusal] {
+    if (sel b.mapping.none) { ret err[Refusal].ok{}; }
+    val m:    *mink_pair.Mapping = b.mapping.some;
+    var name: vector.Vector[u8]  = vector.init[u8](b.a);
+    var last: vector.Vector[u8]  = vector.init[u8](b.a);
+    var done: err[Refusal]       = err[Refusal].ok{};
+    var s:    usize              = 0;
+    for (s < b.areas.len && sel done.ok) {
+        val area: *Area               = ?b.areas.data[s];
+        var at:   Marked              = UNMARKED;
+        var seen: *core_state.Context = nil;
+        var j:    usize               = 0;
+        for (j < area.fragments.len && sel done.ok) {
+            val f: *Fragment = ?area.fragments.data[j];
+            j = j + 1;
+            if (sel f.body.align) { cnt; }
+            if (!sel f.body.code) {
+                if (at != DATA) { done = mark_place(b, o, s, f.offset, m.data, str_len(m.data)); }
+                at = DATA;
+                cnt;
+            }
+            # a view's mark is spelled once each time the view changes, and written when it is another than the last
+            if (at == CODE && f.view == seen) { cnt; }
+            seen = f.view;
+            if (!code_mark(b, m, f.view, ?name)) {
+                done = err[Refusal].err{memory()};
+                cnt;
+            }
+            if (at == CODE && store.same_bytes(store.Bytes{data: name.data, len: name.len}, store.Bytes{data: last.data, len: last.len})) { cnt; }
+            done = mark_place(b, o, s, f.offset, name.data, name.len);
+            at   = CODE;
+            vector.truncate[u8](?last, 0);
+            if (!held(vector.reserve[u8](?last, name.len))) {
+                done = err[Refusal].err{memory()};
+                cnt;
+            }
+            var k: usize = 0;
+            for (k < name.len) {
+                last.data[k] = name.data[k];
+                k            = k + 1;
+            }
+            vector.truncate[u8](?last, 0);
+            vector.commit[u8](?last, name.len);
+        }
+        s = s + 1;
+    }
+    vector.dnit[u8](?name);
+    vector.dnit[u8](?last);
+    ret done;
+}

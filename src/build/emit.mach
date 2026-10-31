@@ -1,0 +1,678 @@
+# the statements a section takes: instructions in their shortest admitted form, data, fills, alignment and values
+#
+# an instruction is written in the shortest form the set's compressions and
+# the selection admit when it is emitted, once, and relaxation then grows
+# that form, so a compressed branch relaxes through the set's rows like any
+# other. a branch or jump to a label is written compressed when the set
+# relaxes the compressed row on that operand, so the layout starts it at its
+# shortest form and grows it to the shortest that reaches: `beq a0, zero, l`
+# is c.beqz while l is in reach and beq or the inverted branch past a jal
+# when it is not. the steps of a longer form that do not take the target are
+# written in their shortest form, as c.bnez past the jal.
+use masc.codec.walk;
+use masc.core.compress;
+use masc.core.field;
+use masc.core.fill;
+use core_fixup: masc.core.fixup;
+use core_form:  masc.core.form;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.relax;
+use masc.core.row;
+use core_source: masc.core.source;
+use core_state:  masc.core.state;
+use masc.core.stating;
+use masc.core.syntax;
+use mink.base.fail;
+use mink.base.table;
+use mink_trait: mink.catalog.trait;
+use mink.format.contract;
+use mink.format.registry;
+use mink_object: mink.model.object;
+use std.collections.vector;
+use std.encoding.leb128;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use masc.build.label.bind_waiting;
+use masc.build.layout.spanned;
+use masc.build.refusal.BOUNDARY;
+use masc.build.refusal.FINISHED;
+use masc.build.refusal.MARKED;
+use masc.build.refusal.NESTED;
+use masc.build.refusal.NOT_A_LABEL;
+use masc.build.refusal.NO_BYTES;
+use masc.build.refusal.NO_DATUM;
+use masc.build.refusal.NO_DATUM_KIND;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.SPLIT;
+use masc.build.refusal.STATED_TWICE;
+use masc.build.refusal.STATED_VALUE;
+use masc.build.refusal.TOO_MANY;
+use masc.build.refusal.WIDENED;
+use masc.build.refusal.WIDTH;
+use masc.build.refusal.about;
+use masc.build.refusal.about_axis;
+use masc.build.refusal.encoding;
+use masc.build.refusal.failed;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refuse;
+use masc.build.refusal.refused;
+use masc.build.section.at_cursor;
+use masc.build.section.here;
+use masc.build.section.raising;
+use masc.build.state.Align;
+use masc.build.state.Area;
+use masc.build.state.Body;
+use masc.build.state.Builder;
+use masc.build.state.Code;
+use masc.build.state.Coded;
+use masc.build.state.Datum;
+use masc.build.state.Difference;
+use masc.build.state.Extent;
+use masc.build.state.Fragment;
+use masc.build.state.Gap;
+use masc.build.state.Measured;
+use masc.build.state.Raised;
+use masc.build.state.Reference;
+use masc.build.state.Said;
+use masc.build.state.Shaped;
+use masc.build.state.Span;
+use masc.build.state.Told;
+use masc.build.state.datum_slot;
+use masc.build.state.gap;
+use masc.build.state.kept_text;
+use masc.build.state.names_label;
+use masc.build.state.of_set;
+use masc.build.state.ordered;
+use masc.build.trait.said_on;
+use masc.build.trait.state;
+
+fun literal_len(v: *operand.Value) usize {
+    if (sel v.literal) { ret v.literal.len::usize; }
+    ret 0;
+}
+
+fun extent(b: *Builder, values: *operand.Value, count: u32) res[Extent, Refusal] {
+    var e: Extent = Extent{members: 0, literals: 0};
+    var k: u32    = 0;
+    for (k < count) {
+        val held: err[Refusal] = extent_of(b, ?values[k], ?e);
+        if (sel held.err) { ret res[Extent, Refusal].err{held.err}; }
+        k = k + 1;
+    }
+    ret res[Extent, Refusal].ok{e};
+}
+
+# the members and literal bytes `v` holds added to `e`, with those the values it holds within it hold, as a variadic
+# operand's groups or an enumerant's params
+fun extent_of(b: *Builder, v: *operand.Value, e: *Extent) err[Refusal] {
+    if (sel v.symbol && !names_label(b, v.symbol.id)) { ret err[Refusal].err{refuse(NOT_A_LABEL)}; }
+    if (sel v.memory) {
+        val id: u32 = v.memory.symbol.id;
+        if (id != operand.NO_SYMBOL && !names_label(b, id)) { ret err[Refusal].err{refuse(NOT_A_LABEL)}; }
+    }
+    e.literals = e.literals + literal_len(v);
+    val inner: operand.Values = operand.inner(v);
+    e.members = e.members + inner.len::usize;
+    var m: u32 = 0;
+    for (m < inner.len) {
+        val w: *operand.Value = ?inner.at[m];
+        if (sel v.list && sel w.list) { ret err[Refusal].err{refuse(NESTED)}; }
+        val held: err[Refusal] = extent_of(b, w, e);
+        if (sel held.err) { ret held; }
+        m = m + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# `v`'s literal bytes appended to the literals store, where `recall` points the value
+fun keep_literal(b: *Builder, v: *operand.Value) {
+    if (!sel v.literal) { ret; }
+    var i: u32 = 0;
+    for (i < v.literal.len) {
+        b.literals.data[b.literals.len + i::usize] = v.literal.at[i];
+        i                                          = i + 1;
+    }
+    vector.commit[u8](?b.literals, v.literal.len::usize);
+}
+
+# whether `ins` encodes under view `v` in form `form` to the bytes and fixups it encodes to in its own, so text may
+# state it in either: a choice its row's encoding does not read, which the listing may spell to pin its row
+pub fun alike(b: *Builder, v: *core_state.Context, ins: *inst.Inst, form: core_form.Form) bool {
+    val start: usize     = b.scratch.len;
+    val marks: usize     = b.fixups.len;
+    var other: inst.Inst = @ins;
+    other.form = form;
+    val x:    res[usize, field.Refusal] = walk.encode(b.set.codec, v, ins, ?b.scratch, ?b.fixups);
+    var same: bool                      = false;
+    if (sel x.ok) {
+        val mid:   usize                     = b.scratch.len;
+        val noted: usize                     = b.fixups.len;
+        val y:     res[usize, field.Refusal] = walk.encode(b.set.codec, v, ?other, ?b.scratch, ?b.fixups);
+        if (sel y.ok) { same = y.ok == x.ok && b.fixups.len - noted == noted - marks; }
+        var i: usize = 0;
+        for (same && i < x.ok) {
+            same = b.scratch.data[start + i] == b.scratch.data[mid + i];
+            i    = i + 1;
+        }
+        i = 0;
+        for (same && i < noted - marks) {
+            val p: *field.Fixup = ?b.fixups.data[marks + i];
+            val q: *field.Fixup = ?b.fixups.data[noted + i];
+            same = p.kind == q.kind && p.operand == q.operand && p.offset == q.offset && p.symbol == q.symbol && p.addend == q.addend;
+            i    = i + 1;
+        }
+    }
+    vector.truncate[u8](?b.scratch, start);
+    vector.truncate[field.Fixup](?b.fixups, marks);
+    ret same;
+}
+
+# whether any value of `s` is a symbol
+fun symbolic(s: *relax.Emitted) bool {
+    var k: u32 = 0;
+    for (k < s.row.operands.len) {
+        if (sel s.values[k].symbol) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the `count` instructions at `steps` in the forms they are written in under view `v`, into `out`, refused as `put`
+# refuses them. each is the shortest form the view admits, except in a sequence holding a symbol, as a call pair, whose
+# form its relocations fix. a fixup whose relocation covers instructions after its own is refused unless the sequence
+# holds them, so a call pair is written as one sequence or not at all
+fun shape(b: *Builder, v: *core_state.Context, modes: *mode.State, steps: *relax.Emitted, count: u32, out: *Shaped) err[Refusal] {
+    var fixed: bool = false;
+    var i:     u32  = 0;
+    for (i < count && count > 1) {
+        fixed = fixed || symbolic(?steps[i]);
+        i     = i + 1;
+    }
+    out.total = Extent{members: 0, literals: 0};
+    out.slots = 0;
+    i         = 0;
+    for (i < count) {
+        # the shortest form the selection admits, once, before any layout
+        out.chosen[i] = steps[i];
+        # a sequence whose relocations fix its forms is written exact, which the listing states
+        if (fixed) { out.chosen[i].form.bits = out.chosen[i].form.bits | core_form.EXACT; }
+        var given:  inst.Inst = inst.Inst{row: steps[i].row, values: ?steps[i].values[0], count: steps[i].row.operands.len, form: out.chosen[i].form};
+        var packed: relax.Emitted;
+        if (compress.compress(b.set.codec, b.set.compress, b.set.relax, v, ?given, ?packed)) {
+            packed.marker = steps[i].marker;
+            out.chosen[i] = packed;
+        }
+        val s: *relax.Emitted       = ?out.chosen[i];
+        val n: u32                  = s.row.operands.len;
+        val e: res[Extent, Refusal] = extent(b, ?s.values[0], n);
+        if (sel e.err) { ret err[Refusal].err{e.err}; }
+        var ins:  inst.Inst                    = inst.Inst{row: s.row, values: ?s.values[0], count: n, form: s.form};
+        val done: res[Measured, field.Refusal] = spanned(b, v, modes, ?ins, count - i);
+        if (sel done.err)                       { ret err[Refusal].err{encoding(done.err)}; }
+        if (done.ok.split != operand.NO_SYMBOL) { ret about(SPLIT, done.ok.split); }
+        # the span's marker rides beside its instruction, whoever built the sequence
+        if (done.ok.marker != operand.NO_FIXUP) {
+            if (s.marker != operand.NO_FIXUP && s.marker != done.ok.marker) { ret refused(MARKED); }
+            s.marker = done.ok.marker;
+        }
+        out.lens[i]        = done.ok.len;
+        out.total.members  = out.total.members + e.ok.members;
+        out.total.literals = out.total.literals + e.ok.literals;
+        out.slots          = out.slots + n::usize;
+        i                  = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the instructions of `ex` in the forms `expansion` writes them in under view `v` and the modes `modes`, into `out`, or
+# why it refuses them. a listing reads a statement back through this, so what it prints is what the builder writes
+pub fun forms(b: *Builder, v: *core_state.Context, modes: *mode.State, ex: *relax.Expansion, out: *relax.Expansion) err[Refusal] {
+    if (ex.count > relax.MAX_STEPS) { ret refused(TOO_MANY); }
+    var shaped: Shaped;
+    val done:   err[Refusal] = shape(b, v, modes, ?ex.steps[0], ex.count, ?shaped);
+    if (sel done.err) { ret done; }
+    out.count = ex.count;
+    var i: u32 = 0;
+    for (i < ex.count) {
+        out.steps[i] = shaped.chosen[i];
+        i            = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# what the `count` instructions `shaped` chose define added to the object's stream, in order, refused where one breaks
+# what the stream holds. a refusal after the first leaves what those before it defined, which no set's sequences reach:
+# a set with a stream states no sequences
+fun observe(b: *Builder, shaped: *Shaped, count: u32) err[Refusal] {
+    if (b.set.codec.stream == nil) { ret err[Refusal].ok{}; }
+    var i: u32 = 0;
+    for (i < count) {
+        val s:    *relax.Emitted     = ?shaped.chosen[i];
+        var ins:  inst.Inst          = inst.Inst{row: s.row, values: ?s.values[0], count: s.row.operands.len, form: s.form};
+        val seen: err[field.Refusal] = b.set.codec.stream.observe(b.object.stream, ?ins);
+        if (sel seen.err) { ret err[Refusal].err{encoding(seen.err)}; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the number an operand value holds, an enumerant's or an immediate's, none for another
+fun number_of(v: *operand.Value) opt[u64] {
+    if (sel v.enumerant) { ret opt[u64].some{v.enumerant.value::u64}; }
+    if (sel v.immediate) {
+        if (v.immediate >= 0) { ret opt[u64].some{v.immediate::u64}; }
+    }
+    ret opt[u64].none{};
+}
+
+# the instruction `steps`, one the set reads as what it states of the object (`stating`), stated on it in place of being
+# written to a section: each trait its operands state, at the choice the object's format maps the value to, as the
+# source states one (`state`), and each fact, kept until the object is made. it is shaped and observed as any
+# instruction is, so the view admits it and the stream sees it, and every value is mapped before anything is stated,
+# so a refusal states nothing. a trait an earlier instruction stated is refused, as a module states each once
+fun stated_by(b: *Builder, steps: *relax.Emitted) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
+    var shaped: Shaped;
+    val formed: err[Refusal] = shape(b, b.view, ?b.modes, steps, 1, ?shaped);
+    if (sel formed.err) { ret formed; }
+    val s:      *relax.Emitted = ?shaped.chosen[0];
+    var traits: [row.MAX_OPERANDS]mink_trait.Trait;
+    var nt:     u32            = 0;
+    var facts:  u32            = 0;
+    var bytes:  usize          = 0;
+    var i:      u32            = 0;
+    for (i < b.set.statings.len) {
+        val st: *stating.Stating = ?b.set.statings.at[i];
+        i = i + 1;
+        if (st.row != s.row) { cnt; }
+        val v:    *operand.Value = ?s.values[st.operand];
+        val what: stating.Stated = st.stated;
+        if (sel what.trait) {
+            val n: opt[u64] = number_of(v);
+            if (sel n.none) { ret refused(STATED_VALUE); }
+            val got: res[mink_trait.Setting, fail.Fail] = registry.setting(b.formats, b.format, what.trait, contract.Written.number{n.some});
+            if (sel got.err) { ret err[Refusal].err{failed(got.err)}; }
+            val before: opt[*Said] = said_on(b, what.trait);
+            if (sel before.some) {
+                if (before.some.by_row) { ret about_axis(STATED_TWICE, what.trait); }
+            }
+            traits[nt] = mink_trait.Trait{axis: what.trait, setting: got.ok};
+            nt         = nt + 1;
+        }
+        or (sel v.literal) {
+            facts = facts + 1;
+            bytes = bytes + v.literal.len::usize;
+        }
+        or {
+            val n: opt[u64] = number_of(v);
+            if (sel n.none) { ret refused(STATED_VALUE); }
+            facts = facts + 1;
+        }
+    }
+    var ok: bool = held(vector.reserve[Told](?b.told, facts::usize));
+    ok = ok && held(vector.reserve[u8](?b.texts, bytes));
+    ok = ok && held(vector.reserve[Said](?b.said, nt::usize));
+    if (!ok) { ret err[Refusal].err{memory()}; }
+    val observed: err[Refusal] = observe(b, ?shaped, 1);
+    if (sel observed.err) { ret observed; }
+    var k: u32 = 0;
+    for (k < nt) {
+        val stated: err[Refusal] = state(b, traits[k]);
+        if (sel stated.err) { ret stated; }
+        val on: opt[*Said] = said_on(b, traits[k].axis);
+        if (sel on.some) { on.some.by_row = true; }
+        k = k + 1;
+    }
+    i = 0;
+    for (i < b.set.statings.len) {
+        val st: *stating.Stating = ?b.set.statings.at[i];
+        i = i + 1;
+        if (st.row != s.row) { cnt; }
+        val what: stating.Stated = st.stated;
+        if (sel what.fact) {
+            val v:    *operand.Value = ?s.values[st.operand];
+            var told: Told           = Told{fact: what.fact, value: 0, data: opt[Span].none{}};
+            if (sel v.literal) {
+                val kept: res[Span, Refusal] = kept_text(b, v.literal.at, v.literal.len::usize, false);
+                if (sel kept.err) { ret err[Refusal].err{kept.err}; }
+                told.data = opt[Span].some{kept.ok};
+            }
+            or {
+                val n: opt[u64] = number_of(v);
+                if (sel n.some) { told.value = n.some; }
+            }
+            vector.push[Told](?b.told, told);
+        }
+    }
+    ret err[Refusal].ok{};
+}
+
+# the facts instructions stated, added to `o` in the order stated, their data owned by `o`
+pub fun record_told(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < b.told.len) {
+        val t:    *Told                = ?b.told.data[i];
+        var data: mink_object.Contents = mink_object.Contents.zero{0};
+        if (sel t.data.some) {
+            val owned: res[mink_object.Contents, fail.Fail] = mink_object.own(o, ?b.texts.data[t.data.some.start], t.data.some.len);
+            if (sel owned.err) { ret err[fail.Fail].err{owned.err}; }
+            data = owned.ok;
+        }
+        val added: res[table.Id[mink_object.Fact], fail.Fail] = mink_object.add_fact(o, mink_object.Fact{format: t.fact.format, key: t.fact.key, value: t.value, data: data});
+        if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the instructions `steps` appended to the current section under the builder's view, all or none, in the forms `shape`
+# chooses, or one the set reads as what it states of the object stated on it (`stated_by`)
+fun put(b: *Builder, steps: *relax.Emitted, count: u32) err[Refusal] {
+    if (count == 1 && stating.states(b.set.statings, steps[0].row)) { ret stated_by(b, steps); }
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)  { ret err[Refusal].err{area.err}; }
+    if (!area.ok.bits) { ret refused(NO_BYTES); }
+    var shaped: Shaped;
+    val formed: err[Refusal] = shape(b, b.view, ?b.modes, steps, count, ?shaped);
+    if (sel formed.err) { ret formed; }
+    val total: Extent = shaped.total;
+    val slots: usize  = shaped.slots;
+    var ok:    bool   = held(vector.reserve[Fragment](?area.ok.fragments, count::usize));
+    ok = ok && held(vector.reserve[operand.Value](?b.values, slots));
+    ok = ok && held(vector.reserve[operand.Value](?b.members, total.members));
+    ok = ok && held(vector.reserve[u8](?b.literals, total.literals));
+    if (!ok) { ret err[Refusal].err{memory()}; }
+    val observed: err[Refusal] = observe(b, ?shaped, count);
+    if (sel observed.err) { ret observed; }
+    val cur: res[usize, Refusal] = at_cursor(b);
+    if (sel cur.ok) { bind_waiting(b, cur.ok::u32, area.ok.fragments.len::u32); }
+    var i: u32 = 0;
+    for (i < count) {
+        val s:    *relax.Emitted         = ?shaped.chosen[i];
+        val n:    u32                    = s.row.operands.len;
+        val rx:   opt[*relax.Relaxation] = relax.find(b.set.relax, s.row);
+        var code: Code                   = Code{
+            of:       Coded.catalog{s.row},
+            values:   b.values.len,
+            count:    n,
+            members:  b.members.len,
+            literals: b.literals.len,
+            marker:   s.marker,
+            marked:   s.marker != operand.NO_FIXUP,
+            form:     s.form,
+            relax:    rx,
+            initial:  shaped.lens[i]::u64,
+            depth:    0,
+            run:      0,
+        };
+        if (i == 0) { code.run = count; }
+        keep_values(b, ?s.values[0], n);
+        vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: shaped.lens[i]::u64, view: b.view, syntax: b.syntax, modes: b.state});
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the `n` values at `values` appended to the builder's values, the values they hold within them and their literal bytes
+# to its own, each reserved
+fun keep_values(b: *Builder, values: *operand.Value, n: u32) {
+    var k: u32 = 0;
+    for (k < n) {
+        val v: *operand.Value = ?values[k];
+        b.values.data[b.values.len] = @v;
+        vector.commit[operand.Value](?b.values, 1);
+        keep_value(b, v);
+        k = k + 1;
+    }
+}
+
+# `v`'s literal bytes and the values it holds within it appended to the builder's stores, its own run of members first
+# and then what each of them holds, the order `recall_of` reads them in
+fun keep_value(b: *Builder, v: *operand.Value) {
+    keep_literal(b, v);
+    val inner: operand.Values = operand.inner(v);
+    val first: usize          = b.members.len;
+    var i:     u32            = 0;
+    for (i < inner.len) {
+        b.members.data[first + i::usize] = inner.at[i];
+        i                                = i + 1;
+    }
+    vector.commit[operand.Value](?b.members, inner.len::usize);
+    i = 0;
+    for (i < inner.len) {
+        keep_value(b, ?b.members.data[first + i::usize]);
+        i = i + 1;
+    }
+}
+
+# the instruction format `f` states with `values`, of its row's operands, at the cursor of the current section under the
+# builder's view, as risc-v's `.insn` states an encoding no catalog row has. it is written as given: never compressed,
+# relaxed or read as a catalog row, its symbols folded and relocated as a catalog row's are
+pub fun format(b: *Builder, f: *core_source.Format, values: *operand.Value) err[Refusal] {
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)  { ret err[Refusal].err{area.err}; }
+    if (!area.ok.bits) { ret refused(NO_BYTES); }
+    val n: u32                  = f.row.operands.len;
+    val e: res[Extent, Refusal] = extent(b, values, n);
+    if (sel e.err) { ret err[Refusal].err{e.err}; }
+    var ins:  inst.Inst                    = inst.Inst{row: f.row, values: values, count: n};
+    val done: res[Measured, field.Refusal] = spanned(b, b.view, ?b.modes, ?ins, 1);
+    if (sel done.err)                       { ret err[Refusal].err{encoding(done.err)}; }
+    if (done.ok.split != operand.NO_SYMBOL) { ret about(SPLIT, done.ok.split); }
+    var ok: bool = held(vector.reserve[Fragment](?area.ok.fragments, 1));
+    ok = ok && held(vector.reserve[operand.Value](?b.values, n::usize));
+    ok = ok && held(vector.reserve[operand.Value](?b.members, e.ok.members));
+    ok = ok && held(vector.reserve[u8](?b.literals, e.ok.literals));
+    if (!ok) { ret err[Refusal].err{memory()}; }
+    val cur: res[usize, Refusal] = at_cursor(b);
+    if (sel cur.ok) { bind_waiting(b, cur.ok::u32, area.ok.fragments.len::u32); }
+    val code: Code = Code{
+        of:       Coded.format{f},
+        values:   b.values.len,
+        count:    n,
+        members:  b.members.len,
+        literals: b.literals.len,
+        marker:   done.ok.marker,
+        marked:   done.ok.marker != operand.NO_FIXUP,
+        relax:    opt[*relax.Relaxation].none{},
+        initial:  done.ok.len::u64,
+        depth:    0,
+        run:      1,
+    };
+    keep_values(b, values, n);
+    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: done.ok.len::u64, view: b.view, syntax: b.syntax, modes: b.state});
+    ret err[Refusal].ok{};
+}
+
+# `ins` encoded at the cursor of the current section, with the marker fixup kind `marker` riding beside it, operand.NO_FIXUP for none
+pub fun emit(b: *Builder, ins: *inst.Inst, marker: operand.FixupKind) err[Refusal] {
+    if (ins.count != ins.row.operands.len) { ret err[Refusal].err{encoding(field.refusal(field.OPERAND_COUNT, field.NO_OPERAND, 0))}; }
+    var one: relax.Emitted = relax.Emitted{row: ins.row, marker: marker, form: ins.form};
+    var k:   u32           = 0;
+    for (k < ins.count) {
+        one.values[k] = ins.values[k];
+        k             = k + 1;
+    }
+    ret put(b, ?one, 1);
+}
+
+# every instruction of `ex`, an expansion of a pseudo instruction, at the cursor of the current section, all or none
+pub fun expansion(b: *Builder, ex: *relax.Expansion) err[Refusal] {
+    if (ex.count > relax.MAX_STEPS) { ret refused(TOO_MANY); }
+    ret put(b, ?ex.steps[0], ex.count);
+}
+
+# context `v` the one what is emitted next is written under: the object's, or another the source states, narrower as a
+# source dialect's `.option norvc` or wider as its `.option arch, +zbb`. the context is the caller's and outlives the
+# builder. it is refused when it views another register file, is of another catalog or axes, or sets an axis the
+# object does not switch to another value, as `.option arch, rv32i` in an rv64 object would
+pub fun under(b: *Builder, v: *core_state.Context) err[Refusal] {
+    if (!of_set(b.set, v) || v.view == nil || v.view.file != b.object.view.file || v.stream != b.object.stream) { ret refused(WIDENED); }
+    var i: u32 = 0;
+    for (i < v.axes.len) {
+        if (!v.axes.at[i].switchable && v.values.at[i] != b.object.values.at[i]) { ret refused(WIDENED); }
+        i = i + 1;
+    }
+    var known: bool  = v == b.object;
+    var k:     usize = 0;
+    for (!known && k < b.views.len) {
+        known = b.views.data[k] == v;
+        k     = k + 1;
+    }
+    if (!known && !held(vector.push[*core_state.Context](?b.views, v))) { ret err[Refusal].err{memory()}; }
+    b.view = v;
+    ret err[Refusal].ok{};
+}
+
+# the object's context, which enters its architecture and states its selection traits
+pub fun object_of(b: *Builder) *core_state.Context {
+    ret b.object;
+}
+
+# the `n` bytes at `p` at the cursor of the current section
+pub fun data(b: *Builder, p: *u8, n: usize) err[Refusal] {
+    val raised: opt[*Raised] = raising(b);
+    if (sel raised.some) {
+        if (!held(vector.reserve[u8](?raised.some.bytes, n))) { ret err[Refusal].err{memory()}; }
+        var k: usize = 0;
+        for (k < n) {
+            raised.some.bytes.data[raised.some.bytes.len + k] = p[k];
+            k                                                 = k + 1;
+        }
+        vector.commit[u8](?raised.some.bytes, n);
+        ret err[Refusal].ok{};
+    }
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)                                                                                    { ret err[Refusal].err{area.err}; }
+    if (!area.ok.bits)                                                                                   { ret refused(NO_BYTES); }
+    if (!held(vector.reserve[Fragment](?area.ok.fragments, 1)) || !held(vector.reserve[u8](?b.data, n))) { ret err[Refusal].err{memory()}; }
+    val start: usize = b.data.len;
+    var i:     usize = 0;
+    for (i < n) {
+        b.data.data[start + i] = p[i];
+        i                      = i + 1;
+    }
+    vector.commit[u8](?b.data, n);
+    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.data{Span{start: start, len: n}}, size: n::u64, view: b.view, syntax: b.syntax, modes: b.state});
+    ret err[Refusal].ok{};
+}
+
+# `n` zero bytes at the cursor of the current section, which in a section holding no bytes are only its size
+pub fun zero(b: *Builder, n: u64) err[Refusal] {
+    val raised: opt[*Raised] = raising(b);
+    if (sel raised.some) { ret pad_raised(raised.some, n, 0); }
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)                                                                                                                            { ret err[Refusal].err{area.err}; }
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.zero{n}, size: n, view: b.view, syntax: b.syntax, modes: b.state}))) { ret err[Refusal].err{memory()}; }
+    ret err[Refusal].ok{};
+}
+
+# the cursor of the current section padded to `al`
+pub fun align(b: *Builder, al: Align) err[Refusal] {
+    val raised: opt[*Raised] = raising(b);
+    if (sel raised.some) {
+        if (al.boundary == 0 || (al.boundary & (al.boundary - 1)) != 0) { ret refused(BOUNDARY); }
+        var fill: u8 = 0;
+        if (sel al.fill.some) { fill = al.fill.some; }
+        ret pad_raised(raised.some, gap(?al, raised.some.bytes.len::u64), fill);
+    }
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)                                                                                                                              { ret err[Refusal].err{area.err}; }
+    if (al.boundary == 0 || (al.boundary & (al.boundary - 1)) != 0)                                                                                { ret refused(BOUNDARY); }
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.align{al}, size: 0, view: b.view, syntax: b.syntax, modes: b.state}))) { ret err[Refusal].err{memory()}; }
+    if (al.boundary > area.ok.align)                                                                                                               { area.ok.align = al.boundary; }
+    ret err[Refusal].ok{};
+}
+
+# `n` bytes of `fill` after the bytes the source wrote in raised section `r`
+fun pad_raised(r: *Raised, n: u64, fill: u8) err[Refusal] {
+    if (!held(vector.reserve[u8](?r.bytes, n::usize))) { ret err[Refusal].err{memory()}; }
+    var k: usize = 0;
+    for (k < n::usize) {
+        r.bytes.data[r.bytes.len + k] = fill;
+        k                             = k + 1;
+    }
+    vector.commit[u8](?r.bytes, n::usize);
+    ret err[Refusal].ok{};
+}
+
+# a datum at the cursor of the current section, which folds or relocates as an instruction's fixup does
+pub fun datum(b: *Builder, r: Reference) err[Refusal] {
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)                                                                    { ret err[Refusal].err{area.err}; }
+    if (!area.ok.bits)                                                                   { ret refused(NO_BYTES); }
+    if (!names_label(b, r.target.id))                                                    { ret refused(NOT_A_LABEL); }
+    if (r.basis > core_fixup.RELATIVE || r.width == 0 || r.width > core_fixup.MAX_WIDTH) { ret refused(NO_DATUM); }
+    var fixup: operand.FixupKind = b.data_kind[datum_slot(r.basis, r.width)];
+    var kept:  Reference         = r;
+    if (fixup == operand.NO_FIXUP) { ret refused(NO_DATUM); }
+    # a kind the datum takes anyway states nothing, so the record holds it as the datum's own
+    if (r.kind == fixup) { kept.kind = operand.NO_FIXUP; }
+    if (kept.kind != operand.NO_FIXUP) {
+        if (!datum_specified(b, fixup, kept.kind)) { ret refused(NO_DATUM_KIND); }
+        fixup = kept.kind;
+    }
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.datum{Datum{fixup: fixup, ref: kept}}, size: r.width::u64, view: b.view, syntax: b.syntax, modes: b.state}))) {
+        ret err[Refusal].err{memory()};
+    }
+    ret err[Refusal].ok{};
+}
+
+# whether a specifier of a syntax of the set spells fixup kind `kind` on a datum whose own kind is `own` under the
+# object's format, so its width and binding are the datum's (`syntax.Specifier`)
+fun datum_specified(b: *Builder, own: operand.FixupKind, kind: operand.FixupKind) bool {
+    var k: u32 = 0;
+    for (k < b.set.syntaxes.len) {
+        val sp: syntax.Specifiers = b.set.syntaxes.at[k].specifiers;
+        var i:  u32               = 0;
+        for (i < sp.len) {
+            if (sp.at[i].operand == own && sp.at[i].fixup == kind && syntax.reads(?sp.at[i], b.format)) { ret true; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the low `width` bytes of `value` at the cursor of the current section, in the set's byte order
+pub fun integer(b: *Builder, value: u64, width: u8) err[Refusal] {
+    if (width == 0 || width > core_fixup.MAX_WIDTH) { ret refused(WIDTH); }
+    var bytes: [8]u8;
+    ordered(b, value, width::usize, ?bytes[0]);
+    ret data(b, ?bytes[0], width::usize);
+}
+
+# the difference `d` as a datum of `width` bytes at the cursor of the current section, a deferred value written
+# FIXED
+pub fun difference(b: *Builder, d: Difference, width: u8) err[Refusal] {
+    ret deferred(b, d, core_fixup.FIXED, width);
+}
+
+# the difference `d` at the cursor of the current section, written by encoding `how` in `width` bytes, a width of 0 for a
+# leb128. its labels need not be placed yet: once laid out it folds when both labels lie in one section with nothing
+# between that the linker may resize, a fixed width is relocated by the set's relative datum when the label subtracted
+# is the datum's own place, and either is relocated by the set's pair for its encoding and width when the linker may
+# resize code between them. labels of two sections, or never placed, are refused at finish
+pub fun deferred(b: *Builder, d: Difference, how: core_fixup.Encoding, width: u8) err[Refusal] {
+    val area: res[*Area, Refusal] = here(b);
+    if (sel area.err)                                                            { ret err[Refusal].err{area.err}; }
+    if (!area.ok.bits)                                                           { ret refused(NO_BYTES); }
+    if (!names_label(b, d.plus.id) || !names_label(b, d.minus.id))               { ret refused(NOT_A_LABEL); }
+    if (how > core_fixup.SLEB)                                                   { ret refused(WIDTH); }
+    if (how == core_fixup.FIXED && (width == 0 || width > core_fixup.MAX_WIDTH)) { ret refused(WIDTH); }
+    if (how != core_fixup.FIXED && width != 0)                                   { ret refused(WIDTH); }
+    # a leb128 starts empty and the layout grows it to its value's length
+    if (!held(vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.difference{Gap{of: d, width: width, encoding: how}}, size: width::u64, view: b.view, syntax: b.syntax, modes: b.state}))) {
+        ret err[Refusal].err{memory()};
+    }
+    ret err[Refusal].ok{};
+}
