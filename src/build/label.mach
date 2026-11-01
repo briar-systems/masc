@@ -56,13 +56,13 @@ use masc.build.state.Fallback;
 use masc.build.state.Label;
 use masc.build.state.Mark;
 use masc.build.state.Order;
+use masc.build.state.Size;
 use masc.build.state.Value;
 use masc.build.state.Waiting;
 use masc.build.state.Writer;
 use masc.build.state.kind_of;
 use masc.build.state.mark_of;
 use masc.build.state.name_bytes;
-use masc.build.state.name_of;
 use masc.build.state.names_label;
 
 # how many labels the builder has made, named or not
@@ -275,14 +275,19 @@ pub fun source(b: *Builder, name: View) err[Refusal] {
 
 # the label named `name`, made local when it is new
 pub fun label(b: *Builder, name: str) res[Label, Refusal] {
+    ret label_bytes(b, name::*u8, str_len(name));
+}
+
+# the label named by the `n` bytes at `p`, made local when it is new
+pub fun label_bytes(b: *Builder, p: *u8, n: usize) res[Label, Refusal] {
     if (b.finished) { ret res[Label, Refusal].err{refuse(FINISHED)}; }
-    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, name::*u8, str_len(name));
+    val known: opt[table.Id[intern.Name]] = intern.find(?b.names, p, n);
     if (sel known.some) {
         val slot: u32 = b.named.data[known.some.index::usize];
         if (slot != operand.NO_SYMBOL) { ret res[Label, Refusal].ok{Label{id: slot}}; }
     }
     if (!held(vector.reserve[Mark](?b.labels, 1))) { ret res[Label, Refusal].err{memory()}; }
-    val id: res[table.Id[intern.Name], Refusal] = name_of(b, name);
+    val id: res[table.Id[intern.Name], Refusal] = name_bytes(b, p, n);
     if (sel id.err) { ret res[Label, Refusal].err{id.err}; }
     vector.push[Mark](?b.labels, Mark{name: opt[table.Id[intern.Name]].some{id.ok}});
     b.named.data[id.ok.index::usize] = b.labels.len::u32;
@@ -379,6 +384,79 @@ pub fun fall_back(b: *Builder, l: Label, target: Label, search: *mink_symbol.Sea
     if (!names_label(b, target.id)) { ret refused(NOT_A_LABEL); }
     if (target.id == l.id)          { ret about(CYCLE, l.id); }
     ret valued(b, l, Value.fallback{Fallback{target: target.id, search: search}});
+}
+
+# the text `.weak.<name>.default` of the name `id` in `out`, as llvm names the label a coff weak
+# symbol's definition moves to
+fun default_name(b: *Builder, id: opt[table.Id[intern.Name]], out: *vector.Vector[u8]) bool {
+    if (sel id.none) { ret false; }
+    val name: View  = intern.bytes_of(?b.names, id.some);
+    val head: str   = ".weak.";
+    val tail: str   = ".default";
+    var ok:   bool  = held(vector.reserve[u8](out, str_len(head) + name.len + str_len(tail)));
+    var k:    usize = 0;
+    for (ok && head[k] != 0) {
+        ok = held(vector.push[u8](out, head[k]));
+        k  = k + 1;
+    }
+    k = 0;
+    for (ok && k < name.len) {
+        ok = held(vector.push[u8](out, name.data[k]));
+        k  = k + 1;
+    }
+    k = 0;
+    for (ok && tail[k] != 0) {
+        ok = held(vector.push[u8](out, tail[k]));
+        k  = k + 1;
+    }
+    ret ok;
+}
+
+# `l`, a weak symbol with no fallback, made a weak external searched for as `search` whose fallback is its own
+# definition, moved to a local label named `.weak.<name>.default`, as llvm's coff writer does for a bare `.weak`. the
+# definition is the place, the value, or absolute zero for a label never defined. common storage is left as it is
+pub fun weak_default(b: *Builder, l: Label, search: *mink_symbol.Search) err[Refusal] {
+    if (b.finished) { ret refused(FINISHED); }
+    val m: opt[*Mark] = mark_of(b, l);
+    if (sel m.none)                                            { ret refused(NO_SUCH); }
+    if (sealed_label(b, l))                                    { ret refused(SEALED); }
+    if (sel m.some.name.none)                                  { ret refused(NAMELESS); }
+    if (sel m.some.value.some && sel m.some.value.some.common) { ret err[Refusal].ok{}; }
+    var text:  vector.Vector[u8] = vector.init[u8](b.a);
+    val spelt: bool              = default_name(b, m.some.name, ?text);
+    if (!spelt) {
+        vector.dnit[u8](?text);
+        ret err[Refusal].err{memory()};
+    }
+    val made: res[Label, Refusal] = label_bytes(b, text.data, text.len);
+    vector.dnit[u8](?text);
+    if (sel made.err) { ret err[Refusal].err{made.err}; }
+    # the label vector may have moved
+    val from: *Mark = ?b.labels.data[l.id::usize - 1];
+    val to:   *Mark = ?b.labels.data[made.ok.id::usize - 1];
+    if (to.defined || sel to.value.some) { ret about(REDEFINED, made.ok.id); }
+    to.defined  = from.defined;
+    to.section  = from.section;
+    to.fragment = from.fragment;
+    to.order    = from.order;
+    to.value    = from.value;
+    if (!from.defined && sel from.value.none) { to.value = opt[Value].some{Value.absolute{0}}; }
+    var exposure: Exposure      = Exposure{binding: ?mink_symbol.LOCAL, visibility: ?mink_symbol.DEFAULT, kind: ?mink_symbol.NOTYPE, size: Size.none{}};
+    val shown:    opt[Exposure] = from.exposure;
+    if (sel shown.some) {
+        var kept: Exposure = shown.some;
+        exposure.kind = kept.kind;
+        exposure.size = kept.size;
+        kept.size     = Size.none{};
+        from.exposure = opt[Exposure].some{kept};
+    }
+    to.exposure   = opt[Exposure].some{exposure};
+    from.defined  = false;
+    from.section  = 0;
+    from.fragment = 0;
+    from.order    = 0;
+    from.value    = opt[Value].some{Value.fallback{Fallback{target: made.ok.id, search: search}}};
+    ret err[Refusal].ok{};
 }
 
 # the relocation `d` stated by itself in the current section
