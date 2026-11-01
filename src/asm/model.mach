@@ -54,6 +54,7 @@ use mink.catalog.arch;
 use mink.catalog.trait;
 use mink.format.contract;
 use mink.format.registry;
+use mink.model.bridge;
 use mink_group:  mink.model.group;
 use mink_object: mink.model.object;
 use mink_symbol: mink.model.symbol;
@@ -125,6 +126,12 @@ pub val RESERVED_LENGTH:   str = "encoding whose low bits state a length no raw 
 pub val UNMET_FULL:        str = "the refusal needs more extensions than it can name";
 pub val STATE_STATED:      str = "states two values of one state axis, or one no axis takes";
 pub val EMPTY_QUANTITY:    str = "bounds a quantity of the register file to no value";
+pub val NOT_BRIDGING:      str = "symbol index outside the section the dialect states bridges in";
+pub val BRIDGE_ORDER:      str = "bridge stated out of order: a symbol index of its symbol, one of its thunk, then its type word";
+pub val BRIDGE_WIDTH:      str = "bridge type word that is not four bytes";
+pub val BRIDGE_ROLE:       str = "bridge type word that states no role";
+pub val BRIDGE_UNFINISHED: str = "bridge left without its symbol, thunk or type word";
+pub val BRIDGE_STATEMENT:  str = "label or instruction in the section the dialect states bridges in";
 
 # the handle `.` resolves to, which every operand binds to the place it is written before the builder sees it
 pub val HERE: u32 = syntax.HERE;
@@ -349,9 +356,28 @@ rec Numbered {
 }
 
 # a saved section state of the section stack
+# ---
+# current:  the current section, none while the bridge section is
+# previous: the section `.previous` returns to
+# bridging: whether the bridge section is current
 rec Frame {
     current:  opt[build.Section];
     previous: opt[build.Section];
+    bridging: bool;
+}
+
+# the bridge being stated in the section the dialect states bridges in, as `.symidx f`, `.symidx t` and `.word 1`
+# state an arm64ec entry thunk
+# ---
+# on:     whether that section is current
+# named:  how many of its symbol and its thunk a symbol index named so far
+# symbol: the label of the symbol it serves, once named
+# thunk:  the label of its thunk, once named
+rec Bridging {
+    on:     bool;
+    named:  u32;
+    symbol: build.Label;
+    thunk:  build.Label;
 }
 
 # a section opened apart from others of its name, re-entered by its name and its keys: the number it was opened with,
@@ -432,6 +458,7 @@ rec Basis {
 # stack:    the section stack
 # apart:    the sections opened apart from others of their name, by the number they were opened with
 # previous: the section `.previous` returns to
+# bridging: the bridge being stated in the section the dialect states bridges in, and whether that section is current
 # items:    the operands of the directive being read
 # strings:  the bytes of its strings
 # spelled:  a name copied to be handed to the builder
@@ -461,6 +488,7 @@ pub rec Assembler {
     stack:    vector.Vector[Frame];
     apart:    vector.Vector[Apart];
     previous: opt[build.Section];
+    bridging: Bridging;
     items:    vector.Vector[Operand];
     strings:  vector.Vector[u8];
     spelled:  vector.Vector[u8];
@@ -576,6 +604,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, object: *state.Context, options: Opti
         stack:    vector.init[Frame](a),
         apart:    vector.init[Apart](a),
         previous: opt[build.Section].none{},
+        bridging: Bridging{on: false, named: 0, symbol: build.Label{id: operand.NO_SYMBOL}, thunk: build.Label{id: operand.NO_SYMBOL}},
         items:    vector.init[Operand](a),
         strings:  vector.init[u8](a),
         spelled:  vector.init[u8](a),
@@ -956,6 +985,7 @@ fun wrote(args: *Args, k: u32, e: err[build.Refusal]) err[diagnostic.Diagnostic]
 # or a difference of labels, each `.` the place it is written
 pub fun datum(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Diagnostic] {
     if (k >= args.count) { ret err[diagnostic.Diagnostic].err{refuse(args, k, read.EXPECTED)}; }
+    if (m.bridging.on)   { ret bridge_word(m, args, k, width); }
     val v: Argument = args.items[k].value;
     if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{refuse(args, k, NOT_CONSTANT)}; }
     var e: expr.Expr = v.expression;
@@ -1198,6 +1228,8 @@ pub fun linked(m: *Assembler, name: View) opt[build.Section] {
 
 # section `s` made current, the current one becoming the previous
 pub fun switch_to(m: *Assembler, s: build.Section) err[str] {
+    val left: err[str] = leave_bridges(m);
+    if (sel left.err) { ret left; }
     val was:      opt[build.Section] = build.current(?m.b);
     val switched: err[build.Refusal] = build.switch(?m.b, s);
     if (sel switched.err) { ret err[str].err{switched.err.message}; }
@@ -1207,9 +1239,10 @@ pub fun switch_to(m: *Assembler, s: build.Section) err[str] {
     ret err[str].ok{};
 }
 
-# the current and previous sections pushed onto the section stack
+# the current and previous sections pushed onto the section stack, refused while a bridge is half stated
 pub fun push_section(m: *Assembler) err[str] {
-    if (!held(vector.push[Frame](?m.stack, Frame{current: build.current(?m.b), previous: m.previous}))) { ret err[str].err{field.MEMORY}; }
+    if (unfinished(m))                                                                                                           { ret err[str].err{BRIDGE_UNFINISHED}; }
+    if (!held(vector.push[Frame](?m.stack, Frame{current: build.current(?m.b), previous: m.previous, bridging: m.bridging.on}))) { ret err[str].err{field.MEMORY}; }
     ret err[str].ok{};
 }
 
@@ -1217,7 +1250,13 @@ pub fun push_section(m: *Assembler) err[str] {
 pub fun pop_section(m: *Assembler) err[str] {
     val top: opt[Frame] = vector.pop[Frame](?m.stack);
     if (sel top.none) { ret err[str].err{EMPTY_STACK}; }
-    if (sel top.some.current.some) {
+    val left: err[str] = leave_bridges(m);
+    if (sel left.err) { ret left; }
+    if (top.some.bridging) {
+        val entered_: err[str] = enter_bridges(m);
+        if (sel entered_.err) { ret entered_; }
+    }
+    or (sel top.some.current.some) {
         val switched: err[build.Refusal] = build.switch(?m.b, top.some.current.some);
         if (sel switched.err) { ret err[str].err{switched.err.message}; }
     }
@@ -1229,6 +1268,65 @@ pub fun pop_section(m: *Assembler) err[str] {
 pub fun swap_previous(m: *Assembler) err[str] {
     if (sel m.previous.none) { ret err[str].err{NO_PREVIOUS}; }
     ret switch_to(m, m.previous.some);
+}
+
+# the section the dialect states bridges in made current: no section of the object, so the builder is left with none
+# and only the bridge's symbol indices and type word are read until another section is entered. the section current
+# before it becomes the previous
+pub fun enter_bridges(m: *Assembler) err[str] {
+    if (m.bridging.on) { ret err[str].ok{}; }
+    val was:  opt[build.Section] = build.current(?m.b);
+    val left: err[build.Refusal] = build.leave(?m.b);
+    if (sel left.err) { ret err[str].err{left.err.message}; }
+    if (sel was.some) { m.previous = was; }
+    m.bridging.on    = true;
+    m.bridging.named = 0;
+    ret err[str].ok{};
+}
+
+# whether the section the dialect states bridges in is current
+pub fun bridging(m: *Assembler) bool {
+    ret m.bridging.on;
+}
+
+# whether a bridge is half stated
+fun unfinished(m: *Assembler) bool {
+    ret m.bridging.on && m.bridging.named != 0;
+}
+
+# the section the dialect states bridges in left, refused while a bridge is half stated
+fun leave_bridges(m: *Assembler) err[str] {
+    if (unfinished(m)) { ret err[str].err{BRIDGE_UNFINISHED}; }
+    m.bridging.on = false;
+    ret err[str].ok{};
+}
+
+# label `l` named by a symbol index of the bridge being stated: its symbol, then its thunk
+pub fun bridge_index(m: *Assembler, l: build.Label, at: diagnostic.Position) err[str] {
+    if (!m.bridging.on) { ret err[str].err{NOT_BRIDGING}; }
+    val br: *Bridging = ?m.bridging;
+    if (br.named == 2) { ret err[str].err{BRIDGE_ORDER}; }
+    val noted: err[str] = note(m, l.id, at);
+    if (sel noted.err) { ret noted; }
+    if (br.named == 0) { br.symbol = l; }
+    or                 { br.thunk = l; }
+    br.named = br.named + 1;
+    ret err[str].ok{};
+}
+
+# operand `k` of `args`, a datum of `width` bytes, read as the type word of the bridge being stated, which states its
+# role by the dialect's words, and the bridge handed to the builder
+fun bridge_word(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Diagnostic] {
+    val br: *Bridging = ?m.bridging;
+    if (width != 4)    { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_WIDTH)}; }
+    if (br.named != 2) { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ORDER)}; }
+    val word: res[i64, diagnostic.Diagnostic] = constant(args, k);
+    if (sel word.err) { ret err[diagnostic.Diagnostic].err{word.err}; }
+    if (word.ok < 0)  { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ROLE)}; }
+    val role: opt[*bridge.Role] = dialect.role_of(m.dialect.bridges, word.ok:~u64);
+    if (sel role.none) { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ROLE)}; }
+    br.named = 0;
+    ret wrote(args, k, build.bridge(?m.b, br.symbol, br.thunk, role.some));
 }
 
 # the previous section, to restore after a directive that writes elsewhere
@@ -2414,8 +2512,9 @@ fun directive_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Dia
 fun statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnostic] {
     m.names.context = m::ptr;
     m.site          = st.site;
-    if (st.kind == source.LABEL)     { ret label_statement(m, st); }
-    if (st.kind == source.DIRECTIVE) { ret directive_statement(m, st); }
+    if (m.bridging.on && st.kind != source.DIRECTIVE) { ret stop_at(st, BRIDGE_STATEMENT, st.head); }
+    if (st.kind == source.LABEL)                      { ret label_statement(m, st); }
+    if (st.kind == source.DIRECTIVE)                  { ret directive_statement(m, st); }
     ret instruction_statement(m, st);
 }
 
@@ -2542,6 +2641,7 @@ pub fun finish(m: *Assembler) res[mink_object.Object, Refusal] {
         if (sel done.err) { ret res[mink_object.Object, Refusal].err{done.err}; }
         i = i + 1;
     }
+    if (unfinished(m)) { ret res[mink_object.Object, Refusal].err{nowhere(BRIDGE_UNFINISHED)}; }
     val made: err[Refusal] = symbols(m);
     if (sel made.err) { ret res[mink_object.Object, Refusal].err{made.err}; }
     val o: res[mink_object.Object, build.Refusal] = build.finish(?m.b);
