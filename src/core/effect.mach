@@ -307,12 +307,14 @@ pub val STRUCTURED: Target = 4;
 #            or an x86 repeat prefix being rep
 # condition: the operand is a condition of exactly this value, as an aarch64 condition code being eq
 # id:        the operand is an id of exactly this value, as a spir-v id naming a builtin
+# absent:    the operand is an optional operand given no value, as an x86 evex opmask left out for no masking
 pub tag Test: u8 {
     register:  Set;
     immediate: i64;
     enumerant: u32;
     condition: u32;
     id:        u32;
+    absent;
 }
 
 # one operand's test
@@ -328,6 +330,36 @@ pub rec Terms {
 }
 
 pub val NO_TERMS: Terms = Terms{at: nil, len: 0};
+
+# a role an operand has in place of its row's when the instruction's operand values meet every term and the
+# configuration state in force (`masc.core.config`) meets the state test. the row's role (`operand.Operand.role`) is
+# what the operand may do under every state and value, so a rule only narrows it, and a reader that resolves no rule
+# reads the row's role and is sound. a rule has at least one term or a nonzero mask. a row whose own encoding decides
+# the role states it on the operand and no rule, as sve's merging `/m` and zeroing `/z` forms are rows of their own
+# ---
+# operand: the operand whose role it replaces
+# terms:   the operand values it holds under, every one must hold, as a risc-v vm being unmasked, an x86 evex opmask
+#          being absent or its `{z}` being given
+# mask:    the bits of the configuration state it tests, 0 for a rule no state decides
+# state:   what those bits must be, as risc-v vtype's vta and vma both set
+# role:    the operand's role then, within the row's, as WRITE for a destination no element of which is kept
+pub rec RoleRule {
+    operand: u8;
+    terms:   Terms;
+    mask:    u64;
+    state:   u64;
+    role:    operand.Role;
+}
+
+# role rules as a pointer to static rules and a count. rules of one operand that can both hold state one role, so
+# their order means nothing, as x86's opmask being absent and its `{z}` being given each leave no element kept
+pub rec RoleRules {
+    at:  *RoleRule;
+    len: u32;
+}
+
+# no role rules, every operand's role its row's whatever the state and values
+pub val NO_ROLE_RULES: RoleRules = RoleRules{at: nil, len: 0};
 
 # registers an instruction reads and writes. a register in written is certainly written and given a new value, and a
 # write that may keep any of a register's old value, as a vector destination's tail or inactive elements or an accrued
@@ -771,6 +803,8 @@ pub fun opens(s: Structure) bool {
 # structure: what it does to a typed stream's structured blocks, FLAT for a set whose stream has none
 # relations: the values it writes as functions of the values it reads, none where no relation is stated
 # order:     how it orders the memory accesses around it, UNORDERED for none
+# roles:     the roles its operands have in place of their rows' under some states and operand values, none where every
+#            role is its row's
 pub rec Effect {
     implicit:  Registers;
     flags:     Flags;
@@ -786,6 +820,7 @@ pub rec Effect {
     structure: Structure;
     relations: Relations;
     order:     Order;
+    roles:     RoleRules;
 }
 
 # what the effect's write of the register at row `at` leaves, operand.AS_ROW when no entry states it
@@ -809,8 +844,11 @@ pub fun has(file: *register.File, set: Set, reg: register.Id) bool {
 }
 
 # whether no value meets both tests, which are of one operand: register sets
-# that share no row, immediates that differ, or a register against an immediate
+# that share no row, immediates that differ, a register against an immediate, or
+# an absent value against any given one
 pub fun disjoint(a: *Test, b: *Test) bool {
+    if (sel a.absent) { ret !sel b.absent; }
+    if (sel b.absent) { ret true; }
     if (sel a.register) {
         if (sel b.register) {
             val x: Set = a.register;
@@ -886,8 +924,8 @@ pub rec Pending {
 # open:       a rule is left open, since an operand it tests has no known value yet, as a register operand before
 #             allocation or an immediate holding a symbol before it resolves
 # opaque:     no operand value decides it, as the registers of an encoding stated with no row's facts (`Opaque`)
-# configured: the registers this operand's groups cover turn on configuration state the query was not given, as a
-#             risc-v vector operand's on vtype (`masc.core.config`)
+# configured: what this operand covers or how it is used turns on configuration state the query was not given, as a
+#             risc-v vector operand's groups or its destination's role on vtype (`masc.core.config`)
 # reserved:   the configuration state the query was given cannot form this operand's groups, so no instruction of
 #             those values runs under it
 # scaled:     the multiplier of a quantity the context leaves to the implementation decides it, the slot that binds it
@@ -932,6 +970,7 @@ fun holds(file: *register.File, term: *Term, values: operand.Values) bool {
     if (sel term.test.immediate) { ret sel v.immediate && v.immediate == term.test.immediate; }
     if (sel term.test.enumerant) { ret sel v.enumerant && v.enumerant.value == term.test.enumerant; }
     if (sel term.test.condition) { ret sel v.condition && v.condition == term.test.condition; }
+    if (sel term.test.absent)    { ret sel v.none; }
     ret sel term.test.id && (sel v.id && v.id == term.test.id);
 }
 
@@ -1024,6 +1063,44 @@ pub fun order(e: *Effect, values: operand.Values) Answer[Order] {
         i = i + 1;
     }
     ret Answer[Order].decided{o};
+}
+
+# the role of operand `at` of the instruction whose operands are `operands`, effect `e` and operand values `values`,
+# under the configuration state `state` in force, by its bits, none when it is not known: the role of the effect's
+# one role rule of that operand that holds, else the operand's own when every such rule is false, else undecided
+# naming the first rule an operand with no known value leaves open, or as configured when a rule tests a state the
+# query was not given. an undecided reader reads the operand's own role, which holds under every state and value
+pub fun role(file: *register.File, operands: *operand.Operand, e: *Effect, at: u8, state: opt[u64], values: operand.Values) Answer[operand.Role] {
+    var open: opt[Undecided] = opt[Undecided].none{};
+    var i:    u32            = 0;
+    for (i < e.roles.len) {
+        val rule: *RoleRule = ?e.roles.at[i];
+        if (rule.operand == at) {
+            var met:   Answer[bool] = decide(file, operands, rule.terms, values, i);
+            var unmet: bool         = false;
+            var given: bool         = rule.mask == 0;
+            if (sel state.some) {
+                given = true;
+                unmet = (state.some & rule.mask) != rule.state;
+            }
+            if (unmet) { met = Answer[bool].decided{false}; }
+            or (!given) {
+                var held: bool = false;
+                if (sel met.decided) { held = met.decided; }
+                if (held)            { met = Answer[bool].undecided{Undecided.configured{at}}; }
+            }
+            val first: bool = sel open.none;
+            if (sel met.undecided) {
+                if (first) { open = opt[Undecided].some{met.undecided}; }
+            }
+            if (sel met.decided) {
+                if (met.decided) { ret Answer[operand.Role].decided{rule.role}; }
+            }
+        }
+        i = i + 1;
+    }
+    if (sel open.some) { ret Answer[operand.Role].undecided{open.some}; }
+    ret Answer[operand.Role].decided{operands[at].role};
 }
 
 # the registers no operand names that the instruction whose operands are `operands` and operand values `values`
