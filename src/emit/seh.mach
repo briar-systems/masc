@@ -15,6 +15,17 @@
 # directives read through these codes give mink the same records it lowers
 # to the same unwind data.
 #
+# an epilogue is the builder's span (`build.cfi_epilogue_begin` and
+# `cfi_epilogue_end`), which mink reads as `frame.Rule.epilogue`. inside it
+# an arm64 code follows the instruction that undoes the prologue operation
+# it names, and states what that instruction undoes: an allocation moves
+# the stack back, a save restores its registers and a pre-indexed one moves
+# the stack back past them, a frame register takes the canonical frame
+# address back to the stack pointer, and a nop states nothing. mink derives
+# which codes an epilogue shares with the prologue or another epilogue, so
+# masc states none of it. x64's epilogues are spans with no codes inside,
+# as Win64 states none.
+#
 # the builder's frames are written back as codes the same way: the rules of
 # each step of a frame's prologue are walked from the state the step began
 # in, the codes that take that state to the next are found as mink's
@@ -23,7 +34,15 @@
 # its rules state is refused. a rule past the prologue that changes the
 # state, which no code states, is refused, and so is a step at the
 # function's start, which Win64 states only as a machine frame. on arm64 every
-# prologue instruction states one code, a nop where it states none.
+# prologue instruction states one code, a nop where it states none. inside an
+# epilogue's span a rule may change the state, and the codes of each step are
+# the operation that takes its state back to the one before, as mink's
+# lowering classifies an epilogue's instruction, read back both ways: by the
+# code's own rules to the state before, and by the rules it states inside an
+# epilogue to the state after. outside the prologue and the epilogues the
+# state is the body's, which the builder restates past each epilogue's
+# return. on arm64 every epilogue instruction but its return states one code,
+# a nop where it states none.
 #
 # the directives of each code are rows (`DIRECTIVES`), which the assembler's
 # `.seh_` layer reads and the listing writes, one table for both.
@@ -62,6 +81,10 @@ pub val INDIRECT:   str = "personality routine through a slot, which no windows 
 pub val TWO_ENDS:   str = "prologue ended twice";
 pub val LONG:       str = "frame whose prologue states more steps than the listing writes";
 pub val PAIRED:     str = "registers saved together that no arm64 unwind code saves together";
+pub val INSIDE:     str = "unwind code inside an epilogue that no epilogue code of the machine states";
+pub val UNFRAMED:   str = "epilogue code that undoes a frame register the canonical frame address is not from";
+pub val EARLY:      str = "epilogue begun before the prologue ends";
+pub val EPILOGUES:  str = "frame with more epilogues, or deeper remembered states, than the listing writes";
 
 # the windows unwind codes of an architecture
 # ---
@@ -165,21 +188,23 @@ pub tag Code: u8 {
 # what a procedure's codes keep that its rules do not: x86-64's frame base, the canonical frame address's offset
 # from the stack pointer where the frame register is set
 # ---
-# machine: whose codes
-# base:    the frame base, none before the frame register is set
-# loose:   whether a register is saved from the stack pointer before the frame register is set, which the base the
-#          prologue's end leaves must then be
-# ended:   whether the prologue has ended
+# machine:  whose codes
+# base:     the frame base, none before the frame register is set
+# loose:    whether a register is saved from the stack pointer before the frame register is set, which the base the
+#           prologue's end leaves must then be
+# ended:    whether the prologue has ended
+# epilogue: whether an epilogue is open, its codes stating what their instructions undo
 pub rec Proc {
-    machine: Machine;
-    base:    opt[i64];
-    loose:   bool;
-    ended:   bool;
+    machine:  Machine;
+    base:     opt[i64];
+    loose:    bool;
+    ended:    bool;
+    epilogue: bool;
 }
 
 # a procedure begun of `m`'s codes
 pub fun begin(m: Machine) Proc {
-    ret Proc{machine: m, base: opt[i64].none{}, loose: false, ended: false};
+    ret Proc{machine: m, base: opt[i64].none{}, loose: false, ended: false, epilogue: false};
 }
 
 # the rules a code states, at most four
@@ -211,9 +236,33 @@ fun moves(c: Code) bool {
     ret false;
 }
 
+# the rules code `c` states inside an epilogue of machine `m` whose canonical frame address is `reg` plus `off`: what
+# the instruction it follows undoes of the prologue operation it names. only arm64 states codes inside an epilogue
+fun undone(c: Code, m: Machine, reg: u16, off: i64) res[Rules, str] {
+    if (!sel m.arm64) { ret res[Rules, str].err{INSIDE}; }
+    if (sel c.nop)    { ret res[Rules, str].ok{Rules{len: 0}}; }
+    if (sel c.alloc) {
+        if (reg != A64_SP) { ret res[Rules, str].err{NOT_SP}; }
+        ret res[Rules, str].ok{one(frame.Rule.cfa_offset{off - c.alloc})};
+    }
+    if (sel c.frame) {
+        if (reg != c.frame.reg) { ret res[Rules, str].err{UNFRAMED}; }
+        ret res[Rules, str].ok{one(frame.Rule.def_cfa{frame.Offset{reg: A64_SP, offset: off + c.frame.offset}})};
+    }
+    if (!sel c.saved) { ret res[Rules, str].err{INSIDE}; }
+    val v: Saved = c.saved;
+    if (reg != A64_SP) { ret res[Rules, str].err{NOT_SP}; }
+    var out: Rules = Rules{len: 0};
+    if (v.pre != 0) { push_rule(?out, frame.Rule.cfa_offset{off - v.pre}); }
+    push_rule(?out, frame.Rule.restore{v.first});
+    if (v.second != NONE) { push_rule(?out, frame.Rule.restore{v.second}); }
+    ret res[Rules, str].ok{out};
+}
+
 # the rules code `c` states of a procedure `p` whose canonical frame address is `reg` plus `off`, and what it leaves
-# in `p`
+# in `p`: inside an epilogue what its instruction undoes, and otherwise the prologue operation it names
 pub fun rules_of(c: Code, reg: u16, off: i64, p: *Proc) res[Rules, str] {
+    if (p.epilogue) { ret undone(c, p.machine, reg, off); }
     val sp: u16 = sp_of(p.machine);
     if (moves(c) && p.loose && sel p.base.none) { ret res[Rules, str].err{BASE_MOVES}; }
     if (sel c.end) {
@@ -509,32 +558,46 @@ fun applied(s: *Walked, initial: *Walked, p: *Proc, c: Code) res[bool, str] {
     ret res[bool, str].ok{true};
 }
 
-# a step of a frame's codes, before statement `at` of its section
+# a step of a frame's codes, before statement `at` of its section, written in field order
 # ---
 # at:    the statement
 # codes: its codes, in the order written
 # end:   whether the prologue ends there, after its codes
+# open:  whether an epilogue begins there
+# close: whether an epilogue's return is the statement, the epilogue's end before it
 pub rec Step {
     at:    u32;
     codes: Codes;
     end:   bool;
+    open:  bool;
+    close: bool;
 }
 
 # a frame's codes, step by step
 # ---
 # machine: whose codes
-# steps:   each step that states a code, in statement order
+# steps:   each step that states a code, ends the prologue, or begins or ends an epilogue, in statement order
 # count:   how many
 # end:     the statement the prologue ends before
 pub rec Written {
     machine: Machine;
-    steps:   [64]Step;
+    steps:   [128]Step;
     count:   u32;
     end:     u32;
 }
 
-# the most steps a frame's prologue is written in
-pub val MAX_STEPS: u32 = 64;
+# the most steps a frame is written in
+pub val MAX_STEPS: u32 = 128;
+
+# the most epilogues a frame is written with, and the deepest its remembered states go
+val MAX_EPILOGUES: usize = 32;
+val MAX_DEPTH:     usize = 8;
+
+# an epilogue's statements: where it begins, and its return, the last
+rec Epilogue {
+    begin: u32;
+    last:  u32;
+}
 
 # why a frame's codes were not found, and the statement of its section the step was before
 pub rec Uncoded {
@@ -550,7 +613,8 @@ fun uncoded(message: str, at: u32) res[*Written, Uncoded] {
 # mink's lowering classifies the step and as their own rules state it again, the prologue's end where it is marked,
 # and on arm64 a nop for each prologue instruction whose step states none. the frame base x86-64's saves are from is
 # the canonical frame address's offset where the frame register is set, or where the prologue ends with none, and a
-# save before that base moves is refused, as its code would read back from another base
+# save before that base moves is refused, as its code would read back from another base. each epilogue's span begins
+# and ends where the builder marked it, and each step inside it is the codes `epilogue_codes` finds
 pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Uncoded] {
     val machine: opt[Machine] = machine_of(b.arch);
     if (sel machine.none) { ret uncoded(NO_UNWIND, f.start); }
@@ -562,9 +626,11 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
     out.count   = 0;
     var initial: Walked = Walked{reg: 0, off: 0};
     if (!starting(b, ?initial)) { ret uncoded(NO_UNWIND, f.start); }
-    # the prologue's end, which a frame with no rule past its start need not mark
+    # the prologue's end, which a frame with no rule past its start need not mark, and the epilogues
     var end:   u32   = f.start;
     var ended: bool  = false;
+    var spans: [MAX_EPILOGUES]Epilogue;
+    var n:     usize = 0;
     var k:     usize = 0;
     for (k < f.count) {
         val r:    build.Rule = build.rule_at(b, f.rules + k);
@@ -574,9 +640,17 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
             end   = r.at;
             ended = true;
         }
+        if (sel rule.epilogue) {
+            if (n == MAX_EPILOGUES) { ret uncoded(EPILOGUES, r.at); }
+            spans[n] = Epilogue{begin: rule.epilogue.begin::u32, last: (rule.epilogue.end - 1)::u32};
+            n        = n + 1;
+        }
         k = k + 1;
     }
     out.end = end;
+    if (n > 0) {
+        if (!ended || spans[0].begin < end) { ret uncoded(EARLY, spans[0].begin); }
+    }
     # the frame base: the offset where the frame register is set, else at the prologue's end
     var base:   i64    = 0;
     var walk:   Walked = initial;
@@ -586,25 +660,43 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
     for (k < f.count) {
         val r: build.Rule = build.rule_at(b, f.rules + k);
         if (r.at > end) { brk; }
+        val rule: frame.Rule = r.rule;
+        k = k + 1;
+        # an epilogue that begins where the prologue ends marks itself there, and the walk past the prologue refuses
+        # the rest
+        if (sel rule.remember || sel rule.restore_state || sel rule.epilogue) { cnt; }
         val before: i64 = walk.off;
         val was:    u16 = walk.reg;
-        if (!follow(?walk, ?initial, r.rule)) { ret uncoded(PROLOGUE, r.at); }
+        if (!follow(?walk, ?initial, rule)) { ret uncoded(PROLOGUE, r.at); }
         if (!framed && was == sp && walk.reg != sp) {
             base   = before;
             framed = true;
         }
-        k = k + 1;
     }
     if (!framed) { base = walk.off; }
-    # each step of the prologue, then the body that must hold past it
-    var s0:   Walked = initial;
-    var proc: Proc   = begin(machine.some);
-    var at:   u32    = f.start;
+    # each step of the prologue, then the body that holds past it outside the epilogues, and the steps inside each
+    var s0:     Walked = initial;
+    var body:   Walked = initial;
+    var bodied: bool   = false;
+    var kept:   [MAX_DEPTH]Walked;
+    var depth:  usize  = 0;
+    var e:      usize  = 0;
+    var proc:   Proc   = begin(machine.some);
+    var at:     u32    = f.start;
     k = 0;
     for {
         if (k >= f.count) { brk; }
         val first: build.Rule = build.rule_at(b, f.rules + k);
         at = first.at;
+        for (e < n && spans[e].last < at) { e = e + 1; }
+        var opens:  bool = false;
+        var closes: bool = false;
+        var inside: bool = false;
+        if (e < n && spans[e].begin <= at) {
+            opens  = spans[e].begin == at;
+            closes = spans[e].last == at;
+            inside = spans[e].begin < at;
+        }
         var s1:     Walked = s0;
         var marked: bool   = false;
         for (k < f.count) {
@@ -612,47 +704,67 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
             if (r.at != at) { brk; }
             val rule: frame.Rule = r.rule;
             if (sel rule.prologue_end) { marked = true; }
-            if (sel rule.remember || sel rule.restore_state) {
-                if (at <= end) { ret uncoded(PROLOGUE, at); }
+            if (sel rule.remember) {
+                if (at < end || (at == end && !opens)) { ret uncoded(PROLOGUE, at); }
+                if (depth == MAX_DEPTH)                { ret uncoded(EPILOGUES, at); }
+                kept[depth] = s1;
+                depth       = depth + 1;
             }
-            or (!follow(?s1, ?initial, rule)) { ret uncoded(PROLOGUE, at); }
+            or (sel rule.restore_state) {
+                if (at <= end || depth == 0) { ret uncoded(PROLOGUE, at); }
+                depth = depth - 1;
+                s1    = kept[depth];
+            }
+            or (!sel rule.epilogue && !follow(?s1, ?initial, rule)) { ret uncoded(PROLOGUE, at); }
             k = k + 1;
         }
+        var step: Step = Step{at: at, codes: Codes{len: 0, full: false}, end: false, open: opens, close: closes};
         if (at > end) {
-            if (!same_walked(?s0, ?s1)) { ret uncoded(PAST, at); }
-            cnt;
-        }
-        if (!ended && at == f.start) { marked = true; }
-        var step: Step = Step{at: at, codes: Codes{len: 0, full: false}, end: marked};
-        if (!same_walked(?s0, ?s1)) {
-            if (at == f.start) {
-                val signal: opt[str] = machine_frame(machine.some, f.signal, ?s0, ?s1, ?step.codes);
-                if (sel signal.some) { ret uncoded(signal.some, at); }
+            if (!bodied) {
+                body   = s0;
+                bodied = true;
             }
-            or {
-                val found: opt[str] = classify(machine.some, ?s0, ?s1, base, ?step.codes);
-                if (sel found.some) { ret uncoded(found.some, at); }
-            }
-            if (step.codes.full) { ret uncoded(LONG, at); }
-            # the codes read back to the state the rules state, and saves read back from the base mink reads them from
-            var again: Walked = s0;
-            var c:     u32    = 0;
-            for (c < step.codes.len) {
-                val code: Code = step.codes.at[c::usize];
-                if (sel code.based) {
-                    var from: i64 = again.off;
-                    if (sel proc.base.some) { from = proc.base.some; }
-                    if (from != base)       { ret uncoded(BASE_MOVES, at); }
+            if (inside) {
+                if (!same_walked(?s0, ?s1)) {
+                    val found: opt[str] = epilogue_codes(machine.some, ?s0, ?s1, ?initial, ?step.codes);
+                    if (sel found.some) { ret uncoded(found.some, at); }
                 }
-                val ok: res[bool, str] = applied(?again, ?initial, ?proc, code);
-                if (sel ok.err) { ret uncoded(ok.err, at); }
-                if (!ok.ok)     { ret uncoded(UNCODED, at); }
-                c = c + 1;
             }
-            if (!same_walked(?again, ?s1)) { ret uncoded(UNCODED, at); }
+            or (!same_walked(?body, ?s1)) { ret uncoded(PAST, at); }
         }
-        or (at == f.start && f.signal) { ret uncoded(UNCODED, at); }
-        if (step.codes.len > 0 || step.end) {
+        or {
+            if (!ended && at == f.start) { marked = true; }
+            step.end = marked;
+            if (!same_walked(?s0, ?s1)) {
+                if (at == f.start) {
+                    val signal: opt[str] = machine_frame(machine.some, f.signal, ?s0, ?s1, ?step.codes);
+                    if (sel signal.some) { ret uncoded(signal.some, at); }
+                }
+                or {
+                    val found: opt[str] = classify(machine.some, ?s0, ?s1, base, ?step.codes);
+                    if (sel found.some) { ret uncoded(found.some, at); }
+                }
+                if (step.codes.full) { ret uncoded(LONG, at); }
+                # the codes read back to the state the rules state, and saves read back from the base mink reads them from
+                var again: Walked = s0;
+                var c:     u32    = 0;
+                for (c < step.codes.len) {
+                    val code: Code = step.codes.at[c::usize];
+                    if (sel code.based) {
+                        var from: i64 = again.off;
+                        if (sel proc.base.some) { from = proc.base.some; }
+                        if (from != base)       { ret uncoded(BASE_MOVES, at); }
+                    }
+                    val ok: res[bool, str] = applied(?again, ?initial, ?proc, code);
+                    if (sel ok.err) { ret uncoded(ok.err, at); }
+                    if (!ok.ok)     { ret uncoded(UNCODED, at); }
+                    c = c + 1;
+                }
+                if (!same_walked(?again, ?s1)) { ret uncoded(UNCODED, at); }
+            }
+            or (at == f.start && f.signal) { ret uncoded(UNCODED, at); }
+        }
+        if (step.codes.len > 0 || step.end || step.open || step.close) {
             if (out.count == MAX_STEPS) { ret uncoded(LONG, at); }
             out.steps[out.count::usize] = step;
             out.count                   = out.count + 1;
@@ -669,7 +781,7 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
             out.steps[i::usize] = out.steps[(i - 1)::usize];
             i                   = i - 1;
         }
-        out.steps[0] = Step{at: f.start, codes: Codes{len: 0, full: false}, end: true};
+        out.steps[0] = Step{at: f.start, codes: Codes{len: 0, full: false}, end: true, open: false, close: false};
         out.count    = out.count + 1;
     }
     if (f.signal) {
@@ -678,6 +790,35 @@ pub fun codes(b: *build.Builder, f: build.Frame, out: *Written) res[*Written, Un
         if (!first_signal) { ret uncoded(UNCODED, f.start); }
     }
     ret res[*Written, Uncoded].ok{out};
+}
+
+# the codes of an epilogue step of machine `m` that takes `s0` to `s1`, `initial` the state the frame began in: the
+# operation that takes `s1` back to `s0`, as mink's lowering classifies an epilogue's instruction, read back to `s0`
+# from `s1` by the code's own rules and to `s1` from `s0` by the rules it states inside an epilogue. only arm64 states
+# codes inside an epilogue
+fun epilogue_codes(m: Machine, s0: *Walked, s1: *Walked, initial: *Walked, out: *Codes) opt[str] {
+    if (!sel m.arm64) { ret opt[str].some{INSIDE}; }
+    val found: opt[str] = classify(m, s1, s0, 0, out);
+    if (sel found.some) { ret found; }
+    if (out.full)       { ret opt[str].some{LONG}; }
+    var back:    Walked = @s1;
+    var forward: Proc   = begin(m);
+    var undo:    Walked = @s0;
+    var inside:  Proc   = begin(m);
+    inside.epilogue = true;
+    var c: u32 = 0;
+    for (c < out.len) {
+        val code: Code           = out.at[c::usize];
+        val was:  res[bool, str] = applied(?back, initial, ?forward, code);
+        if (sel was.err) { ret opt[str].some{was.err}; }
+        if (!was.ok)     { ret opt[str].some{UNCODED}; }
+        val now: res[bool, str] = applied(?undo, initial, ?inside, code);
+        if (sel now.err) { ret opt[str].some{now.err}; }
+        if (!now.ok)     { ret opt[str].some{UNCODED}; }
+        c = c + 1;
+    }
+    if (!same_walked(?back, s0) || !same_walked(?undo, s1)) { ret opt[str].some{UNCODED}; }
+    ret opt[str].none{};
 }
 
 # the machine frame a signal frame begins with, the only step Win64 states at a function's start
