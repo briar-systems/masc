@@ -76,6 +76,7 @@ use masc.build.state.Fragment;
 use masc.build.state.Gap;
 use masc.build.state.Mark;
 use masc.build.state.Measured;
+use masc.build.state.Place;
 use masc.build.state.Realigned;
 use masc.build.state.Section;
 use masc.build.state.Spread;
@@ -393,6 +394,41 @@ pub fun folds(desc: *operand.Operand, v: *operand.Value, kind: *reloc.Kind) bool
     ret folds_kind(kind);
 }
 
+# whether operand `k` of row `r` holding `v` in fragment `j` of section `s` can change with the layout: it names a
+# symbol whose distance from the program counter the layout measures, wherever the linker may resize code, or an
+# immediate symbol of a fixup kind the set's folds fold
+fun measures(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value) bool {
+    val reach: opt[i64] = fold(b, s, j, r, k, v, true);
+    if (sel reach.some) { ret true; }
+    val desc: *operand.Operand = ?r.operands.at[k];
+    if (!sel desc.shape.immediate || !sel v.symbol) { ret false; }
+    var fixup: operand.FixupKind = operand.default_fixup(desc);
+    if (v.symbol.fixup != operand.NO_FIXUP) { fixup = v.symbol.fixup; }
+    val fo: opt[*core_fixup.Fold] = core_fixup.fold_of(b.set.folds, fixup);
+    ret sel fo.some;
+}
+
+# whether the form of fragment `j` of section `s` can change with the layout: a value of row `r` holding the `count`
+# values `given`, or of a step of `out` before it folds, that `measures` answers for
+fun moves(b: *Builder, s: u32, j: u32, r: *row.Row, given: *operand.Value, count: u32, out: *relax.Expansion) bool {
+    var k: u32 = 0;
+    for (k < count) {
+        if (measures(b, s, j, r, k, ?given[k])) { ret true; }
+        k = k + 1;
+    }
+    var i: u32 = 0;
+    for (i < out.count) {
+        val step: *row.Row = out.steps[i].row;
+        k = 0;
+        for (k < step.operands.len) {
+            if (measures(b, s, j, step, k, ?out.steps[i].values[k])) { ret true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # the instructions fragment `j` of section `s` is at depth `c.depth`, into `out`, with what they come to
 pub fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[Formed, Refusal] {
     val codec: *dispatch.Codec     = b.set.codec;
@@ -432,6 +468,7 @@ pub fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[F
         }
         out.steps[0].marker = c.marker;
     }
+    val moving:  bool         = moves(b, s, j, r, ?given[0], c.count, out);
     val folding: err[Refusal] = fold_form(b, s, j, v, out);
     if (sel folding.err) { ret res[Formed, Refusal].err{folding.err}; }
     if (sel c.relax.some) {
@@ -439,7 +476,7 @@ pub fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[F
         if (sel reached.none) { ret res[Formed, Refusal].err{refuse(EXPAND)}; }
         if (!reached.some) {
             if (out.count != 1) { ret res[Formed, Refusal].err{refuse(CHAIN)}; }
-            ret res[Formed, Refusal].ok{Formed{far: true, size: 0, marked: false}};
+            ret res[Formed, Refusal].ok{Formed{far: true, size: 0, marked: false, moves: moving}};
         }
     }
     # each step the form grew to carries the marker its span states under the modes the fragment was written under
@@ -456,13 +493,15 @@ pub fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[F
         size   = size + done.ok.len::u64;
         i      = i + 1;
     }
-    ret res[Formed, Refusal].ok{Formed{far: false, size: size, marked: marked}};
+    ret res[Formed, Refusal].ok{Formed{far: false, size: size, marked: marked, moves: moving}};
 }
 
-# fragment `j` of section `s` grown as far as its target needs, and its length reserved, answering whether either changed
-fun settle(b: *Builder, s: u32, j: u32, out: *relax.Expansion) res[bool, Refusal] {
+# fragment `j` of section `s` grown as far as its target needs, and its length reserved, answering whether either changed,
+# with `live` whether a later pass can change it again
+fun settle(b: *Builder, s: u32, j: u32, out: *relax.Expansion, live: *bool) res[bool, Refusal] {
     val f: *Fragment = ?b.areas.data[s::usize].fragments.data[j::usize];
-    if (sel f.body.difference) { ret res[bool, Refusal].ok{lengthen(b, f, ?f.body.difference)}; }
+    @live = false;
+    if (sel f.body.difference) { ret res[bool, Refusal].ok{lengthen(b, f, ?f.body.difference, live)}; }
     if (!sel f.body.code)      { ret res[bool, Refusal].ok{false}; }
     val c:       *Code = ?f.body.code;
     var changed: bool  = false;
@@ -482,6 +521,7 @@ fun settle(b: *Builder, s: u32, j: u32, out: *relax.Expansion) res[bool, Refusal
             c.marked = true;
             changed  = true;
         }
+        @live = formed.ok.moves;
         brk;
     }
     ret res[bool, Refusal].ok{changed};
@@ -491,6 +531,14 @@ fun settle(b: *Builder, s: u32, j: u32, out: *relax.Expansion) res[bool, Refusal
 # at most as often as its row's chain of relaxations is long, and a leb128 only grows, at most to its longest, so the
 # passes are bounded by one more than the sum of those chains and of each leb128's longest, and a layout past the
 # bound is refused
+#
+# the first pass forms every fragment, and a later pass forms only the live ones, in the same order. an instruction
+# is live while a value of its form names a symbol whose distance the layout measures, wherever the linker may resize
+# code, or an immediate symbol the set's folds fold, since only those values follow where things are placed. one
+# whose target only the linker knows grows within its first pass as far as that needs, and never again. a leb128 is
+# live while its labels share a section and it is shorter than its longest. every other fragment is fixed: its form
+# and length depend on nothing a pass moves, so forming it again would give the same, and it keeps them until the
+# encoding forms it once more
 pub fun lay(b: *Builder) err[Refusal] {
     var out:   relax.Expansion;
     var bound: u32   = 1;
@@ -522,16 +570,38 @@ pub fun lay(b: *Builder) err[Refusal] {
             s = s + 1;
         }
         var changed: bool = false;
-        s = 0;
-        for (s < b.areas.len) {
-            var j: usize = 0;
-            for (j < b.areas.data[s].fragments.len) {
-                val grew: res[bool, Refusal] = settle(b, s::u32, j::u32, ?out);
+        var live:    bool = false;
+        if (b.passes == 1) {
+            vector.truncate[Place](?b.live, 0);
+            s = 0;
+            for (s < b.areas.len) {
+                var j: usize = 0;
+                for (j < b.areas.data[s].fragments.len) {
+                    val grew: res[bool, Refusal] = settle(b, s::u32, j::u32, ?out, ?live);
+                    if (sel grew.err) { ret err[Refusal].err{grew.err}; }
+                    changed = changed || grew.ok;
+                    if (live && !held(vector.push[Place](?b.live, Place{section: s::u32, fragment: j::u32}))) { ret err[Refusal].err{memory()}; }
+                    j = j + 1;
+                }
+                s = s + 1;
+            }
+        }
+        or {
+            # the fragments still live kept in place, in order
+            var kept: usize = 0;
+            var i:    usize = 0;
+            for (i < b.live.len) {
+                val at:   Place              = b.live.data[i];
+                val grew: res[bool, Refusal] = settle(b, at.section, at.fragment, ?out, ?live);
                 if (sel grew.err) { ret err[Refusal].err{grew.err}; }
                 changed = changed || grew.ok;
-                j       = j + 1;
+                if (live) {
+                    b.live.data[kept] = at;
+                    kept              = kept + 1;
+                }
+                i = i + 1;
             }
-            s = s + 1;
+            vector.truncate[Place](?b.live, kept);
         }
         if (!changed) { brk; }
     }
@@ -591,17 +661,22 @@ pub fun leb_size(how: core_fixup.Encoding, value: i64) u64 {
 }
 
 # leb128 fragment `f` of difference `g` grown to the length of the value the current pass measures, whether the
-# linker may resize code between its labels or not. it never shrinks,
+# linker may resize code between its labels or not, with `live` whether it can grow again. it never shrinks,
 # so the layout settles, and a difference the layout cannot measure keeps its length until finish refuses it
-fun lengthen(b: *Builder, f: *Fragment, g: *Gap) bool {
+fun lengthen(b: *Builder, f: *Fragment, g: *Gap, live: *bool) bool {
+    @live = false;
     if (g.encoding == core_fixup.FIXED) { ret false; }
     val m: res[Spread, Refusal] = spread(b, g);
     if (sel m.err)    { ret false; }
     if (!m.ok.shared) { ret false; }
-    val n: u64 = leb_size(g.encoding, m.ok.value);
-    if (n <= f.size) { ret false; }
-    f.size = n;
-    ret true;
+    val n:    u64  = leb_size(g.encoding, m.ok.value);
+    var grew: bool = false;
+    if (n > f.size) {
+        f.size = n;
+        grew   = true;
+    }
+    @live = f.size < leb128.MAX_BYTES::u64;
+    ret grew;
 }
 
 # the symbol a relocation names placed label `m` by where the dialect names an atom's (`dialect.Atoms`): the latest
