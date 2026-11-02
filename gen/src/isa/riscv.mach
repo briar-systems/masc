@@ -3,8 +3,8 @@
 # it reads riscv-opcodes, maps its records onto rows, and emits the risc-v
 # catalog beside masc's riscv modules: the rows with their operands,
 # encodings, requirements and effects, and the codec over them (gen_row), the
-# handles that name them (gen_row_index), the decode dispatch (gen_dispatch), the csr id space (gen_csr), and the
-# relaxation rows and the code fill (gen_relax). shared lists, such as an
+# handles that name them (gen_row_index), the decode dispatch (gen_dispatch), the csr id space (gen_csr), the
+# inverse of each conditional branch (gen_invert), and the relaxation rows and the code fill (gen_relax). shared lists, such as an
 # operand list many rows have, are emitted once and pointed into. a row the
 # ct topic lists is independent under the list's requirement, and every other
 # row's constant-time class is the dependent one.
@@ -66,6 +66,8 @@ use gen.relation;
 use gen.set;
 
 pub val NO_RELAX_ROW:   str = "relaxation or fill names a mnemonic with no single row";
+pub val NO_INVERT:      str = "inverted relaxation names a branch no invert line states the inverse of";
+pub val INVERT_SHAPE:   str = "invert names an inverse whose operands are not its branch's";
 pub val CSR_STATE:      str = "csr state row disagrees with riscv-opcodes, or names no csr";
 pub val CSR_CORRECTION: str = "overlay csr names no csr of riscv-opcodes";
 
@@ -1203,6 +1205,70 @@ fun relative_of(row: *mapping.Row) u8 {
     ret field.NO_OPERAND;
 }
 
+# the inverse the invert lines state of branch `from`, none for a row with none
+fun inverse_of(fx: *effects.Effects, from: str) opt[str] {
+    var i: usize = 0;
+    for (i < fx.inverts.len) {
+        if (str_equals(fx.inverts.data[i].from, from)) { ret opt[str].some{fx.inverts.data[i].to}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the inverse of each conditional branch, as llvm 23.1.1 RISCVInstrInfo::reverseBranchCondition states it: each
+# operand of the inverse the same operand of the branch, its target among them
+fun inversions(t: *Tables, c: *set.Context) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "invert");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.invert");
+    var sources: emit.Pool        = emit.pool(f, "invert.Source");
+    val table:   *emit.Array      = emit.array(f, "invert.Inversion");
+    val keys:    *emit.Array      = emit.keyed(f, "index.Entry");
+    val fx:      *effects.Effects = ?t.facts.effects;
+    var i:       usize            = 0;
+    for (i < fx.inverts.len) {
+        val v:    *effects.Invert        = ?fx.inverts.data[i];
+        val from: res[u32, diag.Refusal] = only(t, v.from);
+        if (sel from.err) { ret err[diag.Refusal].err{from.err}; }
+        val to: res[u32, diag.Refusal] = only(t, v.to);
+        if (sel to.err) { ret err[diag.Refusal].err{to.err}; }
+        val row: *mapping.Row = t.catalog.rows.data[from.ok];
+        val inv: *mapping.Row = t.catalog.rows.data[to.ok];
+        if (row.operands.len != inv.operands.len || relative_of(row) == field.NO_OPERAND) { ret err[diag.Refusal].err{diag.refusal(nil, 0, INVERT_SHAPE, v.from)}; }
+        var values: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
+        var k:      usize                     = 0;
+        for (k < inv.operands.len) {
+            val a: *mapping.Operand = ?row.operands.data[k];
+            val b: *mapping.Operand = ?inv.operands.data[k];
+            if (a.use != b.use || a.relative != b.relative || a.class != b.class) { ret err[diag.Refusal].err{diag.refusal(nil, 0, INVERT_SHAPE, v.from)}; }
+            vector.push[emit.Value](?values, emit.Value.variant{emit.variant(f, "invert.Source.operand", number(k::i64))});
+            k = k + 1;
+        }
+        val at: u32          = emit.pooled(f, ?sources, values.data, values.len::u32);
+        val r:  *emit.Record = record(f, "invert.Inversion");
+        member(f, r, "row", number(from.ok::i64));
+        member(f, r, "inverse", number(to.ok::i64));
+        member(f, r, "values", span_or(f, "invert.Sources", "invert.NO_SOURCES", "SOURCES", at, values.len::u32));
+        emit.item(f, table, rec_value(r));
+        val entry: *emit.Record = record(f, "index.Entry");
+        member(f, entry, "key", emit.Value.text{row.key});
+        member(f, entry, "row", number(i::i64));
+        emit.entry(f, keys, row.key, rec_value(entry));
+        i = i + 1;
+    }
+    emit.declare(f, "SOURCES", nil, emit.Value.array{sources.array});
+    emit.declare(f, "INVERSION_KEYS", nil, emit.Value.array{keys});
+    val all: *emit.Record = record(f, "invert.Inversions");
+    member(f, all, "at", emit.element(f, "INVERSION_ROWS", 0));
+    member(f, all, "len", number(emit.length(table)::i64));
+    member(f, all, "keys", span_or(f, "index.Index", "index.NO_ENTRIES", "INVERSION_KEYS", 0, emit.length(table)));
+    emit.declare(f, "INVERSIONS", "invert.Inversions", rec_value(all));
+    emit.declare(f, "INVERSION_ROWS", nil, emit.Value.array{table});
+    ret err[diag.Refusal].ok{};
+}
+
 # the relaxation rows and the code fill
 fun relaxations(t: *Tables, c: *set.Context) err[diag.Refusal] {
     val opened: res[*emit.File, diag.Refusal] = set.table(c, "relax");
@@ -1223,7 +1289,13 @@ fun relaxations(t: *Tables, c: *set.Context) err[diag.Refusal] {
         val rx:   *effects.Relax         = ?fx.relaxes.data[i];
         val from: res[u32, diag.Refusal] = only(t, rx.from);
         if (sel from.err) { ret err[diag.Refusal].err{from.err}; }
-        val to: res[u32, diag.Refusal] = only(t, rx.to);
+        var first_row: str = rx.to;
+        if (rx.inverted) {
+            val inverse: opt[str] = inverse_of(fx, rx.from);
+            if (sel inverse.none) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INVERT, rx.from)}; }
+            first_row = inverse.some;
+        }
+        val to: res[u32, diag.Refusal] = only(t, first_row);
         if (sel to.err) { ret err[diag.Refusal].err{to.err}; }
         val row:  *mapping.Row              = t.catalog.rows.data[from.ok];
         var form: vector.Vector[emit.Value] = vector.init[emit.Value](t.alloc);
@@ -1414,5 +1486,7 @@ pub fun generate(c: *set.Context) err[diag.Refusal] {
     if (sel shortened.err) { ret shortened; }
     val sequenced: err[diag.Refusal] = sequenced_rows(c, ?x, ?catalog);
     if (sel sequenced.err) { ret sequenced; }
+    val inverted: err[diag.Refusal] = inversions(?t, c);
+    if (sel inverted.err) { ret inverted; }
     ret relaxations(?t, c);
 }
