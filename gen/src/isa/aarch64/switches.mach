@@ -1,0 +1,511 @@
+# the switches topic: how code switches a state value itself
+#
+# neither the instruction model nor the A64 ISA XML states which state a program switches or with which rows, so the
+# topic gen/data/aarch64/switches.txt states masc's own, each read against the state's register in the Arm ARM:
+#
+#   switch <axis>=<value> | saved=<class> mask=<bits> held=<bits> [scratch=<class>,...]
+#   read <axis>=<value> | row=<row> args=<source>,...
+#   set <axis>=<value> | row=<row> args=<source>,...
+#   restore <axis>=<value> | row=<row> args=<source>,...
+#
+# a sequence of more than one instruction is its lines in file order. a source is `saved`, `scratch:<n>`,
+# `register:<name>` or `immediate:<n>`, one per operand of the row. each is held to the row's operand: a register to a
+# register operand admitting its class, the saved register written by the read and read by the restore, an immediate to
+# an immediate operand it fits. the switch is emitted as gen_switch, keyed by the atom of its value, the constant
+# `aarch64_extension.<AXIS>_<VALUE>` masc's aarch64 extension module declares beside its axes
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.operand;
+use masc.core.register;
+
+use gen.diag;
+use gen.emit;
+use gen.isa.aarch64;
+use gen.isa.aarch64.mapping;
+use topic: gen.overlay;
+use gen.set;
+use gen.source;
+
+pub val TOPIC: str = "switches";
+
+pub val BAD_LINE:    str = "switches line is not `switch <axis>=<value> | saved=<class> mask=<bits> held=<bits> [scratch=<class>,...]` or `<read|set|restore> <axis>=<value> | row=<row> args=<source>,...`";
+pub val BAD_VALUE:   str = "switches names a state value that is not `<axis>=<value>` in lowercase letters and digits";
+pub val TWICE:       str = "switches states a switch of one state value twice";
+pub val NO_SWITCH:   str = "switches step names a state value no switch line states";
+pub val BAD_SOURCE:  str = "switches source is not `saved`, `scratch:<n>`, `register:<name>` or `immediate:<n>`";
+pub val NO_ROW:      str = "switches names a row key no row has";
+pub val NO_CLASS:    str = "switches names a register class the register file does not have";
+pub val NO_REGISTER: str = "switches names a register the register file does not spell";
+pub val ARITY:       str = "switches step gives other than one source per operand of its row";
+pub val MISFIT:      str = "switches source does not fit its operand of the row";
+pub val NO_SCRATCH:  str = "switches source names a scratch register past the switch's";
+pub val UNSAVED:     str = "switch's read does not write the saved register or its restore does not read it";
+pub val EMPTY:       str = "switch states no read, set or restore";
+
+# where one operand of a step takes its value from
+# ---
+# saved:     the register the read saves the state into
+# scratch:   the scratch register of this index
+# register:  the register of the file of this name
+# immediate: this immediate
+pub tag Arg: u8 {
+    saved;
+    scratch:   u8;
+    register:  str;
+    immediate: i64;
+}
+
+# one instruction of a sequence
+# ---
+# row:  the key of its row
+# args: the source of each operand of the row, in order
+# fact: the line, for its refusals
+pub rec Step {
+    row:  str;
+    args: vector.Vector[Arg];
+    fact: *topic.Fact;
+}
+
+# how code switches one state value
+# ---
+# axis:    the state's axis
+# value:   the value of the axis it switches to
+# saved:   the class of the saved register, by name
+# mask:    the bits of the saved register that hold the state
+# held:    those bits while the state is at the value
+# scratch: the class of each scratch register, by name, in index order
+# read:    the sequence that saves the state
+# set:     the sequence that sets it to the value
+# restore: the sequence that sets it back from the saved register
+# fact:    the switch line, for its refusals
+pub rec Switch {
+    axis:    str;
+    value:   str;
+    saved:   str;
+    mask:    u64;
+    held:    u64;
+    scratch: vector.Vector[str];
+    read:    vector.Vector[Step];
+    set:     vector.Vector[Step];
+    restore: vector.Vector[Step];
+    fact:    *topic.Fact;
+}
+
+fun fits(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun refused(f: *topic.Fact, message: str, subject: str) err[diag.Refusal] {
+    ret err[diag.Refusal].err{topic.refuse(f, message, subject)};
+}
+
+# the words `text` names, split on commas
+fun members(a: *A.Allocator, text: str, out: *vector.Vector[str]) bool {
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (true) {
+        val c: u8 = text[i];
+        if (c == 0 || c == ',') {
+            val got: res[str, StrError] = str_copy_slice(a, text, start, i - start);
+            if (sel got.err)                          { ret false; }
+            if (!fits(vector.push[str](out, got.ok))) { ret false; }
+            if (c == 0)                               { ret true; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `c` is a lowercase letter or a digit, the bytes of a name the generated constant is derived from
+fun plain(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+# the axis and value of the state value `word`, `<axis>=<value>`, into `axis` and `value`
+fun state_value(a: *A.Allocator, f: *topic.Fact, word: str, axis: *str, value: *str) err[diag.Refusal] {
+    val len: usize = str_len(word);
+    var eq:  usize = 0;
+    for (eq < len && word[eq] != '=') { eq = eq + 1; }
+    if (eq == 0 || eq + 1 >= len) { ret refused(f, BAD_VALUE, word); }
+    var i: usize = 0;
+    for (i < len) {
+        if (i != eq && !plain(word[i])) { ret refused(f, BAD_VALUE, word); }
+        i = i + 1;
+    }
+    val x: res[str, StrError] = str_copy_slice(a, word, 0, eq);
+    val v: res[str, StrError] = str_copy_slice(a, word, eq + 1, len - eq - 1);
+    if (sel x.err) { ret refused(f, diag.MEMORY, nil); }
+    if (sel v.err) { ret refused(f, diag.MEMORY, nil); }
+    @axis  = x.ok;
+    @value = v.ok;
+    ret err[diag.Refusal].ok{};
+}
+
+# whether `word` starts with `prefix`, the rest from `str_len(prefix)`
+fun prefixed(word: str, prefix: str) bool {
+    val n: usize = str_len(prefix);
+    if (str_len(word) <= n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (word[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the sources `text` names, split on commas
+fun args_of(a: *A.Allocator, f: *topic.Fact, text: str, out: *vector.Vector[Arg]) err[diag.Refusal] {
+    var words: vector.Vector[str] = vector.init[str](a);
+    if (!members(a, text, ?words)) { ret refused(f, diag.MEMORY, nil); }
+    var i: usize = 0;
+    for (i < words.len) {
+        val w:   str = words.data[i];
+        var arg: Arg = Arg.saved{};
+        if (str_equals(w, "saved")) { arg = Arg.saved{}; }
+        or (prefixed(w, "scratch:")) {
+            val n: res[i64, diag.Refusal] = topic.number(f, ?w[8]);
+            if (sel n.err)               { ret err[diag.Refusal].err{n.err}; }
+            if (n.ok < 0 || n.ok > 0xff) { ret refused(f, BAD_SOURCE, w); }
+            arg = Arg.scratch{n.ok::u8};
+        }
+        or (prefixed(w, "register:")) { arg = Arg.register{?w[9]}; }
+        or (prefixed(w, "immediate:")) {
+            val n: res[i64, diag.Refusal] = topic.number(f, ?w[10]);
+            if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+            arg = Arg.immediate{n.ok};
+        }
+        or                                     { ret refused(f, BAD_SOURCE, w); }
+        if (!fits(vector.push[Arg](out, arg))) { ret refused(f, diag.MEMORY, nil); }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the bits `word` of fact `f` spell, a number no less than 0
+fun bits(f: *topic.Fact, word: opt[str], out: *u64) err[diag.Refusal] {
+    if (sel word.none) { ret refused(f, BAD_LINE, nil); }
+    val n: res[i64, diag.Refusal] = topic.number(f, word.some);
+    if (sel n.err) { ret err[diag.Refusal].err{n.err}; }
+    if (n.ok < 0)  { ret refused(f, BAD_LINE, word.some); }
+    @out = n.ok::u64;
+    ret err[diag.Refusal].ok{};
+}
+
+# the switch line `l` into `out`
+fun switch_line(a: *A.Allocator, l: *topic.Line, out: *Switch) err[diag.Refusal] {
+    @out = Switch{axis: nil, value: nil, saved: nil, mask: 0, held: 0, scratch: vector.init[str](a), read: vector.init[Step](a), set: vector.init[Step](a), restore: vector.init[Step](a), fact: l.fact};
+    val named: err[diag.Refusal] = state_value(a, l.fact, l.key.data[1], ?out.axis, ?out.value);
+    if (sel named.err) { ret named; }
+    val saved: opt[str] = topic.value(?l.ws, "saved");
+    if (sel saved.none) { ret refused(l.fact, BAD_LINE, nil); }
+    out.saved = saved.some;
+    val m: err[diag.Refusal] = bits(l.fact, topic.value(?l.ws, "mask"), ?out.mask);
+    if (sel m.err) { ret m; }
+    val h: err[diag.Refusal] = bits(l.fact, topic.value(?l.ws, "held"), ?out.held);
+    if (sel h.err)                   { ret h; }
+    if ((out.held & ~out.mask) != 0) { ret refused(l.fact, BAD_LINE, nil); }
+    var n:  usize    = 3;
+    val sc: opt[str] = topic.value(?l.ws, "scratch");
+    if (sel sc.some) {
+        if (!members(a, sc.some, ?out.scratch)) { ret refused(l.fact, diag.MEMORY, nil); }
+        n = n + 1;
+    }
+    if (l.ws.len != n) { ret refused(l.fact, BAD_LINE, nil); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the step line `l` into `out`
+fun step_line(a: *A.Allocator, l: *topic.Line, out: *Step) err[diag.Refusal] {
+    val row:  opt[str] = topic.value(?l.ws, "row");
+    val args: opt[str] = topic.value(?l.ws, "args");
+    if (sel row.none)  { ret refused(l.fact, BAD_LINE, nil); }
+    if (sel args.none) { ret refused(l.fact, BAD_LINE, nil); }
+    if (l.ws.len != 2) { ret refused(l.fact, BAD_LINE, nil); }
+    @out = Step{row: row.some, args: vector.init[Arg](a), fact: l.fact};
+    ret args_of(a, l.fact, args.some, ?out.args);
+}
+
+# the switch of state value `axis`=`value` among `all`, none for none
+fun switch_of(all: *vector.Vector[Switch], axis: str, value: str) opt[*Switch] {
+    var k: usize = 0;
+    for (k < all.len) {
+        if (str_equals(all.data[k].axis, axis) && str_equals(all.data[k].value, value)) { ret opt[*Switch].some{?all.data[k]}; }
+        k = k + 1;
+    }
+    ret opt[*Switch].none{};
+}
+
+# the switches topic of the data tree `tree`, each switch in file order
+pub fun read(a: *A.Allocator, tree: *source.Tree) res[vector.Vector[Switch], diag.Refusal] {
+    val got: res[topic.Topic, diag.Refusal] = topic.read(a, tree, TOPIC);
+    if (sel got.err) { ret res[vector.Vector[Switch], diag.Refusal].err{got.err}; }
+    var t:       topic.Topic       = got.ok;
+    val checked: err[diag.Refusal] = topic.check(?t, nil, topic.unstated);
+    if (sel checked.err) { ret res[vector.Vector[Switch], diag.Refusal].err{checked.err}; }
+    var out: vector.Vector[Switch] = vector.init[Switch](a);
+    var i:   usize                 = 0;
+    for (i < t.facts.len) {
+        var l:    topic.Line        = topic.Line{fact: nil, key: vector.init[str](a), ws: vector.init[str](a)};
+        val line: err[diag.Refusal] = topic.line(a, ?t.facts.data[i], ?l);
+        if (sel line.err)   { ret res[vector.Vector[Switch], diag.Refusal].err{line.err}; }
+        if (l.key.len != 2) { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, BAD_LINE, nil)}; }
+        var axis:  str               = nil;
+        var value: str               = nil;
+        val named: err[diag.Refusal] = state_value(a, l.fact, l.key.data[1], ?axis, ?value);
+        if (sel named.err) { ret res[vector.Vector[Switch], diag.Refusal].err{named.err}; }
+        val known: opt[*Switch] = switch_of(?out, axis, value);
+        if (topic.is(?l, "switch", 2)) {
+            if (sel known.some) { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, TWICE, l.key.data[1])}; }
+            var sw:   Switch            = Switch{axis: nil, value: nil, saved: nil, mask: 0, held: 0, scratch: vector.init[str](a), read: vector.init[Step](a), set: vector.init[Step](a), restore: vector.init[Step](a), fact: nil};
+            val made: err[diag.Refusal] = switch_line(a, ?l, ?sw);
+            if (sel made.err)                         { ret res[vector.Vector[Switch], diag.Refusal].err{made.err}; }
+            if (!fits(vector.push[Switch](?out, sw))) { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+        }
+        or {
+            var into: *vector.Vector[Step] = nil;
+            if (sel known.none)             { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, NO_SWITCH, l.key.data[1])}; }
+            if (topic.is(?l, "read", 2))    { into = ?known.some.read; }
+            or (topic.is(?l, "set", 2))     { into = ?known.some.set; }
+            or (topic.is(?l, "restore", 2)) { into = ?known.some.restore; }
+            or                              { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, BAD_LINE, nil)}; }
+            var s:    Step              = Step{row: nil, args: vector.init[Arg](a), fact: nil};
+            val made: err[diag.Refusal] = step_line(a, ?l, ?s);
+            if (sel made.err)                      { ret res[vector.Vector[Switch], diag.Refusal].err{made.err}; }
+            if (!fits(vector.push[Step](into, s))) { ret res[vector.Vector[Switch], diag.Refusal].err{topic.refuse(l.fact, diag.MEMORY, nil)}; }
+        }
+        i = i + 1;
+    }
+    ret res[vector.Vector[Switch], diag.Refusal].ok{out};
+}
+
+# the index of the class named `name` in the register file `rf`, none for none
+fun class_named(rf: *aarch64.Families, name: str) opt[u16] {
+    var k: usize = 0;
+    for (k < rf.classes.len) {
+        if (str_equals(rf.classes.data[k].name, name)) { ret opt[u16].some{k::u16}; }
+        k = k + 1;
+    }
+    ret opt[u16].none{};
+}
+
+# the register spelled `name` in the register file `rf`, none for none
+fun register_named(rf: *aarch64.Families, name: str) opt[register.Id] {
+    var k: usize = 0;
+    for (k < rf.rows.len) {
+        val r: *aarch64.Row = ?rf.rows.data[k];
+        if (!r.unspelled && str_equals(r.name, name)) { ret opt[register.Id].some{register.make(r.class::u16, r.number::u16)}; }
+        k = k + 1;
+    }
+    ret opt[register.Id].none{};
+}
+
+# whether register operand `op` admits class `class`
+fun admits(op: *mapping.Operand, class: u16) bool {
+    if (op.shape != mapping.REGISTER || op.list) { ret false; }
+    var k: usize = 0;
+    for (k < op.classes.len) {
+        if (op.classes.data[k] == class) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether immediate operand `op` holds `n` as it is written
+fun holds(op: *mapping.Operand, n: i64) bool {
+    if (op.shape != mapping.IMMEDIATE) { ret false; }
+    val imm: operand.Immediate = op.immediate;
+    if (imm.scale != 0 || imm.bias != 0 || imm.bits == 0 || imm.bits >= 63) { ret false; }
+    val top: i64 = 1::i64 << imm.bits::i64;
+    if (imm.sign == operand.UNSIGNED) { ret n >= 0 && n < top; }
+    ret n >= 0 - top / 2 && n < top / 2;
+}
+
+# the classes of a switch's saved register and of its scratch registers, by index
+rec Classes {
+    saved:   u16;
+    scratch: vector.Vector[u16];
+}
+
+fun variant(f: *emit.File, of: str, payload: emit.Value) emit.Value {
+    ret emit.Value.variant{emit.variant(f, of, payload)};
+}
+
+# the step `s` over the rows `all` as a `switch.Step`, its sources pooled into `sources`. `named` is set where it reads
+# or writes the saved register as its sequence's `role` must
+fun step_of(f: *emit.File, all: *vector.Vector[mapping.Row], rf: *aarch64.Families, cs: *Classes, sources: *emit.Pool, s: *Step, role: operand.Role, named: *bool, out: *emit.Value) err[diag.Refusal] {
+    var row: usize = 0;
+    for (row < all.len && !str_equals(all.data[row].key, s.row)) { row = row + 1; }
+    if (row == all.len) { ret refused(s.fact, NO_ROW, s.row); }
+    val r: *mapping.Row = ?all.data[row];
+    if (r.operands.len != s.args.len) { ret refused(s.fact, ARITY, s.row); }
+    var values: vector.Vector[emit.Value] = vector.init[emit.Value](f.alloc);
+    var k:      usize                     = 0;
+    for (k < s.args.len) {
+        val op:  *mapping.Operand = ?r.operands.data[k];
+        val arg: Arg              = s.args.data[k];
+        var v:   emit.Value       = emit.Value.number{0};
+        if (sel arg.saved) {
+            if (!admits(op, cs.saved))                            { ret refused(s.fact, MISFIT, "saved"); }
+            if (op.role == role || op.role == operand.READ_WRITE) { @named = true; }
+            v = emit.Value.variant{emit.bare(f, "switch.Source.saved")};
+        }
+        or (sel arg.scratch) {
+            if (arg.scratch::usize >= cs.scratch.len)             { ret refused(s.fact, NO_SCRATCH, nil); }
+            if (!admits(op, cs.scratch.data[arg.scratch::usize])) { ret refused(s.fact, MISFIT, "scratch"); }
+            v = variant(f, "switch.Source.scratch", emit.Value.number{arg.scratch::i64});
+        }
+        or (sel arg.register) {
+            val reg: opt[register.Id] = register_named(rf, arg.register);
+            if (sel reg.none)                             { ret refused(s.fact, NO_REGISTER, arg.register); }
+            if (!admits(op, register.class_of(reg.some))) { ret refused(s.fact, MISFIT, arg.register); }
+            v = variant(f, "switch.Source.value", variant(f, "operand.Value.register", emit.Value.hex{reg.some::u64}));
+        }
+        or {
+            if (!holds(op, arg.immediate)) { ret refused(s.fact, MISFIT, nil); }
+            v = variant(f, "switch.Source.value", variant(f, "operand.Value.immediate", emit.Value.number{arg.immediate}));
+        }
+        if (!fits(vector.push[emit.Value](?values, v))) { ret refused(s.fact, diag.MEMORY, nil); }
+        k = k + 1;
+    }
+    val at: u32          = emit.pooled(f, sources, values.data, values.len::u32);
+    val st: *emit.Record = emit.record(f, "switch.Step");
+    emit.member(f, st, "row", emit.Value.number{row::i64});
+    if (values.len == 0) { emit.member(f, st, "values", emit.Value.name{"switch.NO_SOURCES"}); }
+    or                   { emit.member(f, st, "values", span(f, "switch.Sources", "SOURCES", at, values.len::u32)); }
+    @out = emit.Value.record{st};
+    ret err[diag.Refusal].ok{};
+}
+
+# a pointer and count record over run `at` of `count` items of the array declared `array`
+fun span(f: *emit.File, of: str, array: str, at: u32, count: u32) emit.Value {
+    val r: *emit.Record = emit.record(f, of);
+    emit.member(f, r, "at", emit.element(f, array, at));
+    emit.member(f, r, "len", emit.Value.number{count::i64});
+    ret emit.Value.record{r};
+}
+
+# the sequence `seq` of switch `sw` as `switch.Steps` over `steps`, refused when it is empty, or when `role` is not
+# NONE and no step reads or writes the saved register so
+fun steps_of(f: *emit.File, all: *vector.Vector[mapping.Row], rf: *aarch64.Families, cs: *Classes, sources: *emit.Pool, steps: *emit.Pool, sw: *Switch, seq: *vector.Vector[Step], role: operand.Role, out: *emit.Value) err[diag.Refusal] {
+    if (seq.len == 0) { ret refused(sw.fact, EMPTY, nil); }
+    var items: vector.Vector[emit.Value] = vector.init[emit.Value](f.alloc);
+    var named: bool                      = false;
+    var k:     usize                     = 0;
+    for (k < seq.len) {
+        var v:   emit.Value        = emit.Value.number{0};
+        val got: err[diag.Refusal] = step_of(f, all, rf, cs, sources, ?seq.data[k], role, ?named, ?v);
+        if (sel got.err)                               { ret got; }
+        if (!fits(vector.push[emit.Value](?items, v))) { ret refused(sw.fact, diag.MEMORY, nil); }
+        k = k + 1;
+    }
+    if (role != operand.NONE && !named) { ret refused(sw.fact, UNSAVED, nil); }
+    @out = span(f, "switch.Steps", "STEPS", emit.pooled(f, steps, items.data, items.len::u32), items.len::u32);
+    ret err[diag.Refusal].ok{};
+}
+
+# the constant masc's aarch64 extension module declares for the atom of `axis`=`value`, as
+# `aarch64_extension.DIT_ON`
+fun atom(f: *emit.File, axis: str, value: str) emit.Value {
+    var text: vector.Vector[u8] = vector.init[u8](f.alloc);
+    val head: str               = "aarch64_extension.";
+    var i:    usize             = 0;
+    for (head[i] != 0) {
+        vector.push[u8](?text, head[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (axis[i] != 0) {
+        var c: u8 = axis[i];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        vector.push[u8](?text, c);
+        i = i + 1;
+    }
+    vector.push[u8](?text, '_');
+    i = 0;
+    for (value[i] != 0) {
+        var c: u8 = value[i];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        vector.push[u8](?text, c);
+        i = i + 1;
+    }
+    vector.push[u8](?text, 0);
+    ret emit.Value.name{text.data};
+}
+
+# the switches `sws` over the rows `all` and the register file `rf`, emitted as gen_switch
+pub fun generate(c: *set.Context, all: *vector.Vector[mapping.Row], rf: *aarch64.Families, sws: *vector.Vector[Switch]) err[diag.Refusal] {
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "switch");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "masc.core.operand");
+    emit.uses(f, "masc.core.switch");
+    emit.uses(f, "aarch64_extension: masc.isa.aarch64.extension");
+    var sources: emit.Pool   = emit.pool(f, "switch.Source");
+    var steps:   emit.Pool   = emit.pool(f, "switch.Step");
+    var classes: emit.Pool   = emit.pool(f, "u16");
+    val table:   *emit.Array = emit.array(f, "switch.Switch");
+    var i:       usize       = 0;
+    for (i < sws.len) {
+        val sw:    *Switch  = ?sws.data[i];
+        val saved: opt[u16] = class_named(rf, sw.saved);
+        if (sel saved.none) { ret refused(sw.fact, NO_CLASS, sw.saved); }
+        var cs:    Classes                   = Classes{saved: saved.some, scratch: vector.init[u16](c.alloc)};
+        var named: vector.Vector[emit.Value] = vector.init[emit.Value](c.alloc);
+        var k:     usize                     = 0;
+        for (k < sw.scratch.len) {
+            val got: opt[u16] = class_named(rf, sw.scratch.data[k]);
+            if (sel got.none) { ret refused(sw.fact, NO_CLASS, sw.scratch.data[k]); }
+            vector.push[u16](?cs.scratch, got.some);
+            vector.push[emit.Value](?named, emit.Value.number{got.some::i64});
+            k = k + 1;
+        }
+        var read:    emit.Value        = emit.Value.number{0};
+        var on:      emit.Value        = emit.Value.number{0};
+        var restore: emit.Value        = emit.Value.number{0};
+        val r:       err[diag.Refusal] = steps_of(f, all, rf, ?cs, ?sources, ?steps, sw, ?sw.read, operand.WRITE, ?read);
+        if (sel r.err) { ret r; }
+        val s: err[diag.Refusal] = steps_of(f, all, rf, ?cs, ?sources, ?steps, sw, ?sw.set, operand.NONE, ?on);
+        if (sel s.err) { ret s; }
+        val b: err[diag.Refusal] = steps_of(f, all, rf, ?cs, ?sources, ?steps, sw, ?sw.restore, operand.READ, ?restore);
+        if (sel b.err) { ret b; }
+        val made: *emit.Record = emit.record(f, "switch.Switch");
+        emit.member(f, made, "state", atom(f, sw.axis, sw.value));
+        emit.member(f, made, "saved", emit.Value.number{saved.some::i64});
+        emit.member(f, made, "mask", emit.Value.hex{sw.mask});
+        emit.member(f, made, "held", emit.Value.hex{sw.held});
+        if (named.len == 0) { emit.member(f, made, "scratch", emit.Value.name{"switch.NO_SCRATCH"}); }
+        or                  { emit.member(f, made, "scratch", span(f, "switch.Scratch", "SCRATCH", emit.pooled(f, ?classes, named.data, named.len::u32), named.len::u32)); }
+        emit.member(f, made, "read", read);
+        emit.member(f, made, "set", on);
+        emit.member(f, made, "restore", restore);
+        emit.item(f, table, emit.Value.record{made});
+        i = i + 1;
+    }
+    if (emit.length(sources.array) != 0) { emit.declare(f, "SOURCES", nil, emit.Value.array{sources.array}); }
+    if (emit.length(steps.array) != 0)   { emit.declare(f, "STEPS", nil, emit.Value.array{steps.array}); }
+    if (emit.length(classes.array) != 0) { emit.declare(f, "SCRATCH", nil, emit.Value.array{classes.array}); }
+    val n: u32 = emit.length(table);
+    if (n == 0) {
+        emit.declare(f, "SWITCHES", "switch.Switches", emit.Value.name{"switch.NO_SWITCHES"});
+        ret err[diag.Refusal].ok{};
+    }
+    emit.declare(f, "SWITCHES", "switch.Switches", span(f, "switch.Switches", "SWITCH_ROWS", 0, n));
+    emit.declare(f, "SWITCH_ROWS", nil, emit.Value.array{table});
+    ret err[diag.Refusal].ok{};
+}
