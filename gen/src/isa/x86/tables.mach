@@ -1,5 +1,5 @@
 # the x86 rows written as masc's tables: gen_row, gen_row_index, gen_operand, gen_encoding, gen_effect, gen_dispatch,
-# gen_key, gen_relax and gen_syntax. the rows and their requirements are gen_row's, and the pools they point into are modules of
+# gen_key, gen_relax, gen_invert and gen_syntax. the rows and their requirements are gen_row's, and the pools they point into are modules of
 # their own, the operands with their classes, the fields with their opcode records, and the effects, so no one object
 # holds the whole catalog and mach builds each apart (mach#4763, mach#4764)
 #
@@ -18,7 +18,7 @@
 # register in its low bits a cube per register, and the syntax spells each row as llvm-objdump 23.1.1's Intel syntax
 # does: its mnemonic and its operands comma separated, in XED's order but where the operands topic states another,
 # evex's opmask and `{z}` decorating the operand before them. a jump with an 8-bit target relaxes to its instruction's
-# wider target.
+# wider target, and a conditional jump's inverse is the row of its negated condition the inverses topic names.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -52,6 +52,8 @@ use gen.isa.x86.keys;
 use gen.isa.x86.rows;
 use gen.isa.x86.xed;
 use gen.lines;
+use gen_order: gen.order;
+use gen.overlay;
 use gen.relation;
 use gen.set;
 
@@ -63,21 +65,27 @@ pub val NO_STRING:    str = "string memory operand states no one base class or n
 pub val TWO_LONGER:   str = "two rows of a jump's instruction have its longer target at one width";
 pub val NO_PREDICATE: str = "comparison row has no predicate immediate or its mnemonic does not start with its stem";
 pub val NO_COUNT:     str = "string row under a repeat prefix reads no rcx no operand names";
+pub val BAD_INVERSE:  str = "inverses line is not `<ICLASS> | to=<ICLASS>`, twice states an iclass or names one with no row";
+pub val NO_INVERSE:   str = "a row the inverses topic names is no lone target or has no one row of its inverse at its width";
+
+pub val INVERSES_TOPIC: str = "inverses";
 
 # what the emission reads
 # ---
-# rows:  the rows, in order
-# needs: each ISA set's requirement, by its name
-# named: the register file's rows
-# atoms: the atoms the catalog names
+# rows:     the rows, in order
+# needs:    each ISA set's requirement, by its name
+# named:    the register file's rows
+# atoms:    the atoms the catalog names
+# inverses: the inverses topic, each conditional jump's iclass and its negated condition's
 pub rec Input {
-    rows:   *vector.Vector[*rows.Row];
-    needs:  map.Map[str, *vector.Vector[vector.Vector[str]]];
-    named:  *vector.Vector[forms.Named];
-    reader: *forms.Reader;
-    atoms:  map.Map[str, u32];
-    counts: map.Map[str, u32];
-    keys:   *keys.Keys;
+    rows:     *vector.Vector[*rows.Row];
+    needs:    map.Map[str, *vector.Vector[vector.Vector[str]]];
+    named:    *vector.Vector[forms.Named];
+    reader:   *forms.Reader;
+    atoms:    map.Map[str, u32];
+    counts:   map.Map[str, u32];
+    keys:     *keys.Keys;
+    inverses: *overlay.Topic;
 }
 
 # the pools of the row table
@@ -93,6 +101,7 @@ rec Pools {
     access:  emit.Pool;
     fixed:   emit.Pool;
     related: emit.Pool;
+    ordered: emit.Pool;
     effects: emit.Pool;
     opcodes: *emit.Array;
     fields:  emit.Pool;
@@ -151,6 +160,7 @@ fun role(r: operand.Role) emit.Value {
     if (r == operand.READ)       { ret name("operand.READ"); }
     if (r == operand.WRITE)      { ret name("operand.WRITE"); }
     if (r == operand.READ_WRITE) { ret name("operand.READ_WRITE"); }
+    if (r == operand.MAY_WRITE)  { ret name("operand.MAY_WRITE"); }
     ret name("operand.NONE");
 }
 
@@ -725,7 +735,7 @@ fun control_of(p: *Pools, r: *rows.Row) emit.Value {
 # at the register operand `op` holds when base is effect.NO_ROW, plus the register at row `index` times `scale` where
 # index is not effect.NO_ROW, governed by operand `governor`, of the elements the register at row `count` decides, one
 # where count is effect.NO_ROW
-fun implied_access(f: *emit.File, role: operand.Role, op: u8, base: u32, offset: i32, bits: u16, governor: u8, count: u32, index: u32, scale: u8) emit.Value {
+fun implied_access(f: *emit.File, mode: operand.Role, op: u8, base: u32, offset: i32, bits: u16, governor: u8, count: u32, index: u32, scale: u8) emit.Value {
     val w: *emit.Record = emit.record(f, "effect.Width");
     val q: *emit.Record = emit.record(f, "quantity.Scaled");
     emit.member(f, q, "fixed", number(bits::i64));
@@ -735,9 +745,7 @@ fun implied_access(f: *emit.File, role: operand.Role, op: u8, base: u32, offset:
     if (count == effect.NO_ROW) { emit.member(f, w, "count", bare(f, "effect.Count.one")); }
     or                          { emit.member(f, w, "count", variant(f, "effect.Count.register", number(count::i64))); }
     val x: *emit.Record = emit.record(f, "effect.Access");
-    if (role == operand.WRITE)  { emit.member(f, x, "role", name("operand.WRITE")); }
-    or (role == operand.READ)   { emit.member(f, x, "role", name("operand.READ")); }
-    or                          { emit.member(f, x, "role", name("operand.READ_WRITE")); }
+    emit.member(f, x, "role", role(mode));
     if (op == field.NO_OPERAND) { emit.member(f, x, "operand", name("field.NO_OPERAND")); }
     or                          { emit.member(f, x, "operand", number(op::i64)); }
     if (base == effect.NO_ROW)  { emit.member(f, x, "base", name("effect.NO_ROW")); }
@@ -907,6 +915,7 @@ fun effect_of(p: *Pools, a: *A.Allocator, in: *Input, r: *rows.Row) res[u32, dia
     emit.member(f, e, "latency", name("effect.ONE"));
     emit.member(f, e, "fixed", fixed);
     emit.member(f, e, "relations", relation.values(f, ?p.related, ?r.related));
+    emit.member(f, e, "order", gen_order.value(f, ?p.ordered, ?r.order));
     var one: [1]emit.Value = [1]emit.Value{rec_value(e)};
     ret res[u32, diag.Refusal].ok{emit.pooled(f, ?p.effects, ?one[0], 1)};
 }
@@ -1272,7 +1281,7 @@ fun row_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] {
     val opened: res[*emit.File, diag.Refusal] = set.table(c, "row");
     if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
     val f:          *emit.File                    = opened.ok;
-    var p:          Pools                         = Pools{f: f, classes: emit.pool(f, "u16"), numbers: emit.pool(f, "u32"), ids: emit.pool(f, "requirement.Id"), alts: emit.pool(f, "requirement.Alternative"), ops: emit.pool(f, "operand.Operand"), slices: emit.pool(f, "field.Slice"), words: emit.pool(f, "u64"), access: emit.pool(f, "effect.Access"), fixed: emit.pool(f, "effect.Fixed"), related: emit.pool(f, "effect.Relation"), effects: emit.pool(f, "effect.Effect"), opcodes: emit.array(f, "x86_opcode.Opcode"), fields: emit.pool(f, "field.Field"), table: emit.array(f, "row.Row"), keeps: emit.pool(f, "constraint.Constraint"), sides: emit.pool(f, "constraint.Side"), timings: emit.pool(f, "ct.Class")};
+    var p:          Pools                         = Pools{f: f, classes: emit.pool(f, "u16"), numbers: emit.pool(f, "u32"), ids: emit.pool(f, "requirement.Id"), alts: emit.pool(f, "requirement.Alternative"), ops: emit.pool(f, "operand.Operand"), slices: emit.pool(f, "field.Slice"), words: emit.pool(f, "u64"), access: emit.pool(f, "effect.Access"), fixed: emit.pool(f, "effect.Fixed"), related: emit.pool(f, "effect.Relation"), ordered: emit.pool(f, "effect.Ordering"), effects: emit.pool(f, "effect.Effect"), opcodes: emit.array(f, "x86_opcode.Opcode"), fields: emit.pool(f, "field.Field"), table: emit.array(f, "row.Row"), keeps: emit.pool(f, "constraint.Constraint"), sides: emit.pool(f, "constraint.Side"), timings: emit.pool(f, "ct.Class")};
     val ops_opened: res[*emit.File, diag.Refusal] = set.table(c, "operand");
     if (sel ops_opened.err) { ret err[diag.Refusal].err{ops_opened.err}; }
     val fo:         *emit.File                    = ops_opened.ok;
@@ -1390,6 +1399,7 @@ fun row_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] {
     emit.declare(fx, "ACCESSES", nil, emit.Value.array{p.access.array});
     emit.declare(fx, "FIXED", nil, emit.Value.array{p.fixed.array});
     if (emit.length(p.related.array) > 0) { emit.declare(fx, "RELATIONS", nil, emit.Value.array{p.related.array}); }
+    if (emit.length(p.ordered.array) > 0) { emit.declare(fx, "ORDERINGS", nil, emit.Value.array{p.ordered.array}); }
     emit.declare(fx, "EFFECTS", nil, emit.Value.array{p.effects.array});
     emit.declare(fr, "IDS", nil, emit.Value.array{p.ids.array});
     emit.declare(fr, "ALTERNATIVES", nil, emit.Value.array{p.alts.array});
@@ -1795,8 +1805,9 @@ val NO_FIXED: usize = 0xFFFF_FFFF;
 # a row whose operands line leaves fixed operands unwritten read too with every operand in XED's order, as llvm-mc reads
 # `vmrun rax` as the `vmrun` llvm-objdump prints (llvm-project 7ddb67460b168b17ebb263dc99bf956b56d7e517
 # llvm/lib/Target/X86/X86InstrSVM.td and X86InstrSNP.td, InstAlias of emit priority 0), a row the operands topic reads
-# either way read too in XED's order, as xchg's `si, ax`, and a string row read with no operands at the width its
-# address size is its own at
+# either way read too in XED's order, as xchg's `si, ax`, a row whose operands line writes implied text read too
+# without it, as llvm-mc reads `sha256rnds2 xmm1, xmm2` (X86InstrSHA.td and X86InstrSSE.td, InstAlias of emit priority
+# 0), and a string row read with no operands at the width its address size is its own at
 fun read_aliases(f: *emit.File, rs: *vector.Vector[*rows.Row], out: *vector.Vector[Spelled]) err[diag.Refusal] {
     var i: usize = 0;
     for (i < rs.len) {
@@ -1804,8 +1815,9 @@ fun read_aliases(f: *emit.File, rs: *vector.Vector[*rows.Row], out: *vector.Vect
         var spelt: str       = nil;
         if (rows.decode_only(r))                                { spelt = nil; }
         or (r.form.constant)                                    { spelt = emit.concat(f, template(f, r), ", 1"); }
-        or (r.written != nil && r.written.len < plain_count(r)) { spelt = spelled_without(f, r, r.mnemonic, r.form.operands.len, false); }
-        or (r.either)                                           { spelt = spelled_without(f, r, r.mnemonic, r.form.operands.len, false); }
+        or (r.written != nil && r.written.len < plain_count(r)) { spelt = spelled_without(f, r, r.mnemonic, r.form.operands.len, false, false); }
+        or (r.either)                                           { spelt = spelled_without(f, r, r.mnemonic, r.form.operands.len, false, false); }
+        or (implies(r))                                         { spelt = spelled_without(f, r, r.mnemonic, r.form.operands.len, true, true); }
         if (spelt != nil) {
             val a: Spelled = Spelled{row: i::u32, mnemonic: r.mnemonic, template: spelt, count: r.form.operands.len::u32, fixed: NO_FIXED, value: 0, preference: 0, bare: NO_WIDTH};
             if (!pushed(vector.push[Spelled](out, a))) { ret err[diag.Refusal].err{memory(r.key)}; }
@@ -1818,6 +1830,17 @@ fun read_aliases(f: *emit.File, rs: *vector.Vector[*rows.Row], out: *vector.Vect
         i = i + 1;
     }
     ret err[diag.Refusal].ok{};
+}
+
+# whether the operands line of `r` writes text that may go unwritten
+fun implies(r: *rows.Row) bool {
+    if (r.written == nil) { ret false; }
+    var i: usize = 0;
+    for (i < r.written.len) {
+        if (r.written.data[i].implied) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # each row's read-only spellings under each further spelling of its condition, none for a decode-only row, into `out`
@@ -1836,7 +1859,7 @@ fun respelled_aliases(f: *emit.File, rs: *vector.Vector[*rows.Row], ones: *vecto
             var k:   usize = 0;
             for (k < r.others.len) {
                 val m: str     = r.others.data[k];
-                val a: Spelled = Spelled{row: i::u32, mnemonic: m, template: spelled_without(f, r, m, r.form.operands.len, true), count: r.form.operands.len::u32, fixed: NO_FIXED, value: 0, preference: 0, bare: NO_WIDTH};
+                val a: Spelled = Spelled{row: i::u32, mnemonic: m, template: spelled_without(f, r, m, r.form.operands.len, true, false), count: r.form.operands.len::u32, fixed: NO_FIXED, value: 0, preference: 0, bare: NO_WIDTH};
                 if (!pushed(vector.push[Spelled](out, a))) { ret err[diag.Refusal].err{memory(r.key)}; }
                 var j: usize = from;
                 for (j < at) {
@@ -1911,7 +1934,7 @@ fun predicate_aliases(f: *emit.File, rs: *vector.Vector[*rows.Row], out: *vector
             for (k < p.count) {
                 if (str_len(p.names[k]) > 0) {
                     val spelled: str     = emit.concat(f, emit.concat(f, p.stem, p.names[k]), ?r.mnemonic[n]);
-                    val a:       Spelled = Spelled{row: i::u32, mnemonic: spelled, template: spelled_without(f, r, spelled, imm::usize, true), count: (r.form.operands.len - 1)::u32, fixed: imm::usize, value: k::i64, preference: k::i64 + 1, bare: NO_WIDTH};
+                    val a:       Spelled = Spelled{row: i::u32, mnemonic: spelled, template: spelled_without(f, r, spelled, imm::usize, true, false), count: (r.form.operands.len - 1)::u32, fixed: imm::usize, value: k::i64, preference: k::i64 + 1, bare: NO_WIDTH};
                     if (!pushed(vector.push[Spelled](out, a))) { ret err[diag.Refusal].err{memory(r.key)}; }
                 }
                 k = k + 1;
@@ -1983,7 +2006,7 @@ fun plain_order(r: *rows.Row, written: bool, out: *rows.Token) usize {
     for (i < r.form.operands.len) {
         val o: *forms.Operand = ?r.form.operands.data[i];
         if (rows.plain(o) && !hidden(o)) {
-            out[len] = rows.Token{operand: i::u8, format: nil, text: nil};
+            out[len] = rows.Token{operand: i::u8, format: nil, text: nil, implied: false};
             len      = len + 1;
         }
         i = i + 1;
@@ -2003,7 +2026,7 @@ fun plain_count(r: *rows.Row) usize {
 # last operand that is no immediate, as Intel SDM 325462-093US Vol 2 writes `{er}` and `{sae}` on the last source and
 # llvm-mc reads `vrangesd xmm1 {k1} {z}, xmm2, xmm3, {sae}, 1`
 fun template(f: *emit.File, r: *rows.Row) str {
-    ret spelled_without(f, r, r.mnemonic, r.form.operands.len, true);
+    ret spelled_without(f, r, r.mnemonic, r.form.operands.len, true, false);
 }
 
 # the number of operand `i` of `r` in a spelling that leaves operand `skip` out
@@ -2013,8 +2036,9 @@ fun renumbered(f: *emit.File, i: usize, skip: usize, format: str) str {
 }
 
 # the template of `r` under `mnemonic` with operand `skip` left out and the operands after it numbered one less, as
-# an alias that fixes it spells the row, and with every operand when `skip` is past the last
-fun spelled_without(f: *emit.File, r: *rows.Row, mnemonic: str, skip: usize, written: bool) str {
+# an alias that fixes it spells the row, and with every operand when `skip` is past the last, less the implied text
+# when `bare`
+fun spelled_without(f: *emit.File, r: *rows.Row, mnemonic: str, skip: usize, written: bool, bare: bool) str {
     var t:     str   = mnemonic;
     val n:     usize = r.form.operands.len;
     var round: usize = n;
@@ -2031,7 +2055,8 @@ fun spelled_without(f: *emit.File, r: *rows.Row, mnemonic: str, skip: usize, wri
     var count: usize = 0;
     var m:     usize = 0;
     for (m < held) {
-        if (all[m].operand == rows.NO_TOKEN || all[m].operand::usize != skip) {
+        val left: bool = all[m].operand != rows.NO_TOKEN && all[m].operand::usize == skip;
+        if (!left && !(bare && all[m].implied)) {
             order[count] = all[m];
             count        = count + 1;
         }
@@ -2294,6 +2319,97 @@ fun relax_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] 
     ret err[diag.Refusal].ok{};
 }
 
+# the iclass the inverses line of `iclass` names its inverse, none for an iclass no line names
+fun inverse_of(lines: *vector.Vector[overlay.Line], iclass: str) opt[str] {
+    var i: usize = 0;
+    for (i < lines.len) {
+        if (str_equals(lines.data[i].fact.key, iclass)) { ret overlay.value(?lines.data[i].ws, "to"); }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the inversion table: each row of a conditional jump's iclass the inverses topic names, whose one operand is a target,
+# inverts to the row of the iclass it names with a target as wide at the same widths and operand size, its target the
+# same. x86 states the condition in the opcode, tttn's n bit negating it (Intel SDM 325462-093US Vol 2 B.1.4.7), so
+# an inverse is another row. a row no line names, as jcxz's and loop's, has no inverse
+fun invert_table(c: *set.Context, a: *A.Allocator, in: *Input) err[diag.Refusal] {
+    val checked: err[diag.Refusal] = overlay.check(in.inverses, nil, overlay.unstated);
+    if (sel checked.err) { ret checked; }
+    var lines: vector.Vector[overlay.Line] = vector.init[overlay.Line](a);
+    var i:     usize                       = 0;
+    for (i < in.inverses.facts.len) {
+        var l:   overlay.Line;
+        val got: err[diag.Refusal] = overlay.line(a, ?in.inverses.facts.data[i], ?l);
+        if (sel got.err) { ret got; }
+        val to: opt[str] = overlay.value(?l.ws, "to");
+        if (l.key.len != 1 || l.ws.len != 1 || sel to.none) { ret overlay.reject(?l, BAD_INVERSE, l.fact.key); }
+        val twice: opt[str] = inverse_of(?lines, l.fact.key);
+        if (sel twice.some) { ret overlay.reject(?l, BAD_INVERSE, l.fact.key); }
+        var named: bool  = false;
+        var k:     usize = 0;
+        for (k < in.rows.len && !named) {
+            named = str_equals(in.rows.data[k].ins.iclass, l.fact.key);
+            k     = k + 1;
+        }
+        if (!named)                                        { ret overlay.reject(?l, BAD_INVERSE, l.fact.key); }
+        if (!pushed(vector.push[overlay.Line](?lines, l))) { ret err[diag.Refusal].err{memory(l.fact.key)}; }
+        i = i + 1;
+    }
+    val opened: res[*emit.File, diag.Refusal] = set.table(c, "invert");
+    if (sel opened.err) { ret err[diag.Refusal].err{opened.err}; }
+    val f: *emit.File = opened.ok;
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.invert");
+    var sources: emit.Pool   = emit.pool(f, "invert.Source");
+    val table:   *emit.Array = emit.array(f, "invert.Inversion");
+    val keyed:   *emit.Array = emit.keyed(f, "index.Entry");
+    var same:    emit.Value  = variant(f, "invert.Source.operand", number(0));
+    val held:    u32         = emit.pooled(f, ?sources, ?same, 1);
+    var count:   u32         = 0;
+    i = 0;
+    for (i < in.rows.len) {
+        val r:  *rows.Row = in.rows.data[i];
+        val to: opt[str]  = inverse_of(?lines, r.ins.iclass);
+        if (sel to.some) {
+            var bits: u8 = 0;
+            if (!relative_only(r, ?bits)) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INVERSE, r.key)}; }
+            var found: u32   = NO_LONGER;
+            var k:     usize = 0;
+            for (k < in.rows.len) {
+                val o:    *rows.Row = in.rows.data[k];
+                var wide: u8        = 0;
+                if (str_equals(o.ins.iclass, to.some) && o.modes == r.modes && o.size == r.size && relative_only(o, ?wide) && wide == bits) {
+                    if (found != NO_LONGER) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INVERSE, r.key)}; }
+                    found = k::u32;
+                }
+                k = k + 1;
+            }
+            if (found == NO_LONGER) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INVERSE, r.key)}; }
+            val inv: *emit.Record = emit.record(f, "invert.Inversion");
+            emit.member(f, inv, "row", number(i::i64));
+            emit.member(f, inv, "inverse", number(found::i64));
+            emit.member(f, inv, "values", span(f, "invert.Sources", "SOURCES", held, 1));
+            emit.item(f, table, rec_value(inv));
+            val entry: *emit.Record = emit.record(f, "index.Entry");
+            emit.member(f, entry, "key", emit.Value.text{r.key});
+            emit.member(f, entry, "row", number(count::i64));
+            emit.entry(f, keyed, r.key, rec_value(entry));
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    emit.declare(f, "SOURCES", nil, emit.Value.array{sources.array});
+    emit.declare(f, "INVERSION_KEYS", nil, emit.Value.array{keyed});
+    emit.declare(f, "INVERSION_ROWS", nil, emit.Value.array{table});
+    val all: *emit.Record = emit.record(f, "invert.Inversions");
+    emit.member(f, all, "at", emit.element(f, "INVERSION_ROWS", 0));
+    emit.member(f, all, "len", number(count::i64));
+    emit.member(f, all, "keys", span(f, "index.Index", "INVERSION_KEYS", 0, count));
+    emit.declare(f, "INVERSIONS", "invert.Inversions", rec_value(all));
+    ret err[diag.Refusal].ok{};
+}
+
 pub fun generate(c: *set.Context, in: *Input) err[diag.Refusal] {
     var i: usize = 0;
     for (i < in.named.len) {
@@ -2310,5 +2426,7 @@ pub fun generate(c: *set.Context, in: *Input) err[diag.Refusal] {
     if (sel r.err) { ret r; }
     val x: err[diag.Refusal] = relax_table(c, c.alloc, in);
     if (sel x.err) { ret x; }
+    val v: err[diag.Refusal] = invert_table(c, c.alloc, in);
+    if (sel v.err) { ret v; }
     ret syntax_table(c, c.alloc, in);
 }

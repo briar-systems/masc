@@ -1,0 +1,174 @@
+# `masc listing`: assemble a source file and print the builder's listing of it
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+
+use std.args;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.asm.asm;
+use masc.asm.cfi;
+use masc.asm.line;
+use masc.asm.model;
+use masc.asm.seh;
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.core.diagnostic;
+use masc.emit.listing;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+
+val ROWS:   [10]*args.FlagSpec = [10]*args.FlagSpec{?context.F_ARCH, ?context.A_ARCH, ?context.F_ISA, ?context.F_SYNTAX, ?context.F_ABI, ?context.F_FORMAT, ?context.F_OUTPUT, ?context.A_OUTPUT, ?context.F_VERBOSE, ?context.A_VERBOSE};
+val TABLES: [1]args.TableRef   = [1]args.TableRef{args.TableRef{rows: ?ROWS[0], n: 10, accepted: nil, docs: nil}};
+
+pub val SPEC: args.CommandSpec = args.CommandSpec{
+    name:            "listing",
+    id:              0,
+    aliases:         nil,
+    alias_n:         0,
+    grammar:         " <input> --arch <arch>",
+    summary:         "assemble a source file and print the builder's listing of it",
+    effect:          "assemble the source file through the builder and print the listing of what it was asked for, source that assembles alone to the same object, in the syntax --syntax names, on stdout or to -o",
+    exits:           nil,
+    exit_n:          0,
+    terminator:      "",
+    tables:          ?TABLES[0],
+    table_n:         1,
+    refused:         nil,
+    refused_n:       0,
+    refusal:         "",
+    relations:       nil,
+    relation_n:      0,
+    constraints:     nil,
+    constraint_n:    0,
+    operand_min:     1,
+    operand_max:     1,
+    truncate_at_sep: false,
+    actions:         nil,
+    action_n:        0,
+    examples:        nil,
+    example_n:       0,
+};
+
+pub fun run(r: *Run) render.Exit {
+    ret context.with_formats(r, listing_with);
+}
+
+fun listing_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
+    val path:    str                     = context.operand(r, 0);
+    val written: res[str, args.Misread]  = args.value(?r.line, ?context.F_OUTPUT);
+    val verbose: res[bool, args.Misread] = args.on(?r.line, ?context.F_VERBOSE);
+    if (sel written.err) { ret context.misread(r, written.err); }
+    if (sel verbose.err) { ret context.misread(r, verbose.err); }
+
+    var o:      context.Output;
+    val opened: opt[render.Exit] = context.open_output(r, formats, ?o);
+    if (sel opened.some) { ret opened.some; }
+
+    # a dialect whose text states its module whole is read by its set's reader, with no builder to list
+    if (o.dialect.module != nil) {
+        if (sel o.dialect.module.printed) {
+            context.release_output(?o);
+            ret context.refuse(r, "listing.module", "the format's text states its module whole, which no builder lists", o.format.name);
+        }
+    }
+
+    var source: vector.Vector[u8];
+    if (!context.load(r, path, ?source)) {
+        context.release_output(?o);
+        ret render.ENVIRONMENT;
+    }
+
+    # the line, call frame and windows unwind directives layered over the assembly, as assemble reads them
+    var lines:  line.Context                        = line.make(r.a);
+    var over:   model.Layer                         = line.layer(?lines);
+    var frames: cfi.Text                            = cfi.make();
+    var framed: model.Layer                         = cfi.layer(?frames);
+    var codes:  seh.Text                            = seh.make();
+    var coded:  model.Layer                         = seh.layer(?codes);
+    var layers: [3]*model.Layer                     = [3]*model.Layer{?over, ?framed, ?coded};
+    val made:   res[model.Assembler, model.Refusal] = asm.make(r.a, o.t.set, ?o.t.context, target.assembler(?o.t, formats, o.dialect, model.Layers{at: ?layers[0], len: 3}));
+    if (sel made.err) {
+        context.refused_source(r, path, source.data, source.len, ?made.err);
+        line.release(?lines);
+        vector.dnit[u8](?source);
+        context.release_output(?o);
+        ret render.USER;
+    }
+
+    var m:    model.Assembler = made.ok;
+    var exit: render.Exit     = listed(r, ?m, ?o, path, ?source, written.ok, verbose.ok);
+    model.release(?m);
+    line.release(?lines);
+    vector.dnit[u8](?source);
+    context.release_output(?o);
+    ret exit;
+}
+
+# the file `path`, whose bytes are `source`, read by `m` and its builder's listing printed, on stdout or to `output`
+fun listed(r: *Run, m: *model.Assembler, o: *context.Output, path: str, source: *vector.Vector[u8], output: str, verbose: bool) render.Exit {
+    val ran: err[model.Refusal] = asm.read(m, o.t.set, source.data, source.len, diagnostic.START);
+    if (sel ran.err) {
+        context.refused_source(r, path, source.data, source.len, ?ran.err);
+        ret render.USER;
+    }
+
+    val finished: res[mink_object.Object, model.Refusal] = model.finish(m);
+    if (sel finished.err) {
+        context.refused_source(r, path, source.data, source.len, ?finished.err);
+        ret render.USER;
+    }
+
+    var object: mink_object.Object = finished.ok;
+
+    # the listing goes to stdout, or is gathered here when it goes to a file
+    var printed: vector.Vector[u8]  = vector.init[u8](r.a);
+    var into:    *vector.Vector[u8] = ?r.out.out;
+    if (output != nil) { into = ?printed; }
+
+    val options: listing.Options      = listing.Options{syntax: o.t.syntax, dialect: o.dialect};
+    val done:    err[listing.Refusal] = listing.write(model.builder(m), options, into);
+    var exit:    render.Exit          = render.SUCCESS;
+    if (sel done.err) { exit = unlisted(r, path, ?done.err); }
+    or (output != nil) {
+        exit = context.save_text(r, output, printed.data, printed.len);
+        if (exit == render.SUCCESS && verbose) {
+            text.put(?r.out, path);
+            text.put(?r.out, ": ");
+            text.decimal(?r.out, printed.len::i64);
+            text.put(?r.out, " bytes of listing, written to ");
+            text.put(?r.out, output);
+            text.byte(?r.out, '\n');
+        }
+    }
+
+    vector.dnit[u8](?printed);
+    val released: err[fail.Fail] = mink_object.release(?object);
+    ret exit;
+}
+
+# the refusal `why` to list what the file `path` assembled to
+fun unlisted(r: *Run, path: str, why: *listing.Refusal) render.Exit {
+    render.begin(?r.err, "listing.refused");
+    text.put(?r.err, why.message);
+    text.byte(?r.err, '\n');
+    text.put(?r.err, " --> ");
+    text.put(?r.err, path);
+    if (why.section != listing.NO_SECTION) {
+        text.put(?r.err, ", section ");
+        text.decimal(?r.err, why.section::i64);
+        text.put(?r.err, ", offset ");
+        text.decimal(?r.err, why.offset::i64);
+    }
+    text.byte(?r.err, '\n');
+    ret render.USER;
+}

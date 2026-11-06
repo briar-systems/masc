@@ -5,6 +5,14 @@
 # statements they precede, starting from the frame the set states for the
 # architecture, and `ct_begin` and `ct_end` mark a range mink's object keeps
 # in memory. masc writes no frame bytes, mink owns them.
+#
+# `cfi_epilogue_begin` and `cfi_epilogue_end` mark an epilogue within the
+# open frame, and the rules between them state what each of its
+# instructions undoes. the end is marked before the return, as
+# `.seh_endepilogue` stands, so the span mink's `frame.Rule.epilogue` holds
+# ends past the statement after it. the builder restates the state the body
+# holds past the return, remembered where the epilogue begins and restored
+# there, so no producer restates it.
 use masc.core.index;
 use masc.core.register;
 use masc.core.row;
@@ -22,9 +30,12 @@ use std.types.result.res;
 use std.types.size.usize;
 
 use masc.build.refusal.ARCH;
+use masc.build.refusal.BEHIND;
 use masc.build.refusal.CFA_SCALES;
 use masc.build.refusal.CT_OPEN;
 use masc.build.refusal.CT_SPLIT;
+use masc.build.refusal.EPILOGUE_OPEN;
+use masc.build.refusal.EPILOGUE_RULE;
 use masc.build.refusal.FINISHED;
 use masc.build.refusal.FRAME_OPEN;
 use masc.build.refusal.FRAME_SPLIT;
@@ -121,6 +132,7 @@ pub fun cfi_start(b: *Builder, function: Label) err[Refusal] {
         open:        true,
         cfa:         Cfa{reg: cfa.some::u16, fixed: start.cfa_offset, scale: 0, quantity: 0},
         depth:       0,
+        epilogue:    opt[u32].none{},
     };
     if (!held(vector.push[Framed](?b.frames, f))) { ret err[Refusal].err{memory()}; }
     vector.truncate[Cfa](?b.kept, 0);
@@ -165,15 +177,38 @@ fun follow(b: *Builder, f: *Framed, rule: frame.Rule) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
+# the statement the cursor of the current section is at, in the open frame's section and at or past every statement its
+# rules take effect at
+fun frame_statement(b: *Builder, f: *Framed) res[u32, Refusal] {
+    val here: res[Ct, Refusal] = statement_at(b);
+    if (sel here.err)                 { ret res[u32, Refusal].err{here.err}; }
+    if (here.ok.section != f.section) { ret res[u32, Refusal].err{refuse(FRAME_SPLIT)}; }
+    if (f.count > 0) {
+        if (here.ok.start < b.rules.data[b.rules.len - 1].at) { ret res[u32, Refusal].err{refuse(BEHIND)}; }
+    }
+    ret res[u32, Refusal].ok{here.ok.start};
+}
+
+# rule `rule`, no expression, of frame `f` at statement `at`, which no earlier rule of it is past
+fun placed(b: *Builder, f: *Framed, at: u32, rule: frame.Rule) err[Refusal] {
+    if (!held(vector.reserve[Ruled](?b.rules, 1))) { ret err[Refusal].err{memory()}; }
+    val followed: err[Refusal] = follow(b, f, rule);
+    if (sel followed.err) { ret followed; }
+    vector.push[Ruled](?b.rules, Ruled{at: at, rule: rule, expression: Span{start: 0, len: 0}});
+    f.count = f.count + 1;
+    ret err[Refusal].ok{};
+}
+
 # rule `rule` of the open frame taking effect at the cursor of the current section, as a `.cfi_*` directive states one.
-# an expression's bytes are copied, so they need only outlive the call
+# an expression's bytes are copied, so they need only outlive the call. an epilogue's mark is `cfi_epilogue_begin` and
+# `cfi_epilogue_end`'s, never a rule stated here
 pub fun cfi(b: *Builder, rule: frame.Rule) err[Refusal] {
     val open: opt[*Framed] = open_frame(b);
-    if (sel open.none) { ret refused(FRAME_OPEN); }
-    val here: res[Ct, Refusal] = statement_at(b);
-    if (sel here.err)                         { ret err[Refusal].err{here.err}; }
-    if (here.ok.section != open.some.section) { ret refused(FRAME_SPLIT); }
-    var r: Ruled = Ruled{at: here.ok.start, rule: rule, expression: Span{start: 0, len: 0}};
+    if (sel open.none)     { ret refused(FRAME_OPEN); }
+    if (sel rule.epilogue) { ret refused(EPILOGUE_RULE); }
+    val here: res[u32, Refusal] = frame_statement(b, open.some);
+    if (sel here.err) { ret err[Refusal].err{here.err}; }
+    var r: Ruled = Ruled{at: here.ok, rule: rule, expression: Span{start: 0, len: 0}};
     if (sel rule.expression) {
         val e: store.Held = rule.expression;
         if (!sel e.borrowed) { ret refused(TRAIT_VALUE); }
@@ -222,14 +257,51 @@ pub fun cfi_signal(b: *Builder) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
-# the open frame ended at the cursor of the current section, the section it begun in
+# an epilogue of the open frame begun at the cursor of the current section, where the state its body holds is
+# remembered. the rules up to `cfi_epilogue_end` state what each instruction of the epilogue undoes, each at the
+# statement after its instruction
+pub fun cfi_epilogue_begin(b: *Builder) err[Refusal] {
+    val open: opt[*Framed] = open_frame(b);
+    if (sel open.none) { ret refused(EPILOGUE_OPEN); }
+    val busy: bool = sel open.some.epilogue.some;
+    if (busy) { ret refused(EPILOGUE_OPEN); }
+    val here: res[u32, Refusal] = frame_statement(b, open.some);
+    if (sel here.err) { ret err[Refusal].err{here.err}; }
+    val kept: err[Refusal] = placed(b, open.some, here.ok, frame.Rule.remember{});
+    if (sel kept.err) { ret kept; }
+    open.some.epilogue = opt[u32].some{here.ok};
+    ret err[Refusal].ok{};
+}
+
+# the open epilogue ended before its return, the statement at the cursor of the current section, as `.seh_endepilogue`
+# stands: its span runs from where it begun to past the return, and the state its body holds is restored there
+pub fun cfi_epilogue_end(b: *Builder) err[Refusal] {
+    val open: opt[*Framed] = open_frame(b);
+    if (sel open.none) { ret refused(EPILOGUE_OPEN); }
+    val begun: opt[u32] = open.some.epilogue;
+    if (sel begun.none) { ret refused(EPILOGUE_OPEN); }
+    val here: res[u32, Refusal] = frame_statement(b, open.some);
+    if (sel here.err) { ret err[Refusal].err{here.err}; }
+    val past: u32          = here.ok + 1;
+    val span: frame.Span   = frame.Span{begin: begun.some::u64, end: past::u64};
+    val mark: err[Refusal] = placed(b, open.some, here.ok, frame.Rule.epilogue{span});
+    if (sel mark.err) { ret mark; }
+    val back: err[Refusal] = placed(b, open.some, past, frame.Rule.restore_state{});
+    if (sel back.err) { ret back; }
+    open.some.epilogue = opt[u32].none{};
+    ret err[Refusal].ok{};
+}
+
+# the open frame ended at the cursor of the current section, the section it begun in, past every statement its rules
+# take effect at, so past an epilogue's return
 pub fun cfi_end(b: *Builder) err[Refusal] {
     val open: opt[*Framed] = open_frame(b);
     if (sel open.none) { ret refused(FRAME_OPEN); }
-    val here: res[Ct, Refusal] = statement_at(b);
-    if (sel here.err)                         { ret err[Refusal].err{here.err}; }
-    if (here.ok.section != open.some.section) { ret refused(FRAME_SPLIT); }
-    open.some.end  = here.ok.start;
+    val busy: bool = sel open.some.epilogue.some;
+    if (busy) { ret refused(EPILOGUE_OPEN); }
+    val here: res[u32, Refusal] = frame_statement(b, open.some);
+    if (sel here.err) { ret err[Refusal].err{here.err}; }
+    open.some.end  = here.ok;
     open.some.open = false;
     ret err[Refusal].ok{};
 }

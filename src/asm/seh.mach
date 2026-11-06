@@ -8,8 +8,12 @@
 # a register of the set, read by its syntax's names. `.seh_handler` names the
 # personality routine, which mink's unwind data always states as both the
 # exception and the termination handler, so both `@except` and `@unwind` are
-# required. language data (`.seh_handlerdata`), epilogue marks and chained
-# regions are no rows.
+# required. `.seh_startepilogue` and `.seh_endepilogue` begin and end an
+# epilogue on the builder (`build.cfi_epilogue_begin` and
+# `cfi_epilogue_end`), the end standing before the return as llvm-mc writes
+# it, and each code between them states what its instruction undoes
+# (`masc.emit.seh`). language data (`.seh_handlerdata`) and chained regions
+# are no rows.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -21,10 +25,14 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.view.View;
 
+use mink.model.frame;
+
 use masc.asm.model;
 use masc.build.build;
 use masc.core.diagnostic;
 use masc.core.operand;
+use rf:          masc.core.register;
+use core_state:  masc.core.state;
 use core_syntax: masc.core.syntax;
 use masc.emit.cfi;
 use masc.emit.seh;
@@ -66,17 +74,31 @@ fun comma(rd: *core_syntax.Reader) err[diagnostic.Diagnostic] {
     ret err[diagnostic.Diagnostic].ok{};
 }
 
-# the register at the reader by its dwarf number
-fun register_at(m: *model.Assembler, rd: *core_syntax.Reader) res[u16, diagnostic.Diagnostic] {
+# a register read: its dwarf number and the width a save of it saves
+rec Named {
+    reg:   u16;
+    width: u16;
+}
+
+# the register at the reader by its dwarf number, and the width machine `machine`'s codes save it at, by the bits of
+# the register named
+fun register_at(m: *model.Assembler, rd: *core_syntax.Reader, machine: seh.Machine) res[Named, diagnostic.Diagnostic] {
     read.skip(rd);
     val at: usize                                      = rd.at;
     val v:  res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.REGISTER);
-    if (sel v.err) { ret res[u16, diagnostic.Diagnostic].err{v.err}; }
+    if (sel v.err) { ret res[Named, diagnostic.Diagnostic].err{v.err}; }
     val got: model.Argument = v.ok;
-    if (!sel got.register) { ret res[u16, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_REGISTER, at, rd.at - at)}; }
-    val n: res[u16, build.Refusal] = cfi.number_within(model.builder(m), got.register);
-    if (sel n.err) { ret res[u16, diagnostic.Diagnostic].err{read.refuse(rd, n.err.message, at, rd.at - at)}; }
-    ret res[u16, diagnostic.Diagnostic].ok{n.ok};
+    if (!sel got.register) { ret res[Named, diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_REGISTER, at, rd.at - at)}; }
+    val b: *build.Builder          = model.builder(m);
+    val n: res[u16, build.Refusal] = cfi.number_within(b, got.register);
+    if (sel n.err) { ret res[Named, diagnostic.Diagnostic].err{read.refuse(rd, n.err.message, at, rd.at - at)}; }
+    val ctx:  *core_state.Context      = build.object_of(b);
+    val bits: res[opt[u64], rf.Absent] = rf.width(ctx.view, got.register);
+    var wide: u64                      = 0;
+    if (sel bits.ok) {
+        if (sel bits.ok.some) { wide = bits.ok.some; }
+    }
+    ret res[Named, diagnostic.Diagnostic].ok{Named{reg: n.ok, width: seh.width_named(machine, n.ok, wide)}};
 }
 
 # the constant number of bytes at the reader
@@ -146,6 +168,31 @@ fun do_handler(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic
     ret built(args, cfi.personality(model.builder(m), l.ok, false));
 }
 
+# `.seh_startepilogue`, an epilogue of the open procedure begun once its prologue has ended
+fun do_epilogue(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val t: *Text = args.layer.context::*Text;
+    if (sel t.site.none) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, NO_PROC)}; }
+    val e: err[diagnostic.Diagnostic] = ended(args.reader);
+    if (sel e.err)     { ret e; }
+    if (!t.proc.ended) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, seh.EARLY)}; }
+    val done: err[diagnostic.Diagnostic] = built(args, build.cfi_epilogue_begin(model.builder(m)));
+    if (sel done.err) { ret done; }
+    t.proc.epilogue = true;
+    ret done;
+}
+
+# `.seh_endepilogue`, the open epilogue ended before its return
+fun do_endepilogue(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val t: *Text = args.layer.context::*Text;
+    if (sel t.site.none) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, NO_PROC)}; }
+    val e: err[diagnostic.Diagnostic] = ended(args.reader);
+    if (sel e.err) { ret e; }
+    val done: err[diagnostic.Diagnostic] = built(args, build.cfi_epilogue_end(model.builder(m)));
+    if (sel done.err) { ret done; }
+    t.proc.epilogue = false;
+    ret done;
+}
+
 # a code directive: the row of the procedure's machine of its name, read by its operands
 fun do_code(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
     val t: *Text = args.layer.context::*Text;
@@ -154,13 +201,15 @@ fun do_code(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
     if (sel d.none) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, OTHER)}; }
     val rd:      *core_syntax.Reader = args.reader;
     var reg:     u16                 = seh.NONE;
+    var width:   u16                 = frame.NATURAL;
     var n:       i64                 = 0;
     var at_code: bool                = false;
     val shape:   seh.Operands        = d.some.operands;
     if (sel shape.register || sel shape.both) {
-        val r: res[u16, diagnostic.Diagnostic] = register_at(m, rd);
+        val r: res[Named, diagnostic.Diagnostic] = register_at(m, rd, t.proc.machine);
         if (sel r.err) { ret err[diagnostic.Diagnostic].err{r.err}; }
-        reg = r.ok;
+        reg   = r.ok.reg;
+        width = r.ok.width;
     }
     if (sel shape.both) {
         val c: err[diagnostic.Diagnostic] = comma(rd);
@@ -177,14 +226,14 @@ fun do_code(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
     }
     val e: err[diagnostic.Diagnostic] = ended(rd);
     if (sel e.err) { ret e; }
-    val code: opt[seh.Code] = seh.code_of(d.some, reg, n, at_code);
+    val code: opt[seh.Code] = seh.code_of(d.some, reg, width, n, at_code);
     if (sel code.none) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNFIT)}; }
     ret built(args, seh.state(model.builder(m), ?t.proc, code.some));
 }
 
-# the rows, one per name of `masc.emit.seh.DIRECTIVES`
-val ROW_COUNT: u32                 = 25;
-val ROWS:      [25]model.Directive = [25]model.Directive{
+# the rows, one per name of `masc.emit.seh.DIRECTIVES`, and the epilogue's marks
+val ROW_COUNT: u32                 = 31;
+val ROWS:      [31]model.Directive = [31]model.Directive{
     model.Directive{name: ".seh_proc", operands: model.TEXT, handler: do_proc, param: 0},
     model.Directive{name: ".seh_endproc", operands: model.NO_ITEMS, handler: do_endproc, param: 0},
     model.Directive{name: ".seh_handler", operands: model.TEXT, handler: do_handler, param: 0},
@@ -207,9 +256,15 @@ val ROWS:      [25]model.Directive = [25]model.Directive{
     model.Directive{name: ".seh_save_reg", operands: model.TEXT, handler: do_code, param: 0},
     model.Directive{name: ".seh_save_freg_x", operands: model.TEXT, handler: do_code, param: 0},
     model.Directive{name: ".seh_save_freg", operands: model.TEXT, handler: do_code, param: 0},
+    model.Directive{name: ".seh_save_any_reg_px", operands: model.TEXT, handler: do_code, param: 0},
+    model.Directive{name: ".seh_save_any_reg_p", operands: model.TEXT, handler: do_code, param: 0},
+    model.Directive{name: ".seh_save_any_reg_x", operands: model.TEXT, handler: do_code, param: 0},
+    model.Directive{name: ".seh_save_any_reg", operands: model.TEXT, handler: do_code, param: 0},
     model.Directive{name: ".seh_set_fp", operands: model.TEXT, handler: do_code, param: 0},
     model.Directive{name: ".seh_add_fp", operands: model.TEXT, handler: do_code, param: 0},
     model.Directive{name: ".seh_nop", operands: model.TEXT, handler: do_code, param: 0},
+    model.Directive{name: ".seh_startepilogue", operands: model.TEXT, handler: do_epilogue, param: 0},
+    model.Directive{name: ".seh_endepilogue", operands: model.TEXT, handler: do_endepilogue, param: 0},
 };
 
 fun finish(context: ptr, m: *model.Assembler) err[model.Refusal] {

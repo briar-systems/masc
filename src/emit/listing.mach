@@ -69,9 +69,11 @@
 # `.seh_endproc` stands where the frame ends, each prologue step is the
 # unwind codes that state its rules, before the statement it takes effect
 # at, `.seh_endprologue` stands where the prologue ends, and the
-# personality routine is its `.seh_handler`. on arm64 every prologue
-# instruction whose step states no code is a `.seh_nop`. a frame no unwind
-# code states is refused.
+# personality routine is its `.seh_handler`. an epilogue is
+# `.seh_startepilogue` where it begins, the codes of each of its steps, and
+# `.seh_endepilogue` before its return. on arm64 every prologue or epilogue
+# instruction but the return whose step states no code is a `.seh_nop`. a
+# frame no unwind code states is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -96,13 +98,15 @@ use mink.base.table;
 use mink_arch: mink.catalog.arch;
 use mink.catalog.format;
 use mink_trait: mink.catalog.trait;
+use mink.format.coff.model.bridging;
 use mink.format.contract;
 use mink.format.registration;
 use mink.format.registry;
 use mink.lower;
 use mink.lower.unwind.pointer;
 use mink.model.frame;
-use mink_group:   mink.model.group;
+use mink_group: mink.model.group;
+use mink.model.reloc;
 use mink_section: mink.model.section;
 use mink.model.symbol;
 
@@ -130,6 +134,7 @@ use masc.emit.cfi;
 use masc.emit.line;
 use masc.emit.seh;
 use masc.format.dialect;
+use masc.syntax.expr;
 use spell: masc.syntax.name;
 use masc.syntax.parse;
 use masc.syntax.print;
@@ -147,6 +152,7 @@ pub val OWNED:              str = "link-order or associative section whose owner
 pub val QUOTED:             str = "name that cannot be written in a string";
 pub val UNSPELLED:          str = "label name the text cannot spell: one holding a control byte";
 pub val BINDING:            str = "symbol binding no directive states";
+pub val SEARCH:             str = "weak external search no directive states";
 pub val VISIBILITY:         str = "symbol visibility no directive states";
 pub val TYPE:               str = "symbol kind no .type states";
 pub val PRIVATE:            str = "local symbol whose name the assembler keeps out of the symbol table";
@@ -158,12 +164,16 @@ pub val UNNAMED_REGISTER:   str = "frame register the set's syntax names no way"
 pub val MODES:              str = "assembler mode value that no directive of the dialect states";
 pub val FRAMES:             str = "frame on a format whose unwind table no call frame directive the listing writes states";
 pub val FRAME_RULE:         str = "frame rule no call frame directive states: an offset that scales or a prologue or epilogue mark";
-pub val UNEVEN:             str = "arm64 prologue whose instructions are not four bytes each, which its unwind codes count";
+pub val SAVE_WIDTH:         str = "register saved at a width other than its natural one, which no call frame directive states";
+pub val UNEVEN:             str = "arm64 prologue or epilogue whose instructions are not four bytes each, which its unwind codes count";
 pub val FRAME_FUNCTION:     str = "frame whose function's label is not placed where it begins, which .cfi_startproc names it by";
 pub val FRAME_ORDER:        str = "frames out of the order of their sections and starts, in which the text begins them";
 pub val ATTRIBUTE:          str = "trait stated by an attribute tag, which the dialect has no directive to state";
 pub val RAW:                str = "instruction stated by its encoding, which the dialect has no directive to state";
 pub val NO_BYTE:            str = "the set's source dialect has no one-byte data directive";
+pub val NO_WORD:            str = "the set's source dialect has no four-byte data directive for a bridge's type word";
+pub val BRIDGES:            str = "bridges the dialect states no section for";
+pub val BRIDGE_ROLE:        str = "bridge role no type word of the dialect states";
 pub val NO_WIDTH:           str = "the set's source dialect has no data directive of this width";
 pub val UNREAD:             str = "instruction whose spelling does not read back to the row and values the builder wrote";
 pub val KINDED:             str = "datum of a stated relocation kind, which no data directive of the source dialect states";
@@ -252,12 +262,14 @@ rec Codes {
 # on:      whether the format's table is a windows one, its frames written as unwind codes
 # written: the open frame's codes
 # si:      the next step of them to write
-# last:    the offset of the last step written, from which arm64's prologue instructions with no code are counted
+# last:    the offset of the last statement passed, from which arm64's instructions with no code are counted
+# inside:  whether the statements passed lie in the prologue or an epilogue, each instruction one code
 rec Windows {
     on:      bool;
     written: seh.Written;
     si:      u32;
     last:    u64;
+    inside:  bool;
 }
 
 # the state of one listing
@@ -268,6 +280,8 @@ rec Windows {
 # places:  every placed label, in place order
 # uses:    per label, less one, how many times the record names it: in a value, a datum, a difference, an equate or a
 #          size
+# folded:  per label, less one, the weak external whose default definition it is, written under that one's name, 0 for
+#          a label that is none
 # pi:      the next of `places` to write
 # scopes:  the views met so far and what states them
 # now:     the scope where the text written so far ends
@@ -299,6 +313,7 @@ rec Lister {
     owners:  vector.Vector[u32];
     places:  vector.Vector[Placed];
     uses:    vector.Vector[u32];
+    folded:  vector.Vector[u32];
     pi:      usize;
     scopes:  vector.Vector[Scope];
     now:     Scope;
@@ -585,14 +600,16 @@ fun kind_directive(l: *Lister, o: *build.Opened) opt[*dialect.Named] {
     ret core.kind_directive(build.naming(l.b), l.dialect.sections, o.kind, o.flags, o.disposition, o.entsize);
 }
 
-# the name section `s` reads back with: its own, or the spelling of the directive that enters its kind, refused for a
-# nameless section of a kind no directive enters
+# the name section `s` reads back with: its own, or the spelling of the directive that enters its kind, or else the name
+# the object format gives its kind, refused for a nameless section of a kind the format has no name for
 fun listed_name(l: *Lister, s: u32) res[View, Refusal] {
     val o: build.Opened = build.opened(l.b, build.Section{index: s});
     if (sel o.name.some) { ret res[View, Refusal].ok{o.name.some}; }
     val d: opt[*dialect.Named] = kind_directive(l, ?o);
-    if (sel d.none) { ret res[View, Refusal].err{Refusal{message: NAMELESS_SECTION, section: s, offset: 0, label: operand.NO_SYMBOL}}; }
-    ret res[View, Refusal].ok{View{data: d.some.name, len: str_len(d.some.name)}};
+    if (sel d.some) { ret res[View, Refusal].ok{View{data: d.some.name, len: str_len(d.some.name)}}; }
+    val named: opt[View] = core.format_name(build.naming(l.b), o.kind, o.entsize);
+    if (sel named.none) { ret res[View, Refusal].err{Refusal{message: NAMELESS_SECTION, section: s, offset: 0, label: operand.NO_SYMBOL}}; }
+    ret res[View, Refusal].ok{named.some};
 }
 
 fun same_name(a: opt[View], b: opt[View]) bool {
@@ -783,7 +800,10 @@ fun spells_difference(l: *Lister, d: build.Difference) bool {
 # the declarations of label `id`: what makes it a symbol, and the value it is given in place of a place
 fun declare(l: *Lister, id: u32) err[Refusal] {
     if (locates(l, id)) { ret err[Refusal].ok{}; }
+    # a default definition is stated under the name of the weak external it stands behind
+    if (l.folded.data[id::usize - 1] != 0) { ret err[Refusal].ok{}; }
     val lb:    build.Label         = build.Label{id: id};
+    val home:  u32                 = defaulted(l, id);
     val shown: opt[build.Exposure] = build.exposure_of(l.b, lb);
     val value: opt[build.Value]    = build.value_of(l.b, lb);
     val spot:  opt[build.Spot]     = build.spot_of(l.b, lb);
@@ -794,16 +814,29 @@ fun declare(l: *Lister, id: u32) err[Refusal] {
     # the assembler makes a symbol of every label it holds whose name is not private
     if (sel shown.none && !starts_with(name, l.dialect.private)) { ret about(NAMED_LOCAL, id); }
     if (sel shown.some) {
-        val e: build.Exposure = shown.some;
+        var e: build.Exposure = shown.some;
+        if (home != operand.NO_SYMBOL) {
+            val given: opt[build.Exposure] = build.exposure_of(l.b, build.Label{id: home});
+            if (sel given.some) { e.size = given.some.size; }
+        }
         if (e.binding == ?symbol.LOCAL) {
             if (starts_with(name, l.dialect.private)) { ret about(PRIVATE, id); }
             if (!build.bound(l.b, lb))                { ret about(UNDEFINED, id); }
         }
-        # a local binding is stated by none where the dialect binds a symbol locally by binding it no other way
+        # a local binding is stated by none where the dialect binds a symbol locally by binding it no other way, and a
+        # weak external with a fallback by the directive of its search
         var binding: opt[str] = core.binding_directive(e.binding);
         if (e.binding == ?symbol.LOCAL) {
             binding = opt[str].none{};
             if (l.dialect.local != nil) { binding = opt[str].some{l.dialect.local}; }
+        }
+        if (sel value.some) {
+            if (sel value.some.fallback) {
+                if (home == operand.NO_SYMBOL) {
+                    binding = core.search_directive(value.some.fallback.search);
+                    if (sel binding.none) { ret about(SEARCH, id); }
+                }
+            }
         }
         if (sel binding.some) {
             directive(l, binding.some, id);
@@ -866,6 +899,15 @@ fun declare(l: *Lister, id: u32) err[Refusal] {
         put_name(l, v.equate.target);
         put_addend(l, v.equate.addend);
         put_char(l, '\n');
+    }
+    if (sel v.fallback) {
+        if (home == operand.NO_SYMBOL) {
+            if (!spelled(l, v.fallback.target)) { ret about(UNSPELLED, v.fallback.target); }
+            directive(l, ".set", id);
+            put(l, ", ");
+            put_name(l, v.fallback.target);
+            put_char(l, '\n');
+        }
     }
     ret err[Refusal].ok{};
 }
@@ -1108,8 +1150,8 @@ fun moded(l: *Lister, m: *mode.State, s: u32, at: u64) err[Refusal] {
 }
 
 # the `.section` that opens section `s` in the dialect's grammar, or the directive that enters a nameless one by its
-# kind. a section in a comdat group states its group, and a section after the first of its name is opened apart by the
-# dialect's next unique number
+# kind, or by the name the object format gives its kind when no directive enters it. a section in a comdat group
+# states its group, and a section after the first of its name is opened apart by the dialect's next unique number
 fun header(l: *Lister, s: u32) err[Refusal] {
     # a typed stream's text states a module, never a section
     if (l.b.set.codec.stream != nil) { ret err[Refusal].ok{}; }
@@ -1117,17 +1159,18 @@ fun header(l: *Lister, s: u32) err[Refusal] {
     val o:      build.Opened       = build.opened(l.b, sec);
     val listed: res[View, Refusal] = listed_name(l, s);
     if (sel listed.err) { ret err[Refusal].err{listed.err}; }
-    val name:  View               = listed.ok;
-    val first: bool               = first_keyed(l, s, name);
-    val owner: opt[build.Section] = build.owner_of(l.b, sec);
-    val group: opt[View]          = build.group_of(l.b, sec);
+    val name:  View                = listed.ok;
+    val first: bool                = first_keyed(l, s, name);
+    val owner: opt[build.Section]  = build.owner_of(l.b, sec);
+    val group: opt[View]           = build.group_of(l.b, sec);
+    val d:     opt[*dialect.Named] = kind_directive(l, ?o);
     if (sel o.name.none && first && sel owner.none && sel group.none) {
-        val d: opt[*dialect.Named] = kind_directive(l, ?o);
-        if (sel d.none) { ret refusal(NAMELESS_SECTION, s, 0); }
-        put_char(l, '\t');
-        put(l, d.some.directive);
-        put_char(l, '\n');
-        ret err[Refusal].ok{};
+        if (sel d.some) {
+            put_char(l, '\t');
+            put(l, d.some.directive);
+            put_char(l, '\n');
+            ret err[Refusal].ok{};
+        }
     }
     val led:    bool             = build.associated(l.b, sec);
     val rule:   *mink_group.Rule = build.group_rule(l.b, sec);
@@ -1371,12 +1414,12 @@ fun put_register(l: *Lister, n: u16, s: u32, at: u64) err[Refusal] {
 }
 
 # `.name register, offset`
-fun put_saved(l: *Lister, name: str, o: frame.Offset, s: u32, at: u64) err[Refusal] {
+fun put_saved(l: *Lister, name: str, reg: u16, offset: i64, s: u32, at: u64) err[Refusal] {
     put(l, name);
-    val r: err[Refusal] = put_register(l, o.reg, s, at);
+    val r: err[Refusal] = put_register(l, reg, s, at);
     if (sel r.err) { ret r; }
     put(l, ", ");
-    put_signed(l, o.offset);
+    put_signed(l, offset);
     put_char(l, '\n');
     ret err[Refusal].ok{};
 }
@@ -1392,10 +1435,13 @@ fun put_alone(l: *Lister, name: str, n: u16, s: u32, at: u64) err[Refusal] {
 
 # frame rule `rule` as the `.cfi_` directive that states it, at `at` of section `s`
 fun frame_rule(l: *Lister, rule: frame.Rule, s: u32, at: u64) err[Refusal] {
-    if (sel rule.def_cfa)       { ret put_saved(l, "\t.cfi_def_cfa ", rule.def_cfa, s, at); }
-    or (sel rule.cfa_register)  { ret put_alone(l, "\t.cfi_def_cfa_register ", rule.cfa_register, s, at); }
-    or (sel rule.offset)        { ret put_saved(l, "\t.cfi_offset ", rule.offset, s, at); }
-    or (sel rule.val_offset)    { ret put_saved(l, "\t.cfi_val_offset ", rule.val_offset, s, at); }
+    if (sel rule.def_cfa)      { ret put_saved(l, "\t.cfi_def_cfa ", rule.def_cfa.reg, rule.def_cfa.offset, s, at); }
+    or (sel rule.cfa_register) { ret put_alone(l, "\t.cfi_def_cfa_register ", rule.cfa_register, s, at); }
+    or (sel rule.offset) {
+        if (rule.offset.width != frame.NATURAL) { ret refusal(SAVE_WIDTH, s, at); }
+        ret put_saved(l, "\t.cfi_offset ", rule.offset.reg, rule.offset.offset, s, at);
+    }
+    or (sel rule.val_offset)    { ret put_saved(l, "\t.cfi_val_offset ", rule.val_offset.reg, rule.val_offset.offset, s, at); }
     or (sel rule.same)          { ret put_alone(l, "\t.cfi_same_value ", rule.same, s, at); }
     or (sel rule.undefined)     { ret put_alone(l, "\t.cfi_undefined ", rule.undefined, s, at); }
     or (sel rule.restore)       { ret put_alone(l, "\t.cfi_restore ", rule.restore, s, at); }
@@ -1462,15 +1508,16 @@ fun frame_rules(l: *Lister, j: u32, s: u32, at: u64) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
-# what the open frame's prologue states before statement `j`, at `at` of section `s`: on arm64 a `.seh_nop` after each
-# prologue instruction since the last statement that states no code, each right after its own instruction, then the
-# codes of the step there when one is, then the end of the prologue when it ends there
+# what the open frame's codes state before statement `j`, at `at` of section `s`: on arm64 a `.seh_nop` after each
+# prologue or epilogue instruction since the last statement that states no code, each right after its own
+# instruction, then the codes of the step there when one is, the end of the prologue when it ends there, and an
+# epilogue's beginning, or its end before its return, when one is there
 fun unwind_step(l: *Lister, j: u32, s: u32, at: u64) err[Refusal] {
     val w: *seh.Written = ?l.windows.written;
     if (l.windows.si >= w.count) { ret err[Refusal].ok{}; }
     val step:  *seh.Step = ?w.steps[l.windows.si::usize];
     val coded: bool      = step.at == j && step.codes.len > 0;
-    if (sel w.machine.arm64) {
+    if (sel w.machine.arm64 && l.windows.inside) {
         val gap: u64 = at - l.windows.last;
         if (gap % 4 != 0) { ret refusal(UNEVEN, s, at); }
         var nops: u64 = gap / 4;
@@ -1489,16 +1536,31 @@ fun unwind_step(l: *Lister, j: u32, s: u32, at: u64) err[Refusal] {
         if (sel wrote.err) { ret wrote; }
         c = c + 1;
     }
-    if (step.end) { put(l, "\t.seh_endprologue\n"); }
+    if (step.end) {
+        put(l, "\t.seh_endprologue\n");
+        l.windows.inside = false;
+    }
+    if (step.open) {
+        put(l, "\t.seh_startepilogue\n");
+        l.windows.inside = true;
+    }
+    if (step.close) {
+        put(l, "\t.seh_endepilogue\n");
+        l.windows.inside = false;
+    }
     ret err[Refusal].ok{};
 }
 
 # dwarf register `n` by its name in the set's syntax, an arm64 floating point register's by its d register, the low half
-# its unwind codes save
-fun put_named_register(l: *Lister, m: seh.Machine, n: u16, s: u32, at: u64) err[Refusal] {
+# its unwind codes save, or by its q register when saved `width` bytes wide, the whole of it
+fun put_named_register(l: *Lister, m: seh.Machine, n: u16, width: u16, s: u32, at: u64) err[Refusal] {
     var reg: res[rf.Id, build.Refusal] = cfi.numbered(l.b, n::u32);
-    if (sel m.arm64 && n >= seh.A64_FLOAT) { reg = cfi.low_view(l.b, n, 64); }
-    if (sel reg.err)                       { ret refusal(reg.err.message, s, at); }
+    if (sel m.arm64 && n >= seh.A64_FLOAT) {
+        var bits: u64 = 64;
+        if (width == seh.Q_WIDTH) { bits = 128; }
+        reg = cfi.low_view(l.b, n, bits);
+    }
+    if (sel reg.err) { ret refusal(reg.err.message, s, at); }
     var w:     core_syntax.Writer = writer(l, build.object_of(l.b), ?l.modes);
     val wrote: err[field.Refusal] = syntax_write.register_name(?w, reg.ok, field.NO_OPERAND);
     if (sel wrote.err) { ret refusal(seh.UNCODED, s, at); }
@@ -1515,7 +1577,7 @@ fun unwind_code(l: *Lister, m: seh.Machine, c: seh.Code, s: u32, at: u64) err[Re
     val shape: seh.Operands = d.operands;
     if (sel shape.register || sel shape.both) {
         put_char(l, ' ');
-        val r: err[Refusal] = put_named_register(l, m, spelled.some.reg, s, at);
+        val r: err[Refusal] = put_named_register(l, m, spelled.some.reg, spelled.some.width, s, at);
         if (sel r.err) { ret r; }
     }
     if (sel shape.both)                    { put(l, ", "); }
@@ -1583,7 +1645,7 @@ fun unwind_start(l: *Lister, f: build.Frame, s: u32, at: u64) err[Refusal] {
     val found: res[*seh.Written, seh.Uncoded] = seh.codes(l.b, f, ?l.windows.written);
     if (sel found.err) { ret refusal(found.err.message, s, at); }
     put(l, "\t.seh_proc ");
-    put_name(l, f.function.id);
+    put_name(l, build.home(l.b, f.function).id);
     put_char(l, '\n');
     if (sel f.personality.some) {
         if (!spelled(l, f.personality.some.label.id)) { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: at, label: f.personality.some.label.id}}; }
@@ -1591,12 +1653,13 @@ fun unwind_start(l: *Lister, f: build.Frame, s: u32, at: u64) err[Refusal] {
         put_name(l, f.personality.some.label.id);
         put(l, ", @unwind, @except\n");
     }
-    l.windows.si   = 0;
-    l.windows.last = at;
-    l.open         = true;
-    l.current      = f;
-    l.ri           = f.rules;
-    l.fi           = l.fi + 1;
+    l.windows.si     = 0;
+    l.windows.last   = at;
+    l.windows.inside = true;
+    l.open           = true;
+    l.current        = f;
+    l.ri             = f.rules;
+    l.fi             = l.fi + 1;
     ret err[Refusal].ok{};
 }
 
@@ -1627,7 +1690,7 @@ fun before(l: *Lister, s: u32, j: u32, at: u64, skip: u32) err[Refusal] {
     if (sel ended.err) { ret ended; }
     val begins:   opt[build.Frame] = frame_begins(l, s, j);
     var function: u32              = operand.NO_SYMBOL;
-    if (sel begins.some) { function = begins.some.function.id; }
+    if (sel begins.some) { function = build.home(l.b, begins.some.function).id; }
     val placed: err[Refusal] = labels_at(l, s, j, at, skip, function);
     if (sel placed.err) { ret placed; }
     if (sel begins.some) {
@@ -1718,12 +1781,20 @@ fun count_uses(l: *Lister) err[Refusal] {
         val value: opt[build.Value]    = build.value_of(l.b, label);
         val e:     opt[build.Exposure] = build.exposure_of(l.b, label);
         if (sel value.some) {
-            if (sel value.some.equate) { use_label(l, value.some.equate.target); }
+            if (sel value.some.equate)   { use_label(l, value.some.equate.target); }
+            if (sel value.some.fallback) { use_label(l, value.some.fallback.target); }
         }
         if (sel e.some) {
             if (sel e.some.size.measured) { use_difference(l, e.some.size.measured); }
         }
         id = id + 1;
+    }
+    k = 0;
+    for (k < build.bridge_count(l.b)) {
+        val br: build.Bridged = build.bridge_at(l.b, k);
+        k = k + 1;
+        use_label(l, br.symbol.id);
+        use_label(l, br.thunk.id);
     }
     ret err[Refusal].ok{};
 }
@@ -2043,12 +2114,26 @@ fun code(l: *Lister, s: u32, j: u32, first: build.Statement) res[u32, Refusal] {
     ret res[u32, Refusal].ok{count};
 }
 
-# the directive that writes data of `width` bytes, none when the dialect has none
+# the directive that writes data of `width` bytes of the width's own kind, none when the dialect has none
 fun width_directive(l: *Lister, width: u8) opt[str] {
     var i: u32 = 0;
     for (i < l.b.set.source.widths.len) {
-        if (l.b.set.source.widths.at[i].width == width) { ret opt[str].some{l.b.set.source.widths.at[i].name}; }
+        if (l.b.set.source.widths.at[i].width == width && l.b.set.source.widths.at[i].kind == operand.NO_FIXUP) { ret opt[str].some{l.b.set.source.widths.at[i].name}; }
         i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the directive of the dialect that states fixup kind `want` itself on data of `width` bytes, none when the dialect
+# states it by a specifier on the width's own directive or not at all
+fun kinded_directive(l: *Lister, width: u8, want: operand.FixupKind) opt[str] {
+    val sought: *reloc.Kind = build.kind_of(l.b, want);
+    var i:      u32         = 0;
+    for (i < l.b.set.source.widths.len) {
+        val w: *source.Width = ?l.b.set.source.widths.at[i];
+        i = i + 1;
+        if (w.width != width || w.kind == operand.NO_FIXUP)                            { cnt; }
+        if (w.kind == want || (sought != nil && build.kind_of(l.b, w.kind) == sought)) { ret opt[str].some{w.name}; }
     }
     ret opt[str].none{};
 }
@@ -2084,6 +2169,36 @@ fun align(l: *Lister, al: build.Align) {
     put_char(l, '\n');
 }
 
+# statement `st` of section `s`, the datum `r` of a stated relocation kind, written as the dialect's own directive of that
+# kind where it has one, else as the width's directive over the symbol under the specifier of the set's syntax that
+# states the kind on a datum of the width's own, both of which the assembler reads back to the kind
+fun kinded(l: *Lister, s: u32, st: build.Statement, r: build.Reference) err[Refusal] {
+    if (r.basis != fixup.ABSOLUTE) { ret refusal(KINDED, s, st.offset); }
+    val own:   operand.FixupKind      = build.datum_own(l.b, r.basis, r.width);
+    val found: opt[operand.FixupKind] = build.datum_kind(l.b, r.basis, r.width, build.kind_of(l.b, r.kind));
+    if (sel found.none) { ret refusal(KINDED, s, st.offset); }
+    val own_dir: opt[str] = kinded_directive(l, r.width, found.some);
+    if (sel own_dir.some) {
+        put_char(l, '\t');
+        put(l, own_dir.some);
+        put_char(l, ' ');
+        put_name(l, r.target.id);
+        put_addend(l, r.addend);
+        put_char(l, '\n');
+        ret err[Refusal].ok{};
+    }
+    val plain: opt[str] = width_directive(l, r.width);
+    if (sel plain.none) { ret refusal(NO_WIDTH, s, st.offset); }
+    put_char(l, '\t');
+    put(l, plain.some);
+    put_char(l, ' ');
+    var w:     core_syntax.Writer = writer(l, nil, ?l.modes);
+    val wrote: err[field.Refusal] = expr.print_symbol(?w, operand.Symbol{id: r.target.id, addend: r.addend, fixup: found.some}, own, field.NO_OPERAND);
+    if (sel wrote.err) { ret refusal(KINDED, s, st.offset); }
+    put_char(l, '\n');
+    ret err[Refusal].ok{};
+}
+
 # statement `st` of section `s` that is data, written
 fun data(l: *Lister, s: u32, st: build.Statement) err[Refusal] {
     val stated: build.Stated = st.stated;
@@ -2101,9 +2216,9 @@ fun data(l: *Lister, s: u32, st: build.Statement) err[Refusal] {
     if (sel stated.datum) {
         val r: build.Reference = stated.datum;
         val d: opt[str]        = width_directive(l, r.width);
-        if (sel d.none)                 { ret refusal(NO_WIDTH, s, st.offset); }
-        if (r.kind != operand.NO_FIXUP) { ret refusal(KINDED, s, st.offset); }
         if (!spelled(l, r.target.id))   { ret err[Refusal].err{Refusal{message: UNSPELLED, section: s, offset: st.offset, label: r.target.id}}; }
+        if (r.kind != operand.NO_FIXUP) { ret kinded(l, s, st, r); }
+        if (sel d.none)                 { ret refusal(NO_WIDTH, s, st.offset); }
         put_char(l, '\t');
         put(l, d.some);
         put_char(l, ' ');
@@ -2261,6 +2376,41 @@ fun raised(l: *Lister) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
+# every bridge, after every section, in the section the dialect states bridges in: a symbol index of the symbol it
+# serves, one of its thunk and the four-byte type word of its role, which the assembler reads back into the same
+# bridges
+fun bridges(l: *Lister) err[Refusal] {
+    val count: usize = build.bridge_count(l.b);
+    if (count == 0)               { ret err[Refusal].ok{}; }
+    if (l.dialect.bridges == nil) { ret whole(BRIDGES); }
+    val word: opt[str] = width_directive(l, 4);
+    if (sel word.none) { ret whole(NO_WORD); }
+    val name: View = View{data: l.dialect.bridges.section, len: str_len(l.dialect.bridges.section)};
+    put(l, "\t.section ");
+    if (plain(name))          { put_view(l, name); }
+    or (!put_string(l, name)) { ret whole(QUOTED); }
+    put_char(l, '\n');
+    var k: usize = 0;
+    for (k < count) {
+        val br: build.Bridged = build.bridge_at(l.b, k);
+        k = k + 1;
+        val type: opt[u32] = bridging.code_of(br.role);
+        if (sel type.none)             { ret whole(BRIDGE_ROLE); }
+        if (!spelled(l, br.symbol.id)) { ret about(UNSPELLED, br.symbol.id); }
+        if (!spelled(l, br.thunk.id))  { ret about(UNSPELLED, br.thunk.id); }
+        directive(l, core.SYMBOL_INDEX, br.symbol.id);
+        put_char(l, '\n');
+        directive(l, core.SYMBOL_INDEX, br.thunk.id);
+        put_char(l, '\n');
+        put_char(l, '\t');
+        put(l, word.some);
+        put_char(l, ' ');
+        put_unsigned(l, type.some::u64);
+        put_char(l, '\n');
+    }
+    ret err[Refusal].ok{};
+}
+
 # the value an operand of shape `shape` holds that states the setting `said` of axis `x`, as `build.setting_of` maps an
 # enumerant's value, none when no member of its enumeration states it
 fun stating_value(l: *Lister, shape: *operand.Shape, x: *mink_trait.Axis, said: mink_trait.Setting) opt[operand.Value] {
@@ -2365,6 +2515,151 @@ fun statings(l: *Lister) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
+# whether `d` spells `.weak.<w>.default`, followed by `.<suffix>` when `suffix` is one, the label llvm moves the
+# definition of a bare weak symbol `w` to
+fun default_named(w: View, suffix: opt[View], d: View) bool {
+    val head:  str   = ".weak.";
+    val tail:  str   = ".default";
+    val hn:    usize = str_len(head);
+    val tn:    usize = str_len(tail);
+    var extra: usize = 0;
+    if (sel suffix.some)                  { extra = suffix.some.len + 1; }
+    if (d.len != hn + w.len + tn + extra) { ret false; }
+    var i: usize = 0;
+    for (i < hn) {
+        if (d.data[i] != head[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.len) {
+        if (d.data[hn + i] != w.data[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < tn) {
+        if (d.data[hn + w.len + i] != tail[i]) { ret false; }
+        i = i + 1;
+    }
+    if (sel suffix.none)                { ret true; }
+    if (d.data[hn + w.len + tn] != '.') { ret false; }
+    i = 0;
+    for (i < suffix.some.len) {
+        if (d.data[hn + w.len + tn + 1 + i] != suffix.some.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the name of the first label that is a global symbol with a definition, as llvm ends every weak default's name with,
+# none when no label is. a label some weak external's default fallback names is not one, as it is made by the
+# assembler
+fun first_defined(l: *Lister) opt[View] {
+    val count: usize = build.label_count(l.b);
+    var i:     usize = 1;
+    for (i <= count) {
+        val lb:    build.Label         = build.Label{id: i::u32};
+        val shown: opt[build.Exposure] = build.exposure_of(l.b, lb);
+        val value: opt[build.Value]    = build.value_of(l.b, lb);
+        val spot:  opt[build.Spot]     = build.spot_of(l.b, lb);
+        val own:   opt[View]           = build.label_name(l.b, lb);
+        i = i + 1;
+        if (sel shown.none || sel own.none) { cnt; }
+        if (sel shown.some) {
+            if (shown.some.binding != ?symbol.GLOBAL) { cnt; }
+        }
+        var defined: bool = sel spot.some;
+        if (sel value.some) {
+            if (sel value.some.absolute || sel value.some.equate) { defined = true; }
+        }
+        if (!defined)                  { cnt; }
+        if (targeted(l, (i - 1)::u32)) { cnt; }
+        ret own;
+    }
+    ret opt[View].none{};
+}
+
+# whether label `id` holds the definition of a weak external, moved there by the assembler
+fun targeted(l: *Lister, id: u32) bool {
+    val count: usize = build.label_count(l.b);
+    var i:     usize = 1;
+    for (i <= count) {
+        val value: opt[build.Value] = build.value_of(l.b, build.Label{id: i::u32});
+        i = i + 1;
+        if (sel value.some) {
+            if (sel value.some.fallback) {
+                if (value.some.fallback.moved && value.some.fallback.target == id) { ret true; }
+            }
+        }
+    }
+    ret false;
+}
+
+# the default definition of weak external `id` that is written as its own definition, operand.NO_SYMBOL for none
+fun defaulted(l: *Lister, id: u32) u32 {
+    val value: opt[build.Value] = build.value_of(l.b, build.Label{id: id});
+    if (sel value.some) {
+        if (sel value.some.fallback) {
+            val d: u32 = value.some.fallback.target;
+            if (l.folded.data[d::usize - 1] == id) { ret d; }
+        }
+    }
+    ret operand.NO_SYMBOL;
+}
+
+# weak external `w` whose fallback is label `at`, folded with it when that is its default definition
+fun fold_default(l: *Lister, w: build.Label, at: u32, suffix: opt[View]) {
+    val d:       build.Label         = build.Label{id: at};
+    val shown:   opt[build.Exposure] = build.exposure_of(l.b, w);
+    val own_w:   opt[View]           = build.label_name(l.b, w);
+    val own_d:   opt[View]           = build.label_name(l.b, d);
+    val d_shown: opt[build.Exposure] = build.exposure_of(l.b, d);
+    val d_value: opt[build.Value]    = build.value_of(l.b, d);
+    val d_spot:  opt[build.Spot]     = build.spot_of(l.b, d);
+    if (sel shown.none)                                 { ret; }
+    if (sel own_w.none)                                 { ret; }
+    if (sel own_d.none)                                 { ret; }
+    if (sel d_shown.none)                               { ret; }
+    if (shown.some.binding != ?symbol.WEAKLY)           { ret; }
+    if (!default_named(own_w.some, suffix, own_d.some)) { ret; }
+    if (d_shown.some.binding != ?symbol.GLOBAL)         { ret; }
+    if (l.uses.data[at::usize - 1] != 1)                { ret; }
+    if (sel d_value.some) {
+        if (sel d_spot.some)            { ret; }
+        if (!sel d_value.some.absolute) { ret; }
+        if (d_value.some.absolute != 0) { ret; }
+    }
+    or (sel d_spot.none) { ret; }
+    l.folded.data[at::usize - 1]  = w.id;
+    l.spelled.data[at::usize - 1] = l.spelled.data[w.id::usize - 1];
+}
+
+# each weak external whose fallback is the dialect's weak search to `.weak.<name>.default`, a local label only that
+# fallback names, which a bare `.weak <name>` states: the default is then written as the name's own definition, or not
+# at all when it is the absolute zero of a name never defined
+fun fold_defaults(l: *Lister) err[Refusal] {
+    val count: usize = build.label_count(l.b);
+    if (!held(vector.reserve[u32](?l.folded, count))) { ret whole(MEMORY); }
+    var id: usize = 0;
+    for (id < count) {
+        vector.push[u32](?l.folded, 0);
+        id = id + 1;
+    }
+    if (l.dialect.weak == nil) { ret err[Refusal].ok{}; }
+    val suffix: opt[View] = first_defined(l);
+    id = 1;
+    for (id <= count) {
+        val w:     build.Label      = build.Label{id: id::u32};
+        val value: opt[build.Value] = build.value_of(l.b, w);
+        id = id + 1;
+        if (sel value.some) {
+            if (sel value.some.fallback) {
+                if (value.some.fallback.search == l.dialect.weak) { fold_default(l, w, value.some.fallback.target, suffix); }
+            }
+        }
+    }
+    ret err[Refusal].ok{};
+}
+
 # the whole listing written
 fun run(l: *Lister) err[Refusal] {
     val read_: err[Refusal] = sections_read(l);
@@ -2377,6 +2672,8 @@ fun run(l: *Lister) err[Refusal] {
     if (sel places.err) { ret places; }
     val used: err[Refusal] = count_uses(l);
     if (sel used.err) { ret used; }
+    val folded: err[Refusal] = fold_defaults(l);
+    if (sel folded.err) { ret folded; }
     val framed: err[Refusal] = frames_read(l);
     if (sel framed.err) { ret framed; }
     val named: err[Refusal] = sources(l);
@@ -2403,7 +2700,9 @@ fun run(l: *Lister) err[Refusal] {
     if (l.open || l.fi != build.frame_count(l.b)) { ret whole(FRAMES); }
     val notes: err[Refusal] = raised(l);
     if (sel notes.err) { ret notes; }
-    if (l.full)        { ret whole(MEMORY); }
+    val bridged: err[Refusal] = bridges(l);
+    if (sel bridged.err) { ret bridged; }
+    if (l.full)          { ret whole(MEMORY); }
     ret err[Refusal].ok{};
 }
 
@@ -2427,6 +2726,7 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
         owners:  vector.init[u32](out.a),
         places:  vector.init[Placed](out.a),
         uses:    vector.init[u32](out.a),
+        folded:  vector.init[u32](out.a),
         pi:      0,
         scopes:  vector.init[Scope](out.a),
         now:     Scope{v: build.object_of(b), mask: 0, restated: false, states: 0, stated: true},
@@ -2443,7 +2743,7 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
         open:    false,
         ri:      0,
         codes:   Codes{personality: opt[u8].none{}, lsda: opt[u8].none{}},
-        windows: Windows{on: false, si: 0, last: 0},
+        windows: Windows{on: false, si: 0, last: 0, inside: false},
         stores:  core_syntax.stores(out.a),
         widened: opt[extension.Selection].none{},
     };
@@ -2463,6 +2763,7 @@ pub fun write(b: *build.Builder, options: Options, out: *vector.Vector[u8]) err[
     vector.dnit[u32](?l.anchors);
     vector.dnit[Placed](?l.places);
     vector.dnit[u32](?l.uses);
+    vector.dnit[u32](?l.folded);
     vector.dnit[Scope](?l.scopes);
     vector.dnit[u32](?l.locs);
     core_syntax.release(?l.stores);

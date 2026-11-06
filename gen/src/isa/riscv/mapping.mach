@@ -60,6 +60,7 @@ use gen.isa.riscv.fields;
 use gen.isa.riscv.overlay;
 use gen.isa.riscv.read;
 use gen.lines;
+use gen_order: gen.order;
 use gen.relation;
 
 pub val UNLISTED_FILE:  str = "extension file not in the overlay";
@@ -97,6 +98,7 @@ pub val LIST_AND_RULE:  str = "row a list and a register rule of the overlay bot
 pub val NO_NF:          str = "riscv-opcodes names no nf argument, whose place a segment's fields are read from";
 pub val NO_LENGTH:      str = "vector access in a register file of no single length register";
 pub val NO_COUNT_LIST:  str = "access of list registers in a row no listed line names";
+pub val WIDER_ROLE:     str = "under line states a role that is not narrower than the row's";
 
 # one extension alternative: the ids it names and its closure under the catalog
 pub rec Alternative {
@@ -197,6 +199,15 @@ pub rec Rule {
     terms:       vector.Vector[Term];
 }
 
+# the role an operand has in place of its own when its operands meet every term and the vector configuration state sets
+# every bit of `state`
+pub rec RoleRule {
+    operand: u8;
+    terms:   vector.Vector[Term];
+    state:   u64;
+    role:    operand.Role;
+}
+
 # the registers a row reads and writes in place of its own when its operands meet every term
 pub rec RegisterRule {
     terms:   vector.Vector[Term];
@@ -215,6 +226,8 @@ pub rec Touched {
 # read, written: the registers it touches when no register rule holds
 # switches: its register rules
 # may, must:     the union and the intersection of its own registers and its rules'
+# order: how it orders the accesses around it, from the order facts its mnemonic matches
+# roles: the roles its operands have in place of their own under a state and operand values
 pub rec Effect {
     read:      vector.Vector[u32];
     written:   vector.Vector[u32];
@@ -228,6 +241,8 @@ pub rec Effect {
     relations: vector.Vector[effect.Relation];
     latency:   effect.Latency;
     fixed:     vector.Vector[effect.Fixed];
+    order:     gen_order.Built;
+    roles:     vector.Vector[RoleRule];
 }
 
 # one register constraint of a row
@@ -372,6 +387,7 @@ fun kinds_of(fs: *fields.Fields, out: *Kinds) err[diag.Refusal] {
 # hints: the hint spaces of each base, keyed `file::name`
 # nf_lo: the low bit of a segment load's or store's nf, riscv-opcodes' argument, when `nf_known`
 # transferred, restating: which of the overlay's TRANSFERS and RESTATES left out or made a row, the rest kept idle
+# ordering, requiring:    which of the effects topic's order and ordered lines named a row, the rest kept idle
 rec Mapper {
     alloc:   *A.Allocator;
     source:  *read.Source;
@@ -395,6 +411,8 @@ rec Mapper {
 
     transferred: vector.Vector[bool];
     restating:   vector.Vector[bool];
+    ordering:    vector.Vector[bool];
+    requiring:   vector.Vector[bool];
 }
 
 fun refuse(r: *read.Record, message: str, subject: str) err[diag.Refusal] {
@@ -1683,6 +1701,50 @@ fun term(m: *Mapper, row: *Row, terms: *vector.Vector[Term], t: *effects.Term) e
     ret err[diag.Refusal].ok{};
 }
 
+# `row`'s role rule from under line `u` for its operand `at`, refused when its role is not narrower than the operand's,
+# since a rule only narrows what the row states
+fun role_rule(m: *Mapper, row: *Row, at: usize, u: *effects.Under) err[diag.Refusal] {
+    val own: operand.Role = row.operands.data[at].role;
+    if (u.role == own || (u.role & ~own) != 0) { ret refuse(row.record, WIDER_ROLE, u.mnemonic); }
+    var made:   RoleRule          = RoleRule{operand: at::u8, terms: vector.init[Term](m.alloc), state: u.state, role: u.role};
+    val tested: err[diag.Refusal] = term(m, row, ?made.terms, ?u.term);
+    if (sel tested.err)                                          { ret tested; }
+    if (!pushed(vector.push[RoleRule](?row.effect.roles, made))) { ret err[diag.Refusal].err{memory()}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# `row`'s role rules: for each argument a recast line does not state, a rule from every under line with a term that
+# matches the row and has the argument and its term's argument, else from the first under line with no term that does
+fun roles_of(m: *Mapper, row: *Row) err[diag.Refusal] {
+    var k: usize = 0;
+    for (k < row.operands.len) {
+        val arg:   str  = row.operands.data[k].arg;
+        var taken: bool = false;
+        var plain: u32  = m.effects.unders.len::u32;
+        var i:     u32  = 0;
+        for (arg != nil && recast_of(m, row, arg) == nil && i < m.effects.unders.len::u32) {
+            val u: *effects.Under = ?m.effects.unders.data[i];
+            if (str_equals(u.arg, arg) && overlay.matches(u.mnemonic, row.mnemonic)) {
+                if (str_len(u.term.arg) == 0) {
+                    if (plain == m.effects.unders.len::u32) { plain = i; }
+                }
+                or (operand_of(row, u.term.arg) != field.NO_OPERAND) {
+                    val made: err[diag.Refusal] = role_rule(m, row, k, u);
+                    if (sel made.err) { ret made; }
+                    taken = true;
+                }
+            }
+            i = i + 1;
+        }
+        if (!taken && plain < m.effects.unders.len::u32) {
+            val made: err[diag.Refusal] = role_rule(m, row, k, ?m.effects.unders.data[plain]);
+            if (sel made.err) { ret made; }
+        }
+        k = k + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
 # the control rules of `row`, in the overlay's order
 fun rules_of(m: *Mapper, row: *Row) err[diag.Refusal] {
     var i: u32 = 0;
@@ -1872,6 +1934,87 @@ fun states(m: *Mapper, row: *Row, table: *effects.State, count: u32, required: b
     ret err[diag.Refusal].ok{};
 }
 
+# where each bit of riscv-opcodes' argument `name` lies in `row`, from its low bit, written to `out` with their count:
+# fixed by the row's bits, or in the value of the operand whose pieces cover it. false when the table has no such
+# argument or a bit of it lies in neither
+fun field_places(m: *Mapper, row: *Row, name: str, out: *gen_order.Place, count: *usize) bool {
+    var found: bool  = false;
+    var lo:    u8    = 0;
+    var hi:    u8    = 0;
+    var i:     usize = 0;
+    for (i < m.source.args.len) {
+        if (str_equals(m.source.args.data[i].name, name)) {
+            found = true;
+            lo    = m.source.args.data[i].lo;
+            hi    = m.source.args.data[i].hi;
+        }
+        i = i + 1;
+    }
+    if (!found || hi < lo || (hi - lo)::usize >= gen_order.MAX_BITS) { ret false; }
+    var k: u8 = 0;
+    for (k <= hi - lo) {
+        val at:     u8   = lo + k;
+        val bit:    u64  = 1::u64 << at::u64;
+        var placed: bool = false;
+        if ((row.mask & bit) != 0) {
+            out[k::usize] = gen_order.Place.fixed{(row.match & bit) != 0};
+            placed        = true;
+        }
+        var o: usize = 0;
+        for (o < row.operands.len && !placed) {
+            val op:     *Operand      = ?row.operands.data[o];
+            var pieces: layout.Pieces = layout.NO_PIECES;
+            if (op.use == overlay.IMMEDIATE || op.use == overlay.CSR) { pieces = op.layout.pieces; }
+            or (op.use == overlay.CHOICE)                             { pieces = op.choice.pieces; }
+            var p: u32 = 0;
+            for (p < pieces.len && !placed) {
+                val pc: layout.Piece = pieces.at[p];
+                if (at >= pc.at && at < pc.at + pc.len) {
+                    out[k::usize] = gen_order.Place.operand{gen_order.Bit{operand: o::u8, bit: pc.lo + (at - pc.at)}};
+                    placed        = true;
+                }
+                p = p + 1;
+            }
+            o = o + 1;
+        }
+        if (!placed) { ret false; }
+        k = k + 1;
+    }
+    @count = (hi - lo)::usize + 1;
+    ret true;
+}
+
+# the order of `row`, joined from every order fact its mnemonic matches, refused for a row an ordered line names that
+# no order fact does
+fun order_of(m: *Mapper, row: *Row) err[diag.Refusal] {
+    row.effect.order = gen_order.init(m.alloc);
+    var required: bool  = false;
+    var i:        usize = 0;
+    for (i < m.effects.ordered.len) {
+        if (overlay.matches(m.effects.ordered.data[i], row.mnemonic)) {
+            required            = true;
+            m.requiring.data[i] = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.effects.orders.len) {
+        val o: *effects.Order = ?m.effects.orders.data[i];
+        if (overlay.matches(o.mnemonic, row.mnemonic)) {
+            m.ordering.data[i] = true;
+            var places: [32]gen_order.Place;
+            var count:  usize            = 0;
+            var at:     *gen_order.Place = nil;
+            if (o.stated.field != nil && field_places(m, row, o.stated.field, ?places[0], ?count)) { at = ?places[0]; }
+            val joined: res[bool, str] = gen_order.join(?row.effect.order, ?o.stated, at, count);
+            if (sel joined.err) { ret refuse(row.record, joined.err, o.mnemonic); }
+        }
+        i = i + 1;
+    }
+    if (required && !row.effect.order.stated) { ret refuse(row.record, gen_order.UNSTATED, row.mnemonic); }
+    ret err[diag.Refusal].ok{};
+}
+
 # the effect of `row`
 fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
     row.effect.read      = vector.init[u32](m.alloc);
@@ -1881,6 +2024,7 @@ fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
     row.effect.fixed     = vector.init[effect.Fixed](m.alloc);
     row.effect.control   = effect.Control{transfer: effect.NONE, target: effect.UNTARGETED, conditional: false, operand: field.NO_OPERAND, rules: effect.NO_RULES};
     row.effect.rules     = vector.init[Rule](m.alloc);
+    row.effect.roles     = vector.init[RoleRule](m.alloc);
     row.effect.delta     = field.NO_OPERAND;
     row.effect.relations = vector.init[effect.Relation](m.alloc);
     row.effect.latency   = effect.ONE;
@@ -1925,6 +2069,8 @@ fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
     }
     val ruled: err[diag.Refusal] = rules_of(m, row);
     if (sel ruled.err) { ret ruled; }
+    val roled: err[diag.Refusal] = roles_of(m, row);
+    if (sel roled.err) { ret roled; }
     i = 0;
     for (i < m.effects.stacks.len::u32) {
         if (str_equals(m.effects.stacks.data[i].mnemonic, row.mnemonic)) {
@@ -1950,6 +2096,8 @@ fun effect_of(m: *Mapper, row: *Row) err[diag.Refusal] {
         }
         i = i + 1;
     }
+    val ordered: err[diag.Refusal] = order_of(m, row);
+    if (sel ordered.err) { ret ordered; }
     val sp_at: u8 = operand_of(row, m.effects.stack_pointer);
     if (sp_at != field.NO_OPERAND) {
         val sp: opt[u32] = register_row(m.file, m.effects.stack_pointer);
@@ -2534,7 +2682,7 @@ pub fun build(a: *A.Allocator, s: *read.Source, x: *facts.Facts, file: *register
     out.rows        = vector.init[*Row](a);
     out.respellings = vector.init[Respelling](a);
     out.idle        = vector.init[str](a);
-    var m:  Mapper   = Mapper{alloc: a, source: s, catalog: ?x.catalog, axes: ?x.axes, file: file, o: ?x.overlay, kinds: Kinds{unit: 0, stack: 0, sregs: 0, push: nil, pop: nil}, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), hints: map.init[str, *vector.Vector[Space]](a), out: out, transferred: vector.init[bool](a), restating: vector.init[bool](a), effects: ?x.effects, constraints: ?x.constraints, nf_lo: 0, nf_known: false, length: length_row(file)};
+    var m:  Mapper   = Mapper{alloc: a, source: s, catalog: ?x.catalog, axes: ?x.axes, file: file, o: ?x.overlay, kinds: Kinds{unit: 0, stack: 0, sregs: 0, push: nil, pop: nil}, required: map.init[str, *Requirement](a), standard: map.init[str, u32](a), rows: map.init[str, u32](a), hints: map.init[str, *vector.Vector[Space]](a), out: out, transferred: vector.init[bool](a), restating: vector.init[bool](a), ordering: vector.init[bool](a), requiring: vector.init[bool](a), effects: ?x.effects, constraints: ?x.constraints, nf_lo: 0, nf_known: false, length: length_row(file)};
     val nf: opt[u64] = arg_lo(s, "nf");
     if (sel nf.some) {
         m.nf_lo    = nf.some;
@@ -2548,6 +2696,16 @@ pub fun build(a: *A.Allocator, s: *read.Source, x: *facts.Facts, file: *register
     t = 0;
     for (t < x.overlay.restates.len::u32) {
         if (!pushed(vector.push[bool](?m.restating, false))) { ret err[diag.Refusal].err{memory()}; }
+        t = t + 1;
+    }
+    t = 0;
+    for (t < x.effects.orders.len::u32) {
+        if (!pushed(vector.push[bool](?m.ordering, false))) { ret err[diag.Refusal].err{memory()}; }
+        t = t + 1;
+    }
+    t = 0;
+    for (t < x.effects.ordered.len::u32) {
+        if (!pushed(vector.push[bool](?m.requiring, false))) { ret err[diag.Refusal].err{memory()}; }
         t = t + 1;
     }
     val kinded: err[diag.Refusal] = kinds_of(?x.fields, ?m.kinds);
@@ -2607,6 +2765,16 @@ pub fun build(a: *A.Allocator, s: *read.Source, x: *facts.Facts, file: *register
     i = 0;
     for (i < m.constraints.elements.len) {
         if (!stated_widths.data[i] && !pushed(vector.push[str](?out.idle, m.constraints.elements.data[i].mnemonic))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.ordering.len) {
+        if (!m.ordering.data[i] && !pushed(vector.push[str](?out.idle, m.effects.orders.data[i].mnemonic))) { ret err[diag.Refusal].err{memory()}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.requiring.len) {
+        if (!m.requiring.data[i] && !pushed(vector.push[str](?out.idle, m.effects.ordered.data[i]))) { ret err[diag.Refusal].err{memory()}; }
         i = i + 1;
     }
     sort.sort_by[*Row](out.rows.data, out.rows.len, by_mnemonic);

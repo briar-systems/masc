@@ -1,0 +1,189 @@
+# the inverse of each conditional branch row of an instruction set
+#
+# a conditional branch's inverse jumps exactly where it does not, to the same
+# target. it is a fact of the set of its own, which a relaxation reads as the
+# first step of an out-of-range branch's longer form and a compiler's block
+# layout reads to turn `bcc next; b other` into `b!cc other`. the inverse is a
+# row and, for each of its operands, where its value comes from: the same
+# operand of the branch, the branch's condition with bits flipped, or an
+# immediate of the branch plus a constant. x86 states its condition in the
+# opcode, so jne is je's inverse row, each operand the same. aarch64's b.cond
+# is its own inverse row with the condition's low bit flipped, al and nv
+# always, so a b.cond on either has none. cbgt x0, x1's inverse is cbge x1, x0,
+# and cbgt x0, #1's is cblt x0, #2, so cbgt x0, #63's is none. a row with no
+# inverse, as x86's jcxz and loop, is absent from the table.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.string.str;
+
+use masc.codec.walk;
+use masc.core.dispatch;
+use masc.core.index;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.row;
+
+# an enumerant or condition operand's value with `mask` flipped, as an inverted branch condition
+# ---
+# operand: the operand of the branch
+# mask:    the bits flipped
+# fixed:   the values below 32 whose flip is no inverse, a bit each, as aarch64's al and nv are both always, so a branch
+#          holding one has no inverse
+pub rec Flip {
+    operand: u8;
+    mask:    u32;
+    fixed:   u32;
+}
+
+# an immediate operand's value plus a constant, as the inverse of aarch64's `cbgt x0, #1` is `cblt x0, #2`
+# ---
+# operand: the operand of the branch
+# by:      what is added to its value. a sum the inverse's operand does not admit, as cbgt's #63, leaves the branch no
+#          inverse
+pub rec Shift {
+    operand: u8;
+    by:      i64;
+}
+
+# where one operand of the inverse takes its value from
+# ---
+# operand: the value of this operand of the branch, its target among them
+# flipped: an operand of the branch with bits flipped
+# shifted: an immediate operand of the branch plus a constant
+pub tag Source: u8 {
+    operand: u8;
+    flipped: Flip;
+    shifted: Shift;
+}
+
+# sources as a pointer to static sources and a count
+pub rec Sources {
+    at:  *Source;
+    len: u32;
+}
+
+pub val NO_SOURCES: Sources = Sources{at: nil, len: 0};
+
+# the inverse of one conditional branch row
+# ---
+# row:     the branch, by its index in the set's rows
+# inverse: its inverse, by its index in the set's rows
+# values:  where each operand of the inverse takes its value from, one per operand of the inverse
+pub rec Inversion {
+    row:     u32;
+    inverse: u32;
+    values:  Sources;
+}
+
+# inversions as a pointer to static inversions and a count, with the index that finds one by the key of its row
+# ---
+# keys: one entry per inversion, under the key of its branch row, whose row is the inversion's place in `at`
+pub rec Inversions {
+    at:   *Inversion;
+    len:  u32;
+    keys: index.Index;
+}
+
+# the inversions of a set with none
+pub val NO_INVERSIONS: Inversions = Inversions{at: nil, len: 0, keys: index.NO_ENTRIES};
+
+# the inverse of an instruction
+# ---
+# row:    the row it encodes
+# values: its operand values, one per operand of the row, its target the branch's
+pub rec Inverse {
+    row:    *row.Row;
+    values: [row.MAX_OPERANDS]operand.Value;
+}
+
+# the inversion of row `r`, found by the row's key through the inversions' index, none for a row with no inverse
+pub fun find(all: Inversions, r: *row.Row) opt[*Inversion] {
+    val at: opt[u32] = index.find(?all.keys, r.key);
+    if (sel at.none) { ret opt[*Inversion].none{}; }
+    ret opt[*Inversion].some{?all.at[at.some]};
+}
+
+# whether value `n` is one `fixed` names
+fun is_fixed(n: u32, fixed: u32) bool {
+    ret n < 32 && (fixed & (1::u32 << n)) != 0;
+}
+
+# condition or enumerant value `n` with the bits of `f`'s mask flipped, none for a value whose flip is no inverse
+pub fun flipped(n: u32, f: Flip) opt[u32] {
+    if (is_fixed(n, f.fixed)) { ret opt[u32].none{}; }
+    ret opt[u32].some{n ^ f.mask};
+}
+
+# immediate `n` plus `s`'s constant, none for a sum operand `desc` of the inverse does not admit
+pub fun shifted(desc: *operand.Operand, n: i64, s: Shift) opt[i64] {
+    if (!sel desc.shape.immediate) { ret opt[i64].none{}; }
+    val sum: i64      = n + s.by;
+    val why: opt[str] = walk.unrepresentable(?desc.shape.immediate, sum);
+    if (sel why.some || operand.excludes_value(?desc.shape.immediate, sum)) { ret opt[i64].none{}; }
+    ret opt[i64].some{sum};
+}
+
+# `v` with the bits of `f`'s mask flipped, none for a value with no bits to flip, as an enumerant whose params its bits
+# name, or one whose flip is no inverse
+pub fun flip_value(v: *operand.Value, f: Flip) operand.Value {
+    if (sel v.enumerant) {
+        if (v.enumerant.params.len != 0) { ret operand.Value.none{}; }
+        val n: opt[u32] = flipped(v.enumerant.value, f);
+        if (sel n.none) { ret operand.Value.none{}; }
+        ret operand.enumerant(n.some);
+    }
+    if (sel v.condition) {
+        val n: opt[u32] = flipped(v.condition, f);
+        if (sel n.none) { ret operand.Value.none{}; }
+        ret operand.Value.condition{n.some};
+    }
+    ret operand.Value.none{};
+}
+
+# `v` plus `s`'s constant as operand `desc` of the inverse, none for a value that is no immediate or a sum it does not
+# admit
+pub fun shift_value(desc: *operand.Operand, v: *operand.Value, s: Shift) operand.Value {
+    if (!sel v.immediate) { ret operand.Value.none{}; }
+    val sum: opt[i64] = shifted(desc, v.immediate, s);
+    if (sel sum.none) { ret operand.Value.none{}; }
+    ret operand.Value.immediate{sum.some};
+}
+
+# the inverse of branch `ins` under the set's inversions `all` into `out`
+# ---
+# codec: the set's codec, whose rows the inversions index
+# ret:   whether `ins`'s row has an inverse and every operand of the inverse took a value, false for a row with no
+#        inverse, a condition whose flip is no inverse or a shifted immediate the inverse does not admit
+pub fun inverse(codec: *dispatch.Codec, all: Inversions, ins: *inst.Inst, out: *Inverse) bool {
+    val found: opt[*Inversion] = find(all, ins.row);
+    if (sel found.none) { ret false; }
+    val inv: *Inversion = found.some;
+    if (inv.inverse >= codec.rows.len) { ret false; }
+    val to: *row.Row = ?codec.rows.at[inv.inverse];
+    if (inv.values.len != to.operands.len || to.operands.len > row.MAX_OPERANDS) { ret false; }
+    out.row = to;
+    var k: u32 = 0;
+    for (k < inv.values.len) {
+        val src: Source = inv.values.at[k];
+        var at:  u8     = 0;
+        if (sel src.operand)      { at = src.operand; }
+        or (sel src.flipped)      { at = src.flipped.operand; }
+        or                        { at = src.shifted.operand; }
+        if (at::u32 >= ins.count) { ret false; }
+        val v: *operand.Value = ?ins.values[at];
+        if (sel src.operand) { out.values[k] = @v; }
+        or (sel src.flipped) {
+            out.values[k] = flip_value(v, src.flipped);
+            if (sel out.values[k].none) { ret false; }
+        }
+        or {
+            out.values[k] = shift_value(?to.operands.at[k], v, src.shifted);
+            if (sel out.values[k].none) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}

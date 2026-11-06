@@ -52,8 +52,10 @@ use mink.base.fail;
 use mink.base.store;
 use mink.catalog.arch;
 use mink.catalog.trait;
+use coff_bridging: mink.format.coff.model.bridging;
 use mink.format.contract;
 use mink.format.registry;
+use mink.model.bridge;
 use mink_group:  mink.model.group;
 use mink_object: mink.model.object;
 use mink_symbol: mink.model.symbol;
@@ -91,6 +93,8 @@ pub val NOT_CONSTANT:      str = "expression is not a constant";
 pub val SPECIFIED:         str = "a specifier has no meaning here";
 pub val RANGE:             str = "value out of range of its width";
 pub val TWO_BINDINGS:      str = "symbol given two bindings";
+pub val TWO_SEARCHES:      str = "weak external given two searches";
+pub val NO_FALLBACK:       str = "weak external with a search and no symbol `.set` names as its fallback";
 pub val TWO_VISIBILITIES:  str = "symbol given two visibilities";
 pub val TWO_TYPES:         str = "symbol given two types";
 pub val FIXED:             str = "symbol defined by .equ cannot be redefined";
@@ -123,6 +127,12 @@ pub val RESERVED_LENGTH:   str = "encoding whose low bits state a length no raw 
 pub val UNMET_FULL:        str = "the refusal needs more extensions than it can name";
 pub val STATE_STATED:      str = "states two values of one state axis, or one no axis takes";
 pub val EMPTY_QUANTITY:    str = "bounds a quantity of the register file to no value";
+pub val NOT_BRIDGING:      str = "symbol index outside the section the dialect states bridges in";
+pub val BRIDGE_ORDER:      str = "bridge stated out of order: a symbol index of its symbol, one of its thunk, then its type word";
+pub val BRIDGE_WIDTH:      str = "bridge type word that is not four bytes";
+pub val BRIDGE_ROLE:       str = "bridge type word that states no role";
+pub val BRIDGE_UNFINISHED: str = "bridge left without its symbol, thunk or type word";
+pub val BRIDGE_STATEMENT:  str = "label or instruction in the section the dialect states bridges in";
 
 # the handle `.` resolves to, which every operand binds to the place it is written before the builder sees it
 pub val HERE: u32 = syntax.HERE;
@@ -135,6 +145,8 @@ pub val HERE: u32 = syntax.HERE;
 # REGISTER:   a register of the set, by its syntax's names
 # WORD:       a name after any of the set's type prefixes, as `@function`
 # FLOAT:      a floating point literal (`float_literal`)
+# DATUM:      an expression written as a datum of the directive's width, whose symbol a specifier of the set's syntax may
+#             state a kind for, which the width's own kind is the default of
 pub def Item: u8;
 
 pub val NAME:       Item = 0;
@@ -143,6 +155,7 @@ pub val STRING:     Item = 2;
 pub val REGISTER:   Item = 3;
 pub val WORD:       Item = 4;
 pub val FLOAT:      Item = 5;
+pub val DATUM:      Item = 6;
 
 # the syntax of a directive's operands, items separated by commas
 # ---
@@ -232,11 +245,13 @@ pub rec Args {
 # operands: the syntax of its operands
 # handler:  what it does, or the refusal of its operands at their column
 # param:    a number the handler reads, as a data directive's width
+# kind:     the fixup kind a data directive's symbol is relocated by, operand.NO_FIXUP for the width's own
 pub rec Directive {
     name:     str;
     operands: Shape;
     handler:  fun(*Assembler, *Args) err[diagnostic.Diagnostic];
     param:    u64;
+    kind:     operand.FixupKind;
 }
 
 # directive rows as a pointer to rows and a count
@@ -319,6 +334,8 @@ pub rec Refusal {
 # visibility: the visibility a directive declared
 # kind:       the type `.type` declared
 # size:       the size `.size` declared
+# search:     how the link searches for it before its fallback stands in, which a directive declared of a weak
+#             external whose fallback `.set` names
 # equated:    the value `.set` or `.equ` gave it
 # fixed:      whether `.equ` gave it, so nothing may redefine it
 # used:       where a statement first referred to it by its handle
@@ -327,6 +344,7 @@ pub rec Facts {
     visibility: opt[*mink_symbol.Visibility];
     kind:       opt[*mink_symbol.Kind];
     size:       build.Size;
+    search:     opt[*mink_symbol.Search];
     equated:    opt[expr.Expr];
     fixed:      bool;
     used:       opt[diagnostic.Position];
@@ -339,9 +357,28 @@ rec Numbered {
 }
 
 # a saved section state of the section stack
+# ---
+# current:  the current section, none while the bridge section is
+# previous: the section `.previous` returns to
+# bridging: whether the bridge section is current
 rec Frame {
     current:  opt[build.Section];
     previous: opt[build.Section];
+    bridging: bool;
+}
+
+# the bridge being stated in the section the dialect states bridges in, as `.symidx f`, `.symidx t` and `.word 1`
+# state an arm64ec entry thunk
+# ---
+# on:     whether that section is current
+# named:  how many of its symbol and its thunk a symbol index named so far
+# symbol: the label of the symbol it serves, once named
+# thunk:  the label of its thunk, once named
+rec Bridging {
+    on:     bool;
+    named:  u32;
+    symbol: build.Label;
+    thunk:  build.Label;
 }
 
 # a section opened apart from others of its name, re-entered by its name and its keys: the number it was opened with,
@@ -422,6 +459,7 @@ rec Basis {
 # stack:    the section stack
 # apart:    the sections opened apart from others of their name, by the number they were opened with
 # previous: the section `.previous` returns to
+# bridging: the bridge being stated in the section the dialect states bridges in, and whether that section is current
 # items:    the operands of the directive being read
 # strings:  the bytes of its strings
 # spelled:  a name copied to be handed to the builder
@@ -451,6 +489,7 @@ pub rec Assembler {
     stack:    vector.Vector[Frame];
     apart:    vector.Vector[Apart];
     previous: opt[build.Section];
+    bridging: Bridging;
     items:    vector.Vector[Operand];
     strings:  vector.Vector[u8];
     spelled:  vector.Vector[u8];
@@ -566,6 +605,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, object: *state.Context, options: Opti
         stack:    vector.init[Frame](a),
         apart:    vector.init[Apart](a),
         previous: opt[build.Section].none{},
+        bridging: Bridging{on: false, named: 0, symbol: build.Label{id: operand.NO_SYMBOL}, thunk: build.Label{id: operand.NO_SYMBOL}},
         items:    vector.init[Operand](a),
         strings:  vector.init[u8](a),
         spelled:  vector.init[u8](a),
@@ -589,7 +629,7 @@ pub fun make(a: *A.Allocator, s: *set.Set, object: *state.Context, options: Opti
     }
     var i: u32 = 0;
     for (ok && i < widths.len) {
-        vector.push[Directive](?m.rows, Directive{name: widths.at[i].name, operands: EXPRESSIONS, handler: integers, param: widths.at[i].width::u64});
+        vector.push[Directive](?m.rows, Directive{name: widths.at[i].name, operands: DATA, handler: integers, param: widths.at[i].width::u64, kind: widths.at[i].kind});
         i = i + 1;
     }
     i = 0;
@@ -946,9 +986,12 @@ fun wrote(args: *Args, k: u32, e: err[build.Refusal]) err[diagnostic.Diagnostic]
 # or a difference of labels, each `.` the place it is written
 pub fun datum(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Diagnostic] {
     if (k >= args.count) { ret err[diagnostic.Diagnostic].err{refuse(args, k, read.EXPECTED)}; }
+    if (m.bridging.on)   { ret bridge_word(m, args, k, width); }
     val v: Argument = args.items[k].value;
     if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{refuse(args, k, NOT_CONSTANT)}; }
     var e: expr.Expr = v.expression;
+    # a directive that states a kind relocates a symbol alone
+    if (args.directive.kind != operand.NO_FIXUP && !sel e.symbol) { ret err[diagnostic.Diagnostic].err{refuse(args, k, NOT_A_NAME)}; }
     if (sel e.constant) {
         if (!fits(e.constant, width)) { ret err[diagnostic.Diagnostic].err{refuse(args, k, RANGE)}; }
         ret wrote(args, k, build.integer(?m.b, e.constant:~u64, width::u8));
@@ -956,8 +999,12 @@ pub fun datum(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Dia
     val bound_: err[str] = bind(m, ?e, position(args, k));
     if (sel bound_.err) { ret err[diagnostic.Diagnostic].err{refuse(args, k, bound_.err)}; }
     if (sel e.symbol) {
-        if (e.symbol.fixup != operand.NO_FIXUP) { ret err[diagnostic.Diagnostic].err{refuse(args, k, SPECIFIED)}; }
-        ret wrote(args, k, build.datum(?m.b, build.Reference{target: build.Label{id: e.symbol.id}, addend: e.symbol.addend, width: width::u8, basis: fixup.ABSOLUTE}));
+        var stated: operand.FixupKind = args.directive.kind;
+        if (e.symbol.fixup != operand.NO_FIXUP) {
+            if (stated != operand.NO_FIXUP) { ret err[diagnostic.Diagnostic].err{refuse(args, k, SPECIFIED)}; }
+            stated = e.symbol.fixup;
+        }
+        ret wrote(args, k, build.datum(?m.b, build.Reference{target: build.Label{id: e.symbol.id}, addend: e.symbol.addend, width: width::u8, basis: fixup.ABSOLUTE, kind: stated}));
     }
     if (sel e.difference) {
         val d: build.Difference = build.Difference{plus: build.Label{id: e.difference.plus}, minus: build.Label{id: e.difference.minus}, addend: e.difference.addend};
@@ -982,6 +1029,18 @@ pub fun declare_binding(m: *Assembler, l: build.Label, binding: *mink_symbol.Bin
     if (sel f.err)                                             { ret err[str].err{field.MEMORY}; }
     if (sel f.ok.binding.some && f.ok.binding.some != binding) { ret err[str].err{TWO_BINDINGS}; }
     f.ok.binding = opt[*mink_symbol.Binding].some{binding};
+    ret err[str].ok{};
+}
+
+# label `l` declared a weak external searched for as `search`, its fallback what `.set` equates it to, refused when
+# another binding or search was declared
+pub fun declare_search(m: *Assembler, l: build.Label, search: *mink_symbol.Search) err[str] {
+    val bound: err[str] = declare_binding(m, l, ?mink_symbol.WEAKLY);
+    if (sel bound.err) { ret bound; }
+    val f: res[*Facts, Refusal] = facts_of(m, l);
+    if (sel f.err)                                          { ret err[str].err{field.MEMORY}; }
+    if (sel f.ok.search.some && f.ok.search.some != search) { ret err[str].err{TWO_SEARCHES}; }
+    f.ok.search = opt[*mink_symbol.Search].some{search};
     ret err[str].ok{};
 }
 
@@ -1170,6 +1229,8 @@ pub fun linked(m: *Assembler, name: View) opt[build.Section] {
 
 # section `s` made current, the current one becoming the previous
 pub fun switch_to(m: *Assembler, s: build.Section) err[str] {
+    val left: err[str] = leave_bridges(m);
+    if (sel left.err) { ret left; }
     val was:      opt[build.Section] = build.current(?m.b);
     val switched: err[build.Refusal] = build.switch(?m.b, s);
     if (sel switched.err) { ret err[str].err{switched.err.message}; }
@@ -1179,9 +1240,10 @@ pub fun switch_to(m: *Assembler, s: build.Section) err[str] {
     ret err[str].ok{};
 }
 
-# the current and previous sections pushed onto the section stack
+# the current and previous sections pushed onto the section stack, refused while a bridge is half stated
 pub fun push_section(m: *Assembler) err[str] {
-    if (!held(vector.push[Frame](?m.stack, Frame{current: build.current(?m.b), previous: m.previous}))) { ret err[str].err{field.MEMORY}; }
+    if (unfinished(m))                                                                                                           { ret err[str].err{BRIDGE_UNFINISHED}; }
+    if (!held(vector.push[Frame](?m.stack, Frame{current: build.current(?m.b), previous: m.previous, bridging: m.bridging.on}))) { ret err[str].err{field.MEMORY}; }
     ret err[str].ok{};
 }
 
@@ -1189,7 +1251,13 @@ pub fun push_section(m: *Assembler) err[str] {
 pub fun pop_section(m: *Assembler) err[str] {
     val top: opt[Frame] = vector.pop[Frame](?m.stack);
     if (sel top.none) { ret err[str].err{EMPTY_STACK}; }
-    if (sel top.some.current.some) {
+    val left: err[str] = leave_bridges(m);
+    if (sel left.err) { ret left; }
+    if (top.some.bridging) {
+        val entered_: err[str] = enter_bridges(m);
+        if (sel entered_.err) { ret entered_; }
+    }
+    or (sel top.some.current.some) {
         val switched: err[build.Refusal] = build.switch(?m.b, top.some.current.some);
         if (sel switched.err) { ret err[str].err{switched.err.message}; }
     }
@@ -1201,6 +1269,65 @@ pub fun pop_section(m: *Assembler) err[str] {
 pub fun swap_previous(m: *Assembler) err[str] {
     if (sel m.previous.none) { ret err[str].err{NO_PREVIOUS}; }
     ret switch_to(m, m.previous.some);
+}
+
+# the section the dialect states bridges in made current: no section of the object, so the builder is left with none
+# and only the bridge's symbol indices and type word are read until another section is entered. the section current
+# before it becomes the previous
+pub fun enter_bridges(m: *Assembler) err[str] {
+    if (m.bridging.on) { ret err[str].ok{}; }
+    val was:  opt[build.Section] = build.current(?m.b);
+    val left: err[build.Refusal] = build.leave(?m.b);
+    if (sel left.err) { ret err[str].err{left.err.message}; }
+    if (sel was.some) { m.previous = was; }
+    m.bridging.on    = true;
+    m.bridging.named = 0;
+    ret err[str].ok{};
+}
+
+# whether the section the dialect states bridges in is current
+pub fun bridging(m: *Assembler) bool {
+    ret m.bridging.on;
+}
+
+# whether a bridge is half stated
+fun unfinished(m: *Assembler) bool {
+    ret m.bridging.on && m.bridging.named != 0;
+}
+
+# the section the dialect states bridges in left, refused while a bridge is half stated
+fun leave_bridges(m: *Assembler) err[str] {
+    if (unfinished(m)) { ret err[str].err{BRIDGE_UNFINISHED}; }
+    m.bridging.on = false;
+    ret err[str].ok{};
+}
+
+# label `l` named by a symbol index of the bridge being stated: its symbol, then its thunk
+pub fun bridge_index(m: *Assembler, l: build.Label, at: diagnostic.Position) err[str] {
+    if (!m.bridging.on) { ret err[str].err{NOT_BRIDGING}; }
+    val br: *Bridging = ?m.bridging;
+    if (br.named == 2) { ret err[str].err{BRIDGE_ORDER}; }
+    val noted: err[str] = note(m, l.id, at);
+    if (sel noted.err) { ret noted; }
+    if (br.named == 0) { br.symbol = l; }
+    or                 { br.thunk = l; }
+    br.named = br.named + 1;
+    ret err[str].ok{};
+}
+
+# operand `k` of `args`, a datum of `width` bytes, read as the type word of the bridge being stated, which states its
+# role by the dialect's words, and the bridge handed to the builder
+fun bridge_word(m: *Assembler, args: *Args, k: u32, width: u64) err[diagnostic.Diagnostic] {
+    val br: *Bridging = ?m.bridging;
+    if (width != 4)    { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_WIDTH)}; }
+    if (br.named != 2) { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ORDER)}; }
+    val word: res[i64, diagnostic.Diagnostic] = constant(args, k);
+    if (sel word.err)                        { ret err[diagnostic.Diagnostic].err{word.err}; }
+    if (word.ok < 0 || word.ok > 0xffffffff) { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ROLE)}; }
+    val role: opt[*bridge.Role] = coff_bridging.role_of(word.ok::u32);
+    if (sel role.none) { ret err[diagnostic.Diagnostic].err{refuse(args, k, BRIDGE_ROLE)}; }
+    br.named = 0;
+    ret wrote(args, k, build.bridge(?m.b, br.symbol, br.thunk, role.some));
 }
 
 # the previous section, to restore after a directive that writes elsewhere
@@ -2148,12 +2275,19 @@ pub fun as_ieee(e: Encoding, bits: u128) Read {
 
 # one operand of kind `kind` read at the reader's position, for a row that reads its operands itself
 pub fun read_item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
-    ret item(m, rd, kind);
+    ret item(m, rd, kind, 0);
 }
 
-# one operand of kind `kind` read at the reader's position
-fun item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic.Diagnostic] {
+# one operand of kind `kind` read at the reader's position, a datum of `width` bytes where it is a DATUM
+fun item(m: *Assembler, rd: *syntax.Reader, kind: Item, width: u64) res[Argument, diagnostic.Diagnostic] {
     val at: usize = rd.at;
+    if (kind == DATUM) {
+        var own: operand.FixupKind = operand.NO_FIXUP;
+        if (width <= fixup.MAX_WIDTH::u64) { own = build.datum_own(?m.b, fixup.ABSOLUTE, width::u8); }
+        val e: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, own);
+        if (sel e.err) { ret res[Argument, diagnostic.Diagnostic].err{e.err}; }
+        ret res[Argument, diagnostic.Diagnostic].ok{Argument.expression{e.ok}};
+    }
     if (kind == NAME) {
         val v: res[View, diagnostic.Diagnostic] = symbol_name(m, rd);
         if (sel v.err) { ret res[Argument, diagnostic.Diagnostic].err{v.err}; }
@@ -2189,8 +2323,9 @@ fun item(m: *Assembler, rd: *syntax.Reader, kind: Item) res[Argument, diagnostic
     ret res[Argument, diagnostic.Diagnostic].ok{Argument.float{f.some}};
 }
 
-# the operands of `shape` read over the reader into the assembler's items, an empty one absent where it is optional
-fun operands(m: *Assembler, rd: *syntax.Reader, shape: *Shape) err[diagnostic.Diagnostic] {
+# the operands of `shape` read over the reader into the assembler's items, an empty one absent where it is optional, a
+# datum among them of `width` bytes
+fun operands(m: *Assembler, rd: *syntax.Reader, shape: *Shape, width: u64) err[diagnostic.Diagnostic] {
     vector.truncate[Operand](?m.items, 0);
     read.skip(rd);
     if (shape.text)     { ret err[diagnostic.Diagnostic].ok{}; }
@@ -2210,7 +2345,7 @@ fun operands(m: *Assembler, rd: *syntax.Reader, shape: *Shape) err[diagnostic.Di
             if (k < shape.least) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.EXPECTED, at, 0)}; }
         }
         or {
-            val got: res[Argument, diagnostic.Diagnostic] = item(m, rd, kind);
+            val got: res[Argument, diagnostic.Diagnostic] = item(m, rd, kind, width);
             if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
             item_ = got.ok;
         }
@@ -2362,7 +2497,7 @@ fun directive_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Dia
     # directive's operands finds them short
     if (!held(vector.ensure[u8](?m.stores.bytes, st.body.len))) { ret stop_at(st, field.MEMORY, st.head); }
     var rd:    syntax.Reader              = reader(m, st, st.body.at, st.body.len, st.body.position);
-    val read_: err[diagnostic.Diagnostic] = operands(m, ?rd, ?row.operands);
+    val read_: err[diagnostic.Diagnostic] = operands(m, ?rd, ?row.operands, row.param);
     if (sel read_.err) { ret stop(st, read_.err); }
     var args: Args                       = Args{directive: row, layer: found.some.layer, statement: st, reader: ?rd, items: m.items.data, count: m.items.len::u32};
     val done: err[diagnostic.Diagnostic] = row.handler(m, ?args);
@@ -2378,8 +2513,9 @@ fun directive_statement(m: *Assembler, st: *source.Statement) err[diagnostic.Dia
 fun statement(m: *Assembler, st: *source.Statement) err[diagnostic.Diagnostic] {
     m.names.context = m::ptr;
     m.site          = st.site;
-    if (st.kind == source.LABEL)     { ret label_statement(m, st); }
-    if (st.kind == source.DIRECTIVE) { ret directive_statement(m, st); }
+    if (m.bridging.on && st.kind != source.DIRECTIVE) { ret stop_at(st, BRIDGE_STATEMENT, st.head); }
+    if (st.kind == source.LABEL)                      { ret label_statement(m, st); }
+    if (st.kind == source.DIRECTIVE)                  { ret directive_statement(m, st); }
     ret instruction_statement(m, st);
 }
 
@@ -2455,10 +2591,20 @@ fun symbols(m: *Assembler) err[Refusal] {
                 cnt;
             }
             var given_: err[build.Refusal] = err[build.Refusal].ok{};
-            if (sel v.constant) { given_ = build.absolute(?m.b, l, v.constant:~u64); }
-            if (sel v.symbol)   { given_ = build.equate(?m.b, l, build.Label{id: v.symbol.id}, v.symbol.addend); }
+            if (sel f.search.some) {
+                # a weak external's fallback is a symbol, never a number or a place past one
+                var target: opt[build.Label] = opt[build.Label].none{};
+                if (sel v.symbol) {
+                    if (v.symbol.addend == 0) { target = opt[build.Label].some{build.Label{id: v.symbol.id}}; }
+                }
+                if (sel target.none) { ret err[Refusal].err{refused_at(NO_FALLBACK, f)}; }
+                given_ = build.fall_back(?m.b, l, target.some, f.search.some);
+            }
+            or (sel v.constant) { given_ = build.absolute(?m.b, l, v.constant:~u64); }
+            or (sel v.symbol)   { given_ = build.equate(?m.b, l, build.Label{id: v.symbol.id}, v.symbol.addend); }
             if (sel given_.err) { ret err[Refusal].err{refused_at(given_.err.message, f)}; }
         }
+        or (sel f.search.some) { ret err[Refusal].err{refused_at(NO_FALLBACK, f)}; }
         val bound_:  bool                 = build.bound(?m.b, l);
         var binding: *mink_symbol.Binding = ?mink_symbol.LOCAL;
         if (sel f.binding.some) { binding = f.binding.some; }
@@ -2496,6 +2642,7 @@ pub fun finish(m: *Assembler) res[mink_object.Object, Refusal] {
         if (sel done.err) { ret res[mink_object.Object, Refusal].err{done.err}; }
         i = i + 1;
     }
+    if (unfinished(m)) { ret res[mink_object.Object, Refusal].err{nowhere(BRIDGE_UNFINISHED)}; }
     val made: err[Refusal] = symbols(m);
     if (sel made.err) { ret res[mink_object.Object, Refusal].err{made.err}; }
     val o: res[mink_object.Object, build.Refusal] = build.finish(?m.b);
@@ -2540,12 +2687,16 @@ val ONE_NAME:       [1]Item = [1]Item{NAME};
 val ONE_EXPRESSION: [1]Item = [1]Item{EXPRESSION};
 val ONE_STRING:     [1]Item = [1]Item{STRING};
 val ONE_FLOAT:      [1]Item = [1]Item{FLOAT};
+val ONE_DATUM:      [1]Item = [1]Item{DATUM};
 
 # a list of names, as `.globl a, b`
 pub val NAMES: Shape = Shape{items: ?ONE_NAME[0], len: 1, least: 1, repeat: true, text: false};
 
 # a list of expressions, as `.long 1, x`
 pub val EXPRESSIONS: Shape = Shape{items: ?ONE_EXPRESSION[0], len: 1, least: 1, repeat: true, text: false};
+
+# a list of data of one width, as `.long 1, x`, a symbol with the kind a specifier of the set states
+pub val DATA: Shape = Shape{items: ?ONE_DATUM[0], len: 1, least: 1, repeat: true, text: false};
 
 # a list of strings, as `.ascii "a", "b"`
 pub val STRINGS: Shape = Shape{items: ?ONE_STRING[0], len: 1, least: 1, repeat: true, text: false};

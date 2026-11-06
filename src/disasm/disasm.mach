@@ -129,6 +129,7 @@ use mink.bytes.sink;
 use mink_arch:   mink.catalog.arch;
 use mink_format: mink.catalog.format;
 use mink_trait:  mink.catalog.trait;
+use mink.format.coff.model.bridging;
 use mink.format.contract;
 use mink_pair: mink.format.pair;
 use mink.format.registry;
@@ -222,6 +223,11 @@ pub val QUOTED:         str = "name that cannot be written in a string";
 pub val UNSPELLED:      str = "symbol name the text cannot spell: one holding a control byte";
 pub val VERSIONED:      str = "symbol version record, which the text states only as part of the name";
 pub val BINDING:        str = "symbol binding no directive states";
+pub val SEARCH:         str = "weak external search no directive states";
+pub val BRIDGES:        str = "bridges the dialect states no section for";
+pub val BRIDGE_ROLE:    str = "bridge role no type word of the dialect states";
+pub val BRIDGED:        str = "bridge naming a symbol the text cannot name: a section's, a nameless one or one holding a control byte";
+pub val NO_WORD:        str = "the set's source dialect has no four-byte data directive for a bridge's type word";
 pub val VISIBILITY:     str = "symbol visibility no directive states";
 pub val TYPE:           str = "symbol kind no .type states";
 pub val ENTRY:          str = "symbol that names an index entry";
@@ -416,6 +422,7 @@ val PAIR:      Attempt = 2;
 # read:    how many instructions the statement that last read back holds
 # labels:  every label, in place order
 # sites:   every relocation, in place order
+# folded:  per symbol, the weak external whose default definition it is, plus one, 0 for a symbol that is none
 # anchors: the labels the disassembler states, in place order, each numbered after the stem
 # bound:   the set's bindings in order of relocation kind
 # count:   how many symbols the object has, the handles past it naming anchors
@@ -459,6 +466,7 @@ rec Disasm {
     labels:     vector.Vector[Label];
     sites:      vector.Vector[Site];
     anchors:    vector.Vector[Label];
+    folded:     vector.Vector[u32];
     marks:      vector.Vector[Mapped];
     marked:     vector.Vector[*row.Row];
     expansions: cmp.Expansions;
@@ -788,7 +796,10 @@ fun stemmed(stem: str, number: u32, to: *u8) usize {
 # the spelling of handle `id`: an object symbol's name, or an anchor's stem and number
 fun named(context: ptr, id: u32) View {
     val d: *Disasm = context::*Disasm;
-    if (id <= d.count) { ret name_of(d, symbol_of(d, id - 1).name); }
+    if (id <= d.count) {
+        if (d.folded.len >= id::usize && d.folded.data[id::usize - 1] != 0) { ret name_of(d, symbol_of(d, d.folded.data[id::usize - 1] - 1).name); }
+        ret name_of(d, symbol_of(d, id - 1).name);
+    }
     val number: u32 = d.anchors.data[(id - d.count - 1)::usize].handle;
     ret view(?d.scratch[0], stemmed(d.dialect.temporary, number, ?d.scratch[0]));
 }
@@ -1325,17 +1336,21 @@ fun laid_out(d: *Disasm, section: u32, at: u64, chosen: *relax.Emitted, out: *re
 # step `ins` at `offset` of section `section` encoded into the disassembler's bytes and fixups as the builder writes it:
 # a value naming by its distance from the program counter a place of the section the builder folds it to
 # (`build.folds`), with no instruction the linker may resize between, encoded as that distance from the step's anchor,
-# answering its length, none when it does not encode
+# and with one between, relocated with its field holding that distance (`masc.build.layout.laid`), answering its
+# length, none when it does not encode
 fun encoded(d: *Disasm, section: u32, offset: u64, ins: *inst.Inst) opt[usize] {
     vector.truncate[u8](?d.bytes, 0);
     vector.truncate[field.Fixup](?d.fixups, 0);
     val done: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ins, ?d.bytes, ?d.fixups);
     if (sel done.err) { ret opt[usize].none{}; }
     var values: [row.MAX_OPERANDS]operand.Value;
+    var shown:  [row.MAX_OPERANDS]operand.Value;
     var any:    bool = false;
+    var laid:   bool = false;
     var k:      u32  = 0;
     for (k < ins.count) {
         values[k] = ins.values[k];
+        shown[k]  = ins.values[k];
         val desc: *operand.Operand    = ?ins.row.operands.at[k];
         val sym:  opt[operand.Symbol] = operand.pc_symbol(desc, ?values[k]);
         if (sel sym.some) {
@@ -1354,23 +1369,33 @@ fun encoded(d: *Disasm, section: u32, offset: u64, ins: *inst.Inst) opt[usize] {
                 var hi: u64 = offset + 1;
                 if (to >= 0 && to:~u64 < lo) { lo = to:~u64; }
                 if (to >= 0 && to:~u64 > hi) { hi = to:~u64; }
-                if (!resized(d, section, lo, hi)) {
-                    var dist: i64 = by;
-                    if (operand.anchor_of(desc) == operand.END) { dist = dist - done.ok::i64; }
-                    values[k] = operand.resolved(?values[k], dist);
+                var dist: i64 = by;
+                if (operand.anchor_of(desc) == operand.END) { dist = dist - done.ok::i64; }
+                shown[k] = operand.resolved(?values[k], dist);
+                if (resized(d, section, lo, hi)) { laid = true; }
+                or {
+                    values[k] = shown[k];
                     any       = true;
                 }
             }
         }
         k = k + 1;
     }
-    if (!any) { ret opt[usize].some{done.ok}; }
-    var again: inst.Inst = inst.Inst{row: ins.row, values: ?values[0], count: ins.count, form: ins.form};
-    vector.truncate[u8](?d.bytes, 0);
-    vector.truncate[field.Fixup](?d.fixups, 0);
-    val redone: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?again, ?d.bytes, ?d.fixups);
-    if (sel redone.err) { ret opt[usize].none{}; }
-    ret opt[usize].some{redone.ok};
+    var len: usize = done.ok;
+    if (any) {
+        var again: inst.Inst = inst.Inst{row: ins.row, values: ?values[0], count: ins.count, form: ins.form};
+        vector.truncate[u8](?d.bytes, 0);
+        vector.truncate[field.Fixup](?d.fixups, 0);
+        val redone: res[usize, field.Refusal] = walk.encode(d.s.codec, d.v, ?again, ?d.bytes, ?d.fixups);
+        if (sel redone.err) { ret opt[usize].none{}; }
+        len = redone.ok;
+    }
+    if (laid) {
+        var whole:     inst.Inst          = inst.Inst{row: ins.row, values: ?shown[0], count: ins.count, form: ins.form};
+        val rewritten: err[field.Refusal] = walk.rewrite(d.s.codec, d.v, ?whole, ?d.bytes, 0, len, ?d.fixups);
+        if (sel rewritten.err) { ret opt[usize].none{}; }
+    }
+    ret opt[usize].some{len};
 }
 
 # whether the expansion `ex` encoded at `at` of section `section` as the builder writes it is the bytes of `data` up to
@@ -2784,13 +2809,13 @@ fun kind_directive(d: *Disasm, sec: *mink_object.Section) opt[*dialect.Named] {
 }
 
 # the name section `i` reads back with: its own, or the spelling of the directive that enters a nameless one by its
-# kind, none for a nameless section of a kind no directive enters
+# kind, else the name the object format gives its kind, none for a nameless section of a kind the format has no name for
 fun listed_name(d: *Disasm, i: u32) opt[View] {
     val sec: *mink_object.Section = section_of(d, i);
     if (sel sec.name.some) { ret opt[View].some{name_of(d, sec.name.some)}; }
     val e: opt[*dialect.Named] = kind_directive(d, sec);
-    if (sel e.none) { ret opt[View].none{}; }
-    ret opt[View].some{View{data: e.some.name, len: str_len(e.some.name)}};
+    if (sel e.some) { ret opt[View].some{View{data: e.some.name, len: str_len(e.some.name)}}; }
+    ret core.format_name(d.naming, sec.kind, sec.entsize);
 }
 
 fun same_name(a: opt[View], b: opt[View]) bool {
@@ -2919,16 +2944,17 @@ fun header(d: *Disasm, i: u32) err[Refusal] {
     }
     val listed: opt[View] = listed_name(d, i);
     if (sel listed.none) { ret refusal(KINDLESS, i, 0); }
-    val name:  View = listed.some;
-    val first: bool = first_named(d, i, name, group, owner);
+    val name:  View                = listed.some;
+    val first: bool                = first_named(d, i, name, group, owner);
+    val e:     opt[*dialect.Named] = kind_directive(d, sec);
     if (sel sec.name.none && first) {
-        val e: opt[*dialect.Named] = kind_directive(d, sec);
-        if (sel e.none) { ret refusal(KINDLESS, i, 0); }
-        put_char(d, '\t');
-        put(d, e.some.directive);
-        put_char(d, '\n');
-        aligned(d, sec);
-        ret err[Refusal].ok{};
+        if (sel e.some) {
+            put_char(d, '\t');
+            put(d, e.some.directive);
+            put_char(d, '\n');
+            aligned(d, sec);
+            ret err[Refusal].ok{};
+        }
     }
     val unique: opt[str] = d.dialect.unique;
     if (!first && sel unique.none) { ret refusal(TWICE, i, 0); }
@@ -3174,6 +3200,8 @@ fun declare(d: *Disasm, i: u32) err[Refusal] {
     if (is_kind(sym.kind, symbol.SECTION) || mapping_symbol(d, sym)) { ret err[Refusal].ok{}; }
     if (sel sym.version.some)                                        { ret whole(VERSIONED); }
     if (!spell.spellable(name))                                      { ret whole(UNSPELLED); }
+    # a default definition is stated under the name of the weak external it stands behind
+    if (d.folded.data[i::usize] != 0) { ret err[Refusal].ok{}; }
     ret declared(d, i, name);
 }
 
@@ -3186,8 +3214,23 @@ fun declared(d: *Disasm, i: u32, name: View) err[Refusal] {
         if (!sel sym.def.placed || sel sym.size.some)                   { ret whole(NAMELESS); }
         ret err[Refusal].ok{};
     }
+    # a weak external with a fallback is bound by the directive of its search, and `.set` names its fallback
+    var fallback: View     = View{data: "", len: 0};
+    val home:     opt[u32] = defaulted(d, sym);
+    if (sel sym.fallback.some) {
+        if (sel home.none) {
+            fallback = name_of(d, symbol_of(d, sym.fallback.some.symbol.index).name);
+            if (fallback.len == 0 || !spell.spellable(fallback)) { ret whole(UNSPELLED); }
+        }
+    }
     if (sym.binding != ?symbol.LOCAL) {
-        val b: opt[str] = core.binding_directive(sym.binding);
+        var b: opt[str] = core.binding_directive(sym.binding);
+        if (sel sym.fallback.some) {
+            if (sel home.none) {
+                b = core.search_directive(sym.fallback.some.search);
+                if (sel b.none) { ret whole(SEARCH); }
+            }
+        }
         if (sel b.none) { ret whole(BINDING); }
         directive(d, b.some, name);
         put_char(d, '\n');
@@ -3208,6 +3251,14 @@ fun declared(d: *Disasm, i: u32, name: View) err[Refusal] {
         put_char(d, '\n');
     }
     if (sel sym.def.entry) { ret whole(ENTRY); }
+    if (sel sym.fallback.some) {
+        if (sel home.none) {
+            directive(d, ".set", name);
+            put(d, ", ");
+            put_symbol(d, fallback);
+            put_char(d, '\n');
+        }
+    }
     if (sel sym.def.absolute) {
         directive(d, ".set", name);
         put(d, ", ");
@@ -3226,6 +3277,7 @@ fun declared(d: *Disasm, i: u32, name: View) err[Refusal] {
     # an undefined symbol's size is the definition's to state
     var sized: opt[u64] = sym.size;
     if (sel sym.def.undefined) { sized = opt[u64].none{}; }
+    if (sel home.some)         { sized = symbol_of(d, home.some).size; }
     if (sel sized.some) {
         directive(d, ".size", name);
         put(d, ", ");
@@ -3313,8 +3365,137 @@ fun serves(s: *set.Set, arch: *mink_arch.Arch) bool {
     ret false;
 }
 
+# whether `n` spells `.weak.<w>.default`, followed by `.<suffix>` when `suffix` is one, the label llvm moves the
+# definition of a bare weak symbol `w` to
+fun default_named(w: View, suffix: opt[View], n: View) bool {
+    val head:  str   = ".weak.";
+    val tail:  str   = ".default";
+    val hn:    usize = str_len(head);
+    val tn:    usize = str_len(tail);
+    var extra: usize = 0;
+    if (sel suffix.some)                  { extra = suffix.some.len + 1; }
+    if (n.len != hn + w.len + tn + extra) { ret false; }
+    var i: usize = 0;
+    for (i < hn) {
+        if (n.data[i] != head[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.len) {
+        if (n.data[hn + i] != w.data[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < tn) {
+        if (n.data[hn + w.len + i] != tail[i]) { ret false; }
+        i = i + 1;
+    }
+    if (sel suffix.none)                { ret true; }
+    if (n.data[hn + w.len + tn] != '.') { ret false; }
+    i = 0;
+    for (i < suffix.some.len) {
+        if (n.data[hn + w.len + tn + 1 + i] != suffix.some.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether symbol `k` is the fallback of a weak external searched for as the dialect's weak search
+fun targeted(d: *Disasm, k: u32) bool {
+    var i: u32 = 0;
+    for (i < d.count) {
+        val w: *mink_object.Symbol = symbol_of(d, i);
+        i = i + 1;
+        if (w.binding != ?symbol.WEAKLY) { cnt; }
+        if (sel w.fallback.some) {
+            if (w.fallback.some.search == d.dialect.weak && w.fallback.some.symbol.index == k) { ret true; }
+        }
+    }
+    ret false;
+}
+
+# the name of the first symbol that is global and defined, as llvm ends every weak default's name with, none when no
+# symbol is. a symbol some weak external's default fallback names is not one, as it is made by the assembler
+fun first_defined(d: *Disasm) opt[View] {
+    var i: u32 = 0;
+    for (i < d.count) {
+        val s: *mink_object.Symbol = symbol_of(d, i);
+        i = i + 1;
+        if (s.binding != ?symbol.GLOBAL)              { cnt; }
+        if (!sel s.def.placed && !sel s.def.absolute) { cnt; }
+        if (targeted(d, i - 1))                       { cnt; }
+        ret opt[View].some{name_of(d, s.name)};
+    }
+    ret opt[View].none{};
+}
+
+# the default definition of weak external `sym`, written as its own definition, none for a symbol with no such
+fun defaulted(d: *Disasm, sym: *mink_object.Symbol) opt[u32] {
+    if (sel sym.fallback.none) { ret opt[u32].none{}; }
+    val k: u32 = sym.fallback.some.symbol.index;
+    if (d.folded.data[k::usize] == 0 || symbol_of(d, d.folded.data[k::usize] - 1) != sym) { ret opt[u32].none{}; }
+    ret opt[u32].some{k};
+}
+
+# weak external `w`, symbol `n` less one, whose fallback is symbol `at`, folded with its fallback when that is a default definition of its own, no
+# relocation naming it (`named_by` counts each symbol's)
+fun folded_by(d: *Disasm, w: *mink_object.Symbol, at: u32, n: u32, named_by: *vector.Vector[u32], suffix: opt[View]) {
+    if (at >= d.count || named_by.data[at::usize] != 0 || d.folded.data[at::usize] != 0) { ret; }
+    val t: *mink_object.Symbol = symbol_of(d, at);
+    if (t.binding != ?symbol.GLOBAL || t.kind != w.kind)                { ret; }
+    if (sel t.fallback.some)                                            { ret; }
+    if (!default_named(name_of(d, w.name), suffix, name_of(d, t.name))) { ret; }
+    if (sel t.def.absolute) {
+        if (t.def.absolute != 0) { ret; }
+    }
+    or (!sel t.def.placed) { ret; }
+    d.folded.data[at::usize] = n;
+}
+
+# each weak external whose fallback is the dialect's weak search to a global `.weak.<name>.default` of its own kind, that
+# no relocation names, which a bare `.weak <name>` states: the default is then written as the name's own definition, or
+# not at all when it is the absolute zero of a name never defined
+fun fold_defaults(d: *Disasm) err[Refusal] {
+    var i: u32 = 0;
+    for (i < d.count) {
+        if (!held(vector.push[u32](?d.folded, 0))) { ret whole(MEMORY); }
+        i = i + 1;
+    }
+    if (d.dialect.weak == nil) { ret err[Refusal].ok{}; }
+    var named_by: vector.Vector[u32] = vector.init[u32](d.a);
+    i = 0;
+    for (i < d.count) {
+        if (!held(vector.push[u32](?named_by, 0))) {
+            vector.dnit[u32](?named_by);
+            ret whole(MEMORY);
+        }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < table.count[mink_object.Reloc](?d.o.relocs)::u32) {
+        val r: *mink_object.Reloc = table.at[mink_object.Reloc](?d.o.relocs, table.nth[mink_object.Reloc](k::usize));
+        k = k + 1;
+        if (sel r.target.symbol) { named_by.data[r.target.symbol.index::usize] = named_by.data[r.target.symbol.index::usize] + 1; }
+        if (sel r.minus.some)    { named_by.data[r.minus.some.index::usize] = named_by.data[r.minus.some.index::usize] + 1; }
+    }
+    val suffix: opt[View] = first_defined(d);
+    i = 0;
+    for (i < d.count) {
+        val w: *mink_object.Symbol = symbol_of(d, i);
+        i = i + 1;
+        if (w.binding != ?symbol.WEAKLY || !sel w.def.undefined) { cnt; }
+        if (sel w.fallback.some) {
+            if (w.fallback.some.search == d.dialect.weak) { folded_by(d, w, w.fallback.some.symbol.index, i, ?named_by, suffix); }
+        }
+    }
+    vector.dnit[u32](?named_by);
+    ret err[Refusal].ok{};
+}
+
 # the anchors, labels, relocations and bindings indexed in place order
 fun index(d: *Disasm) err[Refusal] {
+    val folded: err[Refusal] = fold_defaults(d);
+    if (sel folded.err) { ret folded; }
     var i: u32 = 0;
     for (i < d.s.bindings.len) {
         val b: *core_fixup.Binding = ?d.s.bindings.at[i];
@@ -3775,6 +3956,7 @@ fun released(d: *Disasm) {
     vector.dnit[Label](?d.labels);
     vector.dnit[Site](?d.sites);
     vector.dnit[Label](?d.anchors);
+    vector.dnit[u32](?d.folded);
     vector.dnit[Mapped](?d.marks);
     vector.dnit[*row.Row](?d.marked);
     cmp.release(?d.expansions);
@@ -3834,7 +4016,54 @@ fun written(d: *Disasm) err[Refusal] {
         if (sel done.err) { ret done; }
         i = i + 1;
     }
-    if (d.full) { ret whole(MEMORY); }
+    val bridged: err[Refusal] = bridges(d);
+    if (sel bridged.err) { ret bridged; }
+    if (d.full)          { ret whole(MEMORY); }
+    ret err[Refusal].ok{};
+}
+
+# the name the text names symbol `i` of a bridge by, none for a section's, a nameless one or one with no spelling
+fun bridged_name(d: *Disasm, i: u32) opt[View] {
+    val sym:  *mink_object.Symbol = symbol_of(d, i);
+    val name: View                = name_of(d, sym.name);
+    if (is_kind(sym.kind, symbol.SECTION) || name.len == 0 || !spell.spellable(name)) { ret opt[View].none{}; }
+    ret opt[View].some{name};
+}
+
+# every bridge of the object, after every section, in the section the dialect states bridges in: a symbol index of
+# the symbol it serves, one of its thunk and the four-byte type word of its role, which the assembler reads back into
+# the same bridges
+fun bridges(d: *Disasm) err[Refusal] {
+    val count: usize = table.count[mink_object.Bridge](?d.o.bridges);
+    if (count == 0)               { ret err[Refusal].ok{}; }
+    if (d.dialect.bridges == nil) { ret whole(BRIDGES); }
+    val word: opt[str] = width_directive(d, 4);
+    if (sel word.none) { ret whole(NO_WORD); }
+    val section: View = View{data: d.dialect.bridges.section, len: str_len(d.dialect.bridges.section)};
+    put(d, "\t.section ");
+    if (plain(section))          { put_view(d, section); }
+    or (!put_string(d, section)) { ret whole(QUOTED); }
+    put_char(d, '\n');
+    var k: usize = 0;
+    for (k < count) {
+        val br: *mink_object.Bridge = table.at[mink_object.Bridge](?d.o.bridges, table.nth[mink_object.Bridge](k));
+        k = k + 1;
+        val type: opt[u32] = bridging.code_of(br.role);
+        if (sel type.none) { ret whole(BRIDGE_ROLE); }
+        val served: opt[View] = bridged_name(d, br.symbol.index);
+        if (sel served.none) { ret whole(BRIDGED); }
+        val thunk: opt[View] = bridged_name(d, br.thunk.index);
+        if (sel thunk.none) { ret whole(BRIDGED); }
+        directive(d, core.SYMBOL_INDEX, served.some);
+        put_char(d, '\n');
+        directive(d, core.SYMBOL_INDEX, thunk.some);
+        put_char(d, '\n');
+        put_char(d, '\t');
+        put(d, word.some);
+        put_char(d, ' ');
+        put_unsigned(d, type.some::u64);
+        put_char(d, '\n');
+    }
     ret err[Refusal].ok{};
 }
 
@@ -3927,6 +4156,7 @@ fun sectioned(a: *A.Allocator, s: *set.Set, v: *state.Context, options: Options,
         labels:     vector.init[Label](a),
         sites:      vector.init[Site](a),
         anchors:    vector.init[Label](a),
+        folded:     vector.init[u32](a),
         marks:      vector.init[Mapped](a),
         marked:     vector.init[*row.Row](a),
         expansions: index,
