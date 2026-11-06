@@ -43,6 +43,7 @@ use std.types.size.usize;
 
 use masc.build.label.bind_waiting;
 use masc.build.layout.spanned;
+use masc.build.layout.spans;
 use masc.build.refusal.BOUNDARY;
 use masc.build.refusal.FINISHED;
 use masc.build.refusal.MARKED;
@@ -258,12 +259,19 @@ fun observe(b: *Builder, shaped: *Shaped, count: u32) err[Refusal] {
     if (b.set.codec.stream == nil) { ret err[Refusal].ok{}; }
     var i: u32 = 0;
     for (i < count) {
-        val s:    *relax.Emitted     = ?shaped.chosen[i];
-        var ins:  inst.Inst          = inst.Inst{row: s.row, values: ?s.values[0], count: s.row.operands.len, form: s.form};
-        val seen: err[field.Refusal] = b.set.codec.stream.observe(b.object.stream, ?ins);
-        if (sel seen.err) { ret err[Refusal].err{encoding(seen.err)}; }
+        val s:    *relax.Emitted = ?shaped.chosen[i];
+        var ins:  inst.Inst      = inst.Inst{row: s.row, values: ?s.values[0], count: s.row.operands.len, form: s.form};
+        val seen: err[Refusal]   = observe_one(b, ?ins);
+        if (sel seen.err) { ret seen; }
         i = i + 1;
     }
+    ret err[Refusal].ok{};
+}
+
+# what instruction `ins` defines added to the object's stream, refused where it breaks what the stream holds
+fun observe_one(b: *Builder, ins: *inst.Inst) err[Refusal] {
+    val seen: err[field.Refusal] = b.set.codec.stream.observe(b.object.stream, ins);
+    if (sel seen.err) { ret err[Refusal].err{encoding(seen.err)}; }
     ret err[Refusal].ok{};
 }
 
@@ -399,29 +407,62 @@ fun put(b: *Builder, steps: *relax.Emitted, count: u32) err[Refusal] {
     if (sel cur.ok) { bind_waiting(b, cur.ok::u32, area.ok.fragments.len::u32); }
     var i: u32 = 0;
     for (i < count) {
-        val s:    *relax.Emitted         = ?shaped.chosen[i];
-        val n:    u32                    = s.row.operands.len;
-        val rx:   opt[*relax.Relaxation] = relax.find(b.set.relax, s.row);
-        var code: Code                   = Code{
-            of:       Coded.catalog{s.row},
-            values:   b.values.len,
-            count:    n,
-            members:  b.members.len,
-            literals: b.literals.len,
-            marker:   s.marker,
-            marked:   s.marker != operand.NO_FIXUP,
-            form:     s.form,
-            relax:    rx,
-            initial:  shaped.lens[i]::u64,
-            depth:    0,
-            run:      0,
-        };
-        if (i == 0) { code.run = count; }
-        keep_values(b, ?s.values[0], n);
-        vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: shaped.lens[i]::u64, view: b.view, syntax: b.syntax, modes: b.state});
+        val s:   *relax.Emitted = ?shaped.chosen[i];
+        var run: u32            = 0;
+        if (i == 0) { run = count; }
+        val n: u32 = s.row.operands.len;
+        keep_code(b, area.ok, Coded.catalog{s.row}, ?s.values[0], n, scalars(?s.values[0], n), s.marker, s.form, shaped.lens[i], run);
         i = i + 1;
     }
     ret err[Refusal].ok{};
+}
+
+# whether each of the `n` values at `values` is a scalar that names no symbol, so the fragment holding them is plain
+fun scalars(values: *operand.Value, n: u32) bool {
+    var k: u32 = 0;
+    for (k < n) {
+        val v: *operand.Value = ?values[k];
+        if (sel v.symbol || sel v.literal || operand.inner(v).len > 0) { ret false; }
+        if (sel v.memory) {
+            if (v.memory.symbol.id != operand.NO_SYMBOL) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the code fragment of `of`, holding the `n` values at `values`, scalars when `plain`, and `len` bytes long, appended to
+# `area`, every store reserved. a relaxation grows an operand that holds a symbol, so one of plain values needs none
+fun keep_code(b: *Builder, area: *Area, of: Coded, values: *operand.Value, n: u32, plain: bool, marker: operand.FixupKind, form: core_form.Form, len: usize, run: u32) {
+    var rx: opt[*relax.Relaxation] = opt[*relax.Relaxation].none{};
+    if (sel of.catalog) {
+        if (!plain) { rx = relax.find(b.set.relax, of.catalog); }
+    }
+    val code: Code = Code{
+        of:       of,
+        values:   b.values.len,
+        count:    n,
+        members:  b.members.len,
+        literals: b.literals.len,
+        marker:   marker,
+        marked:   marker != operand.NO_FIXUP,
+        form:     form,
+        relax:    rx,
+        initial:  len::u64,
+        depth:    0,
+        run:      run,
+        plain:    plain,
+    };
+    if (plain) {
+        var k: u32 = 0;
+        for (k < n) {
+            b.values.data[b.values.len + k::usize] = values[k];
+            k                                      = k + 1;
+        }
+        vector.commit[operand.Value](?b.values, n::usize);
+    }
+    or { keep_values(b, values, n); }
+    vector.push[Fragment](?area.fragments, Fragment{body: Body.code{code}, size: len::u64, view: b.view, syntax: b.syntax, modes: b.state});
 }
 
 # the `n` values at `values` appended to the builder's values, the values they hold within them and their literal bytes
@@ -477,21 +518,7 @@ pub fun format(b: *Builder, f: *core_source.Format, values: *operand.Value) err[
     if (!ok) { ret err[Refusal].err{memory()}; }
     val cur: res[usize, Refusal] = at_cursor(b);
     if (sel cur.ok) { bind_waiting(b, cur.ok::u32, area.ok.fragments.len::u32); }
-    val code: Code = Code{
-        of:       Coded.format{f},
-        values:   b.values.len,
-        count:    n,
-        members:  b.members.len,
-        literals: b.literals.len,
-        marker:   done.ok.marker,
-        marked:   done.ok.marker != operand.NO_FIXUP,
-        relax:    opt[*relax.Relaxation].none{},
-        initial:  done.ok.len::u64,
-        depth:    0,
-        run:      1,
-    };
-    keep_values(b, values, n);
-    vector.push[Fragment](?area.ok.fragments, Fragment{body: Body.code{code}, size: done.ok.len::u64, view: b.view, syntax: b.syntax, modes: b.state});
+    keep_code(b, area.ok, Coded.format{f}, values, n, scalars(values, n), done.ok.marker, core_form.PREFERRED, done.ok.len, 1);
     ret err[Refusal].ok{};
 }
 
@@ -505,6 +532,65 @@ pub fun emit(b: *Builder, ins: *inst.Inst, marker: operand.FixupKind) err[Refusa
         k             = k + 1;
     }
     ret put(b, ?one, 1);
+}
+
+# `ins` encoded at the cursor of the current section as `emit` encodes it, with its operands and its row taken as the
+# caller selected them: for a caller that chose the row under the view in force and gives values the row admits, so
+# nothing is checked of them and a wrong instruction is the caller's bug. it is written in the shortest form the
+# selection admits, its symbols are recorded and it relaxes as any other. a symbol-holding instruction is still read
+# against its row as the layout folds it, as a distance the layout measures may be out of its reach
+pub fun emit_trusted(b: *Builder, ins: *inst.Inst, marker: operand.FixupKind) err[Refusal] {
+    if (stating.states(b.set.statings, ins.row)) { ret emit(b, ins, marker); }
+    val cur: res[usize, Refusal] = at_cursor(b);
+    if (sel cur.err) { ret err[Refusal].err{cur.err}; }
+    val area: *Area = ?b.areas.data[cur.ok];
+    if (!area.bits) { ret refused(NO_BYTES); }
+    if (b.set.compress.len > 0) {
+        var packed: relax.Emitted;
+        if (compress.compress(b.set.codec, b.set.compress, b.set.relax, b.view, ins, ?packed)) {
+            var short: inst.Inst = inst.Inst{row: packed.row, values: ?packed.values[0], count: packed.row.operands.len, form: packed.form};
+            ret trusted(b, cur.ok::u32, area, ?short, marker);
+        }
+    }
+    ret trusted(b, cur.ok::u32, area, ins, marker);
+}
+
+# `ins`, in the form it is written in, appended to `area`, section `s`, measured with nothing of it checked
+fun trusted(b: *Builder, s: u32, area: *Area, ins: *inst.Inst, marker: operand.FixupKind) err[Refusal] {
+    val n:     u32                       = ins.row.operands.len;
+    val plain: bool                      = scalars(ins.values, n);
+    val start: usize                     = b.scratch.len;
+    val marks: usize                     = b.fixups.len;
+    val done:  res[usize, field.Refusal] = walk.encode_admitted(b.set.codec, b.view, ins, ?b.scratch, ?b.fixups);
+    if (sel done.err) { ret err[Refusal].err{encoding(done.err)}; }
+    var kept:  operand.FixupKind = marker;
+    var total: Extent            = Extent{members: 0, literals: 0};
+    if (!plain) {
+        var got: Measured = Measured{len: done.ok, split: operand.NO_SYMBOL, marker: operand.NO_FIXUP};
+        spans(b, ?b.modes, marks, relax.MAX_STEPS, ?got);
+        if (got.marker != operand.NO_FIXUP) { kept = got.marker; }
+        val e: res[Extent, Refusal] = extent(b, ins.values, n);
+        if (sel e.err) {
+            vector.truncate[u8](?b.scratch, start);
+            vector.truncate[field.Fixup](?b.fixups, marks);
+            ret err[Refusal].err{e.err};
+        }
+        total = e.ok;
+    }
+    vector.truncate[u8](?b.scratch, start);
+    vector.truncate[field.Fixup](?b.fixups, marks);
+    var ok: bool = held(vector.reserve[Fragment](?area.fragments, 1));
+    ok = ok && held(vector.reserve[operand.Value](?b.values, n::usize));
+    ok = ok && held(vector.reserve[operand.Value](?b.members, total.members));
+    ok = ok && held(vector.reserve[u8](?b.literals, total.literals));
+    if (!ok) { ret err[Refusal].err{memory()}; }
+    if (b.set.codec.stream != nil) {
+        val observed: err[Refusal] = observe_one(b, ins);
+        if (sel observed.err) { ret observed; }
+    }
+    bind_waiting(b, s, area.fragments.len::u32);
+    keep_code(b, area, Coded.catalog{ins.row}, ins.values, n, plain, kept, ins.form, done.ok, 1);
+    ret err[Refusal].ok{};
 }
 
 # every instruction of `ex`, an expansion of a pseudo instruction, at the cursor of the current section, all or none
