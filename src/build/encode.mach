@@ -335,6 +335,7 @@ fun encode_difference(b: *Builder, s: u32, j: u32, area: *Area, g: *Gap, offset:
 # keep:    whether the layout keeps the encoding of the pass that settles
 # changed: whether a fragment grew in this pass, so the pass does not settle and its encoding is not kept
 # refusal: the first refusal of this pass's encoding, which refuses the layout when the pass settles
+# stopped: a refusal that refuses the layout at once, whatever the pass comes to
 # lead:    the line of the first instruction of the sequence being written
 # group:   how many lines that sequence holds
 # left:    how many of its lines are still to be written
@@ -342,9 +343,15 @@ rec Pass {
     keep:    bool;
     changed: bool;
     refusal: opt[Refusal];
+    stopped: opt[Refusal];
     lead:    usize;
     group:   u32;
     left:    u32;
+}
+
+# the layout refused with `why`, which `lay` answers at the fragment that stopped it
+fun stop(p: *Pass, why: Refusal) {
+    p.stopped = opt[Refusal].some{why};
 }
 
 # whether the pass is still writing: its encoding is kept, nothing grew and nothing was refused, so it may be the one
@@ -400,14 +407,14 @@ pub fun lay(b: *Builder, keep: bool) err[Refusal] {
         vector.truncate[Pending](?b.pending, 0);
         vector.truncate[Entry](?b.entries, 0);
         vector.truncate[operand.Value](?b.listed, 0);
-        var p: Pass = Pass{keep: keep, changed: false, refusal: opt[Refusal].none{}, lead: 0, group: 1, left: 0};
+        var p: Pass = Pass{keep: keep, changed: false, refusal: opt[Refusal].none{}, stopped: opt[Refusal].none{}, lead: 0, group: 1, left: 0};
         s = 0;
         for (s < b.areas.len) {
             vector.truncate[u8](?b.areas.data[s].bytes, 0);
             var j: usize = 0;
             for (j < b.areas.data[s].fragments.len) {
-                val put_: err[Refusal] = put(b, s::u32, j::u32, ?out, ?p);
-                if (sel put_.err) { ret put_; }
+                put(b, s::u32, j::u32, ?out, ?p);
+                if (sel p.stopped.some) { ret err[Refusal].err{p.stopped.some}; }
                 j = j + 1;
             }
             s = s + 1;
@@ -421,38 +428,47 @@ pub fun lay(b: *Builder, keep: bool) err[Refusal] {
 }
 
 # fragment `j` of section `s` grown as far as its target needs, its length reserved, marking the pass changed when
-# either changed, and its bytes, relocations and lines written while the pass is writing, refused only where the
-# layout is
-fun put(b: *Builder, s: u32, j: u32, out: *relax.Expansion, p: *Pass) err[Refusal] {
+# either changed, and its bytes, relocations and lines written while the pass is writing, stopping the pass only where
+# the layout is refused
+fun put(b: *Builder, s: u32, j: u32, out: *relax.Expansion, p: *Pass) {
     val area: *Area     = ?b.areas.data[s::usize];
     val f:    *Fragment = ?area.fragments.data[j::usize];
     if (sel f.body.code) {
         val c: *Code = ?f.body.code;
-        if (c.plain) { ret put_plain(b, s, f, c, p); }
+        if (c.plain) {
+            put_plain(b, s, f, c, p);
+            ret;
+        }
         for {
             val far: res[bool, Refusal] = form(b, s, j, c, out);
-            if (sel far.err) { ret err[Refusal].err{far.err}; }
-            if (!far.ok)     { brk; }
+            if (sel far.err) {
+                stop(p, far.err);
+                ret;
+            }
+            if (!far.ok) { brk; }
             c.depth   = c.depth + 1;
             p.changed = true;
         }
-        val coded_: res[Formed, Refusal] = put_code(b, s, j, f, c, out, p);
-        if (sel coded_.err) { ret err[Refusal].err{coded_.err}; }
-        if (coded_.ok.size > f.size) {
-            f.size    = coded_.ok.size;
+        val coded_: opt[Formed] = put_code(b, s, j, f, c, out, p);
+        if (sel coded_.none) { ret; }
+        if (coded_.some.size > f.size) {
+            f.size    = coded_.some.size;
             p.changed = true;
         }
-        if (coded_.ok.marked && !c.marked) {
+        if (coded_.some.marked && !c.marked) {
             c.marked  = true;
             p.changed = true;
         }
-        if (writing(p) && coded_.ok.size != f.size) { refuse_later(p, refused(SHRANK)); }
-        ret err[Refusal].ok{};
+        if (writing(p) && coded_.some.size != f.size) { refuse_later(p, refused(SHRANK)); }
+        ret;
     }
     if (sel f.body.difference && lengthen(b, f, ?f.body.difference)) { p.changed = true; }
-    if (!writing(p))                                                 { ret err[Refusal].ok{}; }
+    if (!writing(p))                                                 { ret; }
     if (sel f.body.data) {
-        if (!held(vector.reserve[u8](?area.bytes, f.body.data.len))) { ret err[Refusal].err{memory()}; }
+        if (!held(vector.reserve[u8](?area.bytes, f.body.data.len))) {
+            stop(p, memory());
+            ret;
+        }
         var i: usize = 0;
         for (i < f.body.data.len) {
             area.bytes.data[area.bytes.len] = b.data.data[f.body.data.start + i];
@@ -462,7 +478,10 @@ fun put(b: *Builder, s: u32, j: u32, out: *relax.Expansion, p: *Pass) err[Refusa
     }
     or (sel f.body.zero) {
         if (area.bits) {
-            if (!held(vector.reserve[u8](?area.bytes, f.body.zero::usize))) { ret err[Refusal].err{memory()}; }
+            if (!held(vector.reserve[u8](?area.bytes, f.body.zero::usize))) {
+                stop(p, memory());
+                ret;
+            }
             var i: u64 = 0;
             for (i < f.body.zero) {
                 area.bytes.data[area.bytes.len] = 0;
@@ -488,28 +507,41 @@ fun put(b: *Builder, s: u32, j: u32, out: *relax.Expansion, p: *Pass) err[Refusa
     }
     or (sel f.body.datum)      { refuse_later(p, encode_datum(b, s, j, area, ?f.body.datum, f.offset)); }
     or (sel f.body.difference) { refuse_later(p, encode_difference(b, s, j, area, ?f.body.difference, f.offset, f.size)); }
-    ret err[Refusal].ok{};
 }
 
 # plain code fragment `f` of section `s`, which nothing of the layout moves, so a pass that is not writing passes over it
-# and one that is writes it from the values as stored, admitted when it was emitted
-fun put_plain(b: *Builder, s: u32, f: *Fragment, c: *Code, p: *Pass) err[Refusal] {
-    if (!writing(p)) { ret err[Refusal].ok{}; }
-    val of:   *row.Row                  = coded(?c.of);
-    var step: inst.Inst                 = inst.Inst{row: of, values: ?b.values.data[c.values], count: c.count, form: c.form};
-    val done: res[usize, field.Refusal] = walk.encode_admitted(b.set.codec, f.view, ?step, ?b.areas.data[s::usize].bytes, ?b.fixups);
-    if (sel done.err) { ret err[Refusal].err{encoding(done.err)}; }
-    if (c.run > 0)    { lead(b, c, p); }
+# and one that is writes the encoding made when it was emitted, which nothing since changes
+fun put_plain(b: *Builder, s: u32, f: *Fragment, c: *Code, p: *Pass) {
+    if (!writing(p)) { ret; }
+    val area: *Area = ?b.areas.data[s::usize];
+    val size: usize = c.initial::usize;
+    if (!held(vector.reserve[u8](?area.bytes, size))) {
+        stop(p, memory());
+        ret;
+    }
+    val to:   *u8   = ?area.bytes.data[area.bytes.len];
+    val from: *u8   = ?b.plains.data[c.encoded];
+    var i:    usize = 0;
+    for (i < size) {
+        to[i] = from[i];
+        i     = i + 1;
+    }
+    vector.commit[u8](?area.bytes, size);
+    if (c.run > 0) { lead(b, c, p); }
     var run: u32 = 0;
     if (p.group == 1) { run = 1; }
+    val of:   *row.Row  = coded(?c.of);
+    var step: inst.Inst = inst.Inst{row: of, values: ?b.values.data[c.values], count: c.count, form: c.form};
     if (c.marker != operand.NO_FIXUP) {
-        val rels: err[Refusal] = relocations(b, s, f.offset, of, done.ok, b.fixups.len, c.marker);
+        val rels: err[Refusal] = relocations(b, s, f.offset, of, size, b.fixups.len, c.marker);
         refuse_later(p, rels);
-        if (sel rels.err) { ret err[Refusal].ok{}; }
+        if (sel rels.err) { ret; }
     }
-    if (!listed(b, s, f.offset, done.ok, c.of, ?step, run)) { ret err[Refusal].err{memory()}; }
+    if (!listed(b, s, f.offset, size, c.of, ?step, run)) {
+        stop(p, memory());
+        ret;
+    }
     wrote(b, p);
-    ret err[Refusal].ok{};
 }
 
 # the sequence code fragment `c` starts, under way in the pass `p`
@@ -565,8 +597,8 @@ fun show(b: *Builder, s: u32, j: u32, f: *Fragment, ins: *inst.Inst, begin: usiz
 
 # the steps of `out`, the form `c` of code fragment `f` of section `s`, encoded with what they come to, each carrying the
 # marker its span states under the modes the fragment was written under: into the section's bytes with their
-# relocations and lines while the pass is writing, else measured in scratch
-fun put_code(b: *Builder, s: u32, j: u32, f: *Fragment, c: *Code, out: *relax.Expansion, p: *Pass) res[Formed, Refusal] {
+# relocations and lines while the pass is writing, else measured in scratch, none when the pass is stopped
+fun put_code(b: *Builder, s: u32, j: u32, f: *Fragment, c: *Code, out: *relax.Expansion, p: *Pass) opt[Formed] {
     val area:  *Area              = ?b.areas.data[s::usize];
     val modes: *mode.State        = modes_at(b, f);
     val kept:  bool               = writing(p);
@@ -588,13 +620,15 @@ fun put_code(b: *Builder, s: u32, j: u32, f: *Fragment, c: *Code, out: *relax.Ex
         if (sel done.err) {
             vector.truncate[field.Fixup](?b.fixups, marks);
             if (!kept) { vector.truncate[u8](?b.scratch, start); }
-            ret res[Formed, Refusal].err{encoding(done.err)};
+            stop(p, encoding(done.err));
+            ret opt[Formed].none{};
         }
         if (kept) {
             val shown: err[field.Refusal] = show(b, s, j, f, ?step, begin, begin - start, done.ok);
             if (sel shown.err) {
                 vector.truncate[field.Fixup](?b.fixups, marks);
-                ret res[Formed, Refusal].err{encoding(shown.err)};
+                stop(p, encoding(shown.err));
+                ret opt[Formed].none{};
             }
         }
         if (out.steps[i].marker == operand.NO_FIXUP) {
@@ -612,13 +646,16 @@ fun put_code(b: *Builder, s: u32, j: u32, f: *Fragment, c: *Code, out: *relax.Ex
         vector.truncate[field.Fixup](?b.fixups, marks);
         if (write) {
             var of: Coded = Coded.catalog{out.steps[i].row};
-            if (sel c.of.format)                            { of = c.of; }
-            if (!listed(b, s, at, done.ok, of, ?step, run)) { ret res[Formed, Refusal].err{memory()}; }
+            if (sel c.of.format) { of = c.of; }
+            if (!listed(b, s, at, done.ok, of, ?step, run)) {
+                stop(p, memory());
+                ret opt[Formed].none{};
+            }
         }
         i = i + 1;
     }
     val size: u64 = (bytes.len - start)::u64;
     if (!kept) { vector.truncate[u8](?b.scratch, start); }
     if (write) { wrote(b, p); }
-    ret res[Formed, Refusal].ok{Formed{size: size, marked: marked}};
+    ret opt[Formed].some{Formed{size: size, marked: marked}};
 }
