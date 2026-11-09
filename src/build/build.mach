@@ -23,10 +23,17 @@
 #
 # the surface a consumer builds against is frozen: `make`, `traits`, `open`,
 # `switch`, `label`, `define`, `expose`, `align`, `data`, `datum`, `finish`,
-# `Size`, the typed `Refusal`, `cfi` with its frame calls and `ct_begin` and
-# `ct_end`. it grows by new calls, never by changing these. masc owns every
-# byte count after relaxation, so a consumer reads `Size`, the layout and the
-# listing and never restates one.
+# `take`, `Size`, the typed `Refusal`, `cfi` with its frame calls and
+# `ct_begin` and `ct_end`. it grows by new calls, never by changing these. masc
+# owns every byte count after relaxation, so a consumer reads `Size`, the
+# layout and the listing and never restates one.
+#
+# the builder makes its object with itself and builds into it, so every name
+# it interns is a name of the object from the start and a finish copies none.
+# a caller that interned names first hands them over with `make_named` and
+# names a label by its handle with `label_of`. `finish` lends the object, which
+# the builder keeps reading names from for the listing, and `take` hands it
+# over once nothing more is read.
 #
 # nothing here names an architecture or a format: the fill, the relaxations,
 # the compressions, the bindings and the markers are the set's, and sections,
@@ -112,6 +119,7 @@ use masc.build.state.datum_slot;
 use masc.build.state.home_of;
 use masc.build.state.mark_of;
 use masc.build.state.modes_at;
+use masc.build.state.name_at;
 use masc.build.state.of_set;
 use masc.build.state.offset_at;
 use masc.build.state.pair_slot;
@@ -166,6 +174,7 @@ fwd masc.build.label.next_position;
 fwd masc.build.label.writer;
 fwd masc.build.label.source;
 fwd masc.build.label.label;
+fwd masc.build.label.label_of;
 fwd masc.build.label.private_label;
 fwd masc.build.label.expose;
 fwd masc.build.label.define;
@@ -234,6 +243,7 @@ fwd masc.build.refusal.CYCLE;
 fwd masc.build.refusal.WIDTH;
 fwd masc.build.refusal.NEGATIVE;
 fwd masc.build.refusal.FINISHED;
+fwd masc.build.refusal.UNTAKEN;
 fwd masc.build.refusal.OBJECT;
 fwd masc.build.refusal.NO_INSTRUCTION;
 fwd masc.build.refusal.SEALED;
@@ -417,7 +427,7 @@ pub fun make(a: *A.Allocator, formats: *registry.Registry, s: *set.Set, object: 
         start:    opt[Spec].none{},
         started:  opt[u32].none{},
         labels:   vector.init[Mark](a),
-        names:    intern.make(a),
+        out:      mink_object.make(a, arch, ?catalog_kind.RELOCATABLE),
         named:    vector.init[u32](a),
         titled:   vector.init[u32](a),
         values:   vector.init[operand.Value](a),
@@ -452,6 +462,7 @@ pub fun make(a: *A.Allocator, formats: *registry.Registry, s: *set.Set, object: 
         direct:   vector.init[Direct](a),
         told:     vector.init[Told](a),
         finished: false,
+        given:    false,
         placings: 0,
         atoms:    vector.init[Atom](a),
         dialect:  spoken_of(format, arch),
@@ -524,6 +535,32 @@ pub fun make(a: *A.Allocator, formats: *registry.Registry, s: *set.Set, object: 
     ret res[Builder, Refusal].ok{b};
 }
 
+# a builder as `make` makes one, whose object's names start as `names`, so every handle the caller interned in them names
+# the same bytes in the object and names a label by `label_of`. the builder owns `names` from then on, refused or not,
+# and `names` lives in `a`
+pub fun make_named(a: *A.Allocator, formats: *registry.Registry, s: *set.Set, object: *core_state.Context, arch: *mink_arch.Arch, format: *mink_format.Format, names: intern.Interner) res[Builder, Refusal] {
+    var kept: intern.Interner       = names;
+    val made: res[Builder, Refusal] = make(a, formats, s, object, arch, format);
+    if (sel made.err) {
+        val dropped: err[fail.Fail] = intern.release(?kept);
+        ret made;
+    }
+    var b:    Builder        = made.ok;
+    val took: err[fail.Fail] = mink_object.take_names(?b.out, kept);
+    if (sel took.err) {
+        val dropped: err[fail.Fail] = intern.release(?kept);
+        release(?b);
+        ret res[Builder, Refusal].err{failed(took.err)};
+    }
+    ret res[Builder, Refusal].ok{b};
+}
+
+# the builder's object, whose names are the builder's, lent until `take` or `release`. a name the caller interns in it
+# names a label by `label_of`, and once finished the caller may add to it what the builder does not state
+pub fun output(b: *Builder) *mink_object.Object {
+    ret ?b.out;
+}
+
 # the mapping symbols an object of `arch` in `format` holds, as mink's pair of them states them. a format that states
 # nothing for the architecture marks nothing
 pub fun mapping_of(formats: *registry.Registry, arch: *mink_arch.Arch, format: *mink_format.Format) opt[*mink_pair.Mapping] {
@@ -556,9 +593,10 @@ pub fun set_mode(b: *Builder, to: mode.Setting) err[Refusal] {
     ret err[Refusal].ok{};
 }
 
-# give back everything the builder owns. a finished object is the caller's and is not touched
+# give back everything the builder owns, its object with it unless `take` handed it over
 pub fun release(b: *Builder) {
-    var i: usize = 0;
+    val gone: err[fail.Fail] = mink_object.release(?b.out);
+    var i:    usize          = 0;
     for (i < b.areas.len) {
         val area: *Area = ?b.areas.data[i];
         vector.dnit[Fragment](?area.fragments);
@@ -570,7 +608,6 @@ pub fun release(b: *Builder) {
     vector.dnit[operand.FixupKind](?b.added);
     vector.dnit[Area](?b.areas);
     vector.dnit[Mark](?b.labels);
-    intern.release(?b.names);
     vector.dnit[u32](?b.named);
     vector.dnit[u32](?b.titled);
     vector.dnit[operand.Value](?b.values);
@@ -678,7 +715,7 @@ fun snapshot(b: *Builder) Snapshot {
         data:     b.data.len,
         plains:   b.plains.len,
         waiting:  b.waiting.len,
-        names:    intern.count(?b.names),
+        names:    intern.count(?b.out.names),
         sources:  b.sources.len,
         realigns: b.realigns.len,
         current:  b.current,
@@ -722,7 +759,7 @@ fun restore(b: *Builder, s: *Snapshot) {
     vector.truncate[table.Id[intern.Name]](?b.sources, s.sources);
     vector.truncate[Realigned](?b.realigns, s.realigns);
     # the mark is the interner's own count from `snapshot`, so truncating to it cannot be refused
-    val cut: err[fail.Fail] = intern.truncate(?b.names, s.names);
+    val cut: err[fail.Fail] = intern.truncate(?b.out.names, s.names);
     vector.truncate[u32](?b.named, s.names);
     vector.truncate[u32](?b.titled, s.names);
     b.current = s.current;
@@ -774,120 +811,94 @@ fun record_stream(b: *Builder, o: *mink_object.Object) err[fail.Fail] {
     ret h.record(b.object.stream, b.object, o);
 }
 
-# the object made of the layout as it stands and the encoding it kept
-fun produce(b: *Builder) res[mink_object.Object, Refusal] {
+# the builder's object built from the layout as it stands and the encoding it kept, its records given back when refused
+fun produce(b: *Builder) err[Refusal] {
     val settled_: err[Refusal] = checked_labels(b);
-    if (sel settled_.err) { ret res[mink_object.Object, Refusal].err{settled_.err}; }
+    if (sel settled_.err) { ret settled_; }
     val numbered: err[Refusal] = number_stems(b);
-    if (sel numbered.err) { ret res[mink_object.Object, Refusal].err{numbered.err}; }
+    if (sel numbered.err) { ret numbered; }
     val raised: err[Refusal] = raise_all(b);
-    if (sel raised.err) { ret res[mink_object.Object, Refusal].err{raised.err}; }
-    var o:      mink_object.Object = mink_object.make(b.a, b.arch, ?catalog_kind.RELOCATABLE);
-    val traits: err[Refusal]       = state_traits(b, ?o);
-    if (sel traits.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{traits.err};
-    }
-    val built: err[fail.Fail] = build_object(b, ?o);
+    if (sel raised.err) { ret raised; }
+    val built: err[Refusal] = build_into(b, ?b.out);
     if (sel built.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{failed(built.err)};
+        # every record given back and the names kept, which `restore` cuts back to the finish's start
+        val cleared: err[fail.Fail] = mink_object.clear(?b.out);
     }
-    val told: err[fail.Fail] = record_told(b, ?o);
-    if (sel told.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{failed(told.err)};
-    }
-    val mapped: err[Refusal] = map_sections(b, ?o);
-    if (sel mapped.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{mapped.err};
-    }
-    val streamed: err[fail.Fail] = record_stream(b, ?o);
-    if (sel streamed.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{failed(streamed.err)};
-    }
-    val marked: err[Refusal] = record_cts(b, ?o);
-    if (sel marked.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{marked.err};
-    }
-    val framed_: err[Refusal] = record_frames(b, ?o);
-    if (sel framed_.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{framed_.err};
-    }
-    val bridged: err[Refusal] = record_bridges(b, ?o);
-    if (sel bridged.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{bridged.err};
-    }
-    val recorded: err[Refusal] = record_all(b, ?o);
-    if (sel recorded.err) {
-        mink_object.release(?o);
-        ret res[mink_object.Object, Refusal].err{recorded.err};
-    }
-    ret res[mink_object.Object, Refusal].ok{o};
+    ret built;
 }
 
-# the builder laid out to a fixed point and encoded, handed over as mink's neutral object, which the caller releases.
+# every record of the layout and the encoding stated on `o`, the builder's object, refused at the first that fails
+fun build_into(b: *Builder, o: *mink_object.Object) err[Refusal] {
+    val traits: err[Refusal] = state_traits(b, o);
+    if (sel traits.err) { ret traits; }
+    val built: err[fail.Fail] = build_object(b, o);
+    if (sel built.err) { ret err[Refusal].err{failed(built.err)}; }
+    val told: err[fail.Fail] = record_told(b, o);
+    if (sel told.err) { ret err[Refusal].err{failed(told.err)}; }
+    val mapped: err[Refusal] = map_sections(b, o);
+    if (sel mapped.err) { ret mapped; }
+    val streamed: err[fail.Fail] = record_stream(b, o);
+    if (sel streamed.err) { ret err[Refusal].err{failed(streamed.err)}; }
+    val marked: err[Refusal] = record_cts(b, o);
+    if (sel marked.err) { ret marked; }
+    val framed_: err[Refusal] = record_frames(b, o);
+    if (sel framed_.err) { ret framed_; }
+    val bridged: err[Refusal] = record_bridges(b, o);
+    if (sel bridged.err) { ret bridged; }
+    ret record_all(b, o);
+}
+
+# the builder laid out to a fixed point and encoded into its object, lent to the caller until `take` or `release`.
 # once the layout is settled every writer runs, in the order added, and what they added is laid out with the rest, and
-# once the object is made every writer states its records on it. a finish is all or none: a refused one takes back
-# everything the writers added, releases the object with its records and leaves the builder as it was, to be emitted
-# into and finished again, when the layout is made anew and every writer runs again from a clean state
-pub fun finish(b: *Builder) res[mink_object.Object, Refusal] {
-    if (b.finished) { ret res[mink_object.Object, Refusal].err{refuse(FINISHED)}; }
+# once the object is built every writer states its records on it. a finish is all or none: a refused one takes back
+# everything the writers added, gives back every record of the object and every name the finish interned, and leaves
+# the builder as it was, to be emitted into and finished again, when the layout is made anew and every writer runs
+# again from a clean state
+pub fun finish(b: *Builder) res[*mink_object.Object, Refusal] {
+    if (b.finished) { ret res[*mink_object.Object, Refusal].err{refuse(FINISHED)}; }
     val named: err[Refusal] = check_abi(b);
-    if (sel named.err) { ret res[mink_object.Object, Refusal].err{named.err}; }
+    if (sel named.err) { ret res[*mink_object.Object, Refusal].err{named.err}; }
     var before: Snapshot             = snapshot(b);
     var moved:  vector.Vector[Moved] = vector.init[Moved](b.a);
     val weak:   err[Refusal]         = weaken(b, ?moved);
     var laid:   err[Refusal]         = weak;
     if (!sel laid.err) { laid = laid_out(b, b.writers.len == 0); }
-    if (sel laid.err) {
-        unweaken(b, ?moved);
-        restore(b, ?before);
-        vector.dnit[Moved](?moved);
-        ret res[mink_object.Object, Refusal].err{laid.err};
-    }
-    if (b.writers.len > 0) {
+    if (!sel laid.err && b.writers.len > 0) {
         # writers write what no source statement scopes, under the object's selection
         val scoped: *core_state.Context = b.view;
         b.taken = opt[Snapshot].some{before};
         b.view  = b.object;
-        val wrote: err[Refusal] = write_all(b);
+        laid    = write_all(b);
         b.taken = opt[Snapshot].none{};
         b.view  = scoped;
-        if (sel wrote.err) {
-            unweaken(b, ?moved);
-            restore(b, ?before);
-            vector.dnit[Moved](?moved);
-            ret res[mink_object.Object, Refusal].err{wrote.err};
-        }
-        val again: err[Refusal] = laid_out(b, true);
-        if (sel again.err) {
-            unweaken(b, ?moved);
-            restore(b, ?before);
-            vector.dnit[Moved](?moved);
-            ret res[mink_object.Object, Refusal].err{again.err};
+        if (!sel laid.err) { laid = laid_out(b, true); }
+    }
+    if (!sel laid.err) {
+        val from: opt[time.Instant] = stats.begin(b.stats);
+        laid = produce(b);
+        if (b.stats != nil) {
+            stats.lap(from, ?b.stats.encode);
+            b.stats.instructions = b.entries.len::u64;
         }
     }
-    val from: opt[time.Instant]                = stats.begin(b.stats);
-    val made: res[mink_object.Object, Refusal] = produce(b);
-    if (b.stats != nil) {
-        stats.lap(from, ?b.stats.encode);
-        b.stats.instructions = b.entries.len::u64;
-    }
-    if (sel made.err) {
+    if (sel laid.err) {
         unweaken(b, ?moved);
         restore(b, ?before);
-        vector.dnit[Moved](?moved);
-        ret made;
     }
     vector.dnit[Moved](?moved);
+    if (sel laid.err) { ret res[*mink_object.Object, Refusal].err{laid.err}; }
     b.finished = true;
-    ret made;
+    ret res[*mink_object.Object, Refusal].ok{?b.out};
+}
+
+# the finished object handed over, which the caller releases. the builder holds an empty object from then on and reads
+# no name, so the listing and every name the builder answers are read before. refused before a finish, or once taken
+pub fun take(b: *Builder) res[mink_object.Object, Refusal] {
+    if (!b.finished || b.given) { ret res[mink_object.Object, Refusal].err{refuse(UNTAKEN)}; }
+    val o: mink_object.Object = b.out;
+    b.out   = mink_object.blank(?o);
+    b.given = true;
+    ret res[mink_object.Object, Refusal].ok{o};
 }
 
 # how many encoded instructions the finished object has
@@ -932,7 +943,7 @@ pub fun label_name(b: *Builder, l: Label) opt[View] {
     val m: opt[*Mark] = mark_of(b, l);
     if (sel m.none)           { ret opt[View].none{}; }
     if (sel m.some.name.none) { ret opt[View].none{}; }
-    ret opt[View].some{intern.bytes_of(?b.names, m.some.name.some)};
+    ret opt[View].some{name_at(b, m.some.name.some)};
 }
 
 # how many sections the builder has opened
@@ -974,7 +985,7 @@ pub fun setting_of(b: *Builder, x: *mink_trait.Axis, n: u64) opt[mink_trait.Sett
 pub fun opened(b: *Builder, s: Section) Opened {
     val area: *Area     = ?b.areas.data[s.index::usize];
     var name: opt[View] = opt[View].none{};
-    if (sel area.name.some) { name = opt[View].some{intern.bytes_of(?b.names, area.name.some)}; }
+    if (sel area.name.some) { name = opt[View].some{name_at(b, area.name.some)}; }
     ret Opened{name: name, kind: area.kind, flags: area.flags, disposition: area.disposition, entsize: area.entsize};
 }
 
@@ -1051,7 +1062,7 @@ pub fun source_count(b: *Builder) usize {
 
 # the name of source file `i`, in the order stated, which `source_count` bounds
 pub fun source_at(b: *Builder, i: usize) View {
-    ret intern.bytes_of(?b.names, b.sources.data[i]);
+    ret name_at(b, b.sources.data[i]);
 }
 
 # the context of the first writer whose records `record` states, nil for none, as a module that added a writer finds
@@ -1076,7 +1087,8 @@ pub fun records(b: *Builder, besides: ptr) bool {
     ret false;
 }
 
-# whether the object was handed over, so the statement record and the layout are final
+# whether the object is finished and still the builder's, so the statement record and the layout are final and its
+# names are read
 pub fun handed_over(b: *Builder) bool {
-    ret b.finished;
+    ret b.finished && !b.given;
 }
