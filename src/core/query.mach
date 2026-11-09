@@ -1,0 +1,388 @@
+# the queries over a row's effect given its operand values: where control goes, how it orders memory, an operand's
+# role, the registers it touches, a fixed register, an address's relation to a register
+#
+# the effect record (`masc.core.effect`) states what a row does under rules on its operands, and a query reads those
+# rules against the values an instruction gives. each answers decided or undecided with the reason, never a guess:
+# an operand with no value yet, an effect no value decides, configuration state the query was not told, or a vector
+# length the implementation chooses. the footprint (`masc.core.footprint`) is made of these.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+
+use masc.core.effect;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.quantity;
+use masc.core.register;
+
+# the rule a query over operand values cannot decide, and the operand left open
+# ---
+# rule:    the position of the first rule no term of which is false but one tests an operand whose value is not known
+# operand: the operand that term tests
+pub rec Pending {
+    rule:    u32;
+    operand: u8;
+}
+
+# why a query gives no answer
+# ---
+# open:       a rule is left open, since an operand it tests has no known value yet, as a register operand before
+#             allocation or an immediate holding a symbol before it resolves
+# opaque:     no operand value decides it, as the registers of an encoding stated with no row's facts (`Opaque`)
+# configured: what this operand covers or how it is used turns on configuration state the query was not given, as a
+#             risc-v vector operand's groups or its destination's role on vtype (`masc.core.config`)
+# reserved:   the configuration state the query was given cannot form this operand's groups, so no instruction of
+#             those values runs under it
+# scaled:     the multiplier of a quantity the context leaves to the implementation decides it, the slot that binds it
+#             named, as an sve register's width under no fixed vector length
+pub tag Undecided: u8 {
+    open: Pending;
+    opaque;
+    configured: u8;
+    reserved:   u8;
+    scaled:     u8;
+}
+
+# what a query over operand values answers, decided only when every rule that may hold is decided
+# ---
+# decided:   the answer
+# undecided: why it is not
+pub tag Answer[T]: u8 {
+    decided:   T;
+    undecided: Undecided;
+}
+
+# whether the value of the operand `term` tests is known: given, not a symbol, whose value is fixed only once it
+# resolves, and not none for an operand that always takes one. an optional operand whose value is none is absent,
+# which is a value
+pub fun known(operands: *operand.Operand, values: operand.Values, term: *effect.Term) bool {
+    if (term.operand::u32 >= values.len) { ret false; }
+    val v: operand.Value = values.at[term.operand];
+    if (sel v.symbol) { ret false; }
+    ret !sel v.none || operands[term.operand].quantity != operand.ONE;
+}
+
+# whether `term`, whose operand's value is known, holds over the operand values of an instruction. check guarantees
+# the operand is one the instruction has and of the test's kind, so the false for any other is a guard that no
+# registered set reaches
+fun holds(file: *register.File, term: *effect.Term, values: operand.Values) bool {
+    if (term.operand >= values.len) { ret false; }
+    val v: operand.Value = values.at[term.operand];
+    if (sel term.test.register) {
+        if (!sel v.register) { ret false; }
+        ret effect.has(file, term.test.register, v.register);
+    }
+    if (sel term.test.immediate) { ret sel v.immediate && v.immediate == term.test.immediate; }
+    if (sel term.test.enumerant) { ret sel v.enumerant && v.enumerant.value == term.test.enumerant; }
+    if (sel term.test.condition) { ret sel v.condition && v.condition == term.test.condition; }
+    if (sel term.test.absent)    { ret sel v.none; }
+    ret sel term.test.id && (sel v.id && v.id == term.test.id);
+}
+
+# whether every one of `terms` holds over the operand values of an instruction, every value they test known
+pub fun meets(file: *register.File, terms: effect.Terms, values: operand.Values) bool {
+    var k: u32 = 0;
+    for (k < terms.len) {
+        if (!holds(file, ?terms.at[k], values)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether `terms` hold over the operand values of an instruction whose operands are `operands`: false when a term
+# whose operand's value is known fails, else undecided naming the first term whose operand's value is not known
+fun decide(file: *register.File, operands: *operand.Operand, terms: effect.Terms, values: operand.Values, rule: u32) Answer[bool] {
+    var open: u8  = field.NO_OPERAND;
+    var k:    u32 = 0;
+    for (k < terms.len) {
+        val term: *effect.Term = ?terms.at[k];
+        if (!known(operands, values, term)) {
+            if (open == field.NO_OPERAND) { open = term.operand; }
+        }
+        or (!holds(file, term, values)) { ret Answer[bool].decided{false}; }
+        k = k + 1;
+    }
+    if (open != field.NO_OPERAND) { ret Answer[bool].undecided{Undecided.open{Pending{rule: rule, operand: open}}}; }
+    ret Answer[bool].decided{true};
+}
+
+# the control transfer of the instruction whose operands are `operands` and operand values `values`: the effect's one
+# rule whose terms all hold, else the effect's own when every rule is false, else undecided naming the first rule an
+# operand with no known value leaves open
+pub fun control(file: *register.File, operands: *operand.Operand, e: *effect.Effect, values: operand.Values) Answer[effect.Control] {
+    var open: opt[Undecided] = opt[Undecided].none{};
+    var i:    u32            = 0;
+    for (i < e.control.rules.len) {
+        val rule:  *effect.Rule        = ?e.control.rules.at[i];
+        val met:   Answer[bool] = decide(file, operands, rule.terms, values, i);
+        val first: bool         = sel open.none;
+        if (sel met.undecided) {
+            if (first) { open = opt[Undecided].some{met.undecided}; }
+        }
+        if (sel met.decided) {
+            if (met.decided) {
+                var at:      u8 = e.control.operand;
+                var chooses: u8 = e.control.chooses;
+                var decides: u8 = e.control.condition;
+                if (rule.target == effect.UNTARGETED) {
+                    at      = field.NO_OPERAND;
+                    chooses = 0;
+                }
+                if (!rule.conditional) { decides = 0; }
+                ret Answer[effect.Control].decided{effect.Control{transfer: rule.transfer, target: rule.target, conditional: rule.conditional, operand: at, rules: effect.NO_RULES, condition: decides, chooses: chooses}};
+            }
+        }
+        i = i + 1;
+    }
+    if (sel open.some) { ret Answer[effect.Control].undecided{open.some}; }
+    ret Answer[effect.Control].decided{e.control};
+}
+
+# the order of an instruction of effect `e` holding operand values `values`: the effect's own, each
+# ordering whose operand's value meets it joined in, its orderings then none. undecided naming the first ordering's
+# operand whose value is not known, as one a symbol or a consumer's placement leaves open
+pub fun order(e: *effect.Effect, values: operand.Values) Answer[effect.Order] {
+    var o: effect.Order = e.order;
+    o.by = effect.NO_ORDERINGS;
+    var i: u32 = 0;
+    for (i < e.order.by.len) {
+        val g:  *effect.Ordering = ?e.order.by.at[i];
+        val at: u8        = g.operand - 1;
+        if (g.operand == 0 || at::u32 >= values.len) { ret Answer[effect.Order].undecided{Undecided.opaque{}}; }
+        val v:     operand.Value = values.at[at];
+        var known: bool          = false;
+        var bits:  u32           = 0;
+        if (sel v.enumerant) {
+            known = true;
+            bits  = v.enumerant.value;
+        }
+        if (sel v.immediate) {
+            known = true;
+            bits  = v.immediate::u32;
+        }
+        if (!known) { ret Answer[effect.Order].undecided{Undecided.open{Pending{rule: i, operand: at}}}; }
+        if ((bits & g.mask) == g.value) {
+            o.before = o.before | g.before;
+            o.after  = o.after | g.after;
+        }
+        i = i + 1;
+    }
+    ret Answer[effect.Order].decided{o};
+}
+
+# the role of operand `at` of the instruction whose operands are `operands`, effect `e` and operand values `values`,
+# under the configuration state `state` in force, by its bits, none when it is not known: the role of the effect's
+# one role rule of that operand that holds, else the operand's own when every such rule is false, else undecided
+# naming the first rule an operand with no known value leaves open, or as configured when a rule tests a state the
+# query was not given. an undecided reader reads the operand's own role, which holds under every state and value
+pub fun role(file: *register.File, operands: *operand.Operand, e: *effect.Effect, at: u8, state: opt[u64], values: operand.Values) Answer[operand.Role] {
+    var open: opt[Undecided] = opt[Undecided].none{};
+    var i:    u32            = 0;
+    for (i < e.roles.len) {
+        val rule: *effect.RoleRule = ?e.roles.at[i];
+        if (rule.operand == at) {
+            var met:   Answer[bool] = decide(file, operands, rule.terms, values, i);
+            var unmet: bool         = false;
+            var given: bool         = rule.mask == 0;
+            if (sel state.some) {
+                given = true;
+                unmet = (state.some & rule.mask) != rule.state;
+            }
+            if (unmet) { met = Answer[bool].decided{false}; }
+            or (!given) {
+                var held: bool = false;
+                if (sel met.decided) { held = met.decided; }
+                if (held)            { met = Answer[bool].undecided{Undecided.configured{at}}; }
+            }
+            val first: bool = sel open.none;
+            if (sel met.undecided) {
+                if (first) { open = opt[Undecided].some{met.undecided}; }
+            }
+            if (sel met.decided) {
+                if (met.decided) { ret Answer[operand.Role].decided{rule.role}; }
+            }
+        }
+        i = i + 1;
+    }
+    if (sel open.some) { ret Answer[operand.Role].undecided{open.some}; }
+    ret Answer[operand.Role].decided{operands[at].role};
+}
+
+# the registers no operand names that the instruction whose operands are `operands` and operand values `values`
+# reads and writes: the effect's one register rule whose terms all hold, else the effect's own when every rule is
+# false, else undecided naming the first rule an operand with no known value leaves open, and undecided as opaque for
+# registers no operand value decides
+pub fun implicit(file: *register.File, operands: *operand.Operand, e: *effect.Effect, values: operand.Values) Answer[effect.Touched] {
+    val g: *effect.Registers = ?e.implicit;
+    if (sel g.opaque) { ret Answer[effect.Touched].undecided{Undecided.opaque{}}; }
+    ret ruled(file, operands, ?g.ruled, values);
+}
+
+# the registers `g` decides for the operand values `values`
+fun ruled(file: *register.File, operands: *operand.Operand, g: *effect.Ruled, values: operand.Values) Answer[effect.Touched] {
+    var open: opt[Undecided] = opt[Undecided].none{};
+    var i:    u32            = 0;
+    for (i < g.rules.len) {
+        val rule:  *effect.RegisterRule = ?g.rules.at[i];
+        val met:   Answer[bool]  = decide(file, operands, rule.terms, values, i);
+        val first: bool          = sel open.none;
+        if (sel met.undecided) {
+            if (first) { open = opt[Undecided].some{met.undecided}; }
+        }
+        if (sel met.decided) {
+            if (met.decided) { ret Answer[effect.Touched].decided{rule.touched}; }
+        }
+        i = i + 1;
+    }
+    if (sel open.some) { ret Answer[effect.Touched].undecided{open.some}; }
+    ret Answer[effect.Touched].decided{g.otherwise};
+}
+
+# the registers no operand names that some instruction of the effect's row
+# reads and writes, for a reader with no operand values, as a constant-time walk
+# or a clobber list
+pub fun may(e: *effect.Effect) effect.Touched {
+    val g: *effect.Registers = ?e.implicit;
+    if (sel g.opaque) { ret g.opaque.may; }
+    ret g.ruled.may;
+}
+
+# the registers no operand names that every instruction of the effect's row
+# reads and writes, for a reader that needs a definite write, as a liveness kill
+pub fun must(e: *effect.Effect) effect.Touched {
+    val g: *effect.Registers = ?e.implicit;
+    if (sel g.opaque) { ret g.opaque.must; }
+    ret g.ruled.must;
+}
+
+# word `w` of `set`, zero past its words
+fun word(set: effect.Set, w: u32) u64 {
+    if (w >= set.len) { ret 0; }
+    ret set.words[w];
+}
+
+# whether `got`, over `count` words, is the union (else the intersection) of the read (else written) sets of `g` and its rules
+fun combined(g: *effect.Ruled, count: u32, written: bool, union: bool, got: effect.Set) bool {
+    var w: u32 = 0;
+    for (w < count) {
+        var acc: u64 = word(g.otherwise.read, w);
+        if (written) { acc = word(g.otherwise.written, w); }
+        var i: u32 = 0;
+        for (i < g.rules.len) {
+            var x: u64 = word(g.rules.at[i].touched.read, w);
+            if (written) { x = word(g.rules.at[i].touched.written, w); }
+            if (union)   { acc = acc | x; }
+            or           { acc = acc & x; }
+            i = i + 1;
+        }
+        if (acc != word(got, w)) { ret false; }
+        w = w + 1;
+    }
+    ret true;
+}
+
+# whether `may` and `must` of `g`, over the first `count` words of every set, are the union and the intersection of its own
+# sets and its rules'
+pub fun bounded(g: *effect.Ruled, count: u32) bool {
+    ret combined(g, count, false, true, g.may.read) && combined(g, count, true, true, g.may.written) && combined(g, count, false, false, g.must.read) && combined(g, count, true, false, g.must.written);
+}
+
+# the register operand `op` must be, none when it is not fixed
+pub fun fixed(file: *register.File, e: *effect.Effect, op: u8) opt[register.Id] {
+    var i: u32 = 0;
+    for (i < e.fixed.len) {
+        if (e.fixed.at[i].operand == op) { ret opt[register.Id].some{register.id_of(?file.registers[e.fixed.at[i].register])}; }
+        i = i + 1;
+    }
+    ret opt[register.Id].none{};
+}
+
+# the register at row `at` of `file`, register.NONE past its rows
+fun row_register(file: *register.File, at: u32) register.Id {
+    if (at >= file.register_count) { ret register.NONE; }
+    ret register.id_of(?file.registers[at]);
+}
+
+# the register operand `op` holds among `values`, register.NONE when it holds none
+fun register_held(values: operand.Values, op: u8) register.Id {
+    if (op::u32 >= values.len) { ret register.NONE; }
+    val v: *operand.Value = ?values.at[op];
+    if (sel v.register) { ret v.register; }
+    ret register.NONE;
+}
+
+# the address operand `op` holds among `values` when it is a base plus a number alone: a base, no index or symbol, and
+# mode OFFSET
+fun plain_address(values: operand.Values, op: u8) opt[operand.Address] {
+    if (op::u32 >= values.len) { ret opt[operand.Address].none{}; }
+    val v: *operand.Value = ?values.at[op];
+    if (!sel v.memory) { ret opt[operand.Address].none{}; }
+    val a: operand.Address = v.memory;
+    if (a.base == register.NONE || a.index != register.NONE || a.mode != operand.OFFSET || a.symbol.id != operand.NO_SYMBOL) { ret opt[operand.Address].none{}; }
+    ret opt[operand.Address].some{a};
+}
+
+# whether offset `o` adds its addend unshifted under operand values `values`: it names no shift operand, or one holding
+# 0, as aarch64's add of a :lo12: with its optional `lsl #12` left out
+pub fun unshifted(o: *effect.Offset, values: operand.Values) bool {
+    if (o.shift == field.NO_OPERAND) { ret true; }
+    val n: opt[i64] = number_held(values, o.shift);
+    if (sel n.none) { ret false; }
+    ret n.some == 0;
+}
+
+# the number operand `op` holds among `values`, an immediate's value or an enumerant's
+fun number_held(values: operand.Values, op: u8) opt[i64] {
+    if (op::u32 >= values.len) { ret opt[i64].none{}; }
+    val v: *operand.Value = ?values.at[op];
+    if (sel v.immediate) { ret opt[i64].some{v.immediate}; }
+    if (sel v.enumerant) { ret opt[i64].some{v.enumerant.value::i64}; }
+    ret opt[i64].none{};
+}
+
+# relation `r` of an instruction over `file` under its operand values, none where they give no number: an operand
+# holding no value or a symbol, an address with an index, a symbol or a mode other than OFFSET, a shift past the
+# register's bits, or a member of Holds this reads as stating nothing
+pub fun affine(file: *register.File, r: *effect.Relation, values: operand.Values) opt[effect.Affine] {
+    var to: register.Id = register.NONE;
+    if (sel r.to.operand)    { to = register_held(values, r.to.operand); }
+    or (sel r.to.row)        { to = row_register(file, r.to.row); }
+    if (to == register.NONE) { ret opt[effect.Affine].none{}; }
+    if (sel r.holds.offset)  { ret offset(file, to, ?r.holds.offset, values); }
+    ret opt[effect.Affine].none{};
+}
+
+# offset `o` writing `to` under operand values `values`, as `affine` reads it
+fun offset(file: *register.File, to: register.Id, o: *effect.Offset, values: operand.Values) opt[effect.Affine] {
+    var from: register.Id = register.NONE;
+    if (sel o.from.operand) { from = register_held(values, o.from.operand); }
+    or (sel o.from.row)     { from = row_register(file, o.from.row); }
+    or (sel o.from.base) {
+        val a: opt[operand.Address] = plain_address(values, o.from.base);
+        if (sel a.some) { from = a.some.base; }
+    }
+    if (from == register.NONE) { ret opt[effect.Affine].none{}; }
+    var by: u64 = 0;
+    if (sel o.by.immediate) {
+        val n: opt[i64] = number_held(values, o.by.immediate);
+        if (sel n.none) { ret opt[effect.Affine].none{}; }
+        by = n.some::u64;
+    }
+    or (sel o.by.displacement) {
+        val a: opt[operand.Address] = plain_address(values, o.by.displacement);
+        if (sel a.none) { ret opt[effect.Affine].none{}; }
+        by = a.some.disp::u64;
+    }
+    if (o.shift != field.NO_OPERAND) {
+        val n: opt[i64] = number_held(values, o.shift);
+        if (sel n.none) { ret opt[effect.Affine].none{}; }
+        if (n.some < 0) { ret opt[effect.Affine].none{}; }
+        val bits: u64 = n.some::u64 * o.step::u64;
+        if (bits >= 64) { ret opt[effect.Affine].none{}; }
+        by = by << bits;
+    }
+    if (o.negated) { by = 0 - by; }
+    ret opt[effect.Affine].some{effect.Affine{to: to, from: from, by: (by + o.constant::u64)::i64}};
+}
