@@ -1,4 +1,4 @@
-# a wasm module read from its text into mink's wasm container
+# a wasm module read from its text into mink's neutral object
 #
 # a module's text is `(module $id? field*)`, or its fields alone (WebAssembly Specification release 3.0, tag wg-3.0,
 # 6.3-text.modules.spectec). its identifiers name entries of index spaces every field fills, so a field may name what
@@ -15,9 +15,16 @@
 # entries and an active segment of them right after it, and a memory's inline `(data ...)` the memory of as many pages
 # and an active segment of it.
 #
-# the module is what mink's container holds (`masc.isa.wasm.container`): each entry is added to the model as it is
-# read and the sections are stated last. what the container cannot hold is refused, never skipped: a type of the gc
-# proposal and a memory's page size.
+# the module is stated through `masc.isa.wasm.object` as each entry is read, and finished into mink's neutral object,
+# which mink writes as the module. where the binary leaves a choice the text does not make, the reader makes it: an
+# active element segment writes its table's index for a table other than the first or for items of a type other than
+# funcref, and its items as expressions unless they are a `(ref func)` list, and an active data segment writes its
+# memory's index for a memory other than the first. a module writes its data count where a body names a data segment.
+# what mink's facts cannot state is refused, never skipped: a type of the gc proposal, a memory's page size and a
+# table's initializer.
+#
+# the text is the module's own form (`MODULE`): the printer (`masc.isa.wasm.print`) writes the fields of a module read
+# as mink's neutral object, and this reader reads them back to one, which mink writes to the same bytes.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -33,12 +40,11 @@ use A: std.allocator;
 use std.collections.vector;
 
 use mink.base.fail.Fail;
-use mink.base.store;
-use mink.base.store.Held;
-use mink.base.table;
-use mink.base.vectors;
-use mink_model:  mink.format.wasm.model;
-use mink_tables: mink.format.wasm.tables;
+use mink.base.table.Id;
+use mink_arch:    mink.catalog.arch;
+use catalog_kind: mink.catalog.kind;
+use mink.format.wasm.fact;
+use mink_object: mink.model.object;
 
 use masc.codec.walk;
 use masc.core.diagnostic;
@@ -49,17 +55,21 @@ use masc.core.inst;
 use masc.core.operand;
 use masc.core.requirement;
 use masc.core.state;
+use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use syntax_read: masc.syntax.read;
 
-use wasm_body:      masc.isa.wasm.body;
-use wasm_container: masc.isa.wasm.container;
-use wasm_field:     masc.isa.wasm.field;
-use wasm_kind:      masc.isa.wasm.kind;
-use wasm_leb:       masc.isa.wasm.leb;
-use wasm_stream:    masc.isa.wasm.stream;
-use wasm_syntax:    masc.isa.wasm.syntax;
-use wasm_text:      masc.isa.wasm.text;
+use wasm_body:    masc.isa.wasm.body;
+use wasm_codec:   masc.isa.wasm.codec;
+use wasm_field:   masc.isa.wasm.field;
+use wasm_kind:    masc.isa.wasm.kind;
+use wasm_leb:     masc.isa.wasm.leb;
+use wasm_object:  masc.isa.wasm.object;
+use wasm_print:   masc.isa.wasm.print;
+use wasm_stream:  masc.isa.wasm.stream;
+use wasm_syntax:  masc.isa.wasm.syntax;
+use wasm_text:    masc.isa.wasm.text;
+use wasm_valtype: masc.isa.wasm.valtype;
 
 use masc.isa.wasm.gen_row;
 use masc.isa.wasm.gen_row_index;
@@ -81,7 +91,14 @@ pub val PAGE_SIZE:    str = "memory page size, which is no wasm 3.0 feature";
 pub val TWO_STARTS:   str = "module with two start functions";
 pub val NO_ITEM:      str = "expected an element segment's item";
 pub val NOT_TEXT:     str = "module of binary or quoted text, which is no module text";
-pub val FAILED:       str = "mink's wasm model refused the module";
+pub val FAILED:       str = "mink refused the module";
+
+# the kinds of import and export, by the byte the binary spells each by (WebAssembly 3.0, 5.5.5 Import Section)
+val FUNC:   u8 = 0;
+val TABLE:  u8 = 1;
+val MEMORY: u8 = 2;
+val GLOBAL: u8 = 3;
+val TAG:    u8 = 4;
 
 # a module field: its keyword, the offset past it and the offset of the `)` closing it, and the kind and index of what
 # it defines, which its inline exports name
@@ -94,21 +111,25 @@ rec Field {
     defines: bool;
 }
 
-# a defined function's field and its index among the module's functions
+# a defined function's field, its index among the functions the module defines, and its type
 rec Defined {
     field: u32;
     index: u32;
+    type:  u32;
 }
 
 # what a segment's items or a global's or a table's initializer is read from: its field, the offset its contents start
 # at, and the table, memory or entry it is of. an inline segment is of its table's or its memory's field, and an inline
-# element segment's items are of its table's reference type, by its stream code
+# element segment's items are of its table's reference type, by its stream code. a global's is of its value type, by
+# masc's code, and its mutability
 rec Pending {
-    field:  u32;
-    at:     usize;
-    of:     u32;
-    inline: bool;
-    type:   u32;
+    field:   u32;
+    at:      usize;
+    of:      u32;
+    inline:  bool;
+    type:    u32;
+    value:   i64;
+    mutable: bool;
 }
 
 # what a read keeps while it reads
@@ -126,7 +147,7 @@ rec Job {
     datas:    vector.Vector[Pending];
     start:    opt[u32];
     started:  bool;
-    out:      *mink_model.Module;
+    out:      *wasm_object.Module;
 }
 
 fun refuse(j: *Job, message: str, at: usize, len: usize) err[diagnostic.Diagnostic] {
@@ -142,7 +163,7 @@ fun refused[T](j: *Job, message: str, at: usize, len: usize) res[T, diagnostic.D
     ret res[T, diagnostic.Diagnostic].err{diagnostic.refusal(message, j.origin, j.text, at, len)};
 }
 
-# a refusal of mink's model at `at`
+# a refusal of mink's at `at`
 fun failure(j: *Job, f: Fail, at: usize) diagnostic.Diagnostic {
     var message: str = f.text;
     if (message == nil) { message = FAILED; }
@@ -151,11 +172,6 @@ fun failure(j: *Job, f: Fail, at: usize) diagnostic.Diagnostic {
 
 fun failed(j: *Job, f: Fail, at: usize) err[diagnostic.Diagnostic] {
     ret err[diagnostic.Diagnostic].err{failure(j, f, at)};
-}
-
-fun kept[T](j: *Job, got: res[table.Id[T], Fail], at: usize) err[diagnostic.Diagnostic] {
-    if (sel got.err) { ret failed(j, got.err, at); }
-    ret err[diagnostic.Diagnostic].ok{};
 }
 
 fun appended(j: *Job, got: err[Fail], at: usize) err[diagnostic.Diagnostic] {
@@ -200,10 +216,10 @@ fun value_type(j: *Job, l: *wasm_text.Lexer) res[u32, diagnostic.Diagnostic] {
     syntax_read.skip(?r);
     val at:  usize                           = r.at;
     val got: res[i64, diagnostic.Diagnostic] = wasm_syntax.valtype_read(?r);
-    if (sel got.err)                            { ret res[u32, diagnostic.Diagnostic].err{got.err}; }
-    if (!wasm_container.held_by_stream(got.ok)) { ret refused[u32](j, TYPE_RANGE, at, r.at - at); }
+    if (sel got.err)                          { ret res[u32, diagnostic.Diagnostic].err{got.err}; }
+    if (!wasm_valtype.held_by_stream(got.ok)) { ret refused[u32](j, TYPE_RANGE, at, r.at - at); }
     l.at = r.at;
-    ret res[u32, diagnostic.Diagnostic].ok{wasm_container.stream_code(got.ok)};
+    ret res[u32, diagnostic.Diagnostic].ok{wasm_valtype.stream_code(got.ok)};
 }
 
 # whether a value type of stream code `code` is a reference type
@@ -283,16 +299,21 @@ fun strings(j: *Job, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnosti
     ret err[diagnostic.Diagnostic].ok{};
 }
 
-# the name of the string at the lexer, owned by the model
-fun name_of(j: *Job, l: *wasm_text.Lexer) res[mink_model.Name, diagnostic.Diagnostic] {
+# the bytes of the string at the lexer, held by the module
+fun name_of(j: *Job, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
     val at:    usize             = l.at;
     var bytes: vector.Vector[u8] = vector.init[u8](j.a);
     fin { vector.dnit[u8](?bytes); }
     val read_: err[diagnostic.Diagnostic] = string(j, l, ?bytes);
-    if (sel read_.err) { ret res[mink_model.Name, diagnostic.Diagnostic].err{read_.err}; }
-    val got: res[mink_model.Name, Fail] = wasm_container.name(j.out, bytes.data, bytes.len);
-    if (sel got.err) { ret res[mink_model.Name, diagnostic.Diagnostic].err{failure(j, got.err, at)}; }
-    ret res[mink_model.Name, diagnostic.Diagnostic].ok{got.ok};
+    if (sel read_.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{read_.err}; }
+    ret held(j, ?bytes, at);
+}
+
+# the bytes of `bytes` held by the module
+fun held(j: *Job, bytes: *vector.Vector[u8], at: usize) res[wasm_object.Span, diagnostic.Diagnostic] {
+    val got: res[wasm_object.Span, Fail] = wasm_object.hold(j.out, bytes.data, bytes.len);
+    if (sel got.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{failure(j, got.err, at)}; }
+    ret res[wasm_object.Span, diagnostic.Diagnostic].ok{got.ok};
 }
 
 # the module's fields, each by its keyword and its extent
@@ -423,19 +444,23 @@ fun address(j: *Job, l: *wasm_text.Lexer) u32 {
     ret wasm_stream.I32;
 }
 
-# limits at the lexer, `min max?`, each within `most`, the 64-bit flag set for address type i64
-fun limits(j: *Job, l: *wasm_text.Lexer, code: u32, most: u64) res[mink_model.Limits, diagnostic.Diagnostic] {
+# limits at the lexer, `min max?`, each within `most`, of 64-bit indices for address type i64
+fun limits(j: *Job, l: *wasm_text.Lexer, code: u32, most: u64) res[fact.Limits, diagnostic.Diagnostic] {
     val min: res[u64, diagnostic.Diagnostic] = number(j, l, most);
-    if (sel min.err) { ret res[mink_model.Limits, diagnostic.Diagnostic].err{min.err}; }
-    var out: mink_model.Limits = mink_model.Limits{flags: 0, min: wasm_container.leb(min.ok), max: wasm_container.leb(0), page: wasm_container.leb(0)};
-    if (code == wasm_stream.I64) { out.flags = out.flags | mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8; }
+    if (sel min.err) { ret res[fact.Limits, diagnostic.Diagnostic].err{min.err}; }
+    var out: fact.Limits = fact.Limits{min: min.ok, max: opt[u64].none{}, shared: false, wide: code == wasm_stream.I64};
     if (numeric(j, l)) {
         val max: res[u64, diagnostic.Diagnostic] = number(j, l, most);
-        if (sel max.err) { ret res[mink_model.Limits, diagnostic.Diagnostic].err{max.err}; }
-        out.max   = wasm_container.leb(max.ok);
-        out.flags = out.flags | mink_tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8;
+        if (sel max.err) { ret res[fact.Limits, diagnostic.Diagnostic].err{max.err}; }
+        out.max = opt[u64].some{max.ok};
     }
-    ret res[mink_model.Limits, diagnostic.Diagnostic].ok{out};
+    ret res[fact.Limits, diagnostic.Diagnostic].ok{out};
+}
+
+# the limits of `n` entries or pages exactly, of 64-bit indices for address type i64, as an inline segment sizes its
+# table or memory
+fun exactly(n: u64, code: u32) fact.Limits {
+    ret fact.Limits{min: n, max: opt[u64].some{n}, shared: false, wide: code == wasm_stream.I64};
 }
 
 # the most pages a memory of address type `code` has, and the most entries a table has
@@ -450,102 +475,100 @@ fun most_entries(code: u32) u64 {
 }
 
 # a memory type at the lexer, `addrtype? limits shared?`, a page size refused
-fun memory_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[mink_model.Limits, diagnostic.Diagnostic] {
+fun memory_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[fact.Limits, diagnostic.Diagnostic] {
     @code = address(j, l);
-    val got: res[mink_model.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_pages(@code));
+    val got: res[fact.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_pages(@code));
     if (sel got.err) { ret got; }
-    var out: mink_model.Limits = got.ok;
+    var out: fact.Limits = got.ok;
     if (wasm_text.is(l, wasm_text.ahead(l), "shared")) {
         val passed: wasm_text.Token = wasm_text.next(l);
-        out.flags = out.flags | mink_tables.WASM_LIMITS_FLAG_IS_SHARED.value::u8;
+        out.shared = true;
     }
-    if (wasm_text.ahead(l).kind == wasm_text.OPEN) { ret refused[mink_model.Limits](j, PAGE_SIZE, l.at, 1); }
-    ret res[mink_model.Limits, diagnostic.Diagnostic].ok{out};
+    if (wasm_text.ahead(l).kind == wasm_text.OPEN) { ret refused[fact.Limits](j, PAGE_SIZE, l.at, 1); }
+    ret res[fact.Limits, diagnostic.Diagnostic].ok{out};
 }
 
 # a table type at the lexer, `addrtype? limits reftype`
-fun table_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[mink_model.TableType, diagnostic.Diagnostic] {
+fun table_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[wasm_object.TableType, diagnostic.Diagnostic] {
     @code = address(j, l);
-    val got: res[mink_model.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_entries(@code));
-    if (sel got.err) { ret res[mink_model.TableType, diagnostic.Diagnostic].err{got.err}; }
+    val got: res[fact.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_entries(@code));
+    if (sel got.err) { ret res[wasm_object.TableType, diagnostic.Diagnostic].err{got.err}; }
     val rt: res[u32, diagnostic.Diagnostic] = ref_type(j, l);
-    if (sel rt.err) { ret res[mink_model.TableType, diagnostic.Diagnostic].err{rt.err}; }
-    ret res[mink_model.TableType, diagnostic.Diagnostic].ok{mink_model.TableType{elem: wasm_container.ref_type(wasm_container.widened(rt.ok)), limits: got.ok}};
+    if (sel rt.err) { ret res[wasm_object.TableType, diagnostic.Diagnostic].err{rt.err}; }
+    ret res[wasm_object.TableType, diagnostic.Diagnostic].ok{wasm_object.TableType{elem: wasm_valtype.widened(rt.ok), limits: got.ok, init: opt[wasm_object.Span].none{}}};
 }
 
-# a global type at the lexer, `valtype` or `(mut valtype)`
-fun global_type(j: *Job, l: *wasm_text.Lexer) res[mink_model.GlobalType, diagnostic.Diagnostic] {
-    var mutable: u8   = 0;
-    val wrapped: bool = wasm_text.opens(l, "mut");
-    if (wrapped) { mutable = 1; }
-    val got: res[u32, diagnostic.Diagnostic] = value_type(j, l);
-    if (sel got.err) { ret res[mink_model.GlobalType, diagnostic.Diagnostic].err{got.err}; }
+# a global type at the lexer, `valtype` or `(mut valtype)`, of no initializer
+fun global_type(j: *Job, l: *wasm_text.Lexer) res[wasm_object.Global, diagnostic.Diagnostic] {
+    val wrapped: bool                            = wasm_text.opens(l, "mut");
+    val got:     res[u32, diagnostic.Diagnostic] = value_type(j, l);
+    if (sel got.err) { ret res[wasm_object.Global, diagnostic.Diagnostic].err{got.err}; }
     if (wrapped) {
         val shut: err[diagnostic.Diagnostic] = closed(j, l);
-        if (sel shut.err) { ret res[mink_model.GlobalType, diagnostic.Diagnostic].err{shut.err}; }
+        if (sel shut.err) { ret res[wasm_object.Global, diagnostic.Diagnostic].err{shut.err}; }
     }
-    ret res[mink_model.GlobalType, diagnostic.Diagnostic].ok{mink_model.GlobalType{valtype: wasm_container.valtype(wasm_container.widened(got.ok)), mutable: mutable}};
+    ret res[wasm_object.Global, diagnostic.Diagnostic].ok{wasm_object.Global{value: wasm_valtype.widened(got.ok), mutable: wrapped, init: opt[wasm_object.Span].none{}}};
 }
 
 # the space a kind of import or export names, by the byte the binary spells the kind by
 fun space_of(kind: u8) u16 {
-    if (kind == mink_tables.WASM_EXTERNAL_FUNCTION.value::u8) { ret wasm_kind.FUNCS; }
-    if (kind == mink_tables.WASM_EXTERNAL_TABLE.value::u8)    { ret wasm_kind.TABLES; }
-    if (kind == mink_tables.WASM_EXTERNAL_MEMORY.value::u8)   { ret wasm_kind.MEMORIES; }
-    if (kind == mink_tables.WASM_EXTERNAL_GLOBAL.value::u8)   { ret wasm_kind.GLOBALS; }
+    if (kind == FUNC)   { ret wasm_kind.FUNCS; }
+    if (kind == TABLE)  { ret wasm_kind.TABLES; }
+    if (kind == MEMORY) { ret wasm_kind.MEMORIES; }
+    if (kind == GLOBAL) { ret wasm_kind.GLOBALS; }
     ret wasm_kind.TAGS;
 }
 
 val KIND_WORDS: [5]str = [5]str{"func", "table", "memory", "global", "tag"};
 
 # what an import of kind `kind` brings in, read at the lexer, defined in its space named `name`
-fun import_desc(j: *Job, l: *wasm_text.Lexer, kind: u8, name: View, at: usize) res[mink_model.Desc, diagnostic.Diagnostic] {
-    var code: u32             = 0;
-    var desc: mink_model.Desc = mink_model.Desc.function{wasm_container.leb(0)};
-    if (kind == mink_tables.WASM_EXTERNAL_FUNCTION.value::u8 || kind == mink_tables.WASM_EXTERNAL_TAG.value::u8) {
+fun import_desc(j: *Job, l: *wasm_text.Lexer, kind: u8, name: View, at: usize) res[wasm_object.Desc, diagnostic.Diagnostic] {
+    var code: u32              = 0;
+    var desc: wasm_object.Desc = wasm_object.Desc.function{0};
+    if (kind == FUNC || kind == TAG) {
         val typed: res[u32, diagnostic.Diagnostic] = type_use(j, l, nil);
-        if (sel typed.err) { ret res[mink_model.Desc, diagnostic.Diagnostic].err{typed.err}; }
+        if (sel typed.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{typed.err}; }
         code = typed.ok;
-        if (kind == mink_tables.WASM_EXTERNAL_TAG.value::u8) { desc = mink_model.Desc.tag_type{mink_model.TagType{attribute: 0, type: wasm_container.leb(code::u64)}}; }
-        or                                                   { desc = mink_model.Desc.function{wasm_container.leb(code::u64)}; }
+        if (kind == TAG) { desc = wasm_object.Desc.exception{code}; }
+        or               { desc = wasm_object.Desc.function{code}; }
     }
-    or (kind == mink_tables.WASM_EXTERNAL_TABLE.value::u8) {
-        val got: res[mink_model.TableType, diagnostic.Diagnostic] = table_type(j, l, ?code);
-        if (sel got.err) { ret res[mink_model.Desc, diagnostic.Diagnostic].err{got.err}; }
-        desc = mink_model.Desc.table{got.ok};
+    or (kind == TABLE) {
+        val got: res[wasm_object.TableType, diagnostic.Diagnostic] = table_type(j, l, ?code);
+        if (sel got.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{got.err}; }
+        desc = wasm_object.Desc.table{got.ok};
     }
-    or (kind == mink_tables.WASM_EXTERNAL_MEMORY.value::u8) {
-        val got: res[mink_model.Limits, diagnostic.Diagnostic] = memory_type(j, l, ?code);
-        if (sel got.err) { ret res[mink_model.Desc, diagnostic.Diagnostic].err{got.err}; }
-        desc = mink_model.Desc.memory{got.ok};
+    or (kind == MEMORY) {
+        val got: res[fact.Limits, diagnostic.Diagnostic] = memory_type(j, l, ?code);
+        if (sel got.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{got.err}; }
+        desc = wasm_object.Desc.memory{got.ok};
     }
     or {
-        val got: res[mink_model.GlobalType, diagnostic.Diagnostic] = global_type(j, l);
-        if (sel got.err) { ret res[mink_model.Desc, diagnostic.Diagnostic].err{got.err}; }
-        code = wasm_container.stream_code(wasm_container.code_of(?got.ok.valtype));
-        desc = mink_model.Desc.global{got.ok};
+        val got: res[wasm_object.Global, diagnostic.Diagnostic] = global_type(j, l);
+        if (sel got.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{got.err}; }
+        code = wasm_valtype.stream_code(got.ok.value);
+        desc = wasm_object.Desc.global{got.ok};
     }
     val defined: res[u32, str] = wasm_stream.define(j.ctx.stream, space_of(kind), code, name);
-    if (sel defined.err) { ret refused[mink_model.Desc](j, defined.err, at, 1); }
-    ret res[mink_model.Desc, diagnostic.Diagnostic].ok{desc};
+    if (sel defined.err) { ret refused[wasm_object.Desc](j, defined.err, at, 1); }
+    ret res[wasm_object.Desc, diagnostic.Diagnostic].ok{desc};
 }
 
 # an import of kind `kind` from module `module` field `field_`, read at the lexer, the field's index set
-fun imported(j: *Job, f: *Field, l: *wasm_text.Lexer, module: mink_model.Name, field_: mink_model.Name, kind: u8, name: View) err[diagnostic.Diagnostic] {
-    val desc: res[mink_model.Desc, diagnostic.Diagnostic] = import_desc(j, l, kind, name, f.keyword.at);
+fun imported(j: *Job, f: *Field, l: *wasm_text.Lexer, module: wasm_object.Span, field_: wasm_object.Span, kind: u8, name: View) err[diagnostic.Diagnostic] {
+    val desc: res[wasm_object.Desc, diagnostic.Diagnostic] = import_desc(j, l, kind, name, f.keyword.at);
     if (sel desc.err) { ret err[diagnostic.Diagnostic].err{desc.err}; }
     f.kind    = kind;
     f.index   = wasm_stream.count(j.ctx.stream, space_of(kind)) - 1;
     f.defines = true;
-    ret kept[mink_model.Import](j, table.push[mink_model.Import](?j.out.imports, mink_model.Import{module: module, field: field_, kind: kind, desc: desc.ok}), f.keyword.at);
+    ret appended(j, wasm_object.import(j.out, wasm_object.view(j.out, module), wasm_object.view(j.out, field_), desc.ok), f.keyword.at);
 }
 
 # an import field, `"m" "n" (kind $id? desc)`
 fun import_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
-    var l:      wasm_text.Lexer                             = lexer(j, f);
-    val module: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, ?l);
+    var l:      wasm_text.Lexer                              = lexer(j, f);
+    val module: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
     if (sel module.err) { ret err[diagnostic.Diagnostic].err{module.err}; }
-    val field_: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, ?l);
+    val field_: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
     if (sel field_.err) { ret err[diagnostic.Diagnostic].err{field_.err}; }
     var k: usize = 0;
     for (k < 5) {
@@ -565,9 +588,9 @@ fun import_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
 # an inline `(import "m" "n")` at the lexer, the import of kind `kind` it abbreviates read and true, false for none
 fun inline_import(j: *Job, f: *Field, l: *wasm_text.Lexer, kind: u8, name: View) res[bool, diagnostic.Diagnostic] {
     if (!wasm_text.opens(l, "import")) { ret res[bool, diagnostic.Diagnostic].ok{false}; }
-    val module: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, l);
+    val module: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, l);
     if (sel module.err) { ret res[bool, diagnostic.Diagnostic].err{module.err}; }
-    val field_: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, l);
+    val field_: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, l);
     if (sel field_.err) { ret res[bool, diagnostic.Diagnostic].err{field_.err}; }
     val shut: err[diagnostic.Diagnostic] = closed(j, l);
     if (sel shut.err) { ret res[bool, diagnostic.Diagnostic].err{shut.err}; }
@@ -596,7 +619,7 @@ fun func_field(j: *Job, b: *wasm_body.Reader, f: *Field, k: u32) err[diagnostic.
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     past_exports(?l);
-    val kind:   u8                               = mink_tables.WASM_EXTERNAL_FUNCTION.value::u8;
+    val kind:   u8                               = FUNC;
     val inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
     if (sel inline.err) { ret err[diagnostic.Diagnostic].err{inline.err}; }
     if (inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
@@ -605,10 +628,10 @@ fun func_field(j: *Job, b: *wasm_body.Reader, f: *Field, k: u32) err[diagnostic.
     val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.FUNCS, typed.ok, name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
     defines(f, kind, index.ok);
-    val own:    usize                      = j.out.functions.len;
-    val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Leb](?j.out.functions, wasm_container.leb(typed.ok::u64)), f.keyword.at);
+    val own:    usize                      = j.funcs.len;
+    val pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.function{typed.ok}), f.keyword.at);
     if (sel pushed.err) { ret pushed; }
-    val noted: res[usize, A.Error] = vector.push[Defined](?j.funcs, Defined{field: k, index: own::u32});
+    val noted: res[usize, A.Error] = vector.push[Defined](?j.funcs, Defined{field: k, index: own::u32, type: typed.ok});
     if (sel noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
     ret wasm_body.imply(b, ?l);
 }
@@ -618,7 +641,7 @@ fun tag_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     past_exports(?l);
-    val kind:   u8                               = mink_tables.WASM_EXTERNAL_TAG.value::u8;
+    val kind:   u8                               = TAG;
     val inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
     if (sel inline.err) { ret err[diagnostic.Diagnostic].err{inline.err}; }
     if (inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
@@ -629,7 +652,7 @@ fun tag_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
     val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.TAGS, typed.ok, name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
     defines(f, kind, index.ok);
-    ret appended(j, vectors.push[mink_model.Tag](?j.out.tags, mink_model.Tag{attribute: 0, type: wasm_container.leb(typed.ok::u64)}), f.keyword.at);
+    ret appended(j, wasm_object.define(j.out, wasm_object.Desc.exception{typed.ok}), f.keyword.at);
 }
 
 # a global field: an import, or a definition of its type, its initializer read in its later pass
@@ -637,20 +660,16 @@ fun global_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     past_exports(?l);
-    val kind:   u8                               = mink_tables.WASM_EXTERNAL_GLOBAL.value::u8;
+    val kind:   u8                               = GLOBAL;
     val inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
     if (sel inline.err) { ret err[diagnostic.Diagnostic].err{inline.err}; }
     if (inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
-    val type: res[mink_model.GlobalType, diagnostic.Diagnostic] = global_type(j, ?l);
+    val type: res[wasm_object.Global, diagnostic.Diagnostic] = global_type(j, ?l);
     if (sel type.err) { ret err[diagnostic.Diagnostic].err{type.err}; }
-    val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.GLOBALS, wasm_container.stream_code(wasm_container.code_of(?type.ok.valtype)), name, f.keyword.at);
+    val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.GLOBALS, wasm_valtype.stream_code(type.ok.value), name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
     defines(f, kind, index.ok);
-    val own:    usize                      = j.out.globals.len;
-    val none:   mink_model.Global          = mink_model.Global{type: type.ok, init: mink_model.Expr{bytes: Held.owned{store.Span{start: 0, len: 0}}}};
-    val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Global](?j.out.globals, none), f.keyword.at);
-    if (sel pushed.err) { ret pushed; }
-    val noted: res[usize, A.Error] = vector.push[Pending](?j.globals, Pending{field: k, at: l.at, of: own::u32, inline: false, type: 0});
+    val noted: res[usize, A.Error] = vector.push[Pending](?j.globals, Pending{field: k, at: l.at, of: 0, inline: false, type: 0, value: type.ok.value, mutable: type.ok.mutable});
     if (sel noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
     ret err[diagnostic.Diagnostic].ok{};
 }
@@ -691,12 +710,12 @@ fun table_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     past_exports(?l);
-    val kind:   u8                               = mink_tables.WASM_EXTERNAL_TABLE.value::u8;
+    val kind:   u8                               = TABLE;
     val inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
     if (sel inline.err) { ret err[diagnostic.Diagnostic].err{inline.err}; }
     if (inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
     var code: u32             = 0;
-    var type: mink_model.TableType;
+    var type: wasm_object.TableType;
     var elem: bool            = false;
     var at:   usize           = 0;
     val back: wasm_text.Lexer = l;
@@ -707,39 +726,36 @@ fun table_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
         if (!wasm_text.opens(?l, "elem")) { ret at_token(j, NOT_CLOSED, wasm_text.ahead(?l)); }
         at   = l.at;
         elem = true;
-        val n:      u64               = items_in(j, l);
-        var limits: mink_model.Limits = mink_model.Limits{flags: mink_tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: wasm_container.leb(n), max: wasm_container.leb(n), page: wasm_container.leb(0)};
-        if (code == wasm_stream.I64) { limits.flags = limits.flags | mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8; }
-        type = mink_model.TableType{elem: wasm_container.ref_type(wasm_container.widened(rt.ok)), limits: limits};
+        val n: u64 = items_in(j, l);
+        type = wasm_object.TableType{elem: wasm_valtype.widened(rt.ok), limits: exactly(n, code), init: opt[wasm_object.Span].none{}};
         val passed: bool = wasm_text.skip(?l);
     }
     or {
         l = back;
-        val got: res[mink_model.TableType, diagnostic.Diagnostic] = table_type(j, ?l, ?code);
+        val got: res[wasm_object.TableType, diagnostic.Diagnostic] = table_type(j, ?l, ?code);
         if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
         type = got.ok;
     }
-    val own:   usize                           = j.out.tables.len;
     val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.TABLES, code, name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
     defines(f, kind, index.ok);
-    val def:    mink_model.TableDef        = mink_model.TableDef{type: type, init: opt[mink_model.Expr].none{}};
-    val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.TableDef](?j.out.tables, def), f.keyword.at);
+    val position: u32                        = wasm_object.defined_tables(j.out);
+    val pushed:   err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.table{type}), f.keyword.at);
     if (sel pushed.err) { ret pushed; }
     if (!elem) {
         if (wasm_text.ahead(?l).kind == wasm_text.CLOSE) { ret err[diagnostic.Diagnostic].ok{}; }
-        val noted: res[usize, A.Error] = vector.push[Pending](?j.tables, Pending{field: k, at: l.at, of: own::u32, inline: false, type: 0});
+        val noted: res[usize, A.Error] = vector.push[Pending](?j.tables, Pending{field: k, at: l.at, of: position, inline: false, type: 0, value: 0, mutable: false});
         if (sel noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
         ret err[diagnostic.Diagnostic].ok{};
     }
-    ret segment(j, ?j.elements, wasm_kind.ELEMS, f, k, at, index.ok, wasm_container.stream_code(wasm_container.ref_code(?type.elem)), View{data: nil, len: 0});
+    ret segment(j, ?j.elements, wasm_kind.ELEMS, f, k, at, index.ok, wasm_valtype.stream_code(type.elem), View{data: nil, len: 0});
 }
 
 # a segment of the field `k` noted for its later pass and defined in `space`, its contents from `at`, of entry `of`
 fun segment(j: *Job, into: *vector.Vector[Pending], space: u16, f: *Field, k: u32, at: usize, of: u32, type: u32, name: View) err[diagnostic.Diagnostic] {
     val index: res[u32, diagnostic.Diagnostic] = define(j, space, 0, name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
-    val noted: res[usize, A.Error] = vector.push[Pending](into, Pending{field: k, at: at, of: of, inline: !is(j, f, "elem") && !is(j, f, "data"), type: type});
+    val noted: res[usize, A.Error] = vector.push[Pending](into, Pending{field: k, at: at, of: of, inline: !is(j, f, "elem") && !is(j, f, "data"), type: type, value: 0, mutable: false});
     if (sel noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
     ret err[diagnostic.Diagnostic].ok{};
 }
@@ -760,12 +776,12 @@ fun memory_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     past_exports(?l);
-    val kind:   u8                               = mink_tables.WASM_EXTERNAL_MEMORY.value::u8;
+    val kind:   u8                               = MEMORY;
     val inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
     if (sel inline.err) { ret err[diagnostic.Diagnostic].err{inline.err}; }
     if (inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
     var code:   u32             = 0;
-    var limits: mink_model.Limits;
+    var limits: fact.Limits;
     var data:   bool            = false;
     var at:     usize           = 0;
     val back:   wasm_text.Lexer = l;
@@ -775,14 +791,12 @@ fun memory_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
         data = true;
         val n: res[u64, diagnostic.Diagnostic] = data_length(j, l);
         if (sel n.err) { ret err[diagnostic.Diagnostic].err{n.err}; }
-        val pages: u64 = (n.ok + 0xFFFF) / 0x1_0000;
-        limits = mink_model.Limits{flags: mink_tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: wasm_container.leb(pages), max: wasm_container.leb(pages), page: wasm_container.leb(0)};
-        if (code == wasm_stream.I64) { limits.flags = limits.flags | mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8; }
+        limits = exactly((n.ok + 0xFFFF) / 0x1_0000, code);
         val passed: bool = wasm_text.skip(?l);
     }
     or {
         l = back;
-        val got: res[mink_model.Limits, diagnostic.Diagnostic] = memory_type(j, ?l, ?code);
+        val got: res[fact.Limits, diagnostic.Diagnostic] = memory_type(j, ?l, ?code);
         if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
         limits = got.ok;
     }
@@ -791,7 +805,7 @@ fun memory_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
     val index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.MEMORIES, code, name, f.keyword.at);
     if (sel index.err) { ret err[diagnostic.Diagnostic].err{index.err}; }
     defines(f, kind, index.ok);
-    val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Limits](?j.out.memories, limits), f.keyword.at);
+    val pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.memory{limits}), f.keyword.at);
     if (sel pushed.err) { ret pushed; }
     if (!data)          { ret err[diagnostic.Diagnostic].ok{}; }
     ret segment(j, ?j.datas, wasm_kind.DATAS, f, k, at, index.ok, 0, View{data: nil, len: 0});
@@ -805,33 +819,36 @@ fun segment_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
     ret segment(j, ?j.datas, wasm_kind.DATAS, f, k, l.at, 0, 0, name);
 }
 
-# the space and kind an export's `(func x)` and its kin name
-fun extern(j: *Job, l: *wasm_text.Lexer) res[mink_model.Export, diagnostic.Diagnostic] {
+# what an export's `(func x)` and its kin name: the kind and the index in its space
+rec Extern {
+    kind:  u8;
+    index: u32;
+}
+
+fun extern(j: *Job, l: *wasm_text.Lexer) res[Extern, diagnostic.Diagnostic] {
     var k: usize = 0;
     for (k < 5) {
         if (wasm_text.opens(l, KIND_WORDS[k])) {
             val got: res[u32, diagnostic.Diagnostic] = index(j, l, space_of(k::u8));
-            if (sel got.err) { ret res[mink_model.Export, diagnostic.Diagnostic].err{got.err}; }
+            if (sel got.err) { ret res[Extern, diagnostic.Diagnostic].err{got.err}; }
             val shut: err[diagnostic.Diagnostic] = closed(j, l);
-            if (sel shut.err) { ret res[mink_model.Export, diagnostic.Diagnostic].err{shut.err}; }
-            ret res[mink_model.Export, diagnostic.Diagnostic].ok{mink_model.Export{name: mink_model.Name{bytes: Held.owned{store.Span{start: 0, len: 0}}, width: 0}, kind: k::u8, index: wasm_container.leb(got.ok::u64)}};
+            if (sel shut.err) { ret res[Extern, diagnostic.Diagnostic].err{shut.err}; }
+            ret res[Extern, diagnostic.Diagnostic].ok{Extern{kind: k::u8, index: got.ok}};
         }
         k = k + 1;
     }
     val t: wasm_text.Token = wasm_text.ahead(l);
-    ret refused[mink_model.Export](j, NO_EXTERN, t.at, t.len);
+    ret refused[Extern](j, NO_EXTERN, t.at, t.len);
 }
 
 # an export field, `"n" (func x)`
 fun export_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
-    var l:     wasm_text.Lexer                             = lexer(j, f);
-    val named: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, ?l);
+    var l:     wasm_text.Lexer                              = lexer(j, f);
+    val named: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
     if (sel named.err) { ret err[diagnostic.Diagnostic].err{named.err}; }
-    val got: res[mink_model.Export, diagnostic.Diagnostic] = extern(j, ?l);
+    val got: res[Extern, diagnostic.Diagnostic] = extern(j, ?l);
     if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
-    var e: mink_model.Export = got.ok;
-    e.name = named.ok;
-    val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Export](?j.out.exports, e), f.keyword.at);
+    val pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.export(j.out, wasm_object.view(j.out, named.ok), got.ok.kind, got.ok.index), f.keyword.at);
     if (sel pushed.err) { ret pushed; }
     ret closed(j, ?l);
 }
@@ -841,10 +858,9 @@ fun inline_exports(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
     for (wasm_text.opens(?l, "export")) {
-        val named: res[mink_model.Name, diagnostic.Diagnostic] = name_of(j, ?l);
+        val named: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
         if (sel named.err) { ret err[diagnostic.Diagnostic].err{named.err}; }
-        val e:      mink_model.Export          = mink_model.Export{name: named.ok, kind: f.kind, index: wasm_container.leb(f.index::u64)};
-        val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Export](?j.out.exports, e), f.keyword.at);
+        val pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.export(j.out, wasm_object.view(j.out, named.ok), f.kind, f.index), f.keyword.at);
         if (sel pushed.err) { ret pushed; }
         val shut: err[diagnostic.Diagnostic] = closed(j, ?l);
         if (sel shut.err) { ret shut; }
@@ -863,41 +879,35 @@ fun start_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
     ret closed(j, ?l);
 }
 
-# the expression of the instructions at the lexer up to the `)` around them, owned by the model
-fun expression(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[mink_model.Expr, diagnostic.Diagnostic] {
+# the expression of the instructions at the lexer up to the `)` around them, held by the module
+fun expression(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
     val at:    usize             = l.at;
     var bytes: vector.Vector[u8] = vector.init[u8](j.a);
     fin { vector.dnit[u8](?bytes); }
     val got: err[diagnostic.Diagnostic] = wasm_body.expression(b, l, ?bytes);
-    if (sel got.err) { ret res[mink_model.Expr, diagnostic.Diagnostic].err{got.err}; }
-    ret owned_expr(j, ?bytes, at);
-}
-
-fun owned_expr(j: *Job, bytes: *vector.Vector[u8], at: usize) res[mink_model.Expr, diagnostic.Diagnostic] {
-    val held: res[Held, Fail] = wasm_container.held(j.out, bytes);
-    if (sel held.err) { ret res[mink_model.Expr, diagnostic.Diagnostic].err{failure(j, held.err, at)}; }
-    ret res[mink_model.Expr, diagnostic.Diagnostic].ok{mink_model.Expr{bytes: held.ok}};
+    if (sel got.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{got.err}; }
+    ret held(j, ?bytes, at);
 }
 
 # an offset at the lexer, `(offset instr*)` or one folded instruction, its expression
-fun offset(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[mink_model.Expr, diagnostic.Diagnostic] {
+fun offset(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
     if (wasm_text.opens(l, "offset")) {
-        val got: res[mink_model.Expr, diagnostic.Diagnostic] = expression(j, b, l);
+        val got: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, l);
         if (sel got.err) { ret got; }
         val shut: err[diagnostic.Diagnostic] = closed(j, l);
-        if (sel shut.err) { ret res[mink_model.Expr, diagnostic.Diagnostic].err{shut.err}; }
+        if (sel shut.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{shut.err}; }
         ret got;
     }
     val at:    usize             = l.at;
     var bytes: vector.Vector[u8] = vector.init[u8](j.a);
     fin { vector.dnit[u8](?bytes); }
     val got: err[diagnostic.Diagnostic] = wasm_body.folded_expression(b, l, ?bytes);
-    if (sel got.err) { ret res[mink_model.Expr, diagnostic.Diagnostic].err{got.err}; }
-    ret owned_expr(j, ?bytes, at);
+    if (sel got.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{got.err}; }
+    ret held(j, ?bytes, at);
 }
 
 # the expression `0` of address type `code`, an inline segment's offset: its const and its end, encoded
-fun zero(j: *Job, code: u32, at: usize) res[mink_model.Expr, diagnostic.Diagnostic] {
+fun zero(j: *Job, code: u32, at: usize) res[wasm_object.Span, diagnostic.Diagnostic] {
     var bytes: vector.Vector[u8] = vector.init[u8](j.a);
     fin { vector.dnit[u8](?bytes); }
     var value: [1]operand.Value = [1]operand.Value{operand.Value.immediate{0}};
@@ -906,11 +916,11 @@ fun zero(j: *Job, code: u32, at: usize) res[mink_model.Expr, diagnostic.Diagnost
     var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](j.a);
     fin { vector.dnit[field.Fixup](?fixups); }
     val wrote: res[usize, field.Refusal] = walk.encode(j.codec, j.ctx, ?ins, ?bytes, ?fixups);
-    if (sel wrote.err) { ret refused[mink_model.Expr](j, wrote.err.message, at, 1); }
+    if (sel wrote.err) { ret refused[wasm_object.Span](j, wrote.err.message, at, 1); }
     var end:   inst.Inst                 = inst.Inst{row: ?gen_row.ROWS[gen_row_index.END], values: nil, count: 0, form: form.PREFERRED};
     val ended: res[usize, field.Refusal] = walk.encode(j.codec, j.ctx, ?end, ?bytes, ?fixups);
-    if (sel ended.err) { ret refused[mink_model.Expr](j, ended.err.message, at, 1); }
-    ret owned_expr(j, ?bytes, at);
+    if (sel ended.err) { ret refused[wasm_object.Span](j, ended.err.message, at, 1); }
+    ret held(j, ?bytes, at);
 }
 
 # the address type of the table or memory `index` of space `space`
@@ -920,23 +930,26 @@ fun address_of(j: *Job, space: u16, index: u32) u32 {
     ret wasm_stream.I32;
 }
 
-# a global's initializer, read in its index order
+# a global's initializer, read in its index order, the global defined with it
 fun global_init(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
-    val f:   *Field                                      = ?j.fields.data[p.field];
-    var l:   wasm_text.Lexer                             = wasm_text.make(j.text, p.at, f.end + 1);
-    val got: res[mink_model.Expr, diagnostic.Diagnostic] = expression(j, b, ?l);
+    val f:   *Field                                       = ?j.fields.data[p.field];
+    var l:   wasm_text.Lexer                              = wasm_text.make(j.text, p.at, f.end + 1);
+    val got: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, ?l);
     if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
-    j.out.globals.data[p.of::usize].init = got.ok;
+    val g:       wasm_object.Global         = wasm_object.Global{value: p.value, mutable: p.mutable, init: opt[wasm_object.Span].some{got.ok}};
+    val defined: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.global{g}), f.keyword.at);
+    if (sel defined.err) { ret defined; }
     ret closed(j, ?l);
 }
 
-# a table's initializer, read in its index order
+# the initializer of the table `p` notes, the table defined at position `p.of`
 fun table_init(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
-    val f:   *Field                                      = ?j.fields.data[p.field];
-    var l:   wasm_text.Lexer                             = wasm_text.make(j.text, p.at, f.end + 1);
-    val got: res[mink_model.Expr, diagnostic.Diagnostic] = expression(j, b, ?l);
+    val f:   *Field                                       = ?j.fields.data[p.field];
+    var l:   wasm_text.Lexer                              = wasm_text.make(j.text, p.at, f.end + 1);
+    val got: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, ?l);
     if (sel got.err) { ret err[diagnostic.Diagnostic].err{got.err}; }
-    j.out.tables.data[p.of::usize].init = opt[mink_model.Expr].some{got.ok};
+    val stated: err[diagnostic.Diagnostic] = appended(j, wasm_object.initialize(j.out, p.of, got.ok), f.keyword.at);
+    if (sel stated.err) { ret stated; }
     ret closed(j, ?l);
 }
 
@@ -997,7 +1010,7 @@ fun ref_expr(j: *Job, x: u32, out: *vector.Vector[u8], at: usize) err[diagnostic
 }
 
 # the reference type `(ref func)`, as the syntax holds it: its byte and its heap type above it
-val REF_FUNC: i64 = (wasm_container.FUNCREF::i64 - 0x80) * 0x100 + wasm_field.REF::i64;
+val REF_FUNC: i64 = (wasm_valtype.FUNCREF::i64 - 0x80) * 0x100 + wasm_field.REF::i64;
 
 # an element segment's reference type at the lexer: `(ref func)` as `funcs`, or its stream code
 fun element_type(j: *Job, l: *wasm_text.Lexer, out: *Items) err[diagnostic.Diagnostic] {
@@ -1009,12 +1022,12 @@ fun element_type(j: *Job, l: *wasm_text.Lexer, out: *Items) err[diagnostic.Diagn
     l.at = r.at;
     if (got.ok == REF_FUNC) {
         out.funcs = true;
-        out.type  = wasm_container.FUNCREF::u32;
+        out.type  = wasm_valtype.FUNCREF::u32;
         ret err[diagnostic.Diagnostic].ok{};
     }
-    if (!wasm_container.held_by_stream(got.ok))         { ret refuse(j, TYPE_RANGE, at, r.at - at); }
-    if (!reference(wasm_container.stream_code(got.ok))) { ret refuse(j, NO_REFTYPE, at, r.at - at); }
-    out.type = wasm_container.stream_code(got.ok);
+    if (!wasm_valtype.held_by_stream(got.ok))         { ret refuse(j, TYPE_RANGE, at, r.at - at); }
+    if (!reference(wasm_valtype.stream_code(got.ok))) { ret refuse(j, NO_REFTYPE, at, r.at - at); }
+    out.type = wasm_valtype.stream_code(got.ok);
     ret err[diagnostic.Diagnostic].ok{};
 }
 
@@ -1091,25 +1104,31 @@ fun offset_ahead(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) bool {
     ret wasm_text.is(l, t, "offset") || wasm_body.instruction(b, t);
 }
 
+# the segment modes a segment's text states
+val PASSIVE:  u8 = 0;
+val ACTIVE:   u8 = 1;
+val DECLARED: u8 = 2;
+
 # the element segment `p` notes, read in its index order: `declare`, or a table use and an offset for an active one,
-# then its items, as the binary takes them under the flags `element_flags` chooses
+# then its items. an active segment writes its table's index for a table other than the first or for items of a type
+# other than funcref, and its items are expressions unless they are a `(ref func)` list
 fun element(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
-    val f:    *Field          = ?j.fields.data[p.field];
-    var l:    wasm_text.Lexer = wasm_text.make(j.text, p.at, f.end + 1);
-    var mode: u64             = wasm_container.PASSIVE;
-    var tab:  u32             = p.of;
-    var off:  mink_model.Expr = mink_model.Expr{bytes: Held.owned{store.Span{start: 0, len: 0}}};
-    var type: opt[u32]        = opt[u32].none{};
+    val f:    *Field           = ?j.fields.data[p.field];
+    var l:    wasm_text.Lexer  = wasm_text.make(j.text, p.at, f.end + 1);
+    var mode: u8               = PASSIVE;
+    var tab:  u32              = p.of;
+    var off:  wasm_object.Span = wasm_object.Span{at: 0, len: 0};
+    var type: opt[u32]         = opt[u32].none{};
     if (p.inline) {
-        mode = wasm_container.ACTIVE;
-        val z: res[mink_model.Expr, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.TABLES, tab), f.keyword.at);
+        mode = ACTIVE;
+        val z: res[wasm_object.Span, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.TABLES, tab), f.keyword.at);
         if (sel z.err) { ret err[diagnostic.Diagnostic].err{z.err}; }
         off  = z.ok;
         type = opt[u32].some{p.type};
     }
     or (wasm_text.is(?l, wasm_text.ahead(?l), "declare")) {
         val passed: wasm_text.Token = wasm_text.next(?l);
-        mode = wasm_container.DECLARED;
+        mode = DECLARED;
     }
     or {
         var used: bool = false;
@@ -1128,54 +1147,61 @@ fun element(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnosti
             used = true;
         }
         if (used || offset_ahead(j, b, ?l)) {
-            val o: res[mink_model.Expr, diagnostic.Diagnostic] = offset(j, b, ?l);
+            val o: res[wasm_object.Span, diagnostic.Diagnostic] = offset(j, b, ?l);
             if (sel o.err) { ret err[diagnostic.Diagnostic].err{o.err}; }
             off  = o.ok;
-            mode = wasm_container.ACTIVE;
+            mode = ACTIVE;
         }
     }
     var it: Items = Items{funcs: false, type: 0, indices: vector.init[u32](j.a), exprs: vector.init[vector.Vector[u8]](j.a)};
     fin { drop_items(?it); }
-    val got: err[diagnostic.Diagnostic] = items(j, b, ?l, mode == wasm_container.ACTIVE, type, ?it);
+    val got: err[diagnostic.Diagnostic] = items(j, b, ?l, mode == ACTIVE, type, ?it);
     if (sel got.err) { ret got; }
     val shut: err[diagnostic.Diagnostic] = closed(j, ?l);
     if (sel shut.err) { ret shut; }
-    val flags: u64                = wasm_container.element_flags(mode, tab, it.funcs, it.type);
-    var e:     mink_model.Element = mink_model.Element{flags: wasm_container.leb(flags), table: wasm_container.leb(tab::u64), offset: off, kind: 0, type: wasm_container.ref_type(wasm_container.FUNCREF::i64), items: mink_model.Items.indices{wasm_container.run(0, 0)}};
-    var i:     usize              = 0;
-    if (!it.funcs) {
-        e.type = wasm_container.ref_type(wasm_container.widened(it.type));
-        val first: usize = j.out.exprs.len;
-        for (i < it.exprs.len) {
-            val held: res[mink_model.Expr, diagnostic.Diagnostic] = owned_expr(j, ?it.exprs.data[i], f.keyword.at);
-            if (sel held.err) { ret err[diagnostic.Diagnostic].err{held.err}; }
-            val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Expr](?j.out.exprs, held.ok), f.keyword.at);
-            if (sel pushed.err) { ret pushed; }
-            i = i + 1;
-        }
-        e.items = mink_model.Items.exprs{wasm_container.run(first, it.exprs.len)};
-        ret appended(j, vectors.push[mink_model.Element](?j.out.elements, e), f.keyword.at);
+    var stated: wasm_object.Element = wasm_object.Element{mode: wasm_object.Mode.passive{}, type: wasm_valtype.FUNCREF::i64, items: wasm_object.Items.functions{vector.init[u32](j.a)}};
+    if (mode == DECLARED) { stated.mode = wasm_object.Mode.declarative{}; }
+    or (mode == ACTIVE) {
+        var index: opt[u32] = opt[u32].none{};
+        if (tab != 0 || (!it.funcs && it.type != wasm_valtype.FUNCREF::u32)) { index = opt[u32].some{tab}; }
+        stated.mode = wasm_object.Mode.active{wasm_object.At{index: index, offset: off}};
     }
-    val first: usize = j.out.indices.len;
-    for (i < it.indices.len) {
-        val pushed: err[diagnostic.Diagnostic] = appended(j, vectors.push[mink_model.Leb](?j.out.indices, wasm_container.leb(it.indices.data[i]::u64)), f.keyword.at);
-        if (sel pushed.err) { ret pushed; }
+    if (it.funcs) {
+        stated.items = wasm_object.Items.functions{it.indices};
+        it.indices   = vector.init[u32](j.a);
+        ret appended(j, wasm_object.element(j.out, stated), f.keyword.at);
+    }
+    stated.type = wasm_valtype.widened(it.type);
+    var spans: vector.Vector[wasm_object.Span] = vector.init[wasm_object.Span](j.a);
+    var i:     usize                           = 0;
+    for (i < it.exprs.len) {
+        val x: res[wasm_object.Span, diagnostic.Diagnostic] = held(j, ?it.exprs.data[i], f.keyword.at);
+        if (sel x.err) {
+            vector.dnit[wasm_object.Span](?spans);
+            ret err[diagnostic.Diagnostic].err{x.err};
+        }
+        val pushed: res[usize, A.Error] = vector.push[wasm_object.Span](?spans, x.ok);
+        if (sel pushed.err) {
+            vector.dnit[wasm_object.Span](?spans);
+            ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len);
+        }
         i = i + 1;
     }
-    e.items = mink_model.Items.indices{wasm_container.run(first, it.indices.len)};
-    ret appended(j, vectors.push[mink_model.Element](?j.out.elements, e), f.keyword.at);
+    stated.items = wasm_object.Items.expressions{spans};
+    ret appended(j, wasm_object.element(j.out, stated), f.keyword.at);
 }
 
-# the data segment `p` notes, read in its index order: a memory use and an offset for an active one, then its strings
+# the data segment `p` notes, read in its index order: a memory use and an offset for an active one, then its strings.
+# an active segment writes its memory's index for a memory other than the first
 fun data(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
-    val f:    *Field          = ?j.fields.data[p.field];
-    var l:    wasm_text.Lexer = wasm_text.make(j.text, p.at, f.end + 1);
-    var mode: u64             = wasm_container.PASSIVE;
-    var mem:  u32             = p.of;
-    var off:  mink_model.Expr = mink_model.Expr{bytes: Held.owned{store.Span{start: 0, len: 0}}};
+    val f:      *Field           = ?j.fields.data[p.field];
+    var l:      wasm_text.Lexer  = wasm_text.make(j.text, p.at, f.end + 1);
+    var active: bool             = false;
+    var mem:    u32              = p.of;
+    var off:    wasm_object.Span = wasm_object.Span{at: 0, len: 0};
     if (p.inline) {
-        mode = wasm_container.ACTIVE;
-        val z: res[mink_model.Expr, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.MEMORIES, mem), f.keyword.at);
+        active = true;
+        val z: res[wasm_object.Span, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.MEMORIES, mem), f.keyword.at);
         if (sel z.err) { ret err[diagnostic.Diagnostic].err{z.err}; }
         off = z.ok;
     }
@@ -1196,10 +1222,10 @@ fun data(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] 
             used = true;
         }
         if (used || offset_ahead(j, b, ?l)) {
-            val o: res[mink_model.Expr, diagnostic.Diagnostic] = offset(j, b, ?l);
+            val o: res[wasm_object.Span, diagnostic.Diagnostic] = offset(j, b, ?l);
             if (sel o.err) { ret err[diagnostic.Diagnostic].err{o.err}; }
-            off  = o.ok;
-            mode = wasm_container.ACTIVE;
+            off    = o.ok;
+            active = true;
         }
     }
     var bytes: vector.Vector[u8] = vector.init[u8](j.a);
@@ -1208,10 +1234,15 @@ fun data(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] 
     if (sel got.err) { ret got; }
     val shut: err[diagnostic.Diagnostic] = closed(j, ?l);
     if (sel shut.err) { ret shut; }
-    val held: res[Held, Fail] = wasm_container.held(j.out, ?bytes);
-    if (sel held.err) { ret failed(j, held.err, f.keyword.at); }
-    val s: mink_model.Segment = mink_model.Segment{flags: wasm_container.leb(wasm_container.data_flags(mode, mem)), memory: wasm_container.leb(mem::u64), offset: off, width: mink_model.SHORTEST, data: held.ok};
-    ret appended(j, vectors.push[mink_model.Segment](?j.out.data, s), f.keyword.at);
+    var head: wasm_object.Head = wasm_object.Head.passive{};
+    if (active) {
+        var index: opt[u32] = opt[u32].none{};
+        if (mem != 0) { index = opt[u32].some{mem}; }
+        head = wasm_object.Head.active{wasm_object.At{index: index, offset: off}};
+    }
+    val s: res[Id[mink_object.Section], Fail] = wasm_object.segment(j.out, head, wasm_object.PLAIN, bytes.data, bytes.len);
+    if (sel s.err) { ret failed(j, s.err, f.keyword.at); }
+    ret err[diagnostic.Diagnostic].ok{};
 }
 
 # the locals at the lexer, `(local $id t)` or `(local t*)`, defined after the params, onto `types`
@@ -1237,7 +1268,7 @@ fun locals(j: *Job, l: *wasm_text.Lexer, types: *vector.Vector[u32]) err[diagnos
 
 # value type of stream code `code` onto `out`: its byte, and a typed reference's heap type as an s33 after it
 fun put_value_type(out: *vector.Vector[u8], code: u32) {
-    val whole: i64 = wasm_container.widened(code);
+    val whole: i64 = wasm_valtype.widened(code);
     val b:     u8  = (whole & 0xFF)::u8;
     vector.push[u8](out, b);
     if (b == wasm_field.REF || b == wasm_field.REF_NULL) { wasm_leb.put_signed(out, whole >> 8); }
@@ -1262,9 +1293,9 @@ fun local_runs(out: *vector.Vector[u8], types: *vector.Vector[u32]) {
     }
 }
 
-# function `d`'s body: the stream entered at its type, its params named, its locals and its code, onto the model's code
+# function `d`'s body: the stream entered at its type, its params named, its locals and its code, stated as its body
 fun body_of(j: *Job, b: *wasm_body.Reader, d: *Defined) err[diagnostic.Diagnostic] {
-    val type: u32             = j.out.functions.data[d.index::usize].value::u32;
+    val type: u32             = d.type;
     val f:    *Field          = ?j.fields.data[d.field];
     var l:    wasm_text.Lexer = lexer(j, f);
     val name: View            = identifier(j, ?l);
@@ -1292,17 +1323,34 @@ fun body_of(j: *Job, b: *wasm_body.Reader, d: *Defined) err[diagnostic.Diagnosti
     if (sel code.err) { ret code; }
     val shut: err[diagnostic.Diagnostic] = closed(j, ?l);
     if (sel shut.err) { ret shut; }
-    val held: res[Held, Fail] = wasm_container.held(j.out, ?body);
-    if (sel held.err) { ret failed(j, held.err, f.keyword.at); }
-    ret appended(j, vectors.push[mink_model.Function](?j.out.code, mink_model.Function{width: mink_model.SHORTEST, body: held.ok}), f.keyword.at);
+    val stated: res[Id[mink_object.Section], Fail] = wasm_object.body(j.out, d.index::usize, body.data, body.len);
+    if (sel stated.err) { ret failed(j, stated.err, f.keyword.at); }
+    ret err[diagnostic.Diagnostic].ok{};
 }
 
-# the module the `len` bytes of `source` spell, read under `ctx`, whose stream it begins and fills, into `out`, mink's
-# model of it, which its caller releases whether or not the read is refused
+# the module the `len` bytes of `source` spell, read under `ctx`, whose stream it begins and fills, as mink's neutral
+# object of a module for `arch`, which the caller releases
 # ---
 # origin: the position of the text's first byte
-pub fun read(a: *A.Allocator, source: *u8, len: usize, origin: diagnostic.Position, codec: *dispatch.Codec, ctx: *state.Context, out: *mink_model.Module) err[diagnostic.Diagnostic] {
-    @out = mink_model.make(a);
+pub fun read(a: *A.Allocator, source: *u8, len: usize, origin: diagnostic.Position, ctx: *state.Context, arch: *mink_arch.Arch) res[mink_object.Object, diagnostic.Diagnostic] {
+    var m: wasm_object.Module         = wasm_object.make(a, arch, ?catalog_kind.MODULE);
+    val e: err[diagnostic.Diagnostic] = read_into(a, source, len, origin, ctx, ?m);
+    if (sel e.err) {
+        wasm_object.release(?m);
+        ret res[mink_object.Object, diagnostic.Diagnostic].err{e.err};
+    }
+    val o: res[mink_object.Object, Fail] = wasm_object.finish(?m, ctx.stream);
+    if (sel o.err) {
+        var message: str = o.err.text;
+        if (message == nil) { message = FAILED; }
+        ret res[mink_object.Object, diagnostic.Diagnostic].err{diagnostic.refusal(message, origin, source, 0, 0)};
+    }
+    ret res[mink_object.Object, diagnostic.Diagnostic].ok{o.ok};
+}
+
+# the module the text spells stated on `out`
+fun read_into(a: *A.Allocator, source: *u8, len: usize, origin: diagnostic.Position, ctx: *state.Context, out: *wasm_object.Module) err[diagnostic.Diagnostic] {
+    val codec: *dispatch.Codec = ?wasm_codec.CODEC;
     wasm_stream.HOOKS.begin(ctx.stream);
     # the fields are read from a copy whose comments are blanked, so the instruction syntax's readers pass them as
     # the white space they are
@@ -1427,7 +1475,10 @@ fun passes(j: *Job, b: *wasm_body.Reader) err[diagnostic.Diagnostic] {
         if (sel got.err) { ret got; }
         k = k + 1;
     }
-    val shut: err[Fail] = wasm_container.close(j.out, j.ctx.stream, j.start, b.datas);
-    if (sel shut.err) { ret failed(j, shut.err, 0); }
+    if (sel j.start.some) { wasm_object.start(j.out, j.start.some); }
+    if (b.datas)          { wasm_object.count_data(j.out); }
     ret err[diagnostic.Diagnostic].ok{};
 }
+
+# a module's text, its fields, read here and printed by `masc.isa.wasm.print`
+pub val MODULE: stream.Module = stream.Module.printed{stream.Printed{print: wasm_print.module, read: read}};
