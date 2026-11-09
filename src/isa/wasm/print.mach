@@ -1,13 +1,17 @@
-# a module of mink's wasm container printed as its text
+# a wasm module read as mink's neutral object, printed as its text
 #
-# every field is written in the form the module reader (`masc.isa.wasm.module`) reads back to the same entries: each
-# index by its number, each function's type by `(type x)`, its locals and its instructions flat, one per line, each by
-# the set's syntax under the stream the module's index spaces fill, and each segment in its full form, so its flags
-# are the ones the reader's container chooses for it. a string is written by its printable bytes and `\hh` escapes. an
-# instruction or a field the set cannot print is refused.
+# the module is read through mink's facts (`mink.format.wasm.fact`): each type, import and definition by its entry,
+# a function's body and a data segment's bytes by the section its entry names, and the element segments, exports and
+# start function by the module's own facts. every field is written in the form the module reader
+# (`masc.isa.wasm.module`) reads back to the same object: each index by its number, each function's type by
+# `(type x)`, its locals and its instructions flat, one per line, each by the set's syntax under the stream the
+# module's index spaces fill, and each segment in its full form, so the reader makes the choices of its encoding the
+# module holds. a string is written by its printable bytes and `\hh` escapes. an instruction or a field the set
+# cannot print, or that mink's facts give no typed form of, is refused.
 
 use std.types.bool.bool;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -16,10 +20,19 @@ use std.types.view.View;
 use A: std.allocator;
 use std.collections.vector;
 
+use mink.base.fail.Fail;
 use mink.base.store.Bytes;
 use mink.base.table;
-use mink_model:  mink.format.wasm.model;
-use mink_tables: mink.format.wasm.tables;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.format;
+use mink.format.wasm.fact;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.space;
+use mink.model.space.Space;
 
 use masc.codec.walk;
 use masc.core.dispatch;
@@ -32,12 +45,13 @@ use masc.core.state;
 use core_syntax:  masc.core.syntax;
 use syntax_print: masc.syntax.print;
 
-use wasm_container: masc.isa.wasm.container;
-use wasm_field:     masc.isa.wasm.field;
-use wasm_kind:      masc.isa.wasm.kind;
-use wasm_leb:       masc.isa.wasm.leb;
-use wasm_stream:    masc.isa.wasm.stream;
-use wasm_syntax:    masc.isa.wasm.syntax;
+use wasm_codec:   masc.isa.wasm.codec;
+use wasm_field:   masc.isa.wasm.field;
+use wasm_kind:    masc.isa.wasm.kind;
+use wasm_leb:     masc.isa.wasm.leb;
+use wasm_stream:  masc.isa.wasm.stream;
+use wasm_syntax:  masc.isa.wasm.syntax;
+use wasm_valtype: masc.isa.wasm.valtype;
 
 use masc.isa.wasm.gen_row;
 use masc.isa.wasm.gen_row_index;
@@ -46,11 +60,13 @@ pub val MEMORY:   str = "out of memory";
 pub val NO_SPACE: str = "the stream refused a module's index space";
 pub val UNENDED:  str = "an expression or a body runs past its bytes with no end";
 pub val NO_FORM:  str = "a module entry the text format has no form of";
+pub val REFUSED:  str = "mink refused a fact of the module";
 
-# what a print writes with: the module, its codec and context, the text so far, and the stores each instruction is
-# decoded into, grown to the operands and the alternatives the largest holds
+# what a print writes with: the object, the index of its entries, its codec and context, the text so far, and the
+# stores each instruction is decoded into, grown to the operands and the alternatives the largest holds
 rec Job {
-    m:     *mink_model.Module;
+    o:     *Object;
+    ix:    *fact.Index;
     codec: *dispatch.Codec;
     ctx:   *state.Context;
     out:   *vector.Vector[u8];
@@ -89,12 +105,14 @@ fun number(j: *Job, v: u64) err[str] {
 
 val HEX: str = "0123456789abcdef";
 
-# the bytes of `b` as a string, its printable bytes as they are and every other as `\hh`
-fun string(j: *Job, b: Bytes) err[str] {
+# the `len` bytes at `data` as a string, its printable bytes as they are and every other as `\hh`, nil `data` standing
+# for zeros
+fun string(j: *Job, data: *u8, len: usize) err[str] {
     var e: err[str] = put(j, "\"");
     var i: usize    = 0;
-    for (i < b.len && !bad(e)) {
-        val c: u8 = b.data[i];
+    for (i < len && !bad(e)) {
+        var c: u8 = 0;
+        if (data != nil) { c = data[i]; }
         if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') {
             val pushed: res[usize, A.Error] = vector.push[u8](j.out, c);
             if (sel pushed.err) { ret err[str].err{MEMORY}; }
@@ -117,17 +135,23 @@ fun value_type(j: *Job, code: i64) err[str] {
     ret err[str].ok{};
 }
 
-fun value_types(j: *Job, word: str, r: mink_model.Run) err[str] {
-    if (r.count == 0) { ret err[str].ok{}; }
-    var e: err[str] = put(j, " (");
-    e = kept(e, put(j, word));
-    var i: usize = 0;
-    for (i < r.count && !bad(e)) {
-        e = kept(e, put(j, " "));
-        e = kept(e, value_type(j, wasm_container.code_of(?j.m.valtypes.data[r.first + i])));
-        i = i + 1;
-    }
-    ret kept(e, put(j, ")"));
+# the wording of mink's refusal `f`
+fun refused(f: Fail) str {
+    if (f.text == nil) { ret REFUSED; }
+    ret f.text;
+}
+
+fun failed(f: Fail) err[str] {
+    ret err[str].err{refused(f)};
+}
+
+fun entry_at(j: *Job, e: Id[Entry]) *Entry {
+    ret table.at[Entry](?j.o.entries, e);
+}
+
+# the index the entry `e` takes in its space
+fun index_of(j: *Job, e: Id[Entry]) u64 {
+    ret @table.at[u64](?j.ix.within, table.nth[u64](e.index::usize));
 }
 
 fun bad(e: err[str]) bool {
@@ -139,35 +163,48 @@ fun kept(first: err[str], next: err[str]) err[str] {
     ret next;
 }
 
-fun limits(j: *Job, l: *mink_model.Limits) err[str] {
-    var e: err[str] = err[str].ok{};
-    if ((l.flags & mink_tables.WASM_LIMITS_FLAG_HAS_PAGE_SIZE.value::u8) != 0) { ret err[str].err{NO_FORM}; }
-    if ((l.flags & mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8) != 0)         { e = put(j, " i64"); }
-    e = kept(e, put(j, " "));
-    e = kept(e, number(j, l.min.value));
-    if ((l.flags & mink_tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8) != 0) {
+fun value_types(j: *Job, word: str, t: *Table[fact.Value]) err[str] {
+    val n: usize = table.count[fact.Value](t);
+    if (n == 0) { ret err[str].ok{}; }
+    var e: err[str] = put(j, " (");
+    e = kept(e, put(j, word));
+    var i: usize = 0;
+    for (i < n && !bad(e)) {
         e = kept(e, put(j, " "));
-        e = kept(e, number(j, l.max.value));
+        e = kept(e, value_type(j, wasm_valtype.code_of(table.at[fact.Value](t, table.nth[fact.Value](i)))));
+        i = i + 1;
+    }
+    ret kept(e, put(j, ")"));
+}
+
+fun limits(j: *Job, l: *fact.Limits) err[str] {
+    var e: err[str] = err[str].ok{};
+    if (l.wide) { e = put(j, " i64"); }
+    e = kept(e, put(j, " "));
+    e = kept(e, number(j, l.min));
+    if (sel l.max.some) {
+        e = kept(e, put(j, " "));
+        e = kept(e, number(j, l.max.some));
     }
     ret e;
 }
 
-fun memory_type(j: *Job, l: *mink_model.Limits) err[str] {
+fun memory_type(j: *Job, l: *fact.Limits) err[str] {
     var e: err[str] = limits(j, l);
-    if ((l.flags & mink_tables.WASM_LIMITS_FLAG_IS_SHARED.value::u8) != 0) { e = kept(e, put(j, " shared")); }
+    if (l.shared) { e = kept(e, put(j, " shared")); }
     ret e;
 }
 
-fun table_type(j: *Job, t: *mink_model.TableType) err[str] {
+fun table_type(j: *Job, t: *fact.TableType) err[str] {
     var e: err[str] = limits(j, ?t.limits);
     e = kept(e, put(j, " "));
-    ret kept(e, value_type(j, wasm_container.ref_code(?t.elem)));
+    ret kept(e, value_type(j, wasm_valtype.reference_code(?t.elem)));
 }
 
-fun global_type(j: *Job, g: *mink_model.GlobalType) err[str] {
-    if (g.mutable == 0) { ret value_type(j, wasm_container.code_of(?g.valtype)); }
+fun global_type(j: *Job, g: *fact.GlobalType) err[str] {
+    if (!g.mutable) { ret value_type(j, wasm_valtype.code_of(?g.value)); }
     var e: err[str] = put(j, "(mut ");
-    e = kept(e, value_type(j, wasm_container.code_of(?g.valtype)));
+    e = kept(e, value_type(j, wasm_valtype.code_of(?g.value)));
     ret kept(e, put(j, ")"));
 }
 
@@ -200,11 +237,10 @@ fun instructions(j: *Job, data: *u8, len: usize, at: usize, indent: str) err[str
 }
 
 # a constant expression, its instructions in its own block
-fun expression(j: *Job, e: *mink_model.Expr) err[str] {
-    val b:       Bytes    = mink_model.bytes(j.m, ?e.bytes);
+fun expression(j: *Job, x: View) err[str] {
     val entered: err[str] = wasm_stream.enter_expression(j.ctx.stream);
     if (sel entered.err) { ret entered; }
-    ret instructions(j, b.data, b.len, 0, "    ");
+    ret instructions(j, x.data, x.len, 0, "    ");
 }
 
 # a run of locals' value type in a body: its code, and the bytes it takes
@@ -223,37 +259,46 @@ fun local_type(b: Bytes, at: usize) res[Local, field.Refusal] {
     ret res[Local, field.Refusal].ok{Local{code: (heap.ok.value:~i64 << 8) | byte::i64, len: 1 + heap.ok.len}};
 }
 
-# function `k`'s locals and instructions, its body entered at its type `type`
-fun body(j: *Job, k: usize, type: u64) err[str] {
-    val f:       *mink_model.Function = ?j.m.code.data[k];
-    val b:       Bytes                = mink_model.bytes(j.m, ?f.body);
-    val entered: err[str]             = wasm_stream.enter(j.ctx.stream, type::u32);
+# the bytes of the section the entry `e` names as its body, refused for a zero fill
+fun body_bytes(j: *Job, e: *Entry) res[Bytes, str] {
+    if (sel e.body.none) { ret res[Bytes, str].err{NO_FORM}; }
+    val s: *object.Section = object.section_at(j.o, e.body.some.section);
+    if (sel s.contents.zero) { ret res[Bytes, str].err{NO_FORM}; }
+    ret res[Bytes, str].ok{object.bytes(j.o, ?s.contents)};
+}
+
+# the locals and instructions of the function the entry `e` defines, its body entered at its type `type`
+fun body(j: *Job, e: *Entry, type: u64) err[str] {
+    val got: res[Bytes, str] = body_bytes(j, e);
+    if (sel got.err) { ret err[str].err{got.err}; }
+    val b:       Bytes    = got.ok;
+    val entered: err[str] = wasm_stream.enter(j.ctx.stream, type::u32);
     if (sel entered.err) { ret entered; }
     val runs: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(b.data, b.len, 0, 32, field.NO_OPERAND);
     if (sel runs.err) { ret err[str].err{runs.err.message}; }
     var at: usize    = runs.ok.len;
-    var e:  err[str] = err[str].ok{};
+    var e2: err[str] = err[str].ok{};
     var r:  u64      = 0;
-    for (r < runs.ok.value && !bad(e)) {
+    for (r < runs.ok.value && !bad(e2)) {
         val n: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(b.data, b.len, at, 32, field.NO_OPERAND);
         if (sel n.err) { ret err[str].err{n.err.message}; }
         at = at + n.ok.len;
         val code: res[Local, field.Refusal] = local_type(b, at);
         if (sel code.err) { ret err[str].err{code.err.message}; }
         at = at + code.ok.len;
-        e  = put(j, " (local");
+        e2 = put(j, " (local");
         var i: u64 = 0;
-        for (i < n.ok.value && !bad(e)) {
-            e = kept(e, put(j, " "));
-            e = kept(e, value_type(j, code.ok.code));
-            val defined: res[u32, str] = wasm_stream.define(j.ctx.stream, wasm_kind.LOCALS, wasm_container.stream_code(code.ok.code), View{data: nil, len: 0});
+        for (i < n.ok.value && !bad(e2)) {
+            e2 = kept(e2, put(j, " "));
+            e2 = kept(e2, value_type(j, code.ok.code));
+            val defined: res[u32, str] = wasm_stream.define(j.ctx.stream, wasm_kind.LOCALS, wasm_valtype.stream_code(code.ok.code), View{data: nil, len: 0});
             if (sel defined.err) { ret err[str].err{defined.err}; }
             i = i + 1;
         }
-        e = kept(e, put(j, ")"));
-        r = r + 1;
+        e2 = kept(e2, put(j, ")"));
+        r  = r + 1;
     }
-    if (bad(e)) { ret e; }
+    if (bad(e2)) { ret e2; }
     ret instructions(j, b.data, b.len, at, "    ");
 }
 
@@ -264,84 +309,136 @@ fun define(j: *Job, space: u16, code: u32) err[str] {
 }
 
 # the address type code of limits `l`
-fun address(l: *mink_model.Limits) u32 {
-    if ((l.flags & mink_tables.WASM_LIMITS_FLAG_IS_64.value::u8) != 0) { ret wasm_stream.I64; }
+fun address(l: *fact.Limits) u32 {
+    if (l.wide) { ret wasm_stream.I64; }
     ret wasm_stream.I32;
+}
+
+# the type index of the function the entry `e` is
+fun function_type(j: *Job, e: *Entry) res[u64, str] {
+    if (sel e.signature.none) { ret res[u64, str].err{NO_FORM}; }
+    ret res[u64, str].ok{index_of(j, e.signature.some)};
+}
+
+# the stream code of what the entry `id` holds in its space: a function's or a tag's type index, a table's or a
+# memory's address type, a global's value type
+fun code_of(j: *Job, id: Id[Entry]) res[u32, str] {
+    val e: *Entry = entry_at(j, id);
+    if (e.space == ?space.FUNCTIONS) {
+        val t: res[u64, str] = function_type(j, e);
+        if (sel t.err) { ret res[u32, str].err{t.err}; }
+        ret res[u32, str].ok{t.ok::u32};
+    }
+    if (e.space == ?space.TABLES) {
+        val t: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+        if (sel t.err) { ret res[u32, str].err{refused(t.err)}; }
+        ret res[u32, str].ok{address(?t.ok.limits)};
+    }
+    if (e.space == ?space.MEMORIES) {
+        val l: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+        if (sel l.err) { ret res[u32, str].err{refused(l.err)}; }
+        ret res[u32, str].ok{address(?l.ok)};
+    }
+    if (e.space == ?space.GLOBALS) {
+        val g: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+        if (sel g.err) { ret res[u32, str].err{refused(g.err)}; }
+        ret res[u32, str].ok{wasm_valtype.stream_code(wasm_valtype.code_of(?g.ok.value))};
+    }
+    val t: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+    if (sel t.err) { ret res[u32, str].err{refused(t.err)}; }
+    ret res[u32, str].ok{index_of(j, t.ok)::u32};
+}
+
+# the stream space of the index space `sp`
+fun stream_space(sp: *Space) u16 {
+    if (sp == ?space.FUNCTIONS) { ret wasm_kind.FUNCS; }
+    if (sp == ?space.TABLES)    { ret wasm_kind.TABLES; }
+    if (sp == ?space.MEMORIES)  { ret wasm_kind.MEMORIES; }
+    if (sp == ?space.GLOBALS)   { ret wasm_kind.GLOBALS; }
+    ret wasm_kind.TAGS;
+}
+
+# the entries of `list` defined in the stream's space of `sp`, imports first as a module numbers them
+fun defined_all(j: *Job, list: *Table[Id[Entry]], sp: *Space) err[str] {
+    var i: usize = 0;
+    for (i < table.count[Id[Entry]](list)) {
+        val code: res[u32, str] = code_of(j, @table.at[Id[Entry]](list, table.nth[Id[Entry]](i)));
+        if (sel code.err) { ret err[str].err{code.err}; }
+        val e: err[str] = define(j, stream_space(sp), code.ok);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
+# how many facts of `key` the object states
+fun facts_of(j: *Job, key: u32) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Fact](?j.o.facts)) {
+        val f: *Fact = table.at[Fact](?j.o.facts, table.nth[Fact](i));
+        if (f.key == key && f.format == ?format.WASM) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# how many data segments the object holds
+fun segment_count(j: *Job) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Entry](?j.o.entries)) {
+        if (entry_at(j, table.nth[Entry](i)).space == ?space.SEGMENTS) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
 }
 
 # the module's index spaces and types defined in the stream, so its instructions decode as the module's
 fun spaces(j: *Job) err[str] {
     wasm_stream.HOOKS.begin(j.ctx.stream);
-    var params:  vector.Vector[u32] = vector.init[u32](j.m.a);
-    var results: vector.Vector[u32] = vector.init[u32](j.m.a);
+    var params:  vector.Vector[u32] = vector.init[u32](j.out.a);
+    var results: vector.Vector[u32] = vector.init[u32](j.out.a);
     fin {
         vector.dnit[u32](?params);
         vector.dnit[u32](?results);
     }
     var i: usize = 0;
-    for (i < j.m.types.len) {
-        val st: *mink_model.SubType = ?j.m.types.data[i];
-        if (!sel st.composite.function) { ret err[str].err{NO_FORM}; }
-        val t: *mink_model.FuncType = ?st.composite.function;
+    for (i < table.count[Id[Entry]](?j.ix.types)) {
+        val got: res[fact.Signature, Fail] = fact.signature_of(j.o, j.ix, @table.at[Id[Entry]](?j.ix.types, table.nth[Id[Entry]](i)));
+        if (sel got.err) { ret failed(got.err); }
+        var sig: fact.Signature = got.ok;
         vector.truncate[u32](?params, 0);
         vector.truncate[u32](?results, 0);
         var k: usize = 0;
-        for (k < t.params.count) {
-            vector.push[u32](?params, wasm_container.stream_code(wasm_container.code_of(?j.m.valtypes.data[t.params.first + k])));
+        for (k < table.count[fact.Value](?sig.params)) {
+            vector.push[u32](?params, wasm_valtype.stream_code(wasm_valtype.code_of(table.at[fact.Value](?sig.params, table.nth[fact.Value](k)))));
             k = k + 1;
         }
         k = 0;
-        for (k < t.results.count) {
-            vector.push[u32](?results, wasm_container.stream_code(wasm_container.code_of(?j.m.valtypes.data[t.results.first + k])));
+        for (k < table.count[fact.Value](?sig.results)) {
+            vector.push[u32](?results, wasm_valtype.stream_code(wasm_valtype.code_of(table.at[fact.Value](?sig.results, table.nth[fact.Value](k)))));
             k = k + 1;
         }
+        val gone:  err[Fail]     = fact.release_signature(?sig);
         val added: res[u32, str] = wasm_stream.add_type(j.ctx.stream, params.data, params.len::u32, results.data, results.len::u32, View{data: nil, len: 0});
         if (sel added.err) { ret err[str].err{added.err}; }
         i = i + 1;
     }
-    var e: err[str] = err[str].ok{};
+    var e: err[str] = defined_all(j, ?j.ix.functions, ?space.FUNCTIONS);
+    e = kept(e, defined_all(j, ?j.ix.tables, ?space.TABLES));
+    e = kept(e, defined_all(j, ?j.ix.memories, ?space.MEMORIES));
+    e = kept(e, defined_all(j, ?j.ix.globals, ?space.GLOBALS));
+    e = kept(e, defined_all(j, ?j.ix.tags, ?space.TAGS));
+    var n: usize = segment_count(j);
     i = 0;
-    for (i < table.count[mink_model.Import](?j.m.imports) && !bad(e)) {
-        val imp: *mink_model.Import = table.at[mink_model.Import](?j.m.imports, table.nth[mink_model.Import](i));
-        if (sel imp.desc.function) { e = define(j, wasm_kind.FUNCS, imp.desc.function.value::u32); }
-        or (sel imp.desc.table)    { e = define(j, wasm_kind.TABLES, address(?imp.desc.table.limits)); }
-        or (sel imp.desc.memory)   { e = define(j, wasm_kind.MEMORIES, address(?imp.desc.memory)); }
-        or (sel imp.desc.global)   { e = define(j, wasm_kind.GLOBALS, wasm_container.stream_code(wasm_container.code_of(?imp.desc.global.valtype))); }
-        or (sel imp.desc.tag_type) { e = define(j, wasm_kind.TAGS, imp.desc.tag_type.type.value::u32); }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.functions.len && !bad(e)) {
-        e = define(j, wasm_kind.FUNCS, j.m.functions.data[i].value::u32);
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.tables.len && !bad(e)) {
-        e = define(j, wasm_kind.TABLES, address(?j.m.tables.data[i].type.limits));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.memories.len && !bad(e)) {
-        e = define(j, wasm_kind.MEMORIES, address(?j.m.memories.data[i]));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.globals.len && !bad(e)) {
-        e = define(j, wasm_kind.GLOBALS, wasm_container.stream_code(wasm_container.code_of(?j.m.globals.data[i].type.valtype)));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.tags.len && !bad(e)) {
-        e = define(j, wasm_kind.TAGS, j.m.tags.data[i].type.value::u32);
-        i = i + 1;
-    }
-    i = 0;
-    for (i < j.m.data.len && !bad(e)) {
+    for (i < n && !bad(e)) {
         e = define(j, wasm_kind.DATAS, 0);
         i = i + 1;
     }
+    n = facts_of(j, fact.ELEMENT);
     i = 0;
-    for (i < j.m.elements.len && !bad(e)) {
+    for (i < n && !bad(e)) {
         e = define(j, wasm_kind.ELEMS, 0);
         i = i + 1;
     }
@@ -350,63 +447,89 @@ fun spaces(j: *Job) err[str] {
 
 val KIND_WORDS: [5]str = [5]str{"func", "table", "memory", "global", "tag"};
 
-fun import(j: *Job, imp: *mink_model.Import) err[str] {
-    var e: err[str] = put(j, "\n  (import ");
-    e = kept(e, string(j, mink_model.name_bytes(j.m, ?imp.module)));
+# the word of the kind of the space `sp`
+fun kind_word(sp: *Space) res[str, str] {
+    val k: opt[u8] = fact.kind_of_space(sp);
+    if (sel k.none)         { ret res[str, str].err{NO_FORM}; }
+    if (k.some::usize >= 5) { ret res[str, str].err{NO_FORM}; }
+    ret res[str, str].ok{KIND_WORDS[k.some]};
+}
+
+fun import(j: *Job, id: Id[Entry]) err[str] {
+    val en: *Entry = entry_at(j, id);
+    if (sel en.import.none) { ret err[str].err{NO_FORM}; }
+    val imp:  *object.Import = ?en.import.some;
+    val word: res[str, str]  = kind_word(en.space);
+    if (sel word.err) { ret err[str].err{word.err}; }
+    val module: View     = object.name_of(j.o, imp.module);
+    val field_: View     = object.name_of(j.o, imp.field);
+    var e:      err[str] = put(j, "\n  (import ");
+    e = kept(e, string(j, module.data, module.len));
     e = kept(e, put(j, " "));
-    e = kept(e, string(j, mink_model.name_bytes(j.m, ?imp.field)));
-    if (imp.kind::usize >= 5) { ret err[str].err{NO_FORM}; }
+    e = kept(e, string(j, field_.data, field_.len));
     e = kept(e, put(j, " ("));
-    e = kept(e, put(j, KIND_WORDS[imp.kind]));
-    if (sel imp.desc.function) { e = kept(e, type_use(j, imp.desc.function.value)); }
-    or (sel imp.desc.table)    { e = kept(e, table_type(j, ?imp.desc.table)); }
-    or (sel imp.desc.memory)   { e = kept(e, memory_type(j, ?imp.desc.memory)); }
-    or (sel imp.desc.global) {
-        e = kept(e, put(j, " "));
-        e = kept(e, global_type(j, ?imp.desc.global));
+    e = kept(e, put(j, word.ok));
+    if (bad(e)) { ret e; }
+    if (en.space == ?space.FUNCTIONS) {
+        val t: res[u64, str] = function_type(j, en);
+        if (sel t.err) { ret err[str].err{t.err}; }
+        e = type_use(j, t.ok);
     }
-    or (sel imp.desc.tag_type) { e = kept(e, type_use(j, imp.desc.tag_type.type.value)); }
+    or (en.space == ?space.TABLES) {
+        val t: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+        if (sel t.err) { ret failed(t.err); }
+        var tt: fact.TableType = t.ok;
+        e = table_type(j, ?tt);
+    }
+    or (en.space == ?space.MEMORIES) {
+        val l: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+        if (sel l.err) { ret failed(l.err); }
+        var ll: fact.Limits = l.ok;
+        e = memory_type(j, ?ll);
+    }
+    or (en.space == ?space.GLOBALS) {
+        val g: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+        if (sel g.err) { ret failed(g.err); }
+        var gg: fact.GlobalType = g.ok;
+        e = put(j, " ");
+        e = kept(e, global_type(j, ?gg));
+    }
+    or {
+        val t: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+        if (sel t.err) { ret failed(t.err); }
+        e = type_use(j, index_of(j, t.ok));
+    }
     ret kept(e, put(j, "))"));
 }
 
-fun element(j: *Job, el: *mink_model.Element) err[str] {
-    val f:       u64  = el.flags.value;
-    val passive: bool = (f & mink_tables.WASM_ELEM_SEGMENT_IS_PASSIVE.value) != 0;
-    val other:   bool = (f & mink_tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value) != 0;
-    val exprs:   bool = (f & mink_tables.WASM_ELEM_SEGMENT_HAS_INIT_EXPRS.value) != 0;
-    # an active segment of no table number states no kind, its flags 0 or 4, and its elements are funcref
-    var kind: i64 = wasm_container.FUNCREF::i64;
-    if ((f & mink_model.ELEM_DESC_MASK) != 0 && exprs) { kind = wasm_container.ref_code(?el.type); }
-    or ((f & mink_model.ELEM_DESC_MASK) != 0)          { kind = el.kind::i64; }
+fun element(j: *Job, el: *fact.Element) err[str] {
     var e: err[str] = put(j, "\n  (elem");
-    if (passive && other) { e = kept(e, put(j, " declare")); }
-    if (!passive) {
+    if (sel el.mode.declarative) { e = kept(e, put(j, " declare")); }
+    or (sel el.mode.active) {
         var tab: u64 = 0;
-        if (other) { tab = el.table.value; }
+        if (sel el.mode.active.table.some) { tab = index_of(j, el.mode.active.table.some); }
         e = kept(e, put(j, " (table "));
         e = kept(e, number(j, tab));
         e = kept(e, put(j, ") (offset"));
-        e = kept(e, expression(j, ?el.offset));
+        e = kept(e, expression(j, el.mode.active.offset));
         e = kept(e, put(j, ")"));
     }
-    if (sel el.items.indices) {
-        if (exprs) { ret err[str].err{NO_FORM}; }
+    if (sel el.items.functions) {
         e = kept(e, put(j, " func"));
         var i: usize = 0;
-        for (i < el.items.indices.count) {
+        for (i < table.count[Id[Entry]](?el.items.functions)) {
             e = kept(e, put(j, " "));
-            e = kept(e, number(j, j.m.indices.data[el.items.indices.first + i].value));
+            e = kept(e, number(j, index_of(j, @table.at[Id[Entry]](?el.items.functions, table.nth[Id[Entry]](i)))));
             i = i + 1;
         }
     }
-    or (sel el.items.exprs) {
-        if (!exprs) { ret err[str].err{NO_FORM}; }
+    or (sel el.items.expressions) {
         e = kept(e, put(j, " "));
-        e = kept(e, value_type(j, kind));
+        e = kept(e, value_type(j, wasm_valtype.reference_code(?el.type)));
         var i: usize = 0;
-        for (i < el.items.exprs.count) {
+        for (i < table.count[View](?el.items.expressions)) {
             e = kept(e, put(j, " (item"));
-            e = kept(e, expression(j, ?j.m.exprs.data[el.items.exprs.first + i]));
+            e = kept(e, expression(j, @table.at[View](?el.items.expressions, table.nth[View](i))));
             e = kept(e, put(j, ")"));
             i = i + 1;
         }
@@ -414,132 +537,192 @@ fun element(j: *Job, el: *mink_model.Element) err[str] {
     ret kept(e, put(j, ")"));
 }
 
-fun segment(j: *Job, s: *mink_model.Segment) err[str] {
-    val f: u64      = s.flags.value;
-    var e: err[str] = put(j, "\n  (data");
-    if ((f & mink_tables.WASM_DATA_SEGMENT_IS_PASSIVE.value) == 0) {
+fun segment(j: *Job, id: Id[Entry]) err[str] {
+    val head: res[opt[fact.SegmentHead], Fail] = fact.segment_head_of(j.o, j.ix, id);
+    if (sel head.err)     { ret failed(head.err); }
+    if (sel head.ok.none) { ret err[str].err{NO_FORM}; }
+    val en: *Entry = entry_at(j, id);
+    if (sel en.body.none) { ret err[str].err{NO_FORM}; }
+    val s: *object.Section  = object.section_at(j.o, en.body.some.section);
+    val h: fact.SegmentHead = head.ok.some;
+    var e: err[str]         = put(j, "\n  (data");
+    if (sel h.active) {
         var mem: u64 = 0;
-        if ((f & mink_tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value) != 0) { mem = s.memory.value; }
+        if (sel h.active.memory.some) { mem = index_of(j, h.active.memory.some); }
         e = kept(e, put(j, " (memory "));
         e = kept(e, number(j, mem));
         e = kept(e, put(j, ") (offset"));
-        e = kept(e, expression(j, ?s.offset));
+        e = kept(e, expression(j, h.active.offset));
         e = kept(e, put(j, ")"));
     }
     e = kept(e, put(j, " "));
-    e = kept(e, string(j, mink_model.bytes(j.m, ?s.data)));
+    if (sel s.contents.zero) { e = kept(e, string(j, nil, s.contents.zero::usize)); }
+    or {
+        val b: Bytes = object.bytes(j.o, ?s.contents);
+        e = kept(e, string(j, b.data, b.len));
+    }
     ret kept(e, put(j, ")"));
 }
 
-# the type of the function at index `index` of the function space
-fun function_type(j: *Job, index: usize) u64 {
-    ret j.m.functions.data[index].value;
-}
-
-# the text of module `m` onto `out`, its instructions decoded under `ctx`, whose stream it begins and fills
-pub fun module(m: *mink_model.Module, codec: *dispatch.Codec, ctx: *state.Context, out: *vector.Vector[u8]) err[str] {
-    var j:     Job          = Job{m: m, codec: codec, ctx: ctx, out: out, modes: mode.initial(?mode.NO_MODES), store: vector.init[operand.Value](out.a), alts: vector.init[requirement.Alternative](out.a)};
+# the text of the module `o` states onto `out`, mink's neutral object of it, its instructions decoded under `ctx`, whose
+# stream it begins and fills
+pub fun module(o: *Object, ctx: *state.Context, out: *vector.Vector[u8]) err[str] {
+    val ix: res[fact.Index, Fail] = fact.indexed(o);
+    if (sel ix.err) { ret failed(ix.err); }
+    var index: fact.Index   = ix.ok;
+    var j:     Job          = Job{o: o, ix: ?index, codec: ?wasm_codec.CODEC, ctx: ctx, out: out, modes: mode.initial(?mode.NO_MODES), store: vector.init[operand.Value](out.a), alts: vector.init[requirement.Alternative](out.a)};
     val done:  err[str]     = written(?j);
     val freed: err[A.Error] = vector.dnit[operand.Value](?j.store);
     val gone:  err[A.Error] = vector.dnit[requirement.Alternative](?j.alts);
+    val left:  err[Fail]    = fact.release_index(?index);
     ret done;
 }
 
+# each entry of `list` the object defines, written by `each`
+fun definitions(j: *Job, list: *Table[Id[Entry]], each: fun(*Job, Id[Entry]) err[str]) err[str] {
+    var e: err[str] = err[str].ok{};
+    var i: usize    = 0;
+    for (i < table.count[Id[Entry]](list) && !bad(e)) {
+        val id: Id[Entry] = @table.at[Id[Entry]](list, table.nth[Id[Entry]](i));
+        val en: *Entry    = entry_at(j, id);
+        if (sel en.import.none) { e = each(j, id); }
+        i = i + 1;
+    }
+    ret e;
+}
+
+fun function(j: *Job, id: Id[Entry]) err[str] {
+    val en: *Entry        = entry_at(j, id);
+    val t:  res[u64, str] = function_type(j, en);
+    if (sel t.err) { ret err[str].err{t.err}; }
+    var e: err[str] = put(j, "\n  (func");
+    e = kept(e, type_use(j, t.ok));
+    e = kept(e, body(j, en, t.ok));
+    ret kept(e, put(j, ")"));
+}
+
+fun table_def(j: *Job, id: Id[Entry]) err[str] {
+    val t: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+    if (sel t.err) { ret failed(t.err); }
+    var tt: fact.TableType = t.ok;
+    var e:  err[str]       = put(j, "\n  (table");
+    e = kept(e, table_type(j, ?tt));
+    ret kept(e, put(j, ")"));
+}
+
+fun memory_def(j: *Job, id: Id[Entry]) err[str] {
+    val l: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+    if (sel l.err) { ret failed(l.err); }
+    var ll: fact.Limits = l.ok;
+    var e:  err[str]    = put(j, "\n  (memory");
+    e = kept(e, memory_type(j, ?ll));
+    ret kept(e, put(j, ")"));
+}
+
+fun tag_def(j: *Job, id: Id[Entry]) err[str] {
+    val t: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+    if (sel t.err) { ret failed(t.err); }
+    var e: err[str] = put(j, "\n  (tag");
+    e = kept(e, type_use(j, index_of(j, t.ok)));
+    ret kept(e, put(j, ")"));
+}
+
+fun global_def(j: *Job, id: Id[Entry]) err[str] {
+    val g: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+    if (sel g.err) { ret failed(g.err); }
+    var gg: fact.GlobalType = g.ok;
+    if (sel gg.init.none) { ret err[str].err{NO_FORM}; }
+    var e: err[str] = put(j, "\n  (global ");
+    e = kept(e, global_type(j, ?gg));
+    e = kept(e, expression(j, gg.init.some));
+    ret kept(e, put(j, ")"));
+}
+
+fun exports(j: *Job) err[str] {
+    val got: res[opt[Table[fact.Export]], Fail] = fact.exports_of(j.o, j.ix);
+    if (sel got.err)     { ret failed(got.err); }
+    if (sel got.ok.none) { ret err[str].ok{}; }
+    var t: Table[fact.Export] = got.ok.some;
+    var e: err[str]           = err[str].ok{};
+    var i: usize              = 0;
+    for (i < table.count[fact.Export](?t) && !bad(e)) {
+        val x:    *fact.Export  = table.at[fact.Export](?t, table.nth[fact.Export](i));
+        val word: res[str, str] = kind_word(entry_at(j, x.entry).space);
+        if (sel word.err) { e = err[str].err{word.err}; }
+        or {
+            e = put(j, "\n  (export ");
+            e = kept(e, string(j, x.name.data, x.name.len));
+            e = kept(e, put(j, " ("));
+            e = kept(e, put(j, word.ok));
+            e = kept(e, put(j, " "));
+            e = kept(e, number(j, index_of(j, x.entry)));
+            e = kept(e, put(j, "))"));
+        }
+        i = i + 1;
+    }
+    val gone: err[Fail] = table.release[fact.Export](?t);
+    ret e;
+}
+
+fun elements(j: *Job) err[str] {
+    var e: err[str] = err[str].ok{};
+    var i: usize    = 0;
+    for (i < table.count[Fact](?j.o.facts) && !bad(e)) {
+        val f: *Fact = table.at[Fact](?j.o.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.WASM || f.key != fact.ELEMENT) { cnt; }
+        val got: res[fact.Element, Fail] = fact.element_of(j.o, j.ix, f);
+        if (sel got.err) { ret failed(got.err); }
+        var el: fact.Element = got.ok;
+        e = element(j, ?el);
+        val gone: err[Fail] = fact.release_element(?el);
+    }
+    ret e;
+}
+
 fun written(j: *Job) err[str] {
-    val m: *mink_model.Module = j.m;
-    var e: err[str]           = spaces(j);
+    var e: err[str] = spaces(j);
     if (bad(e)) { ret e; }
     e = put(j, "(module");
     var i: usize = 0;
-    for (i < m.types.len && !bad(e)) {
-        val st: *mink_model.SubType = ?m.types.data[i];
-        if (!sel st.composite.function) { ret err[str].err{NO_FORM}; }
-        val t: *mink_model.FuncType = ?st.composite.function;
+    for (i < table.count[Id[Entry]](?j.ix.types) && !bad(e)) {
+        val got: res[fact.Signature, Fail] = fact.signature_of(j.o, j.ix, @table.at[Id[Entry]](?j.ix.types, table.nth[Id[Entry]](i)));
+        if (sel got.err) { ret failed(got.err); }
+        var sig: fact.Signature = got.ok;
         e = kept(e, put(j, "\n  (type (func"));
-        e = kept(e, value_types(j, "param", t.params));
-        e = kept(e, value_types(j, "result", t.results));
+        e = kept(e, value_types(j, "param", ?sig.params));
+        e = kept(e, value_types(j, "result", ?sig.results));
         e = kept(e, put(j, "))"));
+        val gone: err[Fail] = fact.release_signature(?sig);
         i = i + 1;
     }
     i = 0;
-    for (i < table.count[mink_model.Import](?m.imports) && !bad(e)) {
-        e = import(j, table.at[mink_model.Import](?m.imports, table.nth[mink_model.Import](i)));
+    for (i < table.count[Entry](?j.o.entries) && !bad(e)) {
+        val id: Id[Entry] = table.nth[Entry](i);
+        val en: *Entry    = entry_at(j, id);
+        if (sel en.import.some) { e = import(j, id); }
         i = i + 1;
     }
-    i = 0;
-    for (i < m.functions.len && !bad(e)) {
-        e = kept(e, put(j, "\n  (func"));
-        e = kept(e, type_use(j, function_type(j, i)));
-        e = kept(e, body(j, i, function_type(j, i)));
-        e = kept(e, put(j, ")"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.tables.len && !bad(e)) {
-        val def: *mink_model.TableDef = ?m.tables.data[i];
-        e = put(j, "\n  (table");
-        e = kept(e, table_type(j, ?def.type));
-        if (sel def.init.some) {
-            var init: mink_model.Expr = def.init.some;
-            e = kept(e, expression(j, ?init));
-        }
-        e = kept(e, put(j, ")"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.memories.len && !bad(e)) {
-        e = put(j, "\n  (memory");
-        e = kept(e, memory_type(j, ?m.memories.data[i]));
-        e = kept(e, put(j, ")"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.tags.len && !bad(e)) {
-        e = put(j, "\n  (tag");
-        e = kept(e, type_use(j, m.tags.data[i].type.value));
-        e = kept(e, put(j, ")"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.globals.len && !bad(e)) {
-        val g: *mink_model.Global = ?m.globals.data[i];
-        e = put(j, "\n  (global ");
-        e = kept(e, global_type(j, ?g.type));
-        e = kept(e, expression(j, ?g.init));
-        e = kept(e, put(j, ")"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.exports.len && !bad(e)) {
-        val x: *mink_model.Export = ?m.exports.data[i];
-        if (x.kind::usize >= 5) { ret err[str].err{NO_FORM}; }
-        e = put(j, "\n  (export ");
-        e = kept(e, string(j, mink_model.name_bytes(m, ?x.name)));
-        e = kept(e, put(j, " ("));
-        e = kept(e, put(j, KIND_WORDS[x.kind]));
-        e = kept(e, put(j, " "));
-        e = kept(e, number(j, x.index.value));
-        e = kept(e, put(j, "))"));
-        i = i + 1;
-    }
-    i = 0;
-    for (i < table.count[mink_model.Section](?m.sections) && !bad(e)) {
-        val s: *mink_model.Section = table.at[mink_model.Section](?m.sections, table.nth[mink_model.Section](i));
-        if (sel s.body.start) {
+    if (!bad(e)) { e = definitions(j, ?j.ix.functions, function); }
+    if (!bad(e)) { e = definitions(j, ?j.ix.tables, table_def); }
+    if (!bad(e)) { e = definitions(j, ?j.ix.memories, memory_def); }
+    if (!bad(e)) { e = definitions(j, ?j.ix.tags, tag_def); }
+    if (!bad(e)) { e = definitions(j, ?j.ix.globals, global_def); }
+    if (!bad(e)) { e = exports(j); }
+    if (!bad(e)) {
+        val start: res[opt[Id[Entry]], Fail] = fact.start_of(j.o, j.ix);
+        if (sel start.err) { ret failed(start.err); }
+        if (sel start.ok.some) {
             e = put(j, "\n  (start ");
-            e = kept(e, number(j, s.body.start.value));
+            e = kept(e, number(j, index_of(j, start.ok.some)));
             e = kept(e, put(j, ")"));
         }
-        i = i + 1;
     }
+    if (!bad(e)) { e = elements(j); }
     i = 0;
-    for (i < m.elements.len && !bad(e)) {
-        e = element(j, ?m.elements.data[i]);
-        i = i + 1;
-    }
-    i = 0;
-    for (i < m.data.len && !bad(e)) {
-        e = segment(j, ?m.data.data[i]);
+    for (i < table.count[Entry](?j.o.entries) && !bad(e)) {
+        val id: Id[Entry] = table.nth[Entry](i);
+        if (entry_at(j, id).space == ?space.SEGMENTS) { e = segment(j, id); }
         i = i + 1;
     }
     if (bad(e)) { ret e; }
