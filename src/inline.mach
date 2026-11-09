@@ -56,7 +56,12 @@ use mink_format: mink.catalog.format;
 use mink_trait:  mink.catalog.trait;
 
 use masc.asm.source;
-use masc.build.build;
+use masc.build;
+use build_emit:    masc.build.emit;
+use build_label:   masc.build.label;
+use build_refusal: masc.build.refusal;
+use build_state:   masc.build.state;
+use build_trait:   masc.build.trait;
 use masc.core.config;
 use masc.core.diagnostic;
 use masc.core.effect;
@@ -65,6 +70,7 @@ use masc.core.footprint;
 use masc.core.mode;
 use masc.core.operand;
 use masc.core.quantity;
+use masc.core.query;
 use masc.core.register;
 use masc.core.relax;
 use masc.core.requirement;
@@ -142,16 +148,6 @@ pub rec Locations {
     len: u32;
 }
 
-# the block `text`, whose first byte is at `origin` in the caller's file, read in set `s` under the context the
-# enclosing function runs under, its operands `operands`
-pub def Parse: fun(*A.Allocator, View, diagnostic.Position, *set.Set, *state.Context, *mink_format.Format, Operands) res[Block, Diagnostics];
-
-# the footprint of the whole block, filled into the footprint given, undecided with the reason when it is not decided
-pub def Effects: fun(*Block, *footprint.Footprint) res[effect.Answer[*footprint.Footprint], A.Error];
-
-# the block written through the builder at its cursor with its operands at `locations`
-pub def Encode: fun(*Block, Locations, *build.Builder) err[build.Refusal];
-
 pub val UNAVAILABLE: str = "inline assembly is not available on this instruction set";
 pub val UNDECLARED:  str = "name the block declares no operand of";
 pub val OUTSIDE:     str = "operand whose constraint the instruction does not admit every value of here";
@@ -181,7 +177,7 @@ val NAMED: u32 = 0xF000_0000;
 val OWN_BOUND: u32 = 0xFFFF_0000;
 
 # where a probe or an encode leaves the offsets each value of a statement was read at
-val SPANS: u32 = relax.MAX_STEPS * row.MAX_OPERANDS;
+val SPANS: u32 = relax.MAX_STEPS * operand.MAX_OPERANDS;
 
 # a run of rows of one of a parsed block's lists
 rec Range {
@@ -287,11 +283,11 @@ rec Reading {
     item:      *Item;
     index:     u32;
     locations: *Location;
-    b:         *build.Builder;
+    b:         *build_state.Builder;
     numbered:  *vector.Vector[Numbered];
     spelled:   *vector.Vector[u8];
     named:     *vector.Vector[View];
-    failed:    opt[build.Refusal];
+    failed:    opt[build_refusal.Refusal];
 }
 
 fun held(r: res[usize, A.Error]) bool {
@@ -494,7 +490,7 @@ fun name_at(p: *Parsed, item: *Item, at: usize) opt[*Name] {
 
 # whether value `k` of step `step` of the statement read last was read from one of its names
 fun named_slot(p: *Parsed, item: *Item, step: u32, k: u32) bool {
-    var at: usize = p.spans[(step * row.MAX_OPERANDS + k)::usize];
+    var at: usize = p.spans[(step * operand.MAX_OPERANDS + k)::usize];
     for (at < p.len && read.blank(p.text[at])) {
         at = at + 1;
     }
@@ -584,7 +580,7 @@ fun fixed_operand(r: *core_syntax.Reader, desc: *operand.Operand) bool {
     var i: u32 = 0;
     for (i < r.row.operands.len) {
         if (desc == ?r.row.operands.at[i]) {
-            val f: opt[register.Id] = effect.fixed(r.codec.registers, r.row.effect, i::u8);
+            val f: opt[register.Id] = query.fixed(r.codec.registers, r.row.effect, i::u8);
             ret sel f.some;
         }
         i = i + 1;
@@ -780,9 +776,9 @@ fun resolve(context: ptr, name: View, spelling: core_syntax.Spelling) res[core_s
         val st: *Numbered = state.some;
         if (back) { ret res[core_syntax.Resolved, str].ok{core_syntax.Resolved.symbol{st.last}}; }
         if (st.next == operand.NO_SYMBOL) {
-            val made: res[build.Label, build.Refusal] = build.anonymous(g.b);
+            val made: res[build_state.Label, build_refusal.Refusal] = build_label.anonymous(g.b);
             if (sel made.err) {
-                g.failed = opt[build.Refusal].some{made.err};
+                g.failed = opt[build_refusal.Refusal].some{made.err};
                 ret res[core_syntax.Resolved, str].err{made.err.message};
             }
             st.next = made.ok.id;
@@ -1091,7 +1087,7 @@ fun lex(p: *Parsed, got: *vector.Vector[diagnostic.Diagnostic]) bool {
 # gathered, false when the allocator refused
 fun check(p: *Parsed, index: u32, got: *vector.Vector[diagnostic.Diagnostic]) bool {
     val it:    *Item                                    = ?p.items.data[index::usize];
-    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, named: nil, failed: opt[build.Refusal].none{}};
+    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, named: nil, failed: opt[build_refusal.Refusal].none{}};
     var ex:    relax.Expansion;
     val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(?g, p.ctx, ?p.modes, ?ex);
     if (sel read_.err)     { ret false; }
@@ -1324,18 +1320,18 @@ fun branches(p: *Parsed) bool {
 }
 
 # the footprint of instruction statement `index` added to `fp`, through `scratch`, its configuration carried in `cfg`
-fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *footprint.Footprint, cfg: *config.Configured, f: *Flow, stack: *effect.Stack) res[effect.Answer[bool], A.Error] {
+fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *footprint.Footprint, cfg: *config.Configured, f: *Flow, stack: *effect.Stack) res[query.Answer[bool], A.Error] {
     val it:    *Item                                    = ?p.items.data[index::usize];
-    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, named: nil, failed: opt[build.Refusal].none{}};
+    var g:     Reading                                  = Reading{p: p, item: it, index: index, locations: nil, b: nil, numbered: nil, spelled: nil, named: nil, failed: opt[build_refusal.Refusal].none{}};
     var ex:    relax.Expansion;
     val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(?g, p.ctx, ?p.modes, ?ex);
-    if (sel read_.err)    { ret res[effect.Answer[bool], A.Error].err{read_.err}; }
-    if (sel read_.ok.err) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{effect.Undecided.opaque{}}}; }
+    if (sel read_.err)    { ret res[query.Answer[bool], A.Error].err{read_.err}; }
+    if (sel read_.ok.err) { ret res[query.Answer[bool], A.Error].ok{query.Answer[bool].undecided{query.Undecided.opaque{}}}; }
     val words: usize = fp.reads.len;
     var j:     u32   = 0;
     for (j < ex.count) {
         val r:      *row.Row = ex.steps[j].row;
-        var values: [row.MAX_OPERANDS]operand.Value;
+        var values: [operand.MAX_OPERANDS]operand.Value;
         var k:      u32      = 0;
         for (k < r.operands.len) {
             values[k] = ex.steps[j].values[k];
@@ -1343,10 +1339,10 @@ fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *
             if (named_slot(p, it, j, k)) { values[k] = operand.Value.none{}; }
             k = k + 1;
         }
-        val held_: operand.Values                                    = operand.Values{at: ?values[0], len: r.operands.len};
-        val one:   res[effect.Answer[*footprint.Footprint], A.Error] = footprint.of(scratch, r, held_, p.ctx, @cfg);
-        if (sel one.err)          { ret res[effect.Answer[bool], A.Error].err{one.err}; }
-        if (sel one.ok.undecided) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{one.ok.undecided}}; }
+        val held_: operand.Values                                   = operand.Values{at: ?values[0], len: r.operands.len};
+        val one:   res[query.Answer[*footprint.Footprint], A.Error] = footprint.of(scratch, r, held_, p.ctx, @cfg);
+        if (sel one.err)          { ret res[query.Answer[bool], A.Error].err{one.err}; }
+        if (sel one.ok.undecided) { ret res[query.Answer[bool], A.Error].ok{query.Answer[bool].undecided{one.ok.undecided}}; }
         add(fp.reads.data, scratch.reads.data, words);
         add(fp.written.data, scratch.written.data, words);
         add(fp.clobbers.data, scratch.clobbers.data, words);
@@ -1354,11 +1350,11 @@ fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *
         var w: usize = 0;
         for (w < scratch.writes.len) {
             val pushed: res[usize, A.Error] = vector.push[effect.Written](?fp.writes, scratch.writes.data[w]);
-            if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
+            if (sel pushed.err) { ret res[query.Answer[bool], A.Error].err{pushed.err}; }
             w = w + 1;
         }
         val noted: err[A.Error] = note_accesses(p, fp.file, r, ?values[0]);
-        if (sel noted.err) { ret res[effect.Answer[bool], A.Error].err{noted.err}; }
+        if (sel noted.err) { ret res[query.Answer[bool], A.Error].err{noted.err}; }
         @stack = add_stack(@stack, scratch.stack, ?values[0]);
         val last: bool = index::usize + 1 == p.items.len && j + 1 == ex.count;
         add_control(f, scratch.control, ?ex.steps[j].values[0], last);
@@ -1369,13 +1365,13 @@ fun add_instruction(p: *Parsed, index: u32, fp: *footprint.Footprint, scratch: *
         }
         j = j + 1;
     }
-    ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
+    ret res[query.Answer[bool], A.Error].ok{query.Answer[bool].decided{true}};
 }
 
 # data directive `it` added to `fp`: what it declares it writes, and as reading every register and any memory, since
 # nothing reads what its bytes do. undecided as opaque when it declares nothing
-fun add_datum(p: *Parsed, it: *Item, fp: *footprint.Footprint) res[effect.Answer[bool], A.Error] {
-    if (!it.declared) { ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].undecided{effect.Undecided.opaque{}}}; }
+fun add_datum(p: *Parsed, it: *Item, fp: *footprint.Footprint) res[query.Answer[bool], A.Error] {
+    if (!it.declared) { ret res[query.Answer[bool], A.Error].ok{query.Answer[bool].undecided{query.Undecided.opaque{}}}; }
     val file: *register.File = fp.file;
     var r:    u32            = 0;
     for (r < file.register_count) {
@@ -1388,12 +1384,12 @@ fun add_datum(p: *Parsed, it: *Item, fp: *footprint.Footprint) res[effect.Answer
         val at:  u32         = row_index(file, reg);
         if (at != effect.NO_ROW) { mark(fp.written.data, at); }
         val pushed: res[usize, A.Error] = vector.push[effect.Written](?fp.writes, effect.Written{at: reg, write: operand.AS_ROW});
-        if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
+        if (sel pushed.err) { ret res[query.Answer[bool], A.Error].err{pushed.err}; }
         i = i + 1;
     }
     val pushed: res[usize, A.Error] = vector.push[effect.Access](?p.accesses, ANYWHERE);
-    if (sel pushed.err) { ret res[effect.Answer[bool], A.Error].err{pushed.err}; }
-    ret res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
+    if (sel pushed.err) { ret res[query.Answer[bool], A.Error].err{pushed.err}; }
+    ret res[query.Answer[bool], A.Error].ok{query.Answer[bool].decided{true}};
 }
 
 # `fp` holding nothing, over its file
@@ -1426,18 +1422,18 @@ fun cleared(fp: *footprint.Footprint) {
 # ret: `fp` when every part is decided, else why not, `fp` then holding nothing: a rule that turns on a name's location,
 #      configuration state the block does not set, or a data directive that declares nothing it does, which is opaque.
 #      refused only when the allocator cannot hold the footprint
-pub fun effects(b: *Block, fp: *footprint.Footprint) res[effect.Answer[*footprint.Footprint], A.Error] {
+pub fun effects(b: *Block, fp: *footprint.Footprint) res[query.Answer[*footprint.Footprint], A.Error] {
     val p: *Parsed = b.parsed::*Parsed;
     cleared(fp);
     vector.truncate[effect.Access](?p.accesses, 0);
     val made: res[footprint.Footprint, A.Error] = footprint.make(p.a, fp.file);
-    if (sel made.err) { ret res[effect.Answer[*footprint.Footprint], A.Error].err{made.err}; }
-    var scratch: footprint.Footprint               = made.ok;
-    var cfg:     config.Configured                 = config.Configured{hooks: p.set.config, state: opt[config.State].none{}};
-    var f:       Flow                              = Flow{leaves: false, control: FALLS, mixed: false, calls: false, call: effect.UNTARGETED, traps: false, taken: true, kinds: effect.NO_TRANSFERS};
-    var stack:   effect.Stack                      = effect.Stack.none{};
-    var answer:  res[effect.Answer[bool], A.Error] = res[effect.Answer[bool], A.Error].ok{effect.Answer[bool].decided{true}};
-    var i:       u32                               = 0;
+    if (sel made.err) { ret res[query.Answer[*footprint.Footprint], A.Error].err{made.err}; }
+    var scratch: footprint.Footprint              = made.ok;
+    var cfg:     config.Configured                = config.Configured{hooks: p.set.config, state: opt[config.State].none{}};
+    var f:       Flow                             = Flow{leaves: false, control: FALLS, mixed: false, calls: false, call: effect.UNTARGETED, traps: false, taken: true, kinds: effect.NO_TRANSFERS};
+    var stack:   effect.Stack                     = effect.Stack.none{};
+    var answer:  res[query.Answer[bool], A.Error] = res[query.Answer[bool], A.Error].ok{query.Answer[bool].decided{true}};
+    var i:       u32                              = 0;
     for (i < p.items.len::u32) {
         val it: *Item = ?p.items.data[i::usize];
         # a label may be reached from anywhere the block branches from, so the configuration there is not known
@@ -1451,15 +1447,15 @@ pub fun effects(b: *Block, fp: *footprint.Footprint) res[effect.Answer[*footprin
     footprint.release(?scratch);
     if (sel answer.err) {
         cleared(fp);
-        ret res[effect.Answer[*footprint.Footprint], A.Error].err{answer.err};
+        ret res[query.Answer[*footprint.Footprint], A.Error].err{answer.err};
     }
     if (sel answer.ok.undecided) {
         cleared(fp);
-        ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].undecided{answer.ok.undecided}};
+        ret res[query.Answer[*footprint.Footprint], A.Error].ok{query.Answer[*footprint.Footprint].undecided{answer.ok.undecided}};
     }
     if (f.mixed) {
         cleared(fp);
-        ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].undecided{effect.Undecided.opaque{}}};
+        ret res[query.Answer[*footprint.Footprint], A.Error].ok{query.Answer[*footprint.Footprint].undecided{query.Undecided.opaque{}}};
     }
     if (branches(p)) {
         # a branch may skip a write, so what it writes may keep its old value, and a change to the stack pointer may not happen
@@ -1486,12 +1482,12 @@ pub fun effects(b: *Block, fp: *footprint.Footprint) res[effect.Answer[*footprin
         fp.control.transfer    = effect.TRAP;
         fp.control.conditional = branches(p) || !f.taken;
     }
-    ret res[effect.Answer[*footprint.Footprint], A.Error].ok{effect.Answer[*footprint.Footprint].decided{fp}};
+    ret res[query.Answer[*footprint.Footprint], A.Error].ok{query.Answer[*footprint.Footprint].decided{fp}};
 }
 
 # a refusal of `message` that is about no label
-fun refused(message: str) err[build.Refusal] {
-    ret err[build.Refusal].err{build.Refusal{message: message, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
+fun refused(message: str) err[build_refusal.Refusal] {
+    ret err[build_refusal.Refusal].err{build_refusal.Refusal{message: message, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build_refusal.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
 }
 
 # whether location `v` lies within constraint `c`
@@ -1520,111 +1516,111 @@ rec Places {
 }
 
 # a label placed at the cursor, `stem` its spelling when it is not nil
-fun placed_label(b: *build.Builder, stem: str) res[u32, build.Refusal] {
-    var made: res[build.Label, build.Refusal] = res[build.Label, build.Refusal].err{build.Refusal{message: field.MEMORY, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
-    if (stem == nil)  { made = build.anonymous(b); }
-    or                { made = build.stemmed(b, stem); }
-    if (sel made.err) { ret res[u32, build.Refusal].err{made.err}; }
-    val placed: err[build.Refusal] = build.define(b, made.ok);
-    if (sel placed.err) { ret res[u32, build.Refusal].err{placed.err}; }
-    ret res[u32, build.Refusal].ok{made.ok.id};
+fun placed_label(b: *build_state.Builder, stem: str) res[u32, build_refusal.Refusal] {
+    var made: res[build_state.Label, build_refusal.Refusal] = res[build_state.Label, build_refusal.Refusal].err{build_refusal.Refusal{message: field.MEMORY, label: operand.NO_SYMBOL, encode: opt[field.Refusal].none{}, object: opt[fail.Fail].none{}, mode: opt[build_refusal.Mismatch].none{}, axis: opt[*mink_trait.Axis].none{}, view: nil}};
+    if (stem == nil)  { made = build_label.anonymous(b); }
+    or                { made = build_label.stemmed(b, stem); }
+    if (sel made.err) { ret res[u32, build_refusal.Refusal].err{made.err}; }
+    val placed: err[build_refusal.Refusal] = build_label.define(b, made.ok);
+    if (sel placed.err) { ret res[u32, build_refusal.Refusal].err{placed.err}; }
+    ret res[u32, build_refusal.Refusal].ok{made.ok.id};
 }
 
 # symbol `id` with `.` and a sequence's own label bound to labels at the cursor, each made the first time it is needed
-fun bound_at(g: *Reading, id: u32, places: *Places) res[u32, build.Refusal] {
+fun bound_at(g: *Reading, id: u32, places: *Places) res[u32, build_refusal.Refusal] {
     if (id == core_syntax.HERE) {
         if (places.here == operand.NO_SYMBOL) {
-            val l: res[u32, build.Refusal] = placed_label(g.b, nil);
+            val l: res[u32, build_refusal.Refusal] = placed_label(g.b, nil);
             if (sel l.err) { ret l; }
             places.here = l.ok;
         }
-        ret res[u32, build.Refusal].ok{places.here};
+        ret res[u32, build_refusal.Refusal].ok{places.here};
     }
     if (id == core_syntax.OWN) {
         if (places.own == operand.NO_SYMBOL) {
-            val l: res[u32, build.Refusal] = placed_label(g.b, g.p.syntax.own);
+            val l: res[u32, build_refusal.Refusal] = placed_label(g.b, g.p.syntax.own);
             if (sel l.err) { ret l; }
             places.own = l.ok;
         }
-        ret res[u32, build.Refusal].ok{places.own};
+        ret res[u32, build_refusal.Refusal].ok{places.own};
     }
     if (id >= NAMED && id < OWN_BOUND) {
         val text: opt[str] = spelled(g, g.named.data[(id - NAMED)::usize]);
         if (sel text.none) {
-            val r: err[build.Refusal] = refused(field.MEMORY);
-            if (sel r.err) { ret res[u32, build.Refusal].err{r.err}; }
-            ret res[u32, build.Refusal].ok{operand.NO_SYMBOL};
+            val r: err[build_refusal.Refusal] = refused(field.MEMORY);
+            if (sel r.err) { ret res[u32, build_refusal.Refusal].err{r.err}; }
+            ret res[u32, build_refusal.Refusal].ok{operand.NO_SYMBOL};
         }
-        val l: res[build.Label, build.Refusal] = build.label(g.b, text.some);
-        if (sel l.err) { ret res[u32, build.Refusal].err{l.err}; }
-        ret res[u32, build.Refusal].ok{l.ok.id};
+        val l: res[build_state.Label, build_refusal.Refusal] = build_label.label(g.b, text.some);
+        if (sel l.err) { ret res[u32, build_refusal.Refusal].err{l.err}; }
+        ret res[u32, build_refusal.Refusal].ok{l.ok.id};
     }
-    ret res[u32, build.Refusal].ok{id};
+    ret res[u32, build_refusal.Refusal].ok{id};
 }
 
 # a symbolic operand value, or one a list, group or enumerant params holds, with `.` and a sequence's own label bound
-fun claim(g: *Reading, v: *operand.Value, places: *Places) err[build.Refusal] {
+fun claim(g: *Reading, v: *operand.Value, places: *Places) err[build_refusal.Refusal] {
     if (sel v.symbol) {
-        val id: res[u32, build.Refusal] = bound_at(g, v.symbol.id, places);
-        if (sel id.err) { ret err[build.Refusal].err{id.err}; }
+        val id: res[u32, build_refusal.Refusal] = bound_at(g, v.symbol.id, places);
+        if (sel id.err) { ret err[build_refusal.Refusal].err{id.err}; }
         v.symbol.id = id.ok;
-        ret err[build.Refusal].ok{};
+        ret err[build_refusal.Refusal].ok{};
     }
     if (sel v.memory) {
         if (v.memory.symbol.id != operand.NO_SYMBOL) {
-            val id: res[u32, build.Refusal] = bound_at(g, v.memory.symbol.id, places);
-            if (sel id.err) { ret err[build.Refusal].err{id.err}; }
+            val id: res[u32, build_refusal.Refusal] = bound_at(g, v.memory.symbol.id, places);
+            if (sel id.err) { ret err[build_refusal.Refusal].err{id.err}; }
             v.memory.symbol.id = id.ok;
         }
-        ret err[build.Refusal].ok{};
+        ret err[build_refusal.Refusal].ok{};
     }
     val inner: operand.Values = operand.inner(v);
     var i:     u32            = 0;
     for (i < inner.len) {
-        val done: err[build.Refusal] = claim(g, ?inner.at[i], places);
+        val done: err[build_refusal.Refusal] = claim(g, ?inner.at[i], places);
         if (sel done.err) { ret done; }
         i = i + 1;
     }
-    ret err[build.Refusal].ok{};
+    ret err[build_refusal.Refusal].ok{};
 }
 
 # numbered label statement `it` placed at the cursor, as the label a reference ahead of it made or a new one
-fun encode_label(g: *Reading, it: *Item) err[build.Refusal] {
+fun encode_label(g: *Reading, it: *Item) err[build_refusal.Refusal] {
     val state: opt[*Numbered] = numbered_state(g, it.number);
     if (sel state.none) { ret refused(field.MEMORY); }
     val n: *Numbered = state.some;
     var l: u32       = n.next;
     if (l == operand.NO_SYMBOL) {
-        val made: res[build.Label, build.Refusal] = build.anonymous(g.b);
-        if (sel made.err) { ret err[build.Refusal].err{made.err}; }
+        val made: res[build_state.Label, build_refusal.Refusal] = build_label.anonymous(g.b);
+        if (sel made.err) { ret err[build_refusal.Refusal].err{made.err}; }
         l = made.ok.id;
     }
-    val placed: err[build.Refusal] = build.define(g.b, build.Label{id: l});
+    val placed: err[build_refusal.Refusal] = build_label.define(g.b, build_state.Label{id: l});
     if (sel placed.err) { ret placed; }
     n.last = l;
     n.next = operand.NO_SYMBOL;
-    ret err[build.Refusal].ok{};
+    ret err[build_refusal.Refusal].ok{};
 }
 
 # data directive `it` written at the cursor, each value at its width in the set's byte order
-fun encode_datum(g: *Reading, it: *Item) err[build.Refusal] {
+fun encode_datum(g: *Reading, it: *Item) err[build_refusal.Refusal] {
     var i: u32 = 0;
     for (i < it.data.len) {
-        val done: err[build.Refusal] = build.integer(g.b, g.p.data.data[(it.data.first + i)::usize], it.width);
+        val done: err[build_refusal.Refusal] = build_emit.integer(g.b, g.p.data.data[(it.data.first + i)::usize], it.width);
         if (sel done.err) { ret done; }
         i = i + 1;
     }
-    ret err[build.Refusal].ok{};
+    ret err[build_refusal.Refusal].ok{};
 }
 
 # instruction statement `it` read with every name its location and written at the cursor under the builder's context
-fun encode_instruction(g: *Reading, it: *Item) err[build.Refusal] {
+fun encode_instruction(g: *Reading, it: *Item) err[build_refusal.Refusal] {
     vector.truncate[View](g.named, 0);
     var ex:    relax.Expansion;
-    val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(g, build.view(g.b), build.modes_of(g.b), ?ex);
+    val read_: res[err[diagnostic.Diagnostic], A.Error] = read_statement(g, build_trait.view(g.b), build.modes_of(g.b), ?ex);
     if (sel read_.err) { ret refused(field.MEMORY); }
     if (sel read_.ok.err) {
-        if (sel g.failed.some) { ret err[build.Refusal].err{g.failed.some}; }
+        if (sel g.failed.some) { ret err[build_refusal.Refusal].err{g.failed.some}; }
         ret refused(read_.ok.err.message);
     }
     var places: Places = Places{here: operand.NO_SYMBOL, own: operand.NO_SYMBOL};
@@ -1632,13 +1628,13 @@ fun encode_instruction(g: *Reading, it: *Item) err[build.Refusal] {
     for (i < ex.count) {
         var k: u32 = 0;
         for (k < ex.steps[i].row.operands.len) {
-            val claimed: err[build.Refusal] = claim(g, ?ex.steps[i].values[k], ?places);
+            val claimed: err[build_refusal.Refusal] = claim(g, ?ex.steps[i].values[k], ?places);
             if (sel claimed.err) { ret claimed; }
             k = k + 1;
         }
         i = i + 1;
     }
-    ret build.expansion(g.b, ?ex);
+    ret build_emit.expansion(g.b, ?ex);
 }
 
 # block `blk` written through the builder at its cursor, under the context the builder writes under, each operand at
@@ -1646,21 +1642,21 @@ fun encode_instruction(g: *Reading, it: *Item) err[build.Refusal] {
 # the block read again with each name its location, so a row, an alias or a sequence is chosen as the assembler chooses
 # it for that text. its numbered labels are labels of the builder no other block or function names, and a symbol a
 # location or the text names is relocated as any operand's
-pub fun encode(blk: *Block, locations: Locations, b: *build.Builder) err[build.Refusal] {
+pub fun encode(blk: *Block, locations: Locations, b: *build_state.Builder) err[build_refusal.Refusal] {
     val p: *Parsed = blk.parsed::*Parsed;
-    if (locations.len != p.count) { ret refused(LOCATIONS); }
-    if (b.format != p.format)     { ret refused(FORMAT); }
+    if (locations.len != p.count)       { ret refused(LOCATIONS); }
+    if (build.format_of(b) != p.format) { ret refused(FORMAT); }
     var k: u32 = 0;
     for (k < p.count) {
         if (!fits(?p.operands[k].constraint, ?locations.at[k])) { ret refused(UNFIT); }
         k = k + 1;
     }
-    var numbered: vector.Vector[Numbered] = vector.init[Numbered](p.a);
-    var spelled:  vector.Vector[u8]       = vector.init[u8](p.a);
-    var named:    vector.Vector[View]     = vector.init[View](p.a);
-    var g:        Reading                 = Reading{p: p, item: nil, index: 0, locations: locations.at, b: b, numbered: ?numbered, spelled: ?spelled, named: ?named, failed: opt[build.Refusal].none{}};
-    var done:     err[build.Refusal]      = err[build.Refusal].ok{};
-    var i:        u32                     = 0;
+    var numbered: vector.Vector[Numbered]    = vector.init[Numbered](p.a);
+    var spelled:  vector.Vector[u8]          = vector.init[u8](p.a);
+    var named:    vector.Vector[View]        = vector.init[View](p.a);
+    var g:        Reading                    = Reading{p: p, item: nil, index: 0, locations: locations.at, b: b, numbered: ?numbered, spelled: ?spelled, named: ?named, failed: opt[build_refusal.Refusal].none{}};
+    var done:     err[build_refusal.Refusal] = err[build_refusal.Refusal].ok{};
+    var i:        u32                        = 0;
     for (i < p.items.len::u32 && sel done.ok) {
         val it: *Item = ?p.items.data[i::usize];
         g.item  = it;
