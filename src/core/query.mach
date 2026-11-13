@@ -344,7 +344,7 @@ fun number_held(values: operand.Values, op: u8) opt[i64] {
 
 # relation `r` of an instruction over `file` under its operand values, none where they give no number: an operand
 # holding no value or a symbol, an address with an index, a symbol or a mode other than OFFSET, a shift past the
-# register's bits, or a member of Holds this reads as stating nothing
+# register's bits, an addend an operand holds, or a member of Holds this reads as stating nothing
 pub fun affine(file: *register.File, r: *effect.Relation, values: operand.Values) opt[effect.Affine] {
     var to: register.Id = register.NONE;
     if (sel r.to.operand)    { to = register_held(values, r.to.operand); }
@@ -354,15 +354,133 @@ pub fun affine(file: *register.File, r: *effect.Relation, values: operand.Values
     ret opt[effect.Affine].none{};
 }
 
+# the number relation `r` leaves its register holding under operand values `values`, as an affine relation from no
+# register, none where it states no number or its operand holds no number
+pub fun numbered(file: *register.File, r: *effect.Relation, values: operand.Values) opt[effect.Affine] {
+    if (!sel r.holds.number) { ret opt[effect.Affine].none{}; }
+    val n:  effect.Number = r.holds.number;
+    var to: register.Id   = register.NONE;
+    if (sel r.to.operand)    { to = register_held(values, r.to.operand); }
+    or (sel r.to.row)        { to = row_register(file, r.to.row); }
+    if (to == register.NONE) { ret opt[effect.Affine].none{}; }
+    val held: opt[i64] = number_held(values, n.operand);
+    if (sel held.none) { ret opt[effect.Affine].none{}; }
+    var units: i64 = 1;
+    if (n.shift != field.NO_OPERAND) {
+        val opt_units: opt[i64] = number_held(values, n.shift);
+        if (sel opt_units.none) { ret opt[effect.Affine].none{}; }
+        units = opt_units.some;
+    }
+    if (units < 0 || units * n.step::i64 >= 64) { ret opt[effect.Affine].none{}; }
+    var bits: u64 = held.some::u64 << (units * n.step::i64)::u64;
+    if (n.inverted) { bits = ~bits; }
+    ret opt[effect.Affine].some{effect.Affine{to: to, from: register.NONE, by: extended(bits, n.extend)::i64}};
+}
+
+# `bits` sign-extended from bit `extend` - 1, unchanged for 0 or a width past 63
+fun extended(bits: u64, extend: u8) u64 {
+    if (extend == 0 || extend >= 64) { ret bits; }
+    val top:  u64 = 1::u64 << (extend - 1)::u64;
+    var kept: u64 = bits & ((top << 1) - 1);
+    if ((kept & top) != 0) { kept = kept | ~((top << 1) - 1); }
+    ret kept;
+}
+
+# whether offset `o` holds under operand values `values`: it names no condition, or its operand holds the value named
+pub fun applies(o: *effect.Offset, values: operand.Values) bool {
+    if (o.when == field.NO_OPERAND) { ret true; }
+    val n: opt[i64] = number_held(values, o.when);
+    if (sel n.none) { ret false; }
+    ret n.some == o.equals;
+}
+
+# the bits offset `o` shifts its addend left by under operand values `values`, none where its shift operand holds no
+# number or one shifting past the register's bits
+pub fun shift_bits(o: *effect.Offset, values: operand.Values) opt[u64] {
+    if (o.shift == field.NO_OPERAND) { ret opt[u64].some{0}; }
+    val n: opt[i64] = number_held(values, o.shift);
+    if (sel n.none) { ret opt[u64].none{}; }
+    if (n.some < 0) { ret opt[u64].none{}; }
+    val bits: u64 = n.some::u64 * o.step::u64;
+    if (bits >= 64) { ret opt[u64].none{}; }
+    ret opt[u64].some{bits};
+}
+
+# the number combined relation `c` leaves its register holding where the register it reads holds the number `from`,
+# under operand values `values`, none where an operand it names holds no number or one shifting past the register's bits
+pub fun combine(c: *effect.Combined, values: operand.Values, from: i64) opt[i64] {
+    val held: opt[i64] = number_held(values, c.operand);
+    if (sel held.none) { ret opt[i64].none{}; }
+    var bits: u64 = 0;
+    if (c.shift != field.NO_OPERAND) {
+        val n: opt[i64] = number_held(values, c.shift);
+        if (sel n.none) { ret opt[i64].none{}; }
+        if (n.some < 0) { ret opt[i64].none{}; }
+        bits = n.some::u64 * c.step::u64;
+        if (bits >= 64) { ret opt[i64].none{}; }
+    }
+    val imm: u64 = held.some::u64 << bits;
+    val x:   u64 = from::u64;
+    var out: u64 = 0;
+    if (c.by == effect.ADD) { out = x + imm; }
+    or (c.by == effect.OR)  { out = x | imm; }
+    or (c.by == effect.AND) { out = x & imm; }
+    or (c.by == effect.SHL) {
+        if (held.some < 0 || held.some >= 64) { ret opt[i64].none{}; }
+        out = x << held.some::u64;
+    }
+    or (c.by == effect.INSERT) {
+        if (c.width == 0 || c.width::u64 + bits > 64) { ret opt[i64].none{}; }
+        var mask: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        if (c.width < 64) { mask = (1::u64 << c.width::u64) - 1; }
+        out = (x & ~(mask << bits)) | ((held.some::u64 & mask) << bits);
+    }
+    or { ret opt[i64].none{}; }
+    ret opt[i64].some{extended(out, c.extend)::i64};
+}
+
+# the registers relation `r` writes and reads under its operand values, none where it states no offset or names a
+# register no operand holds: the one written, the one it starts from, and the one an operand it adds holds,
+# register.NONE for none, as x0, x0 and x1 of aarch64's `ld1 {v0.4s}, [x0], x1`
+pub rec Ends {
+    to:    register.Id;
+    from:  register.Id;
+    added: register.Id;
+}
+
+pub fun ends(file: *register.File, r: *effect.Relation, values: operand.Values) opt[Ends] {
+    var e: Ends = Ends{to: register.NONE, from: register.NONE, added: register.NONE};
+    if (sel r.to.operand) { e.to = register_held(values, r.to.operand); }
+    or (sel r.to.row)     { e.to = row_register(file, r.to.row); }
+    if (sel r.holds.combined) {
+        e.from = source_register(file, r.holds.combined.from, values);
+        if (e.to == register.NONE || e.from == register.NONE) { ret opt[Ends].none{}; }
+        ret opt[Ends].some{e};
+    }
+    if (!sel r.holds.offset) { ret opt[Ends].none{}; }
+    val o: effect.Offset = r.holds.offset;
+    if (!applies(?o, values)) { ret opt[Ends].none{}; }
+    e.from = source_register(file, o.from, values);
+    if (e.to == register.NONE || e.from == register.NONE) { ret opt[Ends].none{}; }
+    if (sel o.by.held)                                    { e.added = register_held(values, o.by.held); }
+    ret opt[Ends].some{e};
+}
+
+# the register source `s` reads under operand values `values`, register.NONE for none
+fun source_register(file: *register.File, s: effect.Source, values: operand.Values) register.Id {
+    if (sel s.operand) { ret register_held(values, s.operand); }
+    if (sel s.row)     { ret row_register(file, s.row); }
+    if (sel s.base) {
+        val a: opt[operand.Address] = plain_address(values, s.base);
+        if (sel a.some) { ret a.some.base; }
+    }
+    ret register.NONE;
+}
+
 # offset `o` writing `to` under operand values `values`, as `affine` reads it
 fun offset(file: *register.File, to: register.Id, o: *effect.Offset, values: operand.Values) opt[effect.Affine] {
-    var from: register.Id = register.NONE;
-    if (sel o.from.operand) { from = register_held(values, o.from.operand); }
-    or (sel o.from.row)     { from = row_register(file, o.from.row); }
-    or (sel o.from.base) {
-        val a: opt[operand.Address] = plain_address(values, o.from.base);
-        if (sel a.some) { from = a.some.base; }
-    }
+    if (!applies(o, values)) { ret opt[effect.Affine].none{}; }
+    val from: register.Id = source_register(file, o.from, values);
     if (from == register.NONE) { ret opt[effect.Affine].none{}; }
     var by: u64 = 0;
     if (sel o.by.immediate) {
@@ -375,14 +493,10 @@ fun offset(file: *register.File, to: register.Id, o: *effect.Offset, values: ope
         if (sel a.none) { ret opt[effect.Affine].none{}; }
         by = a.some.disp::u64;
     }
-    if (o.shift != field.NO_OPERAND) {
-        val n: opt[i64] = number_held(values, o.shift);
-        if (sel n.none) { ret opt[effect.Affine].none{}; }
-        if (n.some < 0) { ret opt[effect.Affine].none{}; }
-        val bits: u64 = n.some::u64 * o.step::u64;
-        if (bits >= 64) { ret opt[effect.Affine].none{}; }
-        by = by << bits;
-    }
+    or (sel o.by.held) { ret opt[effect.Affine].none{}; }
+    val opt_bits: opt[u64] = shift_bits(o, values);
+    if (sel opt_bits.none) { ret opt[effect.Affine].none{}; }
+    by = by << opt_bits.some;
     if (o.negated) { by = 0 - by; }
     ret opt[effect.Affine].some{effect.Affine{to: to, from: from, by: (by + o.constant::u64)::i64}};
 }
