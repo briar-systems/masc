@@ -49,6 +49,13 @@
 # offsets added, so a frame slot stays one extent however the prologue moves
 # sp and fp, and an access provably clear of every secret one is not aliased.
 # one through a register of no known offset falls back to its version.
+# a register as wide as the stack pointer stored whole to a private frame slot
+# the walk places exactly, and loaded whole from it again, holds the value it
+# was stored with where that is a number or a register's value on entry, as a
+# pointer argument spilled across calls and reloaded: a private slot is reached
+# only by accesses the walk places exactly in the frame, so every write of it
+# between is one the walk sees, which leaves it carrying nothing, as does any
+# write of an inline block the walk does not place exactly in the frame.
 # an extent addressed by a symbol is named off the symbol's address, so a
 # global stays one extent wherever its address is formed. the walk reads the
 # address a symbol forms from the sites the caller gives, the fixups its
@@ -204,7 +211,9 @@
 # and so does every extent it writes. a secret reaching the callee through an
 # argument register or a read extent the model does not state it accepts, or
 # through memory it does not keep and no accepted read holds, refuses the call,
-# worded `ct.UNCHECKED`, so a callee not checked constant time accepts none.
+# worded `ct.UNCHECKED`, so a callee not checked constant time accepts none, and
+# `ct.UNDECLARED` where the model states its callee checked, whose declaration
+# then states public what the secret reached.
 # a secret at an address the walk does not place, or in an extent it places
 # off a register's value and neither in the frame nor off a symbol, or within
 # a secret global (`typed_held`), that every statement of it types secret is
@@ -985,6 +994,7 @@ rec Saved {
 #            rewritten any frame slot that is not private
 # written:   the frame extents a store of the function's own placed exactly there wrote, whatever it stored, which no
 #            store it does not place unwrites
+# slotted:   the private frame slots holding a register's value a store left there, which a load of the slot gives back
 rec Point {
     taint:     vector.Vector[u64];
     versions:  vector.Vector[u64];
@@ -1004,6 +1014,19 @@ rec Point {
     rebound:   vector.Vector[Held];
     unbound:   bool;
     written:   vector.Vector[Held];
+    slotted:   vector.Vector[Slotted];
+}
+
+# a register's value the walk carries through a private frame slot: the slot, placed exactly, and the value a store of a
+# register as wide as the stack pointer left there, a number or a register's value on entry, which no instruction makes
+# anew. a private slot is reached only by accesses the walk places exactly in the frame, so every write that could
+# change what it holds is one the walk sees, and a load of it gives the register the value stored
+# ---
+# at:    the slot
+# frame: the value
+rec Slotted {
+    at:    Held;
+    frame: Frame;
 }
 
 # a memory access of one instruction, placed as the walk names extents
@@ -1406,6 +1429,7 @@ fun empty(a: *A.Allocator) Point {
         rebound:   vector.init[Held](a),
         written:   vector.init[Held](a),
         unbound:   false,
+        slotted:   vector.init[Slotted](a),
     };
 }
 
@@ -1461,6 +1485,7 @@ fun drop(p: *Point) {
     vector.dnit[Pointed](?p.pointed);
     vector.dnit[Held](?p.rebound);
     vector.dnit[Held](?p.written);
+    vector.dnit[Slotted](?p.slotted);
 }
 
 fun listed[T](v: *vector.Vector[T]) Slice[T] {
@@ -1504,6 +1529,8 @@ fun assign(into: *Point, from: *Point) err[A.Error] {
     if (sel rebound.err) { ret rebound; }
     val written: err[A.Error] = refill[Held](?into.written, ?from.written);
     if (sel written.err) { ret written; }
+    val slotted: err[A.Error] = refill[Slotted](?into.slotted, ?from.slotted);
+    if (sel slotted.err) { ret slotted; }
     ret refill[u64](?into.entries, ?from.entries);
 }
 
@@ -1940,8 +1967,9 @@ fun narrow(w: *Walk, spared: *vector.Vector[Held], by: *vector.Vector[Held]) res
 
 # whether the bytes of `at` may hold a secret under `p`. a private extent holds none a secret at any address puts there,
 # an extent the walk does not place in the frame none a private one holds, a typed one none a secret every statement
-# types secret puts at an address the walk does not place in the frame (`typed_apart`), and data the program never
-# writes none but what a seed of its own symbol holds, a symbol's got slot, which the loader alone writes, among them
+# types secret puts at an address the walk does not place in the frame (`typed_apart`), a global's bytes no seed states
+# secret none a secret every statement types secret puts anywhere (`public_global`), and data the program never writes
+# none but what a seed of its own symbol holds, a symbol's got slot, which the loader alone writes, among them
 fun secret_at(w: *Walk, p: *Point, at: *Held) bool {
     if (made_public(p, at)) { ret false; }
     if (symbolic(at) && (at.slot || constant_symbol(w, at.symbol))) {
@@ -1952,13 +1980,39 @@ fun secret_at(w: *Walk, p: *Point, at: *Held) bool {
         }
         ret false;
     }
-    if (p.anywhere && !is_spared(p, at) && !is_private(w, at) && !is_typed(w, p, at)) { ret true; }
+    val public: bool = public_global(w, at);
+    if (p.anywhere && !is_spared(p, at) && !is_private(w, at) && !is_typed(w, p, at) && !(public && !p.untyped)) { ret true; }
     var i: usize = 0;
     for (i < p.held.len) {
-        if (may_alias(w, ?p.held.data[i], at) && !privately_apart(w, ?p.held.data[i], at) && !typed_apart(w, p, ?p.held.data[i], at)) { ret true; }
+        val h: *Held = ?p.held.data[i];
+        if (public && typed_held(w, p, h)) {
+            i = i + 1;
+            cnt;
+        }
+        if (may_alias(w, h, at) && !privately_apart(w, h, at) && !typed_apart(w, p, h, at)) { ret true; }
         i = i + 1;
     }
     ret false;
+}
+
+# whether `at`, off a symbol's address, reaches no byte a symbol seed states secret, so it is storage of a public type:
+# a pointer stating its pointee secret never points there, as `*T` never casts to `*^T`, so no store a statement types
+# secret, and no secret a trusted callee's own walk let it store, reaches it. one of a length or an offset the walk
+# does not know reaches every byte of its symbol
+fun public_global(w: *Walk, at: *Held) bool {
+    if (!symbolic(at) || at.slot) { ret false; }
+    var i: u32 = 0;
+    for (i < w.secrets.len) {
+        val sd: Seed = w.secrets.at[i];
+        i = i + 1;
+        if (sel sd.symbol) {
+            val g: Global = sd.symbol;
+            if (g.symbol != at.symbol)                                                         { cnt; }
+            if (g.length == 0 || at.length == 0 || at.indexed)                                 { ret false; }
+            if (at.offset < g.offset + g.length::i64 && g.offset < at.offset + at.length::i64) { ret false; }
+        }
+    }
+    ret true;
 }
 
 # the entries of `from` merged into `into`'s, so the entries either may hold a secret in may in the join
@@ -2163,6 +2217,20 @@ fun merge(w: *Walk, into: *Point, from: *Point, pred: usize, to: usize) res[opt[
         into.unbound = true;
         changed      = true;
     }
+    # a slot carries a value in the join only where it carries that value on both paths
+    var carried: usize = 0;
+    i = 0;
+    for (i < into.slotted.len) {
+        if (slotted_in(from, ?into.slotted.data[i])) {
+            into.slotted.data[carried] = into.slotted.data[i];
+            carried                    = carried + 1;
+        }
+        i = i + 1;
+    }
+    if (carried != into.slotted.len) {
+        vector.truncate[Slotted](?into.slotted, carried);
+        changed = true;
+    }
     i = 0;
     for (i < into.stack.len) {
         if (from.stack.data[i] && !into.stack.data[i]) {
@@ -2184,6 +2252,21 @@ fun merge(w: *Walk, into: *Point, from: *Point, pred: usize, to: usize) res[opt[
         changed     = true;
     }
     ret res[opt[bool], A.Error].ok{opt[bool].some{changed}};
+}
+
+# whether `p` carries the value of `x` in the slot of `x`
+fun slotted_in(p: *Point, x: *Slotted) bool {
+    var i: usize = 0;
+    for (i < p.slotted.len) {
+        val y: *Slotted = ?p.slotted.data[i];
+        if (same(?y.at, ?x.at) && same_frame(y.frame, x.frame)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun same_frame(x: Frame, y: Frame) bool {
+    ret x.known == y.known && x.offset == y.offset && x.number == y.number && x.root == y.root && x.version == y.version;
 }
 
 # whether an extent held off a register's value of `version`, carried from the instruction at `from` into the one at
@@ -3864,6 +3947,12 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *codec.Decoded, fp: *footprint.Fo
         }
         t_at = t_at + 1;
     }
+    val spill:       opt[Moving]  = moving(w, p, ins, true);
+    var reload:      opt[Slotted] = opt[Slotted].none{};
+    val loaded_slot: opt[Moving]  = moving(w, p, ins, false);
+    if (sel loaded_slot.some) { reload = slot_value(p, loaded_slot.some); }
+    val carried: err[A.Error] = reslot(w, p, at, spill);
+    if (sel carried.err) { ret carried; }
     val moved: err[A.Error] = moves(w, p, ins, fp);
     if (sel moved.err) { ret moved; }
     val formed: err[A.Error] = formings(w, p, ins);
@@ -3912,6 +4001,9 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *codec.Decoded, fp: *footprint.Fo
     for (m < w.forming.len) {
         p.formed.data[w.forming.data[m].row] = w.forming.data[m].formed;
         m                                    = m + 1;
+    }
+    if (sel reload.some) {
+        if (sel loaded_slot.some) { p.frames.data[loaded_slot.some.row] = reload.some.frame; }
     }
     var k: usize = 0;
     for (k < w.touches.len) {
@@ -3992,6 +4084,73 @@ fun apply(w: *Walk, p: *Point, at: usize, ins: *codec.Decoded, fp: *footprint.Fo
         if (sel est.sets)      { p.config = opt[config.State].some{est.sets}; }
         if (sel est.undecided) { p.config = opt[config.State].none{}; }
     }
+    ret err[A.Error].ok{};
+}
+
+# the one data register an instruction moves whole between itself and a private frame slot through its one memory
+# access, and the slot
+# ---
+# row: the register's row, as wide as the stack pointer
+# at:  the slot, placed exactly, of the register's width
+rec Moving {
+    row: u32;
+    at:  Held;
+}
+
+# the register `ins` stores whole, where `stores`, or loads whole, to or from a private frame slot the walk places
+# exactly, through its one memory access, which it only writes or only reads, under `p` where it starts
+fun moving(w: *Walk, p: *Point, ins: *codec.Decoded, stores: bool) opt[Moving] {
+    if (w.touches.len != 1 || w.stack == effect.NO_ROW) { ret opt[Moving].none{}; }
+    val t: *Touch = ?w.touches.data[0];
+    if (t.writes != stores || t.reads == stores)                       { ret opt[Moving].none{}; }
+    if (!exact(?t.at) || !in_frame(w, ?t.at) || !is_private(w, ?t.at)) { ret opt[Moving].none{}; }
+    var role: operand.Role = operand.WRITE;
+    if (stores) { role = operand.READ; }
+    val d: Parts = parts_of(w, p, ins, role, t.row);
+    if (d.count != 1 || !wide(w, d.rows[0]) || t.at.length != d.bytes) { ret opt[Moving].none{}; }
+    ret opt[Moving].some{Moving{row: d.rows[0], at: t.at}};
+}
+
+# the value `p` carries in the slot load `m` reads, none where it carries none there
+fun slot_value(p: *Point, m: Moving) opt[Slotted] {
+    var i: usize = 0;
+    for (i < p.slotted.len) {
+        if (same(?p.slotted.data[i].at, ?m.at)) { ret opt[Slotted].some{p.slotted.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[Slotted].none{};
+}
+
+# the slots `p` carries a value in, those the instruction at `at` may write left out, every one where it is an inline
+# block's and writes where the walk does not place it exactly in the frame, and the slot `spill` stores into added with
+# the value its register holds where the value is a number or a register's on entry
+fun reslot(w: *Walk, p: *Point, at: usize, spill: opt[Moving]) err[A.Error] {
+    var k: usize = 0;
+    for (k < w.touches.len) {
+        val t: *Touch = ?w.touches.data[k];
+        k = k + 1;
+        if (!t.writes) { cnt; }
+        if (inlined(w, at) && !(exact(?t.at) && in_frame(w, ?t.at))) {
+            vector.truncate[Slotted](?p.slotted, 0);
+            cnt;
+        }
+        var left: usize = 0;
+        var i:    usize = 0;
+        for (i < p.slotted.len) {
+            val h: *Held = ?p.slotted.data[i].at;
+            if (!may_alias(w, h, ?t.at) || privately_apart(w, h, ?t.at)) {
+                p.slotted.data[left] = p.slotted.data[i];
+                left                 = left + 1;
+            }
+            i = i + 1;
+        }
+        vector.truncate[Slotted](?p.slotted, left);
+    }
+    if (sel spill.none) { ret err[A.Error].ok{}; }
+    val f: Frame = value_of(w, p, spill.some.row);
+    if (!f.known || (!f.number && f.version != ENTRY)) { ret err[A.Error].ok{}; }
+    val res_pushed: res[usize, A.Error] = vector.push[Slotted](?p.slotted, Slotted{at: spill.some.at, frame: f});
+    if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
     ret err[A.Error].ok{};
 }
 
@@ -5099,9 +5258,13 @@ fun step(w: *Walk, at: usize, store: *vector.Vector[operand.Value], alts: *vecto
         val j: res[Joined, A.Error] = join(w, r, model, popped);
         if (sel j.err) { ret failed[opt[Verdict]](j.err); }
         joined = j.ok.secret;
-        if (j.ok.unaccepted) { ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(ct.UNCHECKED, field.NO_OPERAND), at)}; }
-        if (j.ok.pointed)    { ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(ct.POINTED, field.NO_OPERAND), at)}; }
-        if (tail)            { model = nil; }
+        if (j.ok.unaccepted) {
+            var reason: ct.Reason = ct.UNCHECKED;
+            if (model.stated) { reason = ct.UNDECLARED; }
+            ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(reason, field.NO_OPERAND), at)};
+        }
+        if (j.ok.pointed) { ret res[opt[Verdict], A.Error].ok{refused(ct.refusal(ct.POINTED, field.NO_OPERAND), at)}; }
+        if (tail)         { model = nil; }
     }
     val value: bool = read || stacked;
     if (value) {
