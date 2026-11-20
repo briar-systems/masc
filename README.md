@@ -21,8 +21,9 @@ from machine-readable sources wherever one exists.
 masc is a library first. The `masc` program is a command line over the same
 API.
 
-> masc is early work. The design is settled but most of what is described
-> here is not built yet.
+> masc is early work. The design is settled, and the assembler, the
+> disassembler, the builder, inline assembly and the constant-time walk
+> described here are built. Its manual is under [doc](doc/README.md).
 
 
 ## Place in the toolchain
