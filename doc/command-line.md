@@ -115,12 +115,13 @@ stderr:
 ```
 $ masc assemble b.s -t linux-x86_64 -o b.o -vv
 b.s: 4 sections, 8 symbols, 6 relocations, written to b.o as elf
-note[target] linux-x86_64, abi sysv64, isa cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2, format elf
+note[target] linux-x86_64, abi sysv64, isa cx8,cmov,x87,fxsr,osfxsr,mmx,sce,sse,sse2, format elf
 ```
 
-The `isa` of that note is the selection as mink's catalog spells it. It does
-not show extensions added with `--ext`. `-q` prints refusals only, which
-drops the notes `disassemble` prints. `-q` and `-v` together are refused.
+The `isa` of that note is the selection in force, extensions added with
+`--ext` included, spelled the way `--isa` reads it back. `-q` prints refusals
+only, which drops the notes `disassemble` prints. `-q` and `-v` together are
+refused.
 
 `walk` takes the target flags but neither `-o`, `-v` nor `-q`.
 
