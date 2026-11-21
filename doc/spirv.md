@@ -55,7 +55,7 @@ OpFunctionEnd
 
 ```
 $ masc assemble b.spvasm -t vulkan-spirv -o b.spv -v
-b.spvasm: 1 sections, 0 symbols, 0 relocations, written to b.spv as spirv
+b.spvasm: 1 section, 0 symbols, 0 relocations, written to b.spv as spirv
 $ masc disassemble b.spv -t vulkan-spirv
 	OpCapability Shader
 	OpCapability Float64

@@ -39,7 +39,7 @@ anywhere.
 
 ```
 $ masc assemble ext.s -t linux-aarch64 -o ext.o -v
-ext.s: 1 sections, 1 symbols, 0 relocations, written to ext.o as elf
+ext.s: 1 section, 1 symbol, 0 relocations, written to ext.o as elf
 $ masc disassemble ext.o -t linux-aarch64 --isa armv8.1-a+crc
 	.section .text, "ax", @progbits
 	.balign 4
@@ -47,6 +47,49 @@ $ masc disassemble ext.o -t linux-aarch64 --isa armv8.1-a+crc
 	crc32b w0, w1, w2
 	nop
 ```
+
+## Windows unwind codes
+
+On a COFF target an AArch64 procedure states its unwind codes by these
+`.seh_*` directives, between `.seh_proc` and `.seh_endproc` (see
+[source](source.md#call-frames-unwind-codes-and-lines)). Each follows the
+prologue instruction it describes. `n` is a constant number of bytes, an
+offset is from the stack pointer, and a pre-indexed save moves the stack down
+by `n` and saves at its new top. A pair is a register and the one after it,
+general registers in their `x` form and floating point ones in their `d`
+form.
+
+| directive                     | what it records                                          |
+|-------------------------------|----------------------------------------------------------|
+| `.seh_stackalloc n`           | the stack moved down by `n` bytes                        |
+| `.seh_save_r19r20_x n`        | `x19` and `x20` saved pre-indexed, `n` at most 248       |
+| `.seh_save_fplr_x n`          | `x29` and `x30` saved pre-indexed                        |
+| `.seh_save_fplr n`            | `x29` and `x30` saved at offset `n`                      |
+| `.seh_save_lrpair xN, n`      | `xN` and `x30` saved at offset `n`                       |
+| `.seh_save_regp_x xN, n`      | the general pair from `xN` saved pre-indexed             |
+| `.seh_save_regp xN, n`        | the general pair from `xN` saved at offset `n`           |
+| `.seh_save_fregp_x dN, n`     | the floating point pair from `dN` saved pre-indexed      |
+| `.seh_save_fregp dN, n`       | the floating point pair from `dN` saved at offset `n`    |
+| `.seh_save_reg_x xN, n`       | `xN` saved pre-indexed                                   |
+| `.seh_save_reg xN, n`         | `xN` saved at offset `n`                                 |
+| `.seh_save_freg_x dN, n`      | `dN` saved pre-indexed                                   |
+| `.seh_save_freg dN, n`        | `dN` saved at offset `n`                                 |
+| `.seh_save_any_reg_px r, n`   | `r` and the next register of its kind saved pre-indexed  |
+| `.seh_save_any_reg_p r, n`    | `r` and the next register of its kind saved at offset `n` |
+| `.seh_save_any_reg_x r, n`    | `r` saved pre-indexed                                    |
+| `.seh_save_any_reg r, n`      | `r` saved at offset `n`                                  |
+| `.seh_set_fp`                 | `x29` set to the stack pointer, the frame register       |
+| `.seh_add_fp n`               | `x29` set to the stack pointer plus `n`, the frame register |
+| `.seh_nop`                    | a prologue or epilogue instruction that states no unwind operation |
+| `.seh_endprologue`            | the end of the prologue                                  |
+
+The `save_any_reg` family takes any of `x0` to `x30` and any SIMD register in
+its `d` or `q` form, which a `q` name saves 16 bytes wide. The other saves take
+only the class and form their row names. Between `.seh_startepilogue` and
+`.seh_endepilogue` a code follows the instruction that undoes the prologue
+operation it names: a stack move moves the stack back, a save restores its
+registers, a pre-indexed one moves the stack back past them, and a frame
+register returns the canonical frame address to the stack pointer.
 
 ## Operands
 

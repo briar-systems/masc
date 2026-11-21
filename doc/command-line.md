@@ -109,13 +109,13 @@ error[target] the system's hosts for this architecture differ by calling convent
 `masc assemble i386.s -t linux-x86 --isa i386 -o i386.o`. See
 [extensions](extensions.md) for the selection spellings.
 
-`-v` reports what was written, and `-vv` also notes the resolved target on
-stderr:
+`-v` reports what was written, and `-vv` also notes the resolved target first,
+both on stderr, so stdout carries only the command's product:
 
 ```
 $ masc assemble b.s -t linux-x86_64 -o b.o -vv
-b.s: 4 sections, 8 symbols, 6 relocations, written to b.o as elf
 note[target] linux-x86_64, abi sysv64, isa cx8,cmov,x87,fxsr,osfxsr,mmx,sce,sse,sse2, format elf
+b.s: 4 sections, 8 symbols, 6 relocations, written to b.o as elf
 ```
 
 The `isa` of that note is the selection in force, extensions added with
@@ -157,7 +157,7 @@ file in the target's format. With `-v` it prints the counts of what it wrote:
 
 ```
 $ masc assemble a.s -t linux-x86_64 -o a.o -v
-a.s: 1 sections, 1 symbols, 0 relocations, written to a.o as elf
+a.s: 1 section, 1 symbol, 0 relocations, written to a.o as elf
 ```
 
 The first refusal in the source ends the command with exit 1 and nothing is
@@ -176,7 +176,9 @@ is decoded under the target's selection, not under anything the source said,
 so code assembled under a wider selection needs the same `--isa` or `--ext`
 to disassemble as instructions. What the printed text cannot state of the
 object is noted on stderr, see [disassembly](disassembly.md). With `-o` and
-`-v` it prints `<input>: <n> bytes of source, written to <path>`.
+`-v` it reports `<input>: <size> of source, written to <path>` on stderr, the
+size exact in bytes below 1 KiB, then in KiB, MiB or GiB to a tenth while under
+ten of the unit and whole above, as `1.5 KiB` or `78 KiB`.
 
 ## listing
 

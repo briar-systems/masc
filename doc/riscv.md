@@ -43,8 +43,8 @@ pop:
 
 ```
 $ masc assemble b.s -t linux-riscv32 --abi ilp32 --isa rv32imac -o b2.o -vv
-b.s: 1 sections, 2 symbols, 0 relocations, written to b2.o as elf
 note[target] linux-riscv32, abi ilp32, isa rv32imac, format elf
+b.s: 1 section, 2 symbols, 0 relocations, written to b2.o as elf
 $ masc disassemble b2.o -t linux-riscv32 --abi ilp32 --isa rv32imac -q
 	.globl pop
 	.section .text, "ax", @progbits

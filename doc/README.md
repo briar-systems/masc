@@ -48,7 +48,7 @@ wasm32 wasm64
   levels:   wasm1 wasm2 wasm3
 spirv
   syntaxes: spirv
-  levels:
+  levels:   -
 aarch64 arm64e arm64ec
   syntaxes: aarch64
   levels:   armv8-a armv8.1-a armv8.2-a armv8.3-a armv8.4-a armv8.5-a armv8.6-a armv8.7-a armv8.8-a armv8.9-a armv9-a armv9.1-a armv9.2-a armv9.3-a armv9.4-a armv9.5-a armv9.6-a armv9.7-a armv9.8-a

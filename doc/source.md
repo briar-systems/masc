@@ -207,10 +207,10 @@ On linux-x86_64 that object holds an `.eh_frame` section with its relocation.
 Windows unwind codes are the `.seh_*` directives: `.seh_proc`,
 `.seh_endproc`, `.seh_endprologue`, `.seh_startepilogue`, `.seh_endepilogue`,
 `.seh_handler`, `.seh_pushreg`, `.seh_setframe`, `.seh_stackalloc`,
-`.seh_savereg`, `.seh_savexmm`, `.seh_pushframe`, and AArch64's
-`.seh_save_reg`, `.seh_save_regp`, `.seh_save_fplr`, `.seh_set_fp`,
-`.seh_add_fp`, `.seh_nop` and the rest of that family. `.seh_proc` names the
-label placed where the procedure starts, so it follows that label:
+`.seh_savereg`, `.seh_savexmm`, `.seh_pushframe`, and on AArch64 the codes
+listed on [its page](aarch64.md#windows-unwind-codes), from `.seh_save_reg` to
+`.seh_nop`. `.seh_proc` names the label placed where the procedure starts, so
+it follows that label:
 
 ```
 f:

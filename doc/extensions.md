@@ -53,8 +53,8 @@ error[asm.refused] the selection does not make this register available (needs av
   |            ^^^^
 $ masc assemble avx.s -t linux-x86_64 --ext avx -o avx.o
 $ masc assemble avx.s -t linux-x86_64 --isa x86-64-v3 -o avx.o -vv
-avx.s: 1 sections, 1 symbols, 0 relocations, written to avx.o as elf
 note[target] linux-x86_64, abi sysv64, isa cx8,cmov,x87,fxsr,osfxsr,mmx,sce,sse,sse2,sse3,ssse3,sse41,sse42,cx16,lahf,popcnt,movbe,xsave,osxsave,bmi1,bmi2,lzcnt,avx,f16c,fma,avx2, format elf
+avx.s: 1 section, 1 symbol, 0 relocations, written to avx.o as elf
 ```
 
 The refusal names what is missing in parentheses, as `(needs avx)`,

@@ -60,7 +60,7 @@ in that register, read and written, its constraint the register's class.
 
 ```
 $ masc inline blk.s -t linux-x86_64 --operand acc=rax --operand step=rcx -o blk.o -v
-blk.s: 1 sections, 0 symbols, 0 relocations, written to blk.o as elf
+blk.s: 1 section, 0 symbols, 0 relocations, written to blk.o as elf
 $ masc disassemble blk.o -t linux-x86_64
 	.section .text, "ax", @progbits
 	add rax, rcx
@@ -100,5 +100,5 @@ Raw bytes with the registers they write:
 
 ```
 $ masc inline raw.s -t linux-x86_64 -o raw.o -v
-raw.s: 1 sections, 0 symbols, 0 relocations, written to raw.o as elf
+raw.s: 1 section, 0 symbols, 0 relocations, written to raw.o as elf
 ```
