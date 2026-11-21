@@ -108,14 +108,23 @@ note[disasm.unwritten] the text does not state trait riscv-arch rv64i2p1_m2p0_a2
 `-q` drops these notes. What the text cannot state at all is refused with
 `disasm.refused`, naming the section and offset, with nothing printed: a
 group that is no comdat group, a link-order owner no name reads back to,
-note records, index entries, a version record and a relocation that
-subtracts a symbol.
+note records, index entries, a version record, a relocation that
+subtracts a symbol and a call frame record no `.cfi_*` line states.
 
-Line records are restated as `.file` and `.loc` lines. Call frame records
-are not: an object assembled with `.cfi_*` directives disassembles to text
-without them, with no note, and that text assembles to an object with no
-`.eh_frame`. Windows unwind data prints as the `.xdata` and `.pdata`
-sections' bytes and their `.reloc` lines.
+Line records are restated as `.file` and `.loc` lines, and call frame
+records as `.cfi_*` lines: `.cfi_startproc` right after the label of the
+function where its frame begins, its `.cfi_personality`, `.cfi_lsda` and
+`.cfi_signal_frame`, each rule as its directive before the statement it
+takes effect at, and `.cfi_endproc` where the frame ends. The tables the
+object names are restated by `.cfi_sections`. A frame whose function has a
+section symbol's or a nameless symbol's place is named by a label the
+disassembler states there, as a relocation is. Refused are a frame whose
+starting rules are not the ones the set begins every `.cfi_startproc`
+from, a rule no directive states (an offset that scales, a save narrower
+than the register's natural width, a prologue or epilogue mark), frames
+that overlap, a pointer no label names, and frames on a format whose
+unwind table is no call frame table. Windows unwind data prints as the
+`.xdata` and `.pdata` sections' bytes and their `.reloc` lines.
 
 A later section of a name already entered is opened apart by the dialect's
 unique number on ELF, as `.section .text.hot, "ax", @progbits, unique, 1`,
@@ -184,7 +193,7 @@ $ masc disassemble d.o -t linux-x86_64
 ```
 
 The listing keeps what only the source knew: the alignment as an alignment,
-the `.code32` width, the private label's name and the call frame directives.
+the `.code32` width and the private label's name.
 Disassembly keeps only what the bytes and the object hold. A listing also
 writes a symbol's size as a difference of labels, as `.size add, .Ltmp0 -
 add`, and a symbol's local binding, as `.local f`.

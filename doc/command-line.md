@@ -69,7 +69,7 @@ The codes seen from the command line are `cli.line`, `cli.flag_missing`,
 `target.selection`, `object.read`, `object.write`, `object.format`,
 `asm.refused`, `asm.mode`, `asm.cause`, `disasm.refused`, `listing.module`,
 `listing.refused`, `inline.operand`, `inline.refused`, `inline.encode`,
-`walk.symbol`, `walk.secret`, `walk.access`, `walk.private`,
+`walk.symbol`, `walk.secret`, `walk.access`, `walk.private`, `walk.state`,
 `walk.refused` and `walk.unread`. Notes are printed as `note[<code>]` and
 warnings as `warning[<code>]`.
 
@@ -210,7 +210,9 @@ Walks the function `--symbol` names in the object file from the seeds given,
 and reports the first secret it leaks through timing. `--secret register`
 seeds a register, `--access offset:n=secret|public` states what an access the
 walk cannot place reads, and `--private offset:length` states a private
-frame extent. At most 32 seeds in all. See [constant-time walk](walk.md).
+frame extent. At most 32 seeds in all. `--state axis=value`
+sets a state value each instruction's timing is classified under, as
+`--state dit=on`. See [constant-time walk](walk.md).
 
 ## isas
 

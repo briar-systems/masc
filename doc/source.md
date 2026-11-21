@@ -102,6 +102,7 @@ directive binds it otherwise:
 | `.globl name`, `.global name`  | bind globally. both take several names          |
 | `.weak name`                   | bind weakly                                     |
 | `.local name`                  | bind locally (ELF)                              |
+| `.unique name`                 | bind as the one definition in the process (ELF `STB_GNU_UNIQUE`) |
 | `.hidden`, `.internal`, `.protected` | set the visibility                        |
 | `.type name, @kind`            | the kind, `@function` or `@object` (ELF). `%` may stand for `@` |
 | `.size name, expr`             | the size (ELF)                                  |

@@ -39,7 +39,8 @@ masc walk [options] <input> -t <sys-arch> --symbol <name>
 
 The function is the symbol `--symbol` names. It must be placed in a section
 and state its size, as `.size name, . - name` gives it. The walk reads under
-the target's selection and the state it enters at.
+the target's selection and the state it enters at, and classifies each
+instruction's timing under that state with the `--state` values set.
 
 | flag                                 | seed                                     |
 |--------------------------------------|------------------------------------------|
@@ -47,6 +48,7 @@ the target's selection and the state it enters at.
 | `--access offset:n=secret\|public`   | what the access of operand `n` of the instruction at `offset` reads |
 | `--access offset:@n=secret\|public`  | the same, by the access's position `n` in the instruction's footprint |
 | `--private offset:length`            | a frame extent off the stack pointer's value on entry that no unplaced access reaches |
+| `--state axis=value`                 | a state value each instruction's timing is classified under, as `dit=on`; not a seed |
 
 Offsets are decimal or hexadecimal after `0x`, from the function's start.
 A `--private` offset may be negative, as `-16:16`, and its length is never
@@ -156,11 +158,13 @@ error[walk.refused] memory access whose address or length is formed from a secre
   @ ct.o, lookup + 0
 ```
 
-## State the command line does not set
+## Timing state
 
-The walk reads under the target's state on entry. x86's `doitm` is set only
-by the operating system, and no flag of the command line sets it, so on x86
-every row whose timing is independent only under `doitm=on` is refused:
+Each instruction's timing is classified under the target's state on entry,
+with each `--state axis=value` set on it. Decoding stays under the entry
+state. x86's `doitm` is set only by the operating system, so on x86 every row
+whose timing is independent only under `doitm=on` is refused unless the line
+states `--state doitm=on`:
 
 ```
 $ masc walk ct.o -t linux-x86_64 --symbol select --secret rdi
@@ -168,9 +172,10 @@ error[walk.refused] secret value in an input the instruction's timing depends on
   @ ct.o, select + 0
 ```
 
-On AArch64 a function that switches `dit` on with `msr dit, #1` is still
-walked under the state it enters at, so its first data-dependent row after
-the switch is refused with `(needs dit=on)`:
+The walk does not follow a switch the code makes. On AArch64 a function that
+switches `dit` on with `msr dit, #1` is walked under the state the line
+states, so without `--state dit=on` its first data-dependent row after the
+switch is refused with `(needs dit=on)`:
 
 ```
 select:
@@ -186,5 +191,7 @@ error[walk.refused] secret value in an input the instruction's timing depends on
   @ ct64.o, select + 4
 ```
 
-The library's `walk.check` takes the context the function runs under from
-its caller, which is where a compiler states `dit=on` for code it switches.
+With `--state dit=on` that row is classified under `dit=on`. A value that names no axis of the target, or
+no value of one, is refused with `walk.state`. The library's
+`walk.check_timed` takes the timing context from its caller, which is where a
+compiler states `dit=on` for code it switches.

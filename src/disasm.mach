@@ -87,9 +87,17 @@
 # is an equivalent one with its ids renumbered, and the byte-exact round trip
 # of a file is mink's native one.
 #
-# a line table is written as `.file` and `.loc` lines. what the text cannot
+# a line table is written as `.file` and `.loc` lines, and call frame records
+# as the call frame directives: `.cfi_startproc` right after the label of the
+# function where its frame begins, then its pointers and signal mark, each
+# rule as its directive before the statement it takes effect at, and
+# `.cfi_endproc` where it ends, with the tables the object names stated by
+# `.cfi_sections`. what the text cannot
 # state is refused, naming the section and offset, with the output left as it
-# was: a line sequence the `.loc` lines cannot state, a group that is no comdat
+# was: a line sequence the `.loc` lines cannot state, a frame that does not
+# begin from the set's starting rules, a frame rule no directive states,
+# frames that overlap, a frame on a format whose unwind table no call frame
+# directive states, a group that is no comdat
 # group, a link-order owner no name reads back to, a note record held apart
 # from any section, index entries of an object written as sections, a version
 # record, and a relocation that subtracts a symbol. a nameless section is
@@ -138,6 +146,8 @@ use mink.format.coff.model.bridging;
 use mink.format.contract;
 use mink_pair: mink.format.pair;
 use mink.format.registry;
+use mink.lower.unwind.pointer;
+use mink.model.frame;
 use mink_group:   mink.model.group;
 use mink_line:    mink.model.line;
 use mink_object:  mink.model.object;
@@ -175,6 +185,7 @@ use masc.core.stating;
 use masc.core.stream;
 use core_syntax: masc.core.syntax;
 use masc.core.trait;
+use masc.emit.cfi;
 use lines: masc.emit.line;
 use masc.format.dialect;
 use spell: masc.syntax.name;
@@ -196,6 +207,10 @@ pub val REREAD:    str = "text that reads back to another module than the format
 # - line tables the line directives do not state (`masc.asm.line`): a section's rows run from a sequence's first row to
 #   its section's end, one sequence per section, each row's `.loc` before the instruction it starts at, so a sequence
 #   of another extent, a row where no instruction starts and a row with an end column are refused
+# - call frame records the call frame directives do not state (`masc.asm.cfi`): a frame begins from the set's starting
+#   rules, names its function by the label placed where it begins and holds only rules a directive states, so other
+#   starting rules, a scaled or narrow save, a prologue or epilogue mark, a pointer no label names and overlapping
+#   frames are refused
 # - link-order owners written after the sections they order: a link-order section is stated by its `.section` order
 #   flag `o` and a name of the section it orders after, the section's own where its name alone enters it and no symbol
 #   of another section has it, else an anchor the disassembler states at the section's start, which the assembler reads
@@ -252,6 +267,14 @@ pub val WIDENED:        str = "instruction that widens the selection to one the 
 pub val MARK_SELECTION: str = "code mark naming a selection the set does not read, or one the object's register file and state do not hold";
 pub val UNROWED:        str = "relocation the object's format names no row of, which no .reloc states";
 pub val RAISED:         str = "label or relocation in a section the object's format holds its traits in, which the text states as traits";
+pub val FRAMES:         str = "frame on a format whose unwind table no call frame directive states";
+pub val FRAME_START:    str = "frame whose starting rules are not the set's, which every .cfi_startproc begins from";
+pub val FRAME_FUNCTION: str = "frame whose function no label placed where it begins names, which .cfi_startproc names it by";
+pub val FRAME_POINTER:  str = "personality or language data pointer no label the text states names";
+pub val FRAME_ORDER:    str = "frames that overlap, which the text begins one at a time";
+pub val FRAME_RULE:     str = "frame rule no call frame directive states, such as an offset that scales or a prologue or epilogue mark";
+pub val SAVE_WIDTH:     str = "register saved at a width other than its natural one, which no call frame directive states";
+pub val UNNAMED:        str = "frame register the set's syntax names no way";
 
 # how an instruction is spelled
 # ---
@@ -447,6 +470,11 @@ val PAIR:      Attempt = 2;
 # cleared:    every section's bytes as the builder encodes them, each field its format holds a relocation's addend in
 #             cleared, as the format writes the addend there from the relocation
 # starts:     per section, where its bytes start in `cleared`, empty until they are made
+# frames:     the object's frames in the order the text begins them
+# fi:         the next frame to begin, the open one before it
+# open:       whether a frame is begun and not yet ended
+# si:         the next rule of the open frame to write
+# spelling:   how the object's format writes a frame to its runtime unwind table
 rec Disasm {
     a:          *A.Allocator;
     s:          *set.Set;
@@ -504,6 +532,26 @@ rec Disasm {
     xi:         usize;
     spoken:     lines.Spoken;
     pending:    bool;
+    frames:     vector.Vector[Framed];
+    fi:         usize;
+    open:       bool;
+    si:         usize;
+    spelling:   cfi.Spelling;
+}
+
+# a frame of the object at its place
+# ---
+# section:  the section of its function
+# index:    its index among the object's frames
+# start:    where it begins in the section
+# end:      where it ends
+# function: the handle of the label its `.cfi_startproc` follows
+rec Framed {
+    section:  u32;
+    index:    usize;
+    start:    u64;
+    end:      u64;
+    function: u32;
 }
 
 # a line row at its place, `order` its place among the object's rows, which keeps rows at one offset in their order
@@ -592,18 +640,9 @@ fun put_hex(d: *Disasm, b: u8) {
     put_char(d, "0123456789abcdef"[(b & 15)::usize]);
 }
 
-# `name` written as a string, refused when it holds a quote, a backslash or a control character
-fun put_string(d: *Disasm, name: View) bool {
-    var i: usize = 0;
-    for (i < name.len) {
-        val c: u8 = name.data[i];
-        if (c == '"' || c == '\\' || c < 0x20) { ret false; }
-        i = i + 1;
-    }
-    put_char(d, '"');
-    put_view(d, name);
-    put_char(d, '"');
-    ret true;
+# `v` written in quotes as the assembler's strings read it back (`masc.emit.line.put_string`)
+fun put_string(d: *Disasm, v: View) {
+    if (!lines.put_string(d.out, v)) { d.full = true; }
 }
 
 # symbol name `name` written bare or in quotes, as `masc.syntax.write.name` spells it. `declare` refused every name the
@@ -2228,7 +2267,7 @@ fun labels_at(d: *Disasm, section: u32, at: u64, skip: u32) {
     for (d.li < d.labels.len && d.labels.data[d.li].section == section && d.labels.data[d.li].offset == at) {
         val h: u32 = d.labels.data[d.li].handle;
         d.li = d.li + 1;
-        if (h == skip) { cnt; }
+        if (h == skip || begins(d, section, at, h)) { cnt; }
         label_line(d, h);
     }
 }
@@ -2335,6 +2374,436 @@ fun next_row(d: *Disasm, section: u32, none: u64) u64 {
 fun unrowed(d: *Disasm, section: u32, at: u64) err[fail.Fail] {
     if (d.pending) { ret refusal(ROW, section, at); }
     ret err[fail.Fail].ok{};
+}
+
+fun frame_at(d: *Disasm, k: usize) *mink_object.Frame {
+    ret table.at[mink_object.Frame](?d.o.frames, table.nth[mink_object.Frame](k));
+}
+
+# an anchor stated where a frame names symbol `index` plus `addend` and the text can name that place only by one: a
+# section symbol's at the addend, a nameless one's at its place
+fun frame_anchor(d: *Disasm, index: u32, addend: i64, sections: u32) err[fail.Fail] {
+    val sym: *mink_object.Symbol = symbol_of(d, index);
+    if (!sel sym.def.placed) { ret err[fail.Fail].ok{}; }
+    val p: mink_object.Place = sym.def.placed;
+    if (p.section.index >= sections) { ret whole(PAST); }
+    var at: u64 = p.offset;
+    if (is_kind(sym.kind, symbol.SECTION))                                                             { at = anchored(d, p.section.index, addend); }
+    or (name_of(d, sym.name).len != 0)                                                                 { ret err[fail.Fail].ok{}; }
+    if (!held(vector.push[Label](?d.anchors, Label{section: p.section.index, offset: at, handle: 0}))) { ret whole(MEMORY); }
+    ret err[fail.Fail].ok{};
+}
+
+# the anchors the object's frames name their functions and pointers by
+fun frame_anchors(d: *Disasm, sections: u32) err[fail.Fail] {
+    var k: usize = 0;
+    for (k < table.count[mink_object.Frame](?d.o.frames)) {
+        val f: *mink_object.Frame = frame_at(d, k);
+        k = k + 1;
+        val err_function: err[fail.Fail] = frame_anchor(d, f.function.index, f.start:~i64, sections);
+        if (sel err_function.err) { ret err_function; }
+        if (sel f.personality.some) {
+            val err_personality: err[fail.Fail] = frame_anchor(d, f.personality.some.symbol.index, f.personality.some.addend, sections);
+            if (sel err_personality.err) { ret err_personality; }
+        }
+        if (sel f.lsda.some) {
+            val err_lsda: err[fail.Fail] = frame_anchor(d, f.lsda.some.symbol.index, f.lsda.some.addend, sections);
+            if (sel err_lsda.err) { ret err_lsda; }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the handle of the label the text names symbol `index` plus `addend` by where a frame names it: a section symbol's
+# anchor at the addend, a nameless symbol's anchor, or a named symbol with no addend, none when no label stands there
+fun frame_handle(d: *Disasm, index: u32, addend: i64) opt[u32] {
+    val sym: *mink_object.Symbol = symbol_of(d, index);
+    if (mapping_symbol(d, sym)) { ret opt[u32].none{}; }
+    if (sel sym.def.placed) {
+        val p: mink_object.Place = sym.def.placed;
+        if (is_kind(sym.kind, symbol.SECTION)) {
+            val at: u64 = anchored(d, p.section.index, addend);
+            if (at:~i64 != addend) { ret opt[u32].none{}; }
+            ret anchor_at(d, p.section.index, at);
+        }
+        if (name_of(d, sym.name).len == 0) {
+            if (addend != 0) { ret opt[u32].none{}; }
+            ret anchor_at(d, p.section.index, p.offset);
+        }
+    }
+    if (name_of(d, sym.name).len == 0 || addend != 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{index + 1};
+}
+
+# whether the label of handle `h` is placed at `at` of section `section`, a binary search of the labels
+fun placed_at(d: *Disasm, section: u32, at: u64, h: u32) bool {
+    var want: Label = Label{section: section, offset: at, handle: h};
+    var lo:   usize = 0;
+    var hi:   usize = d.labels.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (by_place(?d.labels.data[mid], ?want) < 0) { lo = mid + 1; }
+        or                                            { hi = mid; }
+    }
+    ret lo < d.labels.len && by_place(?d.labels.data[lo], ?want) == 0;
+}
+
+# whether the frame rules `x` and `y` state the same rule
+fun same_rule(d: *Disasm, x: frame.Rule, y: frame.Rule) bool {
+    if (sel x.def_cfa) {
+        if (sel y.def_cfa) { ret y.def_cfa.reg == x.def_cfa.reg && y.def_cfa.offset == x.def_cfa.offset; }
+        ret false;
+    }
+    if (sel x.def_cfa_scaled) {
+        if (sel y.def_cfa_scaled) { ret same_scaled(x.def_cfa_scaled, y.def_cfa_scaled); }
+        ret false;
+    }
+    if (sel x.cfa_offset) {
+        if (sel y.cfa_offset) { ret y.cfa_offset == x.cfa_offset; }
+        ret false;
+    }
+    if (sel x.cfa_register) {
+        if (sel y.cfa_register) { ret y.cfa_register == x.cfa_register; }
+        ret false;
+    }
+    if (sel x.offset) {
+        if (sel y.offset) { ret y.offset.reg == x.offset.reg && y.offset.offset == x.offset.offset && y.offset.width == x.offset.width; }
+        ret false;
+    }
+    if (sel x.val_offset) {
+        if (sel y.val_offset) { ret y.val_offset.reg == x.val_offset.reg && y.val_offset.offset == x.val_offset.offset; }
+        ret false;
+    }
+    if (sel x.register) {
+        if (sel y.register) { ret y.register.reg == x.register.reg && y.register.from == x.register.from; }
+        ret false;
+    }
+    if (sel x.same) {
+        if (sel y.same) { ret y.same == x.same; }
+        ret false;
+    }
+    if (sel x.undefined) {
+        if (sel y.undefined) { ret y.undefined == x.undefined; }
+        ret false;
+    }
+    if (sel x.restore) {
+        if (sel y.restore) { ret y.restore == x.restore; }
+        ret false;
+    }
+    if (sel x.expression) {
+        if (sel y.expression) {
+            var hx: store.Held = x.expression;
+            var hy: store.Held = y.expression;
+            ret store.same_bytes(store.bytes(?d.o.store, ?hx), store.bytes(?d.o.store, ?hy));
+        }
+        ret false;
+    }
+    if (sel x.scaled) {
+        if (sel y.scaled) { ret same_scaled(x.scaled, y.scaled); }
+        ret false;
+    }
+    if (sel x.epilogue) {
+        if (sel y.epilogue) { ret y.epilogue.begin == x.epilogue.begin && y.epilogue.end == x.epilogue.end; }
+        ret false;
+    }
+    if (sel x.remember)      { ret sel y.remember; }
+    if (sel x.restore_state) { ret sel y.restore_state; }
+    if (sel x.prologue_end)  { ret sel y.prologue_end; }
+    ret sel y.negate_ra;
+}
+
+# whether the scaled offsets `x` and `y` are the same
+fun same_scaled(x: frame.Scaled, y: frame.Scaled) bool {
+    ret x.reg == y.reg && x.fixed == y.fixed && x.scale == y.scale && x.quantity == y.quantity;
+}
+
+# whether frame `f` begins from the rules the set's frame `start` states, as the builder begins every frame it makes
+# (`masc.build.object.starting`): its canonical frame address, the return address where the set saves it, then the
+# set's other starting rules, under the set's alignment factors
+fun starts_as_set(d: *Disasm, f: *mink_object.Frame, start: *set.Frame) bool {
+    if (f.cie.code_align != start.code_align || f.cie.data_align != start.data_align) { ret false; }
+    val opt_unwind: opt[mink_arch.Unwind] = d.o.target.arch.unwind;
+    if (sel opt_unwind.none) { ret false; }
+    val opt_cfa: opt[u32] = state.debug_number(d.v.view.file, start.cfa_register, register.DWARF, d.v);
+    if (sel opt_cfa.none)      { ret false; }
+    if (opt_cfa.some > 0xFFFF) { ret false; }
+    var lead: usize = 1;
+    if (sel start.return_saved_at.some)                                                                                           { lead = 2; }
+    if (f.cie.initial.len != lead + start.initial.len::usize)                                                                     { ret false; }
+    if (!same_rule(d, f.cie.initial.data[0], frame.Rule.def_cfa{frame.Offset{reg: opt_cfa.some::u16, offset: start.cfa_offset}})) { ret false; }
+    if (sel start.return_saved_at.some) {
+        val ra: frame.Rule = frame.Rule.offset{frame.Saved{reg: opt_unwind.some.ra, offset: start.return_saved_at.some, width: frame.NATURAL}};
+        if (!same_rule(d, f.cie.initial.data[1], ra)) { ret false; }
+    }
+    var k: u32 = 0;
+    for (k < start.initial.len) {
+        if (!same_rule(d, f.cie.initial.data[lead + k::usize], start.initial.at[k])) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# frame `f` of section `s` checked against what the text states of it: the set's starting rules, pointers the format's
+# table writes and a label names, and rules a directive states
+fun frame_checked(d: *Disasm, f: *mink_object.Frame, s: u32, start: *set.Frame, codes: cfi.Codes) err[fail.Fail] {
+    if (!starts_as_set(d, f, start)) { ret refusal(FRAME_START, s, f.start); }
+    if (sel f.personality.some) {
+        if (sel codes.personality.none) { ret refusal(FRAMES, s, f.start); }
+        val opt_personality: opt[u32] = frame_handle(d, f.personality.some.symbol.index, f.personality.some.addend);
+        if (sel opt_personality.none) { ret refusal(FRAME_POINTER, s, f.start); }
+    }
+    if (sel f.lsda.some) {
+        if (sel codes.lsda.none) { ret refusal(FRAMES, s, f.start); }
+        val opt_lsda: opt[u32] = frame_handle(d, f.lsda.some.symbol.index, f.lsda.some.addend);
+        if (sel opt_lsda.none) { ret refusal(FRAME_POINTER, s, f.start); }
+    }
+    var k: usize = 0;
+    for (k < f.steps.len) {
+        val step: frame.Step = f.steps.data[k];
+        val rule: frame.Rule = step.rule;
+        k = k + 1;
+        if (sel rule.def_cfa_scaled || sel rule.scaled || sel rule.prologue_end || sel rule.epilogue || sel rule.negate_ra) { ret refusal(FRAME_RULE, s, step.at); }
+        if (sel rule.offset && rule.offset.width != frame.NATURAL)                                                          { ret refusal(SAVE_WIDTH, s, step.at); }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun by_frame(x: *Framed, y: *Framed) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.start != y.start) {
+        if (x.start < y.start) { ret -1; }
+        ret 1;
+    }
+    if (x.index < y.index) { ret -1; }
+    if (x.index > y.index) { ret 1; }
+    ret 0;
+}
+
+# the object's frames in the order the text begins them, each checked against what the text states of it, refused for
+# frames on a format whose table no call frame directive states, or frames that overlap
+fun frames_read(d: *Disasm) err[fail.Fail] {
+    val count: usize = table.count[mink_object.Frame](?d.o.frames);
+    if (count == 0)            { ret err[fail.Fail].ok{}; }
+    if (!sel d.spelling.dwarf) { ret whole(FRAMES); }
+    val codes:   cfi.Codes      = d.spelling.dwarf;
+    val opt_row: opt[*set.Arch] = set.arch_of(d.s, d.o.target.arch);
+    if (sel opt_row.none)          { ret whole(FRAMES); }
+    if (opt_row.some.frame == nil) { ret whole(FRAMES); }
+    val start:    *set.Frame = opt_row.some.frame;
+    val sections: u32        = table.count[mink_object.Section](?d.o.sections)::u32;
+    if (!held(vector.reserve[Framed](?d.frames, count))) { ret whole(MEMORY); }
+    var k: usize = 0;
+    for (k < count) {
+        val f:   *mink_object.Frame  = frame_at(d, k);
+        val sym: *mink_object.Symbol = symbol_of(d, f.function.index);
+        if (!sel sym.def.placed) { ret whole(FRAME_FUNCTION); }
+        val p: mink_object.Place = sym.def.placed;
+        if (p.section.index >= sections) { ret whole(PAST); }
+        val opt_function: opt[u32] = frame_handle(d, f.function.index, f.start:~i64 - p.offset:~i64);
+        if (sel opt_function.none)                                      { ret refusal(FRAME_FUNCTION, p.section.index, f.start); }
+        if (!placed_at(d, p.section.index, f.start, opt_function.some)) { ret refusal(FRAME_FUNCTION, p.section.index, f.start); }
+        val err_checked: err[fail.Fail] = frame_checked(d, f, p.section.index, start, codes);
+        if (sel err_checked.err) { ret err_checked; }
+        vector.push[Framed](?d.frames, Framed{section: p.section.index, index: k, start: f.start, end: f.end, function: opt_function.some});
+        k = k + 1;
+    }
+    sort.sort_by[Framed](d.frames.data, d.frames.len, by_frame);
+    k = 1;
+    for (k < d.frames.len) {
+        val before: *Framed = ?d.frames.data[k - 1];
+        val now:    *Framed = ?d.frames.data[k];
+        if (before.section == now.section && before.end > now.start) { ret refusal(FRAME_ORDER, now.section, now.start); }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the tables the frames are written to, as `.cfi_sections` names them, when the object states them
+fun frame_tables(d: *Disasm) {
+    val opt_frame_to: opt[frame.Destinations] = d.o.frame_to;
+    if (sel opt_frame_to.none) { ret; }
+    put(d, "\t.cfi_sections");
+    var first: bool  = true;
+    var i:     usize = 0;
+    for (i < frame.DESTINATION_COUNT) {
+        val dest: *frame.Destination = frame.DESTINATIONS[i];
+        i = i + 1;
+        if (!frame.has(opt_frame_to.some, dest)) { cnt; }
+        if (first)                               { put_char(d, ' '); }
+        or                                       { put(d, ", "); }
+        put(d, dest.name);
+        first = false;
+    }
+    put_char(d, '\n');
+}
+
+# whether a frame beginning at `at` of `section` is named by the label of handle `h`, which is written right before its
+# `.cfi_startproc`
+fun begins(d: *Disasm, section: u32, at: u64, h: u32) bool {
+    var k: usize = d.fi;
+    for (k < d.frames.len && d.frames.data[k].section == section && d.frames.data[k].start == at) {
+        if (d.frames.data[k].function == h) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# dwarf register `n` written by its name in the set's syntax, refused when no register the object's context admits has
+# it or the syntax names none
+fun frame_register(d: *Disasm, n: u16, s: u32, at: u64) err[fail.Fail] {
+    val opt_reg: opt[register.Id] = state.from_debug_number(d.v.view.file, n::u32, register.DWARF, d.v);
+    if (sel opt_reg.none) { ret refusal(cfi.NO_COLUMN, s, at); }
+    val err_held: err[register.Absent] = register.admitted(d.v.view, opt_reg.some);
+    if (sel err_held.err) { ret refusal(cfi.NO_REGISTER, s, at); }
+    var w:         core_syntax.Writer = writer(d);
+    val err_wrote: err[field.Refusal] = syntax_write.register_name(?w, opt_reg.some, field.NO_OPERAND);
+    if (sel err_wrote.err) { ret refusal(UNNAMED, s, at); }
+    ret err[fail.Fail].ok{};
+}
+
+# `.name register, offset`
+fun frame_saved(d: *Disasm, name: str, reg: u16, offset: i64, s: u32, at: u64) err[fail.Fail] {
+    put(d, name);
+    val err_register: err[fail.Fail] = frame_register(d, reg, s, at);
+    if (sel err_register.err) { ret err_register; }
+    put(d, ", ");
+    put_signed(d, offset);
+    put_char(d, '\n');
+    ret err[fail.Fail].ok{};
+}
+
+# `.name register`
+fun frame_alone(d: *Disasm, name: str, reg: u16, s: u32, at: u64) err[fail.Fail] {
+    put(d, name);
+    val err_register: err[fail.Fail] = frame_register(d, reg, s, at);
+    if (sel err_register.err) { ret err_register; }
+    put_char(d, '\n');
+    ret err[fail.Fail].ok{};
+}
+
+# frame rule `rule` as the `.cfi_` directive that states it, at `at` of section `s`. `frame_checked` refused the rules
+# no directive states
+fun frame_rule(d: *Disasm, rule: frame.Rule, s: u32, at: u64) err[fail.Fail] {
+    if (sel rule.def_cfa)       { ret frame_saved(d, "\t.cfi_def_cfa ", rule.def_cfa.reg, rule.def_cfa.offset, s, at); }
+    or (sel rule.cfa_register)  { ret frame_alone(d, "\t.cfi_def_cfa_register ", rule.cfa_register, s, at); }
+    or (sel rule.offset)        { ret frame_saved(d, "\t.cfi_offset ", rule.offset.reg, rule.offset.offset, s, at); }
+    or (sel rule.val_offset)    { ret frame_saved(d, "\t.cfi_val_offset ", rule.val_offset.reg, rule.val_offset.offset, s, at); }
+    or (sel rule.same)          { ret frame_alone(d, "\t.cfi_same_value ", rule.same, s, at); }
+    or (sel rule.undefined)     { ret frame_alone(d, "\t.cfi_undefined ", rule.undefined, s, at); }
+    or (sel rule.restore)       { ret frame_alone(d, "\t.cfi_restore ", rule.restore, s, at); }
+    or (sel rule.remember)      { put(d, "\t.cfi_remember_state\n"); }
+    or (sel rule.restore_state) { put(d, "\t.cfi_restore_state\n"); }
+    or (sel rule.cfa_offset) {
+        put(d, "\t.cfi_def_cfa_offset ");
+        put_signed(d, rule.cfa_offset);
+        put_char(d, '\n');
+    }
+    or (sel rule.register) {
+        put(d, "\t.cfi_register ");
+        val err_register: err[fail.Fail] = frame_register(d, rule.register.reg, s, at);
+        if (sel err_register.err) { ret err_register; }
+        put(d, ", ");
+        val err_from: err[fail.Fail] = frame_register(d, rule.register.from, s, at);
+        if (sel err_from.err) { ret err_from; }
+        put_char(d, '\n');
+    }
+    or (sel rule.expression) {
+        var h: store.Held  = rule.expression;
+        val b: store.Bytes = store.bytes(?d.o.store, ?h);
+        put(d, "\t.cfi_escape ");
+        var i: usize = 0;
+        for (i < b.len) {
+            if (i > 0) { put(d, ", "); }
+            put_hex(d, b.data[i]);
+            i = i + 1;
+        }
+        put_char(d, '\n');
+    }
+    or { ret refusal(FRAME_RULE, s, at); }
+    ret err[fail.Fail].ok{};
+}
+
+# a frame's pointer as `.cfi_personality` or `.cfi_lsda` states it: the table's encoding, its slot bit when it is
+# through one, and the label `frame_checked` found names it
+fun frame_pointer(d: *Disasm, name: str, code: u8, p: mink_object.Pointer) {
+    val opt_handle: opt[u32] = frame_handle(d, p.symbol.index, p.addend);
+    if (sel opt_handle.none) { ret; }
+    var c: u8 = code;
+    if (p.indirect) { c = c | pointer.INDIRECT; }
+    put(d, name);
+    put_hex(d, c);
+    put(d, ", ");
+    put_symbol(d, named(d::ptr, opt_handle.some));
+    put_char(d, '\n');
+}
+
+# the rules of the open frame at `at` of section `s` written
+fun frame_steps(d: *Disasm, s: u32, at: u64) err[fail.Fail] {
+    val f: *mink_object.Frame = frame_at(d, d.frames.data[d.fi - 1].index);
+    for (d.si < f.steps.len && f.steps.data[d.si].at == at) {
+        val err_wrote: err[fail.Fail] = frame_rule(d, f.steps.data[d.si].rule, s, at);
+        if (sel err_wrote.err) { ret err_wrote; }
+        d.si = d.si + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the open frame's rules at `at` of section `s` written, then its `.cfi_endproc` when it ends there
+fun frame_close(d: *Disasm, s: u32, at: u64) err[fail.Fail] {
+    if (!d.open) { ret err[fail.Fail].ok{}; }
+    val err_steps: err[fail.Fail] = frame_steps(d, s, at);
+    if (sel err_steps.err)                 { ret err_steps; }
+    if (d.frames.data[d.fi - 1].end != at) { ret err[fail.Fail].ok{}; }
+    put(d, "\t.cfi_endproc\n");
+    d.open = false;
+    ret err[fail.Fail].ok{};
+}
+
+# each frame beginning at `at` of section `s` begun: its function's label, `.cfi_startproc`, its pointers, whether it is
+# a signal handler's and its rules there, then its end when it ends there too
+fun frame_begin(d: *Disasm, s: u32, at: u64) err[fail.Fail] {
+    for (d.fi < d.frames.len && d.frames.data[d.fi].section == s && d.frames.data[d.fi].start == at) {
+        val fr: Framed = d.frames.data[d.fi];
+        # a frame of the function the frame before it here named follows that label still
+        if (d.fi == 0 || d.frames.data[d.fi - 1].section != s || d.frames.data[d.fi - 1].start != at || d.frames.data[d.fi - 1].function != fr.function) { label_line(d, fr.function); }
+        d.fi   = d.fi + 1;
+        d.open = true;
+        d.si   = 0;
+        put(d, "\t.cfi_startproc\n");
+        val f:   *mink_object.Frame = frame_at(d, fr.index);
+        val how: cfi.Spelling       = d.spelling;
+        # `frame_checked` refused a pointer the format's table writes no encoding for
+        if (sel how.dwarf) {
+            val codes: cfi.Codes = how.dwarf;
+            if (sel f.personality.some) {
+                if (sel codes.personality.some) { frame_pointer(d, "\t.cfi_personality ", codes.personality.some, f.personality.some); }
+            }
+            if (sel f.lsda.some) {
+                if (sel codes.lsda.some) { frame_pointer(d, "\t.cfi_lsda ", codes.lsda.some, f.lsda.some); }
+            }
+        }
+        if (f.signal) { put(d, "\t.cfi_signal_frame\n"); }
+        val err_closed: err[fail.Fail] = frame_close(d, s, at);
+        if (sel err_closed.err) { ret err_closed; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the offset of the next call frame directive of `section` before `none`: the open frame's next rule or its end, or
+# where the next frame begins
+fun next_frame(d: *Disasm, section: u32, none: u64) u64 {
+    var next: u64 = none;
+    if (d.open) {
+        val fr: *Framed            = ?d.frames.data[d.fi - 1];
+        val f:  *mink_object.Frame = frame_at(d, fr.index);
+        if (d.si < f.steps.len && f.steps.data[d.si].at < next) { next = f.steps.data[d.si].at; }
+        if (fr.end < next)                                      { next = fr.end; }
+    }
+    if (d.fi < d.frames.len && d.frames.data[d.fi].section == section && d.frames.data[d.fi].start < next) { next = d.frames.data[d.fi].start; }
+    ret next;
 }
 
 # the offset of the next label of `section`, `none` when it has no more
@@ -3045,8 +3514,8 @@ fun header(d: *Disasm, i: u32) err[fail.Fail] {
     val opt_flag_string: opt[usize] = core.flag_string(sec.flags, ?letters[0]);
     if (sel opt_flag_string.none) { ret refusal(SECTION, i, 0); }
     put(d, "\t.section ");
-    if (plain(name))          { put_view(d, name); }
-    or (!put_string(d, name)) { ret refusal(QUOTED, i, 0); }
+    if (plain(name)) { put_view(d, name); }
+    or               { put_string(d, name); }
     put(d, ", \"");
     put_bytes(d, ?letters[0], opt_flag_string.some);
     if (linked)             { put_char(d, core.ORDER_LETTER); }
@@ -3068,8 +3537,8 @@ fun header(d: *Disasm, i: u32) err[fail.Fail] {
     }
     if (sel opt_group.some) {
         put(d, ", ");
-        if (plain(opt_group.some))          { put_view(d, opt_group.some); }
-        or (!put_string(d, opt_group.some)) { ret refusal(QUOTED, i, 0); }
+        if (plain(opt_group.some)) { put_view(d, opt_group.some); }
+        or                         { put_string(d, opt_group.some); }
         put(d, ", ");
         put(d, core.COMDAT);
     }
@@ -3138,10 +3607,16 @@ fun section(d: *Disasm, i: u32) err[fail.Fail] {
         code = marked_at(d, i, at, code);
         var here: u32 = operand.NO_SYMBOL;
         if (code && sel sec.contents.held) { here = pair_label(d, i, at); }
+        # a frame's function is written before its `.cfi_startproc`, so no sequence binds it
+        if (begins(d, i, at, here)) { here = operand.NO_SYMBOL; }
+        val err_closed: err[fail.Fail] = frame_close(d, i, at);
+        if (sel err_closed.err) { ret err_closed; }
         labels_at(d, i, at, here);
+        val err_begun: err[fail.Fail] = frame_begin(d, i, at);
+        if (sel err_begun.err) { ret err_begun; }
         val err_located: err[fail.Fail] = rows_at(d, i, at);
         if (sel err_located.err) { ret err_located; }
-        val limit: u64 = next_row(d, i, next_mark(d, i, next_label(d, i, size)));
+        val limit: u64 = next_frame(d, i, next_row(d, i, next_mark(d, i, next_label(d, i, size))));
         if (here != operand.NO_SYMBOL) {
             d.here = here;
             val res_bound: res[u64, fail.Fail] = scoped(d, PAIR, i, data, len, at, limit);
@@ -3200,13 +3675,18 @@ fun section(d: *Disasm, i: u32) err[fail.Fail] {
         if (sel res_run.err) { ret err[fail.Fail].err{res_run.err}; }
         at = at + res_run.ok;
     }
+    val err_ended: err[fail.Fail] = frame_close(d, i, size);
+    if (sel err_ended.err) { ret err_ended; }
     labels_at(d, i, size, operand.NO_SYMBOL);
+    val err_last: err[fail.Fail] = frame_begin(d, i, size);
+    if (sel err_last.err)                                    { ret err_last; }
     if (d.xi < d.rows.len && d.rows.data[d.xi].section == i) { ret refusal(ROW, i, d.rows.data[d.xi].offset); }
     code = marked_at(d, i, size, code);
     leave(d);
     if (d.li < d.labels.len && d.labels.data[d.li].section == i) { ret refusal(PAST, i, d.labels.data[d.li].offset); }
     if (d.mi < d.marks.len && d.marks.data[d.mi].section == i)   { ret refusal(PAST, i, d.marks.data[d.mi].offset); }
     if (d.ri < d.sites.len && d.sites.data[d.ri].section == i)   { ret refusal(PAST, i, d.sites.data[d.ri].offset); }
+    if (d.fi < d.frames.len && d.frames.data[d.fi].section == i) { ret refusal(PAST, i, d.frames.data[d.fi].start); }
     ret err[fail.Fail].ok{};
 }
 
@@ -3229,6 +3709,7 @@ fun raised(d: *Disasm, i: u32) bool {
 fun unstated(d: *Disasm, i: u32) err[fail.Fail] {
     if (d.li < d.labels.len && d.labels.data[d.li].section == i) { ret refusal(RAISED, i, d.labels.data[d.li].offset); }
     if (d.ri < d.sites.len && d.sites.data[d.ri].section == i)   { ret refusal(RAISED, i, d.sites.data[d.ri].offset); }
+    if (d.fi < d.frames.len && d.frames.data[d.fi].section == i) { ret refusal(RAISED, i, d.frames.data[d.fi].start); }
     for (d.mi < d.marks.len && d.marks.data[d.mi].section == i) { d.mi = d.mi + 1; }
     ret err[fail.Fail].ok{};
 }
@@ -3247,7 +3728,7 @@ fun declare(d: *Disasm, i: u32) err[fail.Fail] {
     val name: View                = name_of(d, sym.name);
     if (is_kind(sym.kind, symbol.FILE)) {
         put(d, "\t.file ");
-        if (!put_string(d, name)) { ret whole(QUOTED); }
+        put_string(d, name);
         put_char(d, '\n');
         ret err[fail.Fail].ok{};
     }
@@ -3564,6 +4045,8 @@ fun index(d: *Disasm) err[fail.Fail] {
         }
         i = i + 1;
     }
+    val err_framed: err[fail.Fail] = frame_anchors(d, sections);
+    if (sel err_framed.err) { ret err_framed; }
     # an owner its name does not single out is named by an anchor at its start
     i = 0;
     for (i < sections) {
@@ -3989,6 +4472,7 @@ fun branch_targets(d: *Disasm) err[fail.Fail] {
 # everything the disassembly `d` allocated given back
 fun released(d: *Disasm) {
     vector.dnit[Located](?d.rows);
+    vector.dnit[Framed](?d.frames);
     vector.dnit[Label](?d.labels);
     vector.dnit[Site](?d.sites);
     vector.dnit[Label](?d.anchors);
@@ -4026,8 +4510,8 @@ fun released(d: *Disasm) {
     }
 }
 
-# the whole text of `d` written: its scopes, indices and line rows made, then the declarations, the file table, every
-# section, the bridges and the file's split, refused at the first fact it cannot state or when the output failed to grow
+# the whole text of `d` written: its scopes, indices, line rows and frames made, then the declarations, the file table,
+# the frame tables, every section, the bridges and the file's split, refused at the first fact it cannot state or when the output failed to grow
 fun written(d: *Disasm) err[fail.Fail] {
     val err_scoped: err[fail.Fail] = scopes(d, d.v);
     if (sel err_scoped.err) { ret err_scoped; }
@@ -4038,6 +4522,8 @@ fun written(d: *Disasm) err[fail.Fail] {
     d.fills = ?d.scopes.data[0].fills;
     val err_rowed: err[fail.Fail] = line_rows(d);
     if (sel err_rowed.err) { ret err_rowed; }
+    val err_framed: err[fail.Fail] = frames_read(d);
+    if (sel err_framed.err) { ret err_framed; }
     var i: u32 = 0;
     for (i < d.count) {
         val err_declared: err[fail.Fail] = declare(d, i);
@@ -4046,6 +4532,7 @@ fun written(d: *Disasm) err[fail.Fail] {
     }
     val err_filed: err[fail.Fail] = files(d);
     if (sel err_filed.err) { ret err_filed; }
+    frame_tables(d);
     i = 0;
     for (i < table.count[mink_object.Section](?d.o.sections)::u32) {
         var err_done: err[fail.Fail] = err[fail.Fail].ok{};
@@ -4095,8 +4582,8 @@ fun bridges(d: *Disasm) err[fail.Fail] {
     if (sel opt_word.none) { ret whole(NO_WORD); }
     val section: View = View{data: d.dialect.bridges.section, len: str_len(d.dialect.bridges.section)};
     put(d, "\t.section ");
-    if (plain(section))          { put_view(d, section); }
-    or (!put_string(d, section)) { ret whole(QUOTED); }
+    if (plain(section)) { put_view(d, section); }
+    or                  { put_string(d, section); }
     put_char(d, '\n');
     var k: usize = 0;
     for (k < count) {
@@ -4246,6 +4733,11 @@ fun sectioned(a: *A.Allocator, s: *set.Set, v: *state.Context, options: Options,
         xi:         0,
         spoken:     lines.UNSPOKEN,
         pending:    false,
+        frames:     vector.init[Framed](a),
+        fi:         0,
+        open:       false,
+        si:         0,
+        spelling:   cfi.spelling(options.formats, options.dialect.format),
     };
     var k: u32 = 0;
     for (k < relax.MAX_STEPS) {
