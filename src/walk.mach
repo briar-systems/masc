@@ -29,7 +29,8 @@
 # loads and stores of each width, extensions, shifts and rotates by a constant,
 # byte swaps, bitfields and bitwise ops with a constant, `spreads`) carries
 # each byte where it puts it, and a register xored with itself, or and with
-# its own complement, writes public zero bytes. any other write makes every byte it writes secret
+# its own complement, writes public zero bytes, as it writes a row held whole
+# public (`self_zeroed`). any other write makes every byte it writes secret
 # where its value is, and the bytes of the bank it leaves are as a row's write
 # leaves them. a read of a row asks its own bytes alone, so a narrow compare of
 # a public byte reads no secret.
@@ -2786,6 +2787,8 @@ fun moves(w: *Walk, p: *Point, ins: *codec.Decoded, fp: *footprint.Footprint) er
         if (sel rel.holds.bytes) {
             val err_realigned: err[A.Error] = realigned(w, p, ins, rel, rel.holds.bytes);
             if (sel err_realigned.err) { ret err_realigned; }
+            val err_zeroed: err[A.Error] = self_zeroed(w, ins, rel, rel.holds.bytes);
+            if (sel err_zeroed.err) { ret err_zeroed; }
             cnt;
         }
         if (sel rel.holds.number || sel rel.holds.fixed) {
@@ -2941,6 +2944,23 @@ fun realigned(w: *Walk, p: *Point, ins: *codec.Decoded, rel: *effect.Relation, b
     ret err[A.Error].ok{};
 }
 
+# the register a bytes relation `rel` of `ins` writes into `w.derived` as public where it is a register xored with
+# itself, or anded with its own complement, unshifted and unconditional: zero whatever the register held, a row the
+# walk holds whole, as x86's xorps of an xmm register with itself, as much as one it holds per byte
+fun self_zeroed(w: *Walk, ins: *codec.Decoded, rel: *effect.Relation, b: effect.Bytes) err[A.Error] {
+    if (b.spread != effect.BIT_XOR && b.spread != effect.BIT_ANDN)                               { ret err[A.Error].ok{}; }
+    if (b.with == field.NO_OPERAND || b.shift != field.NO_OPERAND || b.when != field.NO_OPERAND) { ret err[A.Error].ok{}; }
+    val values:    operand.Values = operand.Values{at: ins.inst.values, len: ins.inst.count};
+    val opt_to:    opt[u32]       = relation_row(w, ins, rel);
+    val opt_from:  opt[u32]       = lane_source(w, ins, b.from);
+    val opt_other: opt[u32]       = row_index(w, query.register_held(values, b.with));
+    if (sel opt_to.none)                 { ret err[A.Error].ok{}; }
+    if (sel opt_from.none)               { ret err[A.Error].ok{}; }
+    if (sel opt_other.none)              { ret err[A.Error].ok{}; }
+    if (opt_from.some != opt_other.some) { ret err[A.Error].ok{}; }
+    ret derive(w, opt_to.some, false);
+}
+
 # row `row` into `w.derived` as written from inputs of which any is secret when `secret` is, one a relation and the
 # stack's delta both write taking either's
 fun derive(w: *Walk, row: u32, secret: bool) err[A.Error] {
@@ -3055,6 +3075,23 @@ fun bytes_of(width: *effect.Width) u64 {
     val count: effect.Count = width.count;
     if (!sel count.one || width.element.per != 0 || width.element.fixed == 0) { ret 0; }
     ret (width.element.fixed::u64 + 7) / 8;
+}
+
+# the bytes access `acc` of `ins` covers under `p`, 0 when the walk does not know them: its width's where that is
+# fixed, and for one counted by a register, the elements the set's configuration hooks say the state in force fixes
+# exactly (`config.Hooks.counted`) times its element, as a risc-v unit-stride load under the vl vsetivli set
+fun access_bytes(w: *Walk, p: *Point, ins: *codec.Decoded, acc: *effect.Access) u64 {
+    val fixed: u64 = bytes_of(?acc.width);
+    if (fixed != 0) { ret fixed; }
+    val count: effect.Count  = acc.width.count;
+    val hooks: *config.Hooks = w.code.set.config;
+    if (!sel count.register || hooks == nil)                                                            { ret 0; }
+    if (acc.width.element.per != 0 || acc.width.element.fixed == 0 || acc.width.element.fixed % 8 != 0) { ret 0; }
+    val held: opt[config.State] = p.config;
+    if (sel held.none) { ret 0; }
+    val opt_counted: opt[u64] = hooks.counted(held.some, ins.inst.row, operand.Values{at: ins.inst.values, len: ins.inst.count}, w.ctx);
+    if (sel opt_counted.none) { ret 0; }
+    ret opt_counted.some * (acc.width.element.fixed::u64 / 8);
 }
 
 # the extent an address of `ins` touches, from the operand that is or holds it plus the immediates of the further
@@ -3973,10 +4010,11 @@ fun touches(w: *Walk, p: *Point, ins: *codec.Decoded, fp: *footprint.Footprint) 
         val acc:  *effect.Access = ?fp.memory.at[i];
         var role: operand.Role   = acc.role;
         if (role == operand.NONE && acc.operand != field.NO_OPERAND && acc.operand::u32 < ins.inst.count) { role = constraint.role_under(?r[acc.operand], w.ctx); }
-        var t: Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: UNPLACED, row: effect.NO_ROW, rebased: 0, named: acc.operand, index: i, seeded: false, secret: false, ranged: false};
-        placed(w, p, ins, acc.operand, acc.base, acc.forming, acc.offset, bytes_of(?acc.width), !sel acc.index.none, ?t);
+        var t:      Touch = Touch{reads: (role & operand.READ) != 0, writes: (role & operand.WRITE) != 0, operand: field.NO_OPERAND, at: UNPLACED, row: effect.NO_ROW, rebased: 0, named: acc.operand, index: i, seeded: false, secret: false, ranged: false};
+        val length: u64   = access_bytes(w, p, ins, acc);
+        placed(w, p, ins, acc.operand, acc.base, acc.forming, acc.offset, length, !sel acc.index.none, ?t);
         take_seed(w, p, ?t);
-        take_within(w, ?t, bytes_of(?acc.width), !sel acc.index.none);
+        take_within(w, ?t, length, !sel acc.index.none);
         confine(w, ?t);
         val opt_indexed: opt[ct.Refusal] = index_secret(w, p, ins, ?acc.index);
         if (sel opt_indexed.some)                                                      { ret found(opt_indexed.some); }
@@ -4551,7 +4589,7 @@ fun apply(w: *Walk, p: *Point, r: *Point, at: usize, ins: *codec.Decoded, fp: *f
     }
     val hooks: *config.Hooks = w.code.set.config;
     if (hooks != nil) {
-        val est: config.Established = hooks.establish(ins.inst.row, operand.Values{at: ins.inst.values, len: ins.inst.count});
+        val est: config.Established = hooks.establish(ins.inst.row, operand.Values{at: ins.inst.values, len: ins.inst.count}, p.config);
         if (sel est.sets)      { p.config = opt[config.State].some{est.sets}; }
         if (sel est.undecided) { p.config = opt[config.State].none{}; }
     }
