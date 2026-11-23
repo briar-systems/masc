@@ -1,0 +1,192 @@
+# the XED reader: the generator-side model of Intel's XED datafiles
+#
+# XED (github.com/intelxed/xed) states the x86 instruction set as datafiles: instruction records
+# with their decode patterns and operands, the nonterminals those patterns match, and the
+# registers, operand widths and cpuid bits they name. the reader reads every datafile the
+# layers of the copy under vendor/xed list into one model and refuses a malformed record with
+# its file and line. it emits nothing: the x86 generators build their tables from the model,
+# and the model holds what every mode needs, so a 64-bit table and a 32-bit one come from it
+# alike
+#
+# the model holds, each read where its module says:
+#   files         the datafiles the layers list, by kind (gen.isa.x86.xed.layer)
+#   tables        the state macros, operand fields, registers, widths and element types
+#                 (gen.isa.x86.xed.table)
+#   cpuid         each ISA set's cpuid bits (gen.isa.x86.xed.cpuid)
+#   nonterminals  the decode nonterminals, from the dec-spine and dec-patterns files and the
+#                 plain sections of the instruction files (gen.isa.x86.xed.nonterminal)
+#   instructions  the decode instruction records, one a pattern (gen.isa.x86.xed.instruction)
+# every nonterminal a pattern, an operand or a binding names is one the model holds. the encode
+# patterns, the encoder's own nonterminals, are not read: an encoding is the inverse of the
+# decode patterns, which state every bit
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use gen.diag;
+use gen.lines;
+use gen.source;
+
+use gen.isa.x86.xed.cpuid;
+use gen.isa.x86.xed.instruction;
+use gen.isa.x86.xed.layer;
+use gen.isa.x86.xed.nonterminal;
+use gen.isa.x86.xed.operand;
+use gen.isa.x86.xed.pattern;
+use gen.isa.x86.xed.section;
+use gen.isa.x86.xed.table;
+
+# the model of a copy of XED's datafiles
+pub rec Xed {
+    files:        vector.Vector[layer.Listed];
+    tables:       table.Tables;
+    cpuid:        cpuid.Cpuid;
+    nonterminals: nonterminal.Nonterminals;
+    instructions: vector.Vector[instruction.Instruction];
+}
+
+pub val NO_NONTERMINAL: str = "names no nonterminal the decode patterns state";
+
+fun named(x: *Xed, l: *lines.Line, name: str) err[diag.Refusal] {
+    val opt_find: opt[*nonterminal.Nonterminal] = nonterminal.find(?x.nonterminals, name);
+    if (sel opt_find.none) { ret err[diag.Refusal].err{lines.refuse(l, NO_NONTERMINAL, name)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun calls(x: *Xed, l: *lines.Line, p: *pattern.Pattern) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < p.pieces.len) {
+        if (p.pieces.data[i].kind == pattern.CALL) {
+            val err_named: err[diag.Refusal] = named(x, l, p.pieces.data[i].name);
+            if (sel err_named.err) { ret err_named; }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun operands(x: *Xed, l: *lines.Line, ops: *vector.Vector[operand.Operand]) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < ops.len) {
+        if (ops.data[i].form == operand.NONTERMINAL) {
+            val err_named: err[diag.Refusal] = named(x, l, ops.data[i].value);
+            if (sel err_named.err) { ret err_named; }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# every nonterminal the model names is one it holds
+fun closed(x: *Xed) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < x.nonterminals.all.len) {
+        val nt: *nonterminal.Nonterminal = ?x.nonterminals.all.data[i];
+        var k:  usize                    = 0;
+        for (k < nt.rules.len) {
+            val r:         *nonterminal.Rule = ?nt.rules.data[k];
+            val err_calls: err[diag.Refusal] = calls(x, ?r.line, ?r.pattern);
+            if (sel err_calls.err) { ret err_calls; }
+            val err_operands: err[diag.Refusal] = operands(x, ?r.line, ?r.bindings);
+            if (sel err_operands.err) { ret err_operands; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.instructions.len) {
+        val n:         *instruction.Instruction = ?x.instructions.data[i];
+        val err_calls: err[diag.Refusal]        = calls(x, ?n.line, ?n.pattern);
+        if (sel err_calls.err) { ret err_calls; }
+        val err_operands: err[diag.Refusal] = operands(x, ?n.line, ?n.operands);
+        if (sel err_operands.err) { ret err_operands; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the sections of every file of `kind` read into the model
+# ---
+# a file that opens with no header continues the last section before it. a file of instruction records continues
+# only its own layer's, as amd/xed-amd-sse4a.txt continues xed-amd-svm.txt's INSTRUCTIONS, and the first of its layer
+# past the first file opens INSTRUCTIONS, the legacy space's records, as via/via-padlock-isa.xed.txt's legacy
+# encodings are, never the vex or evex records of a layer read before it
+fun sections(a: *A.Allocator, x: *Xed, kind: str, d: *instruction.Drops) err[diag.Refusal] {
+    val res_listed: res[vector.Vector[*layer.Listed], diag.Refusal] = layer.of(a, ?x.files, kind);
+    if (sel res_listed.err) { ret err[diag.Refusal].err{res_listed.err}; }
+    val records: bool  = str_equals(kind, "dec-instructions");
+    var last:    section.Section;
+    var layered: str   = nil;
+    var any:     bool  = false;
+    var i:       usize = 0;
+    for (i < res_listed.ok.len) {
+        val here:   *layer.Listed    = res_listed.ok.data[i];
+        var opened: section.Section  = section.Section{name: "INSTRUCTIONS", type: nil, instructions: true, header: here.listed, lines: vector.init[lines.Line](a)};
+        var before: *section.Section = nil;
+        if (any)                                                      { before = ?last; }
+        if (records && any && !str_equals(layered, here.listed.file)) { before = ?opened; }
+        val res_read: res[vector.Vector[section.Section], diag.Refusal] = section.read(a, res_listed.ok.data[i].file, before);
+        if (sel res_read.err) { ret err[diag.Refusal].err{res_read.err}; }
+        if (res_read.ok.len > 0) {
+            last    = res_read.ok.data[res_read.ok.len - 1];
+            layered = here.listed.file;
+            any     = true;
+        }
+        var k: usize = 0;
+        for (k < res_read.ok.len) {
+            val s: *section.Section = ?res_read.ok.data[k];
+            if (s.instructions) {
+                val res_opened: res[*nonterminal.Nonterminal, diag.Refusal] = nonterminal.open(a, ?x.nonterminals, s);
+                if (sel res_opened.err) { ret err[diag.Refusal].err{res_opened.err}; }
+                val err_read: err[diag.Refusal] = instruction.read(a, ?x.tables, s, d, ?x.instructions);
+                if (sel err_read.err) { ret err_read; }
+            }
+            or {
+                val err_read: err[diag.Refusal] = nonterminal.read(a, ?x.tables, ?x.nonterminals, s);
+                if (sel err_read.err) { ret err_read; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the model of the copy `t`
+# ---
+# a:   allocator for the model, which outlives every reader of it
+# t:   the copy's tree, checked against its record
+# ret: the model, or the refusal of a malformed record naming its file and line
+pub fun read(a: *A.Allocator, t: *source.Tree) res[Xed, diag.Refusal] {
+    val res_files: res[vector.Vector[layer.Listed], diag.Refusal] = layer.read(a, t);
+    if (sel res_files.err) { ret res[Xed, diag.Refusal].err{res_files.err}; }
+    var x:          Xed                             = Xed{files: res_files.ok, tables: table.Tables{}, cpuid: cpuid.Cpuid{}, nonterminals: nonterminal.init(a), instructions: vector.init[instruction.Instruction](a)};
+    val res_tables: res[table.Tables, diag.Refusal] = table.read(a, ?x.files);
+    if (sel res_tables.err) { ret res[Xed, diag.Refusal].err{res_tables.err}; }
+    x.tables = res_tables.ok;
+    val res_bits: res[cpuid.Cpuid, diag.Refusal] = cpuid.read(a, ?x.files);
+    if (sel res_bits.err) { ret res[Xed, diag.Refusal].err{res_bits.err}; }
+    x.cpuid = res_bits.ok;
+    var d:         instruction.Drops = instruction.drops(a);
+    val err_spine: err[diag.Refusal] = sections(a, ?x, "dec-spine", ?d);
+    if (sel err_spine.err) { ret res[Xed, diag.Refusal].err{err_spine.err}; }
+    val err_patterns: err[diag.Refusal] = sections(a, ?x, "dec-patterns", ?d);
+    if (sel err_patterns.err) { ret res[Xed, diag.Refusal].err{err_patterns.err}; }
+    val err_records: err[diag.Refusal] = sections(a, ?x, "dec-instructions", ?d);
+    if (sel err_records.err) { ret res[Xed, diag.Refusal].err{err_records.err}; }
+    val err_settled: err[diag.Refusal] = instruction.settle(a, ?x.instructions, ?d);
+    if (sel err_settled.err) { ret res[Xed, diag.Refusal].err{err_settled.err}; }
+    val err_whole: err[diag.Refusal] = closed(?x);
+    if (sel err_whole.err) { ret res[Xed, diag.Refusal].err{err_whole.err}; }
+    ret res[Xed, diag.Refusal].ok{x};
+}

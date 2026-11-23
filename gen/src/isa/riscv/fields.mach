@@ -1,0 +1,854 @@
+# the riscv operand layouts, read from the fields topic and written as gen_field
+#
+# almost every riscv field is a slice of an operand's number: the split b, j,
+# s and compressed immediates are pieces of one encoded number, the implied
+# zero low bit stated as the immediate's scale, and the register-prime fields a
+# register range of x8 to x15 in three bits. a layout states those pieces and
+# the immediate once, a choice the pieces and members of an enumerant, and a
+# position where a register's number lies. the topic gen/data/riscv/fields.txt
+# states each, and its lines:
+#
+#   integers <name> | <numbers>          values an immediate never admits, as `NAME_EXCLUDED`
+#   numbers <name> | <numbers>           register numbers a position never admits, as `NAME_EXCLUDED`
+#   value <name> | <number>              an enumerant value the set's modules name
+#   member <set> | "<name>" <value>      the next member of an enumerant's set, its value a number or a value's name
+#   layout <name> | <words>              unit, pieces, bits, sign, scale, bias, excluded, and `relative` for a target
+#   immediate <name> | <words>           an immediate with no pieces, a field kind encoding it whole
+#   choice <name> | <words>              unit, pieces and members
+#   position <name> | <words>            unit, at, len, first, count, excluded and group
+#   kind <name> | <number>               the index of a field kind in the set's field table, as `NAME_KIND`
+#
+# pieces are `lo:len@at`, comma separated, numbers are numbers or ranges
+# `lo-hi`. riscv-opcodes states none of these, so no line overrides it. the
+# generator builds each in memory as the core record masc holds, computes rows
+# from them, and writes them to gen_field.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use masc.core.index;
+use masc.core.layout;
+use masc.core.operand;
+
+use gen.diag;
+use gen.emit;
+use gen.overlay;
+use gen.set;
+
+pub val TOPIC: str = "fields";
+
+pub val BAD_FACT:    str = "fields line is not integers, numbers, value, member, layout, immediate, choice, position or kind";
+pub val NAMED_TWICE: str = "field name given twice";
+pub val NO_SUCH:     str = "fields line names a list, value or member set the topic does not state";
+pub val BAD_PIECE:   str = "piece is not lo:len@at";
+pub val BAD_SIGN:    str = "sign is not signed, unsigned or either";
+pub val MISSING:     str = "fields line lacks a word its kind needs";
+pub val NO_MEMBERS:  str = "choice's member set states no member";
+
+# a list of integers or register numbers, declared as `<NAME>_EXCLUDED`
+pub rec Excluded {
+    name:    str;
+    ints:    vector.Vector[i64];
+    numbers: vector.Vector[u32];
+    signed:  bool;
+}
+
+# a value the set's modules name, or a field kind's index
+pub rec Constant {
+    name:  str;
+    value: u32;
+}
+
+# one member of an enumerant set
+# ---
+# constant: the value it names, nil for a number
+pub rec Member {
+    name:     str;
+    value:    u32;
+    constant: str;
+}
+
+# an enumerant set, declared as `<NAME>_MEMBERS` and indexed by name as `<NAME>_NAMES`
+pub rec Members {
+    name:    str;
+    members: vector.Vector[Member];
+    built:   *operand.Enumerant;
+    names:   *index.Entry;
+}
+
+# a layout and whether it is a target relative to its row
+pub rec Layout {
+    name:     str;
+    relative: bool;
+    excluded: *Excluded;
+    at:       *layout.Layout;
+}
+
+pub rec Immediate {
+    name:     str;
+    excluded: *Excluded;
+    at:       *operand.Immediate;
+}
+
+pub rec Choice {
+    name:    str;
+    members: *Members;
+    at:      *layout.Choice;
+}
+
+pub rec Position {
+    name:     str;
+    excluded: *Excluded;
+    at:       *layout.Position;
+}
+
+# every field fact of the topic, built
+pub rec Fields {
+    excluded:   vector.Vector[*Excluded];
+    values:     vector.Vector[Constant];
+    sets:       vector.Vector[*Members];
+    layouts:    vector.Vector[*Layout];
+    immediates: vector.Vector[*Immediate];
+    choices:    vector.Vector[*Choice];
+    positions:  vector.Vector[*Position];
+    kinds:      vector.Vector[Constant];
+    names:      map.Map[str, u32];
+}
+
+fun memory(f: *overlay.Fact) diag.Refusal {
+    ret overlay.refuse(f, diag.MEMORY, nil);
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# the name of the subject of `f`, the word after its kind
+fun subject(f: *overlay.Fact) str {
+    var i: usize = 0;
+    for (f.key[i] != 0 && f.key[i] != ' ') {
+        i = i + 1;
+    }
+    if (f.key[i] == 0) { ret ""; }
+    ret ?f.key[i + 1];
+}
+
+fun kind_is(f: *overlay.Fact, kind: str) bool {
+    val n: usize = str_len(kind);
+    if (str_len(f.key) <= n || f.key[n] != ' ') { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (f.key[i] != kind[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# `name` claimed for one field fact
+fun claim(fs: *Fields, f: *overlay.Fact, name: str) err[diag.Refusal] {
+    var key:       str       = name;
+    val opt_known: opt[*u32] = map.get[str, u32](?fs.names, ?key);
+    if (sel opt_known.some) { ret err[diag.Refusal].err{overlay.refuse(f, NAMED_TWICE, name)}; }
+    val res_put: res[bool, A.Error] = map.insert[str, u32](?fs.names, name, 0);
+    if (sel res_put.err) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the numbers and ranges `lo-hi` of words `from` on of `ws`, into `out`
+fun numbers(f: *overlay.Fact, ws: *vector.Vector[str], from: usize, out: *vector.Vector[i64]) err[diag.Refusal] {
+    var i: usize = from;
+    for (i < ws.len) {
+        val w:    str   = ws.data[i];
+        var dash: usize = 1;
+        for (w[dash] != 0 && w[dash] != '-') {
+            dash = dash + 1;
+        }
+        if (w[0] != 0 && w[dash] == '-') {
+            var head: [24]u8;
+            var k:    usize = 0;
+            for (k < dash && k < 23) {
+                head[k] = w[k];
+                k       = k + 1;
+            }
+            head[k] = 0;
+            val res_number: res[i64, diag.Refusal] = overlay.number(f, ?head[0]);
+            val res_high:   res[i64, diag.Refusal] = overlay.number(f, ?w[dash + 1]);
+            if (sel res_number.err) { ret err[diag.Refusal].err{res_number.err}; }
+            if (sel res_high.err)   { ret err[diag.Refusal].err{res_high.err}; }
+            var n: i64 = res_number.ok;
+            for (n <= res_high.ok) {
+                if (!pushed(vector.push[i64](out, n))) { ret err[diag.Refusal].err{memory(f)}; }
+                n = n + 1;
+            }
+        }
+        or {
+            val res_one: res[i64, diag.Refusal] = overlay.number(f, w);
+            if (sel res_one.err)                            { ret err[diag.Refusal].err{res_one.err}; }
+            if (!pushed(vector.push[i64](out, res_one.ok))) { ret err[diag.Refusal].err{memory(f)}; }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the named value `name` of `ws` as a number, `otherwise` when no word names it
+fun word_number(f: *overlay.Fact, ws: *vector.Vector[str], name: str, otherwise: i64, needed: bool) res[i64, diag.Refusal] {
+    val opt_value: opt[str] = overlay.value(ws, name);
+    if (sel opt_value.none) {
+        if (needed) { ret res[i64, diag.Refusal].err{overlay.refuse(f, MISSING, name)}; }
+        ret res[i64, diag.Refusal].ok{otherwise};
+    }
+    ret overlay.number(f, opt_value.some);
+}
+
+# every word of `ws` is a named value of `allowed` or a flag of `flags`
+fun only(f: *overlay.Fact, ws: *vector.Vector[str], allowed: *str, count: usize, flags: *str, flag_count: usize) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < ws.len) {
+        val w:    str   = ws.data[i];
+        var good: bool  = false;
+        var k:    usize = 0;
+        for (!good && k < count) {
+            val n: usize = str_len(allowed[k]);
+            if (str_len(w) > n && w[n] == '=') {
+                var same: bool  = true;
+                var j:    usize = 0;
+                for (j < n) {
+                    if (w[j] != allowed[k][j]) { same = false; }
+                    j = j + 1;
+                }
+                good = same;
+            }
+            k = k + 1;
+        }
+        k = 0;
+        for (!good && k < flag_count) {
+            good = str_equals(w, flags[k]);
+            k    = k + 1;
+        }
+        if (!good) { ret err[diag.Refusal].err{overlay.refuse(f, overlay.UNKNOWN_WORD, w)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+fun excluded_named(fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str], signed: bool) res[*Excluded, diag.Refusal] {
+    val opt_value: opt[str] = overlay.value(ws, "excluded");
+    if (sel opt_value.none) { ret res[*Excluded, diag.Refusal].ok{nil}; }
+    var i: usize = 0;
+    for (i < fs.excluded.len) {
+        val x: *Excluded = fs.excluded.data[i];
+        if (str_equals(x.name, opt_value.some) && x.signed == signed) { ret res[*Excluded, diag.Refusal].ok{x}; }
+        i = i + 1;
+    }
+    ret res[*Excluded, diag.Refusal].err{overlay.refuse(f, NO_SUCH, opt_value.some)};
+}
+
+fun integers_of(x: *Excluded) operand.Integers {
+    if (x == nil) { ret operand.NO_INTEGERS; }
+    ret operand.Integers{at: x.ints.data, len: x.ints.len::u32};
+}
+
+fun numbers_of(x: *Excluded) operand.Numbers {
+    if (x == nil) { ret operand.NO_NUMBERS; }
+    ret operand.Numbers{at: x.numbers.data, len: x.numbers.len::u32};
+}
+
+# the pieces `pieces=` names, allocated
+fun pieces(a: *A.Allocator, f: *overlay.Fact, ws: *vector.Vector[str]) res[layout.Pieces, diag.Refusal] {
+    val opt_value: opt[str] = overlay.value(ws, "pieces");
+    if (sel opt_value.none) { ret res[layout.Pieces, diag.Refusal].err{overlay.refuse(f, MISSING, "pieces")}; }
+    var out:  vector.Vector[layout.Piece] = vector.init[layout.Piece](a);
+    val text: str                         = opt_value.some;
+    var at:   usize                       = 0;
+    for (text[at] != 0) {
+        var p: [3]i64;
+        var k: u32 = 0;
+        for (k < 3) {
+            var n:   i64  = 0;
+            var any: bool = false;
+            for (text[at] >= '0' && text[at] <= '9') {
+                n   = n * 10 + (text[at] - '0')::i64;
+                any = true;
+                at  = at + 1;
+            }
+            if (!any) { ret res[layout.Pieces, diag.Refusal].err{overlay.refuse(f, BAD_PIECE, text)}; }
+            p[k] = n;
+            if (k == 0 && text[at] != ':') { ret res[layout.Pieces, diag.Refusal].err{overlay.refuse(f, BAD_PIECE, text)}; }
+            if (k == 1 && text[at] != '@') { ret res[layout.Pieces, diag.Refusal].err{overlay.refuse(f, BAD_PIECE, text)}; }
+            if (k < 2)                     { at = at + 1; }
+            k = k + 1;
+        }
+        if (!pushed(vector.push[layout.Piece](?out, layout.Piece{lo: p[0]::u8, len: p[1]::u8, at: p[2]::u8}))) { ret res[layout.Pieces, diag.Refusal].err{memory(f)}; }
+        if (text[at] == ',')                                                                                   { at = at + 1; }
+        or (text[at] != 0)                                                                                     { ret res[layout.Pieces, diag.Refusal].err{overlay.refuse(f, BAD_PIECE, text)}; }
+    }
+    ret res[layout.Pieces, diag.Refusal].ok{layout.Pieces{at: out.data, len: out.len::u32}};
+}
+
+# the immediate the words state, its excluded values among the topic's integers
+fun immediate_of(fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str], out: *operand.Immediate, excluded: **Excluded) err[diag.Refusal] {
+    val res_bits:  res[i64, diag.Refusal] = word_number(f, ws, "bits", 0, true);
+    val res_scale: res[i64, diag.Refusal] = word_number(f, ws, "scale", 0, false);
+    val res_bias:  res[i64, diag.Refusal] = word_number(f, ws, "bias", 0, false);
+    if (sel res_bits.err)  { ret err[diag.Refusal].err{res_bits.err}; }
+    if (sel res_scale.err) { ret err[diag.Refusal].err{res_scale.err}; }
+    if (sel res_bias.err)  { ret err[diag.Refusal].err{res_bias.err}; }
+    val opt_sign: opt[str] = overlay.value(ws, "sign");
+    if (sel opt_sign.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "sign")}; }
+    var s: operand.Sign = operand.UNSIGNED;
+    if (str_equals(opt_sign.some, "signed"))    { s = operand.SIGNED; }
+    or (str_equals(opt_sign.some, "either"))    { s = operand.EITHER; }
+    or (!str_equals(opt_sign.some, "unsigned")) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_SIGN, opt_sign.some)}; }
+    val res_excluded_named: res[*Excluded, diag.Refusal] = excluded_named(fs, f, ws, true);
+    if (sel res_excluded_named.err) { ret err[diag.Refusal].err{res_excluded_named.err}; }
+    @excluded = res_excluded_named.ok;
+    @out      = operand.Immediate{bits: res_bits.ok::u8, sign: s, scale: res_scale.ok::u8, bias: res_bias.ok, fixup: operand.NO_FIXUP, format: operand.INTEGER, excluded: integers_of(res_excluded_named.ok)};
+    ret err[diag.Refusal].ok{};
+}
+
+val LAYOUT_WORDS:    [7]str = [7]str{"unit", "pieces", "bits", "sign", "scale", "bias", "excluded"};
+val RELATIVE:        [1]str = [1]str{"relative"};
+val IMMEDIATE_WORDS: [5]str = [5]str{"bits", "sign", "scale", "bias", "excluded"};
+val CHOICE_WORDS:    [3]str = [3]str{"unit", "pieces", "members"};
+val POSITION_WORDS:  [7]str = [7]str{"unit", "at", "len", "first", "count", "excluded", "group"};
+
+fun excluded_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str], signed: bool) err[diag.Refusal] {
+    val res_allocate: res[*Excluded, A.Error] = A.allocate[Excluded](a, 1);
+    if (sel res_allocate.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val x: *Excluded = res_allocate.ok;
+    @x = Excluded{name: subject(f), ints: vector.init[i64](a), numbers: vector.init[u32](a), signed: signed};
+    val err_read: err[diag.Refusal] = numbers(f, ws, 0, ?x.ints);
+    if (sel err_read.err) { ret err_read; }
+    var i: usize = 0;
+    for (!signed && i < x.ints.len) {
+        if (!pushed(vector.push[u32](?x.numbers, x.ints.data[i]::u32))) { ret err[diag.Refusal].err{memory(f)}; }
+        i = i + 1;
+    }
+    val res_named: res[str, StrError] = str_join(a, x.name, "_excluded");
+    if (sel res_named.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val err_claimed: err[diag.Refusal] = claim(fs, f, res_named.ok);
+    if (sel err_claimed.err)                              { ret err_claimed; }
+    if (!pushed(vector.push[*Excluded](?fs.excluded, x))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun constant_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str], into: *vector.Vector[Constant], suffix: str) err[diag.Refusal] {
+    if (ws.len != 1) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.fact)}; }
+    val res_number: res[i64, diag.Refusal] = overlay.number(f, ws.data[0]);
+    if (sel res_number.err) { ret err[diag.Refusal].err{res_number.err}; }
+    val res_named: res[str, StrError] = str_join(a, subject(f), suffix);
+    if (sel res_named.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val err_claimed: err[diag.Refusal] = claim(fs, f, res_named.ok);
+    if (sel err_claimed.err)                                                                         { ret err_claimed; }
+    if (!pushed(vector.push[Constant](into, Constant{name: subject(f), value: res_number.ok::u32}))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun set_named(fs: *Fields, name: str) *Members {
+    var i: usize = 0;
+    for (i < fs.sets.len) {
+        if (str_equals(fs.sets.data[i].name, name)) { ret fs.sets.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun member_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    if (ws.len != 2) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.fact)}; }
+    var set: *Members = set_named(fs, subject(f));
+    if (set == nil) {
+        val res_allocate: res[*Members, A.Error] = A.allocate[Members](a, 1);
+        if (sel res_allocate.err) { ret err[diag.Refusal].err{memory(f)}; }
+        set  = res_allocate.ok;
+        @set = Members{name: subject(f), members: vector.init[Member](a), built: nil, names: nil};
+        val res_named: res[str, StrError] = str_join(a, set.name, "_members");
+        if (sel res_named.err) { ret err[diag.Refusal].err{memory(f)}; }
+        val err_claimed: err[diag.Refusal] = claim(fs, f, res_named.ok);
+        if (sel err_claimed.err)                           { ret err_claimed; }
+        if (!pushed(vector.push[*Members](?fs.sets, set))) { ret err[diag.Refusal].err{memory(f)}; }
+    }
+    var m: Member = Member{name: ws.data[0], value: 0, constant: nil};
+    var i: usize  = 0;
+    for (m.constant == nil && i < fs.values.len) {
+        if (str_equals(fs.values.data[i].name, ws.data[1])) {
+            m.constant = fs.values.data[i].name;
+            m.value    = fs.values.data[i].value;
+        }
+        i = i + 1;
+    }
+    if (m.constant == nil) {
+        val res_number: res[i64, diag.Refusal] = overlay.number(f, ws.data[1]);
+        if (sel res_number.err) { ret err[diag.Refusal].err{overlay.refuse(f, NO_SUCH, ws.data[1])}; }
+        m.value = res_number.ok::u32;
+    }
+    if (!pushed(vector.push[Member](?set.members, m))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun layout_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    val err_words: err[diag.Refusal] = only(f, ws, ?LAYOUT_WORDS[0], 7, ?RELATIVE[0], 1);
+    if (sel err_words.err) { ret err_words; }
+    val res_unit: res[i64, diag.Refusal] = word_number(f, ws, "unit", 0, true);
+    if (sel res_unit.err) { ret err[diag.Refusal].err{res_unit.err}; }
+    val res_pieces: res[layout.Pieces, diag.Refusal] = pieces(a, f, ws);
+    if (sel res_pieces.err) { ret err[diag.Refusal].err{res_pieces.err}; }
+    val res_allocate:         res[*Layout, A.Error]        = A.allocate[Layout](a, 1);
+    val res_layout_allocated: res[*layout.Layout, A.Error] = A.allocate[layout.Layout](a, 1);
+    if (sel res_allocate.err)         { ret err[diag.Refusal].err{memory(f)}; }
+    if (sel res_layout_allocated.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val l: *Layout = res_allocate.ok;
+    @l = Layout{name: subject(f), relative: false, excluded: nil, at: res_layout_allocated.ok};
+    var i: usize = 0;
+    for (i < ws.len) {
+        if (str_equals(ws.data[i], "relative")) { l.relative = true; }
+        i = i + 1;
+    }
+    var value:    operand.Immediate;
+    val err_read: err[diag.Refusal] = immediate_of(fs, f, ws, ?value, ?l.excluded);
+    if (sel err_read.err) { ret err_read; }
+    @res_layout_allocated.ok = layout.Layout{name: l.name, unit: res_unit.ok::u8, pieces: res_pieces.ok, value: value};
+    val err_claimed: err[diag.Refusal] = claim(fs, f, l.name);
+    if (sel err_claimed.err)                           { ret err_claimed; }
+    if (!pushed(vector.push[*Layout](?fs.layouts, l))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun immediate_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    val err_words: err[diag.Refusal] = only(f, ws, ?IMMEDIATE_WORDS[0], 5, nil, 0);
+    if (sel err_words.err) { ret err_words; }
+    val res_allocate:            res[*Immediate, A.Error]         = A.allocate[Immediate](a, 1);
+    val res_immediate_allocated: res[*operand.Immediate, A.Error] = A.allocate[operand.Immediate](a, 1);
+    if (sel res_allocate.err)            { ret err[diag.Refusal].err{memory(f)}; }
+    if (sel res_immediate_allocated.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val x: *Immediate = res_allocate.ok;
+    @x = Immediate{name: subject(f), excluded: nil, at: res_immediate_allocated.ok};
+    val err_read: err[diag.Refusal] = immediate_of(fs, f, ws, res_immediate_allocated.ok, ?x.excluded);
+    if (sel err_read.err) { ret err_read; }
+    val err_claimed: err[diag.Refusal] = claim(fs, f, x.name);
+    if (sel err_claimed.err)                                 { ret err_claimed; }
+    if (!pushed(vector.push[*Immediate](?fs.immediates, x))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun choice_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    val err_words: err[diag.Refusal] = only(f, ws, ?CHOICE_WORDS[0], 3, nil, 0);
+    if (sel err_words.err) { ret err_words; }
+    val res_unit: res[i64, diag.Refusal] = word_number(f, ws, "unit", 0, true);
+    if (sel res_unit.err) { ret err[diag.Refusal].err{res_unit.err}; }
+    val res_pieces: res[layout.Pieces, diag.Refusal] = pieces(a, f, ws);
+    if (sel res_pieces.err) { ret err[diag.Refusal].err{res_pieces.err}; }
+    val opt_value: opt[str] = overlay.value(ws, "members");
+    if (sel opt_value.none) { ret err[diag.Refusal].err{overlay.refuse(f, MISSING, "members")}; }
+    val set: *Members = set_named(fs, opt_value.some);
+    if (set == nil) { ret err[diag.Refusal].err{overlay.refuse(f, NO_SUCH, opt_value.some)}; }
+    val res_allocate:         res[*Choice, A.Error]        = A.allocate[Choice](a, 1);
+    val res_choice_allocated: res[*layout.Choice, A.Error] = A.allocate[layout.Choice](a, 1);
+    if (sel res_allocate.err)         { ret err[diag.Refusal].err{memory(f)}; }
+    if (sel res_choice_allocated.err) { ret err[diag.Refusal].err{memory(f)}; }
+    val c: *Choice = res_allocate.ok;
+    @c                       = Choice{name: subject(f), members: set, at: res_choice_allocated.ok};
+    @res_choice_allocated.ok = layout.Choice{name: c.name, unit: res_unit.ok::u8, pieces: res_pieces.ok, values: operand.Enumeration{members: nil, count: 0, mask: false, names: index.NO_ENTRIES}};
+    val err_claimed: err[diag.Refusal] = claim(fs, f, c.name);
+    if (sel err_claimed.err)                           { ret err_claimed; }
+    if (!pushed(vector.push[*Choice](?fs.choices, c))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun position_line(a: *A.Allocator, fs: *Fields, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    val err_words: err[diag.Refusal] = only(f, ws, ?POSITION_WORDS[0], 7, nil, 0);
+    if (sel err_words.err) { ret err_words; }
+    val res_unit:        res[i64, diag.Refusal] = word_number(f, ws, "unit", 0, true);
+    val res_word_number: res[i64, diag.Refusal] = word_number(f, ws, "at", 0, true);
+    val res_len:         res[i64, diag.Refusal] = word_number(f, ws, "len", 0, true);
+    val res_first:       res[i64, diag.Refusal] = word_number(f, ws, "first", 0, false);
+    val res_count:       res[i64, diag.Refusal] = word_number(f, ws, "count", 0, false);
+    val res_group:       res[i64, diag.Refusal] = word_number(f, ws, "group", 0, false);
+    if (sel res_unit.err)        { ret err[diag.Refusal].err{res_unit.err}; }
+    if (sel res_word_number.err) { ret err[diag.Refusal].err{res_word_number.err}; }
+    if (sel res_len.err)         { ret err[diag.Refusal].err{res_len.err}; }
+    if (sel res_first.err)       { ret err[diag.Refusal].err{res_first.err}; }
+    if (sel res_count.err)       { ret err[diag.Refusal].err{res_count.err}; }
+    if (sel res_group.err)       { ret err[diag.Refusal].err{res_group.err}; }
+    val res_excluded_named: res[*Excluded, diag.Refusal] = excluded_named(fs, f, ws, false);
+    if (sel res_excluded_named.err) { ret err[diag.Refusal].err{res_excluded_named.err}; }
+    val res_allocate: res[*Position, A.Error]        = A.allocate[Position](a, 1);
+    val res_made:     res[*layout.Position, A.Error] = A.allocate[layout.Position](a, 1);
+    if (sel res_allocate.err) { ret err[diag.Refusal].err{memory(f)}; }
+    if (sel res_made.err)     { ret err[diag.Refusal].err{memory(f)}; }
+    val p: *Position = res_allocate.ok;
+    @p           = Position{name: subject(f), excluded: res_excluded_named.ok, at: res_made.ok};
+    @res_made.ok = layout.Position{name: p.name, unit: res_unit.ok::u8, first: res_first.ok::u32, count: res_count.ok::u32, at: res_word_number.ok::u8, len: res_len.ok::u8, excluded: numbers_of(res_excluded_named.ok), group: res_group.ok::u8};
+    val err_claimed: err[diag.Refusal] = claim(fs, f, p.name);
+    if (sel err_claimed.err)                               { ret err_claimed; }
+    if (!pushed(vector.push[*Position](?fs.positions, p))) { ret err[diag.Refusal].err{memory(f)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun by_key(a: *index.Entry, b: *index.Entry) i64 {
+    ret str_compare(a.key, b.key);
+}
+
+# each member set built as its enumerants and its name index, and each choice pointed at its set
+fun seal(a: *A.Allocator, fs: *Fields) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < fs.sets.len) {
+        val set:      *Members                         = fs.sets.data[i];
+        val n:        usize                            = set.members.len;
+        val res_made: res[*operand.Enumerant, A.Error] = A.allocate[operand.Enumerant](a, n);
+        val res_keys: res[*index.Entry, A.Error]       = A.allocate[index.Entry](a, n);
+        if (sel res_made.err) { ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, set.name)}; }
+        if (sel res_keys.err) { ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, set.name)}; }
+        var k: usize = 0;
+        for (k < n) {
+            res_made.ok[k] = operand.Enumerant{name: set.members.data[k].name, value: set.members.data[k].value};
+            res_keys.ok[k] = index.Entry{key: set.members.data[k].name, row: k::u32};
+            k              = k + 1;
+        }
+        sort.sort_by[index.Entry](res_keys.ok, n, by_key);
+        set.built = res_made.ok;
+        set.names = res_keys.ok;
+        i         = i + 1;
+    }
+    i = 0;
+    for (i < fs.choices.len) {
+        val c: *Choice = fs.choices.data[i];
+        if (c.members.members.len == 0) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_MEMBERS, c.name)}; }
+        c.at.values = operand.Enumeration{members: c.members.built, count: c.members.members.len::u32, mask: false, names: index.Index{at: c.members.names, len: c.members.members.len::u32}};
+        i           = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the fields topic `t` read and built into `out`
+pub fun read(a: *A.Allocator, t: *overlay.Topic, out: *Fields) err[diag.Refusal] {
+    @out = Fields{
+        excluded:   vector.init[*Excluded](a),
+        values:     vector.init[Constant](a),
+        sets:       vector.init[*Members](a),
+        layouts:    vector.init[*Layout](a),
+        immediates: vector.init[*Immediate](a),
+        choices:    vector.init[*Choice](a),
+        positions:  vector.init[*Position](a),
+        kinds:      vector.init[Constant](a),
+        names:      map.init[str, u32](a),
+    };
+    val err_checked: err[diag.Refusal] = overlay.check(t, nil, overlay.unstated);
+    if (sel err_checked.err) { ret err_checked; }
+    var i: usize = 0;
+    for (i < t.facts.len) {
+        val f:         *overlay.Fact                         = ?t.facts.data[i];
+        val res_words: res[vector.Vector[str], diag.Refusal] = overlay.words(a, f, f.fact);
+        if (sel res_words.err) { ret err[diag.Refusal].err{res_words.err}; }
+        var err_done: err[diag.Refusal] = err[diag.Refusal].ok{};
+        if (kind_is(f, "integers"))  { err_done = excluded_line(a, out, f, ?res_words.ok, true); }
+        or (kind_is(f, "numbers"))   { err_done = excluded_line(a, out, f, ?res_words.ok, false); }
+        or (kind_is(f, "value"))     { err_done = constant_line(a, out, f, ?res_words.ok, ?out.values, ""); }
+        or (kind_is(f, "member"))    { err_done = member_line(a, out, f, ?res_words.ok); }
+        or (kind_is(f, "layout"))    { err_done = layout_line(a, out, f, ?res_words.ok); }
+        or (kind_is(f, "immediate")) { err_done = immediate_line(a, out, f, ?res_words.ok); }
+        or (kind_is(f, "choice"))    { err_done = choice_line(a, out, f, ?res_words.ok); }
+        or (kind_is(f, "position"))  { err_done = position_line(a, out, f, ?res_words.ok); }
+        or (kind_is(f, "kind"))      { err_done = constant_line(a, out, f, ?res_words.ok, ?out.kinds, "_kind"); }
+        or                           { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+        if (sel err_done.err)        { ret err_done; }
+        i = i + 1;
+    }
+    ret seal(a, out);
+}
+
+pub fun layout_named(fs: *Fields, name: str) *Layout {
+    var i: usize = 0;
+    for (i < fs.layouts.len) {
+        if (str_equals(fs.layouts.data[i].name, name)) { ret fs.layouts.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun choice_named(fs: *Fields, name: str) *layout.Choice {
+    var i: usize = 0;
+    for (i < fs.choices.len) {
+        if (str_equals(fs.choices.data[i].name, name)) { ret fs.choices.data[i].at; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun position_named(fs: *Fields, name: str) *layout.Position {
+    var i: usize = 0;
+    for (i < fs.positions.len) {
+        if (str_equals(fs.positions.data[i].name, name)) { ret fs.positions.data[i].at; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun immediate_named(fs: *Fields, name: str) *operand.Immediate {
+    var i: usize = 0;
+    for (i < fs.immediates.len) {
+        if (str_equals(fs.immediates.data[i].name, name)) { ret fs.immediates.data[i].at; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the value of `name` among the values or the kinds
+fun constant_of(cs: *vector.Vector[Constant], name: str) opt[u32] {
+    var i: usize = 0;
+    for (i < cs.len) {
+        if (str_equals(cs.data[i].name, name)) { ret opt[u32].some{cs.data[i].value}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+pub fun value_named(fs: *Fields, name: str) opt[u32] {
+    ret constant_of(?fs.values, name);
+}
+
+pub fun kind_named(fs: *Fields, name: str) opt[u32] {
+    ret constant_of(?fs.kinds, name);
+}
+
+# whether layout `l` is a target relative to its row
+pub fun relative(fs: *Fields, l: *layout.Layout) bool {
+    var i: usize = 0;
+    for (i < fs.layouts.len) {
+        if (fs.layouts.data[i].at == l) { ret fs.layouts.data[i].relative; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the path the generated tables spell array `at` by, in the generated field table
+pub fun path(fs: *Fields, f: *emit.File, at: ptr) opt[str] {
+    if (at == nil) { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < fs.excluded.len) {
+        val x:    *Excluded = fs.excluded.data[i];
+        var data: ptr       = x.numbers.data::ptr;
+        if (x.signed)   { data = x.ints.data::ptr; }
+        if (data == at) { ret opt[str].some{emit.concat(f, "gen_field.", emit.ident(f, emit.concat(f, x.name, "_excluded")))}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.sets.len) {
+        val set: *Members = fs.sets.data[i];
+        if (set.built::ptr == at) { ret opt[str].some{emit.concat(f, "gen_field.", emit.ident(f, emit.concat(f, set.name, "_members")))}; }
+        if (set.names::ptr == at) { ret opt[str].some{emit.concat(f, "gen_field.", emit.ident(f, emit.concat(f, set.name, "_names")))}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# a stack field's param: the index of the register list operand in bits 0 to 7, bit 8 set at rv64 and bit 9 set when
+# the adjustment is written negative, as cm.push does. masc's stack kind reads it back
+pub fun stack_param(list: u8, wide: bool, negative: bool) u64 {
+    var p: u64 = list::u64;
+    if (wide)     { p = p | 0x100; }
+    if (negative) { p = p | 0x200; }
+    ret p;
+}
+
+# a sregs field's param: the operand coded at sreg7's bits in bits 0 to 7, and the one coded at sreg2's in bits 8 to
+# 15. masc's sregs kind reads it back
+pub fun sreg_param(first: u8, second: u8) u64 {
+    ret first::u64 | (second::u64 << 8);
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun record(f: *emit.File, of: str) *emit.Record {
+    ret emit.record(f, of);
+}
+
+fun ident(f: *emit.File, a: str, b: str) str {
+    ret emit.ident(f, emit.concat(f, a, b));
+}
+
+fun excluded_value(f: *emit.File, x: *Excluded, of: str, empty: str) emit.Value {
+    if (x == nil) { ret name(empty); }
+    val r: *emit.Record = record(f, of);
+    emit.member(f, r, "at", emit.element(f, ident(f, x.name, "_excluded"), 0));
+    if (x.signed) { emit.member(f, r, "len", number(x.ints.len::i64)); }
+    or            { emit.member(f, r, "len", number(x.numbers.len::i64)); }
+    ret emit.Value.record{r};
+}
+
+fun pieces_value(f: *emit.File, owner: str, ps: layout.Pieces) emit.Value {
+    val arr: *emit.Array = emit.array(f, "layout.Piece");
+    var i:   u32         = 0;
+    for (i < ps.len) {
+        val r: *emit.Record = record(f, "layout.Piece");
+        emit.member(f, r, "lo", number(ps.at[i].lo::i64));
+        emit.member(f, r, "len", number(ps.at[i].len::i64));
+        emit.member(f, r, "at", number(ps.at[i].at::i64));
+        emit.item(f, arr, emit.Value.record{r});
+        i = i + 1;
+    }
+    val r: *emit.Record = record(f, "layout.Pieces");
+    emit.member(f, r, "at", emit.declare_array(f, ident(f, owner, "_pieces"), arr));
+    emit.member(f, r, "len", number(ps.len::i64));
+    ret emit.Value.record{r};
+}
+
+fun sign_value(s: operand.Sign) emit.Value {
+    if (s == operand.SIGNED) { ret name("operand.SIGNED"); }
+    if (s == operand.EITHER) { ret name("operand.EITHER"); }
+    ret name("operand.UNSIGNED");
+}
+
+fun immediate_value(f: *emit.File, imm: *operand.Immediate, x: *Excluded) emit.Value {
+    val r: *emit.Record = record(f, "operand.Immediate");
+    emit.member(f, r, "bits", number(imm.bits::i64));
+    emit.member(f, r, "sign", sign_value(imm.sign));
+    emit.member(f, r, "scale", number(imm.scale::i64));
+    emit.member(f, r, "bias", number(imm.bias));
+    emit.member(f, r, "fixup", name("operand.NO_FIXUP"));
+    emit.member(f, r, "format", name("operand.INTEGER"));
+    emit.member(f, r, "excluded", excluded_value(f, x, "operand.Integers", "operand.NO_INTEGERS"));
+    ret emit.Value.record{r};
+}
+
+# the field facts written as gen_field
+pub fun generate(c: *set.Context, fs: *Fields) err[diag.Refusal] {
+    val res_opened: res[*emit.File, diag.Refusal] = set.table(c, "field");
+    if (sel res_opened.err) { ret err[diag.Refusal].err{res_opened.err}; }
+    val f: *emit.File = res_opened.ok;
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.layout");
+    emit.uses(f, "masc.core.operand");
+    var i: usize = 0;
+    for (i < fs.excluded.len) {
+        val x:   *Excluded   = fs.excluded.data[i];
+        var arr: *emit.Array = nil;
+        if (x.signed) {
+            arr = emit.array(f, "i64");
+            var k: usize = 0;
+            for (k < x.ints.len) {
+                emit.item(f, arr, number(x.ints.data[k]));
+                k = k + 1;
+            }
+        }
+        or {
+            arr = emit.array(f, "u32");
+            var k: usize = 0;
+            for (k < x.numbers.len) {
+                emit.item(f, arr, number(x.numbers.data[k]::i64));
+                k = k + 1;
+            }
+        }
+        emit.declare_array(f, ident(f, x.name, "_excluded"), arr);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.values.len) {
+        emit.declare(f, emit.ident(f, fs.values.data[i].name), "u32", number(fs.values.data[i].value::i64));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.kinds.len) {
+        emit.declare(f, ident(f, fs.kinds.data[i].name, "_kind"), "u16", number(fs.kinds.data[i].value::i64));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.sets.len) {
+        val set:     *Members    = fs.sets.data[i];
+        val members: *emit.Array = emit.array(f, "operand.Enumerant");
+        val names:   *emit.Array = emit.keyed(f, "index.Entry");
+        var k:       usize       = 0;
+        for (k < set.members.len) {
+            val m: *Member      = ?set.members.data[k];
+            val r: *emit.Record = record(f, "operand.Enumerant");
+            emit.member(f, r, "name", emit.Value.text{m.name});
+            if (m.constant != nil) { emit.member(f, r, "value", name(emit.ident(f, m.constant))); }
+            or                     { emit.member(f, r, "value", number(m.value::i64)); }
+            emit.item(f, members, emit.Value.record{r});
+            val e: *emit.Record = record(f, "index.Entry");
+            emit.member(f, e, "key", emit.Value.text{m.name});
+            emit.member(f, e, "row", number(k::i64));
+            emit.entry(f, names, m.name, emit.Value.record{e});
+            k = k + 1;
+        }
+        emit.declare_array(f, ident(f, set.name, "_members"), members);
+        emit.declare_array(f, ident(f, set.name, "_names"), names);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.layouts.len) {
+        val l: *Layout      = fs.layouts.data[i];
+        val r: *emit.Record = record(f, "layout.Layout");
+        emit.member(f, r, "name", emit.Value.text{l.name});
+        emit.member(f, r, "unit", number(l.at.unit::i64));
+        emit.member(f, r, "pieces", pieces_value(f, l.name, l.at.pieces));
+        emit.member(f, r, "value", immediate_value(f, ?l.at.value, l.excluded));
+        emit.declare(f, emit.ident(f, l.name), "layout.Layout", emit.Value.record{r});
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.immediates.len) {
+        val x: *Immediate = fs.immediates.data[i];
+        emit.declare(f, emit.ident(f, x.name), "operand.Immediate", immediate_value(f, x.at, x.excluded));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.choices.len) {
+        val ch: *Choice      = fs.choices.data[i];
+        val r:  *emit.Record = record(f, "layout.Choice");
+        val e:  *emit.Record = record(f, "operand.Enumeration");
+        val ix: *emit.Record = record(f, "index.Index");
+        val n:  i64          = ch.members.members.len::i64;
+        emit.member(f, e, "members", emit.element(f, ident(f, ch.members.name, "_members"), 0));
+        emit.member(f, e, "count", number(n));
+        emit.member(f, e, "mask", name("false"));
+        emit.member(f, ix, "at", emit.element(f, ident(f, ch.members.name, "_names"), 0));
+        emit.member(f, ix, "len", number(n));
+        emit.member(f, e, "names", emit.Value.record{ix});
+        emit.member(f, r, "name", emit.Value.text{ch.name});
+        emit.member(f, r, "unit", number(ch.at.unit::i64));
+        emit.member(f, r, "pieces", pieces_value(f, ch.name, ch.at.pieces));
+        emit.member(f, r, "values", emit.Value.record{e});
+        emit.declare(f, emit.ident(f, ch.name), "layout.Choice", emit.Value.record{r});
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fs.positions.len) {
+        val p: *Position    = fs.positions.data[i];
+        val r: *emit.Record = record(f, "layout.Position");
+        emit.member(f, r, "name", emit.Value.text{p.name});
+        emit.member(f, r, "unit", number(p.at.unit::i64));
+        emit.member(f, r, "first", number(p.at.first::i64));
+        emit.member(f, r, "count", number(p.at.count::i64));
+        emit.member(f, r, "at", number(p.at.at::i64));
+        emit.member(f, r, "len", number(p.at.len::i64));
+        emit.member(f, r, "excluded", excluded_value(f, p.excluded, "operand.Numbers", "operand.NO_NUMBERS"));
+        emit.member(f, r, "group", number(p.at.group::i64));
+        emit.declare(f, emit.ident(f, p.name), "layout.Position", emit.Value.record{r});
+        i = i + 1;
+    }
+    if (fs.choices.len > 0) { emit.uses(f, "std.types.bool.false"); }
+    ret err[diag.Refusal].ok{};
+}

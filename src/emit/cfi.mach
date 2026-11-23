@@ -1,0 +1,451 @@
+# call frame facts as calls on the builder, by masc register and by offsets that may scale
+#
+# a call frame fact is a call shaped like the `.cfi_` directive of the same
+# name, made on the builder at its cursor: the rule takes effect at the next
+# statement of the current section, and the builder places it once the layout
+# is settled. a register is named by its masc identity and numbered from its
+# row's dwarf column under the object's context, never by a number the caller
+# holds, and the return address column is mink's (`Arch.unwind.ra`).
+#
+# an offset is a byte count plus a multiple of a slot's quantity, as a vector
+# length scales an rvv or sve save slot. it reaches mink as a first-class
+# scaled rule over the register that measures the quantity, the gauge of its
+# row under the object's state (`quantity.Gauge`), never as a dwarf expression masc builds.
+#
+# the builder owns the frame: the canonical frame address its rules leave and
+# the states they remember (`build.cfa`), so `adjust_cfa_offset` and
+# `rel_offset` read it there and a direct `build.cfi` caller and these calls
+# agree. masc writes no frame bytes, mink owns them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.base.fail;
+use mink.base.store;
+use mink_arch:   mink.catalog.arch;
+use mink_format: mink.catalog.format;
+use mink.format.registration;
+use mink.format.registry;
+use mink.lower;
+use mink.lower.unwind.pointer;
+use mink.model.frame;
+
+use masc.build;
+use build_emit:    masc.build.emit;
+use build_frame:   masc.build.frame;
+use build_refusal: masc.build.refusal;
+use build_state:   masc.build.state;
+use masc.core.operand;
+use masc.core.quantity;
+use rf:         masc.core.register;
+use core_state: masc.core.state;
+
+pub val NO_NUMBER:   str = "register with no dwarf number under the object's context";
+pub val NO_COLUMN:   str = "dwarf number no register of the object's context has";
+pub val NO_REGISTER: str = "register the object's selection does not admit";
+pub val NO_SCALE:    str = "offset that scales by a slot that binds no quantity under the object's context";
+pub val NO_GAUGE:    str = "offset that scales by a quantity no register measures under the object's state";
+pub val UNEVEN:      str = "offset that scales by a share of its quantity that is no whole count of its register";
+pub val MIXED:       str = "offsets that scale by two quantities, which no one rule adds";
+pub val NO_SCALED:   str = "value rule at a scaled offset, which mink's frame model has no rule for";
+pub val RETURN:      str = "return address column other than the architecture's, which mink's frame model holds";
+pub val NO_FRAME:    str = "rule where no frame is begun";
+
+# the pointer encodings a format's unwind table writes a frame's pointers in, their slot bit aside
+# ---
+# personality: a personality routine's, none for a table that writes none
+# lsda:        language specific data's, likewise
+pub rec Codes {
+    personality: opt[u8];
+    lsda:        opt[u8];
+}
+
+# how a format's runtime unwind table writes a frame
+# ---
+# unstated: by no directive the text states
+# dwarf:    as the call frame directives state it, its pointers in these encodings
+# windows:  as the windows unwind codes state it
+pub tag Spelling: u8 {
+    unstated;
+    dwarf: Codes;
+    windows;
+}
+
+# the pointer encoding the format's unwind table writes `field` in, its slot bit left to the pointer's own, none for a
+# table that writes no such field
+fun field_code(field: opt[pointer.Field]) opt[u8] {
+    if (sel field.none) { ret opt[u8].none{}; }
+    var e: pointer.Encoding = field.some.encoding;
+    e.indirect = false;
+    ret opt[u8].some{pointer.code(e)};
+}
+
+# how format `f` of `formats` writes a frame to its runtime unwind table, read from mink's lowering row. a compact table
+# states the dwarf table it falls back to
+pub fun spelling(formats: *registry.Registry, f: *mink_format.Format) Spelling {
+    val res_known: res[*registration.Registration, fail.Fail] = registry.by_format(formats, f);
+    if (sel res_known.err) { ret Spelling.unstated{}; }
+    val opt_lowering: opt[*lower.Lowering] = registration.lowering(res_known.ok);
+    if (sel opt_lowering.none)            { ret Spelling.unstated{}; }
+    if (sel opt_lowering.some.frame.none) { ret Spelling.unstated{}; }
+    val opt_offer: opt[*lower.FrameOffer] = lower.offer(?opt_lowering.some.frame.some, ?frame.UNWIND);
+    if (sel opt_offer.none) { ret Spelling.unstated{}; }
+    val form: lower.FrameForm = opt_offer.some.form;
+    var row:  lower.DwarfFrame;
+    if (sel form.dwarf_eh) { row = form.dwarf_eh; }
+    or (sel form.compact) {
+        val fallback: lower.FrameForm = @form.compact.fallback;
+        if (!sel fallback.dwarf_eh) { ret Spelling.unstated{}; }
+        row = fallback.dwarf_eh;
+    }
+    or (sel form.windows || sel form.win64 || sel form.arm64_xdata) { ret Spelling.windows{}; }
+    or                                                              { ret Spelling.unstated{}; }
+    ret Spelling.dwarf{Codes{personality: field_code(row.personality), lsda: field_code(row.lsda)}};
+}
+
+# bytes fixed plus a multiple of the quantity one slot of the register file binds
+# ---
+# fixed: the bytes no quantity changes
+# per:   the bytes for each unit of the quantity's multiplier, 0 when none scales
+# scale: the slot whose quantity scales it, read only when `per` is nonzero
+pub rec Offset {
+    fixed: i64;
+    per:   i64;
+    scale: u8;
+}
+
+# an offset of `n` bytes
+pub fun bytes(n: i64) Offset {
+    ret Offset{fixed: n, per: 0, scale: 0};
+}
+
+fun refusal(message: str) build_refusal.Refusal {
+    ret build_refusal.Refusal{message: message, label: operand.NO_SYMBOL};
+}
+
+fun refused(message: str) err[build_refusal.Refusal] {
+    ret err[build_refusal.Refusal].err{refusal(message)};
+}
+
+# the dwarf number of `reg` under the object's context
+pub fun number(b: *build_state.Builder, reg: rf.Id) res[u16, build_refusal.Refusal] {
+    val ctx:      *core_state.Context = build_emit.object_of(b);
+    val err_held: err[rf.Absent]      = rf.admitted(ctx.view, reg);
+    if (sel err_held.err) { ret res[u16, build_refusal.Refusal].err{refusal(NO_REGISTER)}; }
+    ret narrow(core_state.debug_number(ctx.view.file, reg, rf.DWARF, ctx));
+}
+
+# the dwarf number of `reg`, or where it has none, of the smallest numbered register it is the lowest bits of, as an
+# unwind code saving arm64's d8 saves the low half of v8, whose number dwarf states
+pub fun number_within(b: *build_state.Builder, reg: rf.Id) res[u16, build_refusal.Refusal] {
+    val res_direct: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_direct.ok) { ret res_direct; }
+    val ctx:     *core_state.Context = build_emit.object_of(b);
+    val file:    *rf.File            = ctx.view.file;
+    val opt_row: opt[*rf.Register]   = rf.row_of(file, reg);
+    if (sel opt_row.none) { ret res_direct; }
+    var opt_best: opt[u16]     = opt[u16].none{};
+    var least:    *rf.Register = nil;
+    var i:        u32          = 0;
+    for (i < file.register_count) {
+        val y: *rf.Register = ?file.registers[i];
+        i = i + 1;
+        if (y == opt_row.some) { cnt; }
+        val opt_within: opt[rf.Placement] = rf.within(file, opt_row.some, y, 1);
+        if (sel opt_within.none)               { cnt; }
+        if (opt_within.some.offset.fixed != 0) { cnt; }
+        if (least != nil) {
+            val opt_inner: opt[rf.Placement] = rf.within(file, y, least, 1);
+            if (sel opt_inner.none) { cnt; }
+        }
+        val res_number: res[u16, build_refusal.Refusal] = number(b, rf.id_of(y));
+        if (sel res_number.err) { cnt; }
+        opt_best = opt[u16].some{res_number.ok};
+        least    = y;
+    }
+    if (sel opt_best.some) { ret res[u16, build_refusal.Refusal].ok{opt_best.some}; }
+    ret res_direct;
+}
+
+# the register of `bits` bits at the lowest bits of the register dwarf number `n` names, itself when it is that wide, as
+# an arm64 unwind code names the d register of the v register whose low half it saves
+pub fun low_view(b: *build_state.Builder, n: u16, bits: u64) res[rf.Id, build_refusal.Refusal] {
+    val res_whole: res[rf.Id, build_refusal.Refusal] = numbered(b, n::u32);
+    if (sel res_whole.err) { ret res_whole; }
+    val ctx:     *core_state.Context = build_emit.object_of(b);
+    val file:    *rf.File            = ctx.view.file;
+    val opt_row: opt[*rf.Register]   = rf.row_of(file, res_whole.ok);
+    if (sel opt_row.none) { ret res[rf.Id, build_refusal.Refusal].err{refusal(NO_COLUMN)}; }
+    var i: u32 = 0;
+    for (i < file.register_count) {
+        val y: *rf.Register = ?file.registers[i];
+        i = i + 1;
+        val opt_within: opt[rf.Placement] = rf.within(file, y, opt_row.some, 1);
+        if (sel opt_within.none)                                                                                              { cnt; }
+        if (opt_within.some.offset.fixed != 0 || opt_within.some.width.fixed::u64 * opt_within.some.count.fixed::u64 != bits) { cnt; }
+        val id:       rf.Id          = rf.id_of(y);
+        val err_held: err[rf.Absent] = rf.admitted(ctx.view, id);
+        if (sel err_held.ok) { ret res[rf.Id, build_refusal.Refusal].ok{id}; }
+    }
+    ret res[rf.Id, build_refusal.Refusal].err{refusal(NO_COLUMN)};
+}
+
+# the register dwarf number `n` names under the object's context, refused when no register the selection admits has it
+pub fun numbered(b: *build_state.Builder, n: u32) res[rf.Id, build_refusal.Refusal] {
+    val ctx:     *core_state.Context = build_emit.object_of(b);
+    val opt_reg: opt[rf.Id]          = core_state.from_debug_number(ctx.view.file, n, rf.DWARF, ctx);
+    if (sel opt_reg.none) { ret res[rf.Id, build_refusal.Refusal].err{refusal(NO_COLUMN)}; }
+    val err_held: err[rf.Absent] = rf.admitted(ctx.view, opt_reg.some);
+    if (sel err_held.err) { ret res[rf.Id, build_refusal.Refusal].err{refusal(NO_REGISTER)}; }
+    ret res[rf.Id, build_refusal.Refusal].ok{opt_reg.some};
+}
+
+# a dwarf number as mink's frame model holds one
+fun narrow(n: opt[u32]) res[u16, build_refusal.Refusal] {
+    if (sel n.none)      { ret res[u16, build_refusal.Refusal].err{refusal(NO_NUMBER)}; }
+    if (n.some > 0xFFFF) { ret res[u16, build_refusal.Refusal].err{refusal(NO_NUMBER)}; }
+    ret res[u16, build_refusal.Refusal].ok{n.some::u16};
+}
+
+# an offset as the canonical frame address and the builder hold one: its fixed bytes, the multiple of a register's
+# value it adds and that register's dwarf number, from the gauge of the quantity its slot binds
+fun measured(b: *build_state.Builder, reg: u16, off: Offset) res[build_state.Cfa, build_refusal.Refusal] {
+    if (off.per == 0) { ret res[build_state.Cfa, build_refusal.Refusal].ok{build_state.Cfa{reg: reg, fixed: off.fixed, scale: 0, quantity: 0}}; }
+    val ctx:       *core_state.Context = build_emit.object_of(b);
+    val opt_bound: opt[u8]             = rf.bound(ctx.view, off.scale);
+    if (sel opt_bound.none) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(NO_SCALE)}; }
+    val held:      *quantity.Quantity   = ?ctx.view.file.quantities.at[opt_bound.some];
+    val opt_gauge: opt[*quantity.Gauge] = core_state.gauge(ctx, held);
+    if (sel opt_gauge.none) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(NO_GAUGE)}; }
+    val opt_share: opt[i64] = quantity.share(held, opt_gauge.some, off.per);
+    if (sel opt_share.none) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(UNEVEN)}; }
+    val opt_col: opt[*rf.Column] = core_state.column(ctx.view.file, rf.DWARF, ctx);
+    if (sel opt_col.none) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(NO_NUMBER)}; }
+    val res_narrow: res[u16, build_refusal.Refusal] = narrow(rf.numbered_in(opt_col.some, opt_gauge.some.row));
+    if (sel res_narrow.err) { ret res[build_state.Cfa, build_refusal.Refusal].err{res_narrow.err}; }
+    ret res[build_state.Cfa, build_refusal.Refusal].ok{build_state.Cfa{reg: reg, fixed: off.fixed, scale: opt_share.some, quantity: res_narrow.ok}};
+}
+
+# the sum of `x` and `y`, or `x` less `y`, refused when they scale by two quantities
+fun combined(x: build_state.Cfa, y: build_state.Cfa, minus: bool) res[build_state.Cfa, build_refusal.Refusal] {
+    if (x.scale != 0 && y.scale != 0 && x.quantity != y.quantity) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(MIXED)}; }
+    var out: build_state.Cfa = x;
+    if (minus) {
+        out.fixed = x.fixed - y.fixed;
+        out.scale = x.scale - y.scale;
+    }
+    or {
+        out.fixed = x.fixed + y.fixed;
+        out.scale = x.scale + y.scale;
+    }
+    if (x.scale == 0) { out.quantity = y.quantity; }
+    ret res[build_state.Cfa, build_refusal.Refusal].ok{out};
+}
+
+# the canonical frame address the open frame's rules leave
+fun current(b: *build_state.Builder) res[build_state.Cfa, build_refusal.Refusal] {
+    val opt_cfa: opt[build_state.Cfa] = build_frame.cfa(b);
+    if (sel opt_cfa.none) { ret res[build_state.Cfa, build_refusal.Refusal].err{refusal(NO_FRAME)}; }
+    ret res[build_state.Cfa, build_refusal.Refusal].ok{opt_cfa.some};
+}
+
+# the rule that makes the canonical frame address `c`, whose offset scales, when `cfa`, else that saves register `n` at
+# offset `c` from it, as mink's first-class scaled rules
+fun scaled(n: u16, c: build_state.Cfa, cfa: bool) frame.Rule {
+    if (cfa) { ret frame.Rule.def_cfa_scaled{frame.Scaled{reg: c.reg, fixed: c.fixed, scale: c.scale, quantity: c.quantity}}; }
+    ret frame.Rule.scaled{frame.Scaled{reg: n, fixed: c.fixed, scale: c.scale, quantity: c.quantity}};
+}
+
+# the canonical frame address made `c`, by the rule that states the least of it that changes from what the rules left
+fun set_cfa(b: *build_state.Builder, c: build_state.Cfa) err[build_refusal.Refusal] {
+    if (c.scale != 0) { ret build_frame.cfi(b, scaled(c.reg, c, true)); }
+    val res_now: res[build_state.Cfa, build_refusal.Refusal] = current(b);
+    if (sel res_now.err)                                  { ret err[build_refusal.Refusal].err{res_now.err}; }
+    if (res_now.ok.scale == 0 && res_now.ok.reg == c.reg) { ret build_frame.cfi(b, frame.Rule.cfa_offset{c.fixed}); }
+    ret build_frame.cfi(b, frame.Rule.def_cfa{frame.Offset{reg: c.reg, offset: c.fixed}});
+}
+
+# the procedure of the function at `function` begun at the cursor, as `.cfi_startproc` begins one
+pub fun start_proc(b: *build_state.Builder, function: build_state.Label) err[build_refusal.Refusal] {
+    ret build_frame.cfi_start(b, function);
+}
+
+# the open procedure ended at the cursor, as `.cfi_endproc` ends one
+pub fun end_proc(b: *build_state.Builder) err[build_refusal.Refusal] {
+    ret build_frame.cfi_end(b);
+}
+
+# the canonical frame address made `reg` plus `off`, as `.cfi_def_cfa`
+pub fun def_cfa(b: *build_state.Builder, reg: rf.Id, off: Offset) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val res_measured: res[build_state.Cfa, build_refusal.Refusal] = measured(b, res_number.ok, off);
+    if (sel res_measured.err)       { ret err[build_refusal.Refusal].err{res_measured.err}; }
+    if (res_measured.ok.scale != 0) { ret set_cfa(b, res_measured.ok); }
+    ret build_frame.cfi(b, frame.Rule.def_cfa{frame.Offset{reg: res_number.ok, offset: off.fixed}});
+}
+
+# the canonical frame address made an offset from `reg`, its offset kept, as `.cfi_def_cfa_register`
+pub fun def_cfa_register(b: *build_state.Builder, reg: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val res_now: res[build_state.Cfa, build_refusal.Refusal] = current(b);
+    if (sel res_now.err) { ret err[build_refusal.Refusal].err{res_now.err}; }
+    if (res_now.ok.scale != 0) {
+        var c: build_state.Cfa = res_now.ok;
+        c.reg = res_number.ok;
+        ret set_cfa(b, c);
+    }
+    ret build_frame.cfi(b, frame.Rule.cfa_register{res_number.ok});
+}
+
+# the canonical frame address made `off` from its register, as `.cfi_def_cfa_offset`
+pub fun def_cfa_offset(b: *build_state.Builder, off: Offset) err[build_refusal.Refusal] {
+    val res_now: res[build_state.Cfa, build_refusal.Refusal] = current(b);
+    if (sel res_now.err) { ret err[build_refusal.Refusal].err{res_now.err}; }
+    val res_measured: res[build_state.Cfa, build_refusal.Refusal] = measured(b, res_now.ok.reg, off);
+    if (sel res_measured.err) { ret err[build_refusal.Refusal].err{res_measured.err}; }
+    ret set_cfa(b, res_measured.ok);
+}
+
+# the canonical frame address's offset moved by `delta`, as `.cfi_adjust_cfa_offset`
+pub fun adjust_cfa_offset(b: *build_state.Builder, delta: Offset) err[build_refusal.Refusal] {
+    val res_now: res[build_state.Cfa, build_refusal.Refusal] = current(b);
+    if (sel res_now.err) { ret err[build_refusal.Refusal].err{res_now.err}; }
+    val res_measured: res[build_state.Cfa, build_refusal.Refusal] = measured(b, res_now.ok.reg, delta);
+    if (sel res_measured.err) { ret err[build_refusal.Refusal].err{res_measured.err}; }
+    val res_combined: res[build_state.Cfa, build_refusal.Refusal] = combined(res_now.ok, res_measured.ok, false);
+    if (sel res_combined.err) { ret err[build_refusal.Refusal].err{res_combined.err}; }
+    ret set_cfa(b, res_combined.ok);
+}
+
+# the register of dwarf number `n` saved at `c` from the canonical frame address, or its value that address plus `c`
+# when `value`, refused for a value rule at a scaled offset or when the frame refuses the rule
+fun saved(b: *build_state.Builder, n: u16, c: build_state.Cfa, value: bool) err[build_refusal.Refusal] {
+    if (c.scale != 0) {
+        if (value) { ret refused(NO_SCALED); }
+        ret build_frame.cfi(b, scaled(n, c, false));
+    }
+    if (value) { ret build_frame.cfi(b, frame.Rule.val_offset{frame.Offset{reg: n, offset: c.fixed}}); }
+    ret build_frame.cfi(b, frame.Rule.offset{frame.Saved{reg: n, offset: c.fixed, width: frame.NATURAL}});
+}
+
+# `reg` saved at `off` from the canonical frame address, or its value that address plus `off` when `value`
+fun save(b: *build_state.Builder, reg: rf.Id, off: Offset, value: bool) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val res_measured: res[build_state.Cfa, build_refusal.Refusal] = measured(b, res_number.ok, off);
+    if (sel res_measured.err) { ret err[build_refusal.Refusal].err{res_measured.err}; }
+    ret saved(b, res_number.ok, res_measured.ok, value);
+}
+
+# `reg` saved at `off` from the canonical frame address, as `.cfi_offset`
+pub fun offset(b: *build_state.Builder, reg: rf.Id, off: Offset) err[build_refusal.Refusal] {
+    ret save(b, reg, off, false);
+}
+
+# `reg`'s value the canonical frame address plus `off`, as `.cfi_val_offset`
+pub fun val_offset(b: *build_state.Builder, reg: rf.Id, off: Offset) err[build_refusal.Refusal] {
+    ret save(b, reg, off, true);
+}
+
+# `reg` saved at `off` from the canonical frame address's register, as `.cfi_rel_offset`
+pub fun rel_offset(b: *build_state.Builder, reg: rf.Id, off: Offset) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val res_now: res[build_state.Cfa, build_refusal.Refusal] = current(b);
+    if (sel res_now.err) { ret err[build_refusal.Refusal].err{res_now.err}; }
+    val res_measured: res[build_state.Cfa, build_refusal.Refusal] = measured(b, res_number.ok, off);
+    if (sel res_measured.err) { ret err[build_refusal.Refusal].err{res_measured.err}; }
+    val res_combined: res[build_state.Cfa, build_refusal.Refusal] = combined(res_measured.ok, res_now.ok, true);
+    if (sel res_combined.err) { ret err[build_refusal.Refusal].err{res_combined.err}; }
+    ret saved(b, res_number.ok, res_combined.ok, false);
+}
+
+# `reg` saved in `other`, as `.cfi_register`
+pub fun register(b: *build_state.Builder, reg: rf.Id, other: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val res_number_other: res[u16, build_refusal.Refusal] = number(b, other);
+    if (sel res_number_other.err) { ret err[build_refusal.Refusal].err{res_number_other.err}; }
+    ret build_frame.cfi(b, frame.Rule.register{frame.Moved{reg: res_number.ok, from: res_number_other.ok}});
+}
+
+# `reg`'s rule made the one the frame began with, as `.cfi_restore`
+pub fun restore(b: *build_state.Builder, reg: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    ret build_frame.cfi(b, frame.Rule.restore{res_number.ok});
+}
+
+# `reg`'s value at the call lost, as `.cfi_undefined`
+pub fun undefined(b: *build_state.Builder, reg: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    ret build_frame.cfi(b, frame.Rule.undefined{res_number.ok});
+}
+
+# `reg` holding its value at the call, as `.cfi_same_value`
+pub fun same_value(b: *build_state.Builder, reg: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    ret build_frame.cfi(b, frame.Rule.same{res_number.ok});
+}
+
+# every rule remembered, to be restored by `restore_state`, as `.cfi_remember_state`
+pub fun remember_state(b: *build_state.Builder) err[build_refusal.Refusal] {
+    ret build_frame.cfi(b, frame.Rule.remember{});
+}
+
+# the rules the last `remember_state` remembered made the rules again, refused when none is remembered, as
+# `.cfi_restore_state`
+pub fun restore_state(b: *build_state.Builder) err[build_refusal.Refusal] {
+    ret build_frame.cfi(b, frame.Rule.restore_state{});
+}
+
+# the `n` call frame instruction bytes at `p` as written, as `.cfi_escape`, which only dwarf formats encode
+pub fun escape(b: *build_state.Builder, p: *u8, n: usize) err[build_refusal.Refusal] {
+    ret build_frame.cfi(b, frame.Rule.expression{store.Held.borrowed{store.Bytes{data: p, len: n}}});
+}
+
+# the open procedure's personality routine, the function at `target`, or with `indirect` a slot of the object at
+# `target` that holds its address, as `.cfi_personality`
+pub fun personality(b: *build_state.Builder, target: build_state.Label, indirect: bool) err[build_refusal.Refusal] {
+    ret build_frame.cfi_personality(b, build_state.Pointed{label: target, indirect: indirect});
+}
+
+# the open procedure's language specific data, at `target`, or with `indirect` a slot of the object at `target` that
+# holds its address, as `.cfi_lsda`
+pub fun lsda(b: *build_state.Builder, target: build_state.Label, indirect: bool) err[build_refusal.Refusal] {
+    ret build_frame.cfi_lsda(b, build_state.Pointed{label: target, indirect: indirect});
+}
+
+# the tables every procedure is written to, in place of the format's default, as `.cfi_sections`. a table the format
+# does not offer is refused when the object is written
+pub fun sections(b: *build_state.Builder, to: frame.Destinations) {
+    build_frame.cfi_sections(b, to);
+}
+
+# the open procedure made a signal handler's, as `.cfi_signal_frame`
+pub fun signal_frame(b: *build_state.Builder) err[build_refusal.Refusal] {
+    ret build_frame.cfi_signal(b);
+}
+
+# the return address column stated as `reg`, as `.cfi_return_column`: the column is the architecture's in mink's frame
+# model, so only that one is taken, and it states nothing more
+pub fun return_column(b: *build_state.Builder, reg: rf.Id) err[build_refusal.Refusal] {
+    val res_number: res[u16, build_refusal.Refusal] = number(b, reg);
+    if (sel res_number.err) { ret err[build_refusal.Refusal].err{res_number.err}; }
+    val opt_open: opt[build_state.Cfa] = build_frame.cfa(b);
+    if (sel opt_open.none) { ret refused(NO_FRAME); }
+    val opt_unwind: opt[mink_arch.Unwind] = build.arch_of(b).unwind;
+    if (sel opt_unwind.none)                 { ret refused(RETURN); }
+    if (opt_unwind.some.ra != res_number.ok) { ret refused(RETURN); }
+    ret err[build_refusal.Refusal].ok{};
+}

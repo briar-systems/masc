@@ -1,0 +1,439 @@
+# the reader of the aarch64 effects topic, what each instruction of the model does beyond what its operands state
+#
+# the instruction model states no instruction's meaning, so every fact here is masc's reading of the instruction's page
+# of the A64 ISA XML, its decode and execute pseudocode, cited by its file:
+#
+#   flags <instruction> | <read|write|read-write>
+#     the condition flags its PSTATE.N, Z, C and V reads and writes, a write of some of them reading the rest it keeps
+#   implicit <instruction> | [read=<registers>] [written=<registers>]
+#     the registers it reads and writes that no operand names, by the register file's names, as bl's x30 and a floating
+#     point instruction's fpcr and fpsr
+#   control <instruction> | transfer=<jump|call|return|trap> [returns=<yes|no>] target=<direct|indirect|untargeted>
+#                           [conditional=yes] [arg=<rule>]
+#     its transfer of control, a trap's `returns` whether its handler resumes at the next instruction (gen.control), and
+#     `arg` the operand holding the target
+#   memory <instruction> | role=<read|write|read-write> base=<rule> [forming=<rules>] [governor=<rule>]
+#                          [count=<unstated|rule>] width=<width> | by=<fields> <bits>=<width> ...
+#     one access through the address its base operand holds, the further operands that form the address, the predicate
+#     governing which elements it touches, how many elements of the width it covers where that is not one (an operand's
+#     value, or `unstated` for a count no operand states, as a gather's active elements), and the width in bits,
+#     `<fixed>+<per>*<slot>` for one that scales with a slot, or by the bits of the fields the rows fix
+#   offset <instruction> | to=<rule> from=<rule> [by=<rule>] [negated=yes] [shift=<rule> step=<bits>]
+#     the value it writes as the value it reads plus an immediate (gen.relation)
+#   latency <instruction> | <one|few|many|serial>
+#     masc's latency class, which no page states
+#   order <instruction|group> | [before=<kinds>] [after=<kinds>] [field=<fields> bits=<pattern>]
+#     an order fact (gen.order) of one instruction, or of every instruction of a group of the model, by the last name of
+#     its group, its fields the model's named fields of the instruction joined by `:`
+#   ordered <instruction|group> | <atomic|fence>
+#     an instruction, or every instruction of a group, that must state an order fact
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+
+use masc.core.effect;
+use masc.core.operand;
+
+use gen.control;
+use gen.diag;
+use gen_order: gen.order;
+use topic:     gen.overlay;
+use gen.relation;
+use gen.source;
+
+pub val TOPIC: str = "effects";
+
+pub val BAD_KIND:     str = "effects line is not a flags, implicit, control, memory, offset, latency, order or ordered fact";
+pub val BAD_ROLE:     str = "effects role is not read, write or read-write";
+pub val BAD_TRANSFER: str = "effects transfer is not jump, call, return or trap";
+pub val BAD_TARGET:   str = "effects target is not direct, indirect or untargeted";
+pub val BAD_LATENCY:  str = "effects latency is not one, few, many or serial";
+pub val BAD_WIDTH:    str = "effects width is not bits or bits plus bits per slot";
+pub val TWICE:        str = "effects instruction states one kind of fact twice";
+
+# a width in bits: fixed plus per times the multiplier of the slot named `slot`, nil for none
+pub rec Width {
+    fixed: u32;
+    per:   u32;
+    slot:  str;
+}
+
+# a width the rows' bits of some fields choose
+# ---
+# pattern: the bits of the fields, joined by `:` as the fields are
+# width:   the width under them
+pub rec Patterned {
+    pattern: str;
+    width:   Width;
+}
+
+# one access
+# ---
+# role:     what it does
+# base:     the rule of the operand holding the address
+# forming:  the rules of further operands forming the address, which a row may not have
+# governor: the rule of its governing predicate, nil for none
+# count:    the rule of the operand whose value counts its elements, nil for one
+# unstated: whether a count no operand states covers it
+# fields:   the fields whose bits choose its width, empty for one width
+# widths:   its width, or one per pattern of those fields' bits
+pub rec Access {
+    role:     operand.Role;
+    base:     str;
+    forming:  vector.Vector[str];
+    governor: str;
+    count:    str;
+    unstated: bool;
+    fields:   vector.Vector[str];
+    widths:   vector.Vector[Patterned];
+}
+
+# what one instruction does beyond its operands
+# ---
+# flags_read, flags_written: whether it reads or writes the condition flags, flagged once a flags line is read
+# read, written:             the names of the registers no operand names that it reads and writes, implied once an
+#                            implicit line is read
+# accesses:   its memory accesses
+# controlled: whether it transfers control as transfer, target, conditional and arg state
+# offsets:    the values it writes as the values it reads plus a number
+# latency:    its latency class, timed once a latency line is read
+pub rec Effect {
+    flags_read:    bool;
+    flags_written: bool;
+    flagged:       bool;
+    read:          vector.Vector[str];
+    written:       vector.Vector[str];
+    implied:       bool;
+    accesses:      vector.Vector[Access];
+    controlled:    bool;
+    transfer:      effect.Transfer;
+    target:        effect.Target;
+    conditional:   bool;
+    arg:           str;
+    offsets:       vector.Vector[relation.Stated];
+    timed:         bool;
+    latency:       effect.Latency;
+}
+
+# an order fact of the instructions its key names, an instruction or a group by its last name (gen.order)
+pub rec Order {
+    key:    str;
+    stated: gen_order.Stated;
+}
+
+# every instruction's effect, by its name
+# ---
+# orders:  every order fact
+# ordered: the instructions and groups that must state one
+pub rec Effects {
+    effects: vector.Vector[Effect];
+    by:      map.Map[str, u32];
+    orders:  vector.Vector[Order];
+    ordered: vector.Vector[str];
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun refused(l: *topic.Line, message: str, subject: str) res[Effects, diag.Refusal] {
+    ret res[Effects, diag.Refusal].err{topic.refuse(l.fact, message, subject)};
+}
+
+# the effect of instruction `name`, made when there is none
+fun effect_of(a: *A.Allocator, out: *Effects, name: str) res[*Effect, A.Error] {
+    val opt_name_entry: opt[*u32] = map.get[str, u32](?out.by, ?name);
+    if (sel opt_name_entry.some) { ret res[*Effect, A.Error].ok{?out.effects.data[@opt_name_entry.some]}; }
+    val e: Effect = Effect{
+        flags_read:    false,
+        flags_written: false,
+        flagged:       false,
+        read:          vector.init[str](a),
+        written:       vector.init[str](a),
+        implied:       false,
+        accesses:      vector.init[Access](a),
+        controlled:    false,
+        transfer:      effect.NONE,
+        target:        effect.UNTARGETED,
+        conditional:   false,
+        arg:           nil,
+        offsets:       vector.init[relation.Stated](a),
+        timed:         false,
+        latency:       effect.ONE,
+    };
+    val at: u32 = out.effects.len::u32;
+    if (!pushed(vector.push[Effect](?out.effects, e))) { ret res[*Effect, A.Error].err{A.Error.exhausted{}}; }
+    val res_put: res[bool, A.Error] = map.insert[str, u32](?out.by, name, at);
+    if (sel res_put.err) { ret res[*Effect, A.Error].err{res_put.err}; }
+    ret res[*Effect, A.Error].ok{?out.effects.data[at]};
+}
+
+# the comma list `text` split into `out`
+fun list(a: *A.Allocator, text: str, out: *vector.Vector[str]) bool {
+    val len: usize = str_len(text);
+    var at:  usize = 0;
+    for (at < len) {
+        var end: usize = at;
+        for (end < len && text[end] != ',') {
+            end = end + 1;
+        }
+        val res_str_copy_slice: res[str, StrError] = str_copy_slice(a, text, at, end - at);
+        if (sel res_str_copy_slice.err)                            { ret false; }
+        if (!pushed(vector.push[str](out, res_str_copy_slice.ok))) { ret false; }
+        at = end + 1;
+    }
+    ret true;
+}
+
+fun role_named(text: str) opt[operand.Role] {
+    if (str_equals(text, "read"))       { ret opt[operand.Role].some{operand.READ}; }
+    if (str_equals(text, "write"))      { ret opt[operand.Role].some{operand.WRITE}; }
+    if (str_equals(text, "read-write")) { ret opt[operand.Role].some{operand.READ_WRITE}; }
+    ret opt[operand.Role].none{};
+}
+
+# the decimal digits of `text` from `at` to `end`, -1 when there are none or other bytes
+fun decimal(text: str, at: usize, end: usize) i64 {
+    if (at >= end || end - at > 9) { ret -1; }
+    var n: i64   = 0;
+    var i: usize = at;
+    for (i < end) {
+        if (text[i] < '0' || text[i] > '9') { ret -1; }
+        n = n * 10 + (text[i] - '0')::i64;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# a width `<fixed>` or `<fixed>+<per>*<slot>`
+fun width_of(a: *A.Allocator, text: str) opt[Width] {
+    val len:  usize = str_len(text);
+    var plus: usize = 0;
+    for (plus < len && text[plus] != '+') {
+        plus = plus + 1;
+    }
+    val fixed: i64 = decimal(text, 0, plus);
+    if (fixed < 0)   { ret opt[Width].none{}; }
+    if (plus == len) { ret opt[Width].some{Width{fixed: fixed::u32, per: 0, slot: nil}}; }
+    var star: usize = plus + 1;
+    for (star < len && text[star] != '*') {
+        star = star + 1;
+    }
+    val per: i64 = decimal(text, plus + 1, star);
+    if (per <= 0 || star + 1 >= len) { ret opt[Width].none{}; }
+    val res_slot: res[str, StrError] = str_copy_slice(a, text, star + 1, len - star - 1);
+    if (sel res_slot.err) { ret opt[Width].none{}; }
+    ret opt[Width].some{Width{fixed: fixed::u32, per: per::u32, slot: res_slot.ok}};
+}
+
+# whether `word` is `<bits>=<width>`, the bits 0 and 1 joined by `:`
+fun patterned(word: str) usize {
+    var i: usize = 0;
+    for (word[i] == '0' || word[i] == '1' || word[i] == ':') {
+        i = i + 1;
+    }
+    if (i == 0 || word[i] != '=') { ret 0; }
+    ret i;
+}
+
+fun access_line(a: *A.Allocator, l: *topic.Line, e: *Effect) err[diag.Refusal] {
+    var x: Access = Access{
+        role:     operand.READ,
+        base:     nil,
+        forming:  vector.init[str](a),
+        governor: nil,
+        count:    nil,
+        unstated: false,
+        fields:   vector.init[str](a),
+        widths:   vector.init[Patterned](a),
+    };
+    var role:       str               = nil;
+    val err_needed: err[diag.Refusal] = topic.needed(l, "role", ?role);
+    if (sel err_needed.err) { ret err_needed; }
+    val opt_role_named: opt[operand.Role] = role_named(role);
+    if (sel opt_role_named.none) { ret topic.reject(l, BAD_ROLE, role); }
+    x.role = opt_role_named.some;
+    val err_based: err[diag.Refusal] = topic.needed(l, "base", ?x.base);
+    if (sel err_based.err) { ret err_based; }
+    val opt_forming: opt[str] = topic.value(?l.ws, "forming");
+    if (sel opt_forming.some && !list(a, opt_forming.some, ?x.forming)) { ret topic.reject(l, diag.MEMORY, nil); }
+    x.governor = topic.optional(l, "governor", nil);
+    val count: str = topic.optional(l, "count", nil);
+    if (count != nil && str_equals(count, "unstated")) { x.unstated = true; }
+    or                                                 { x.count = count; }
+    val opt_value: opt[str] = topic.value(?l.ws, "by");
+    if (sel opt_value.some) {
+        # the fields of `by` are joined by `:`
+        val text: str   = opt_value.some;
+        val len:  usize = str_len(text);
+        var at:   usize = 0;
+        for (at < len) {
+            var end: usize = at;
+            for (end < len && text[end] != ':') {
+                end = end + 1;
+            }
+            val res_str_copy_slice: res[str, StrError] = str_copy_slice(a, text, at, end - at);
+            if (sel res_str_copy_slice.err)                                  { ret topic.reject(l, diag.MEMORY, nil); }
+            if (!pushed(vector.push[str](?x.fields, res_str_copy_slice.ok))) { ret topic.reject(l, diag.MEMORY, nil); }
+            at = end + 1;
+        }
+        var i: usize = 0;
+        for (i < l.ws.len) {
+            val word: str   = l.ws.data[i];
+            val eq:   usize = patterned(word);
+            if (eq > 0) {
+                val res_bits:  res[str, StrError] = str_copy_slice(a, word, 0, eq);
+                val opt_width: opt[Width]         = width_of(a, ?word[eq + 1]);
+                if (sel res_bits.err)                                                                                   { ret topic.reject(l, diag.MEMORY, nil); }
+                if (sel opt_width.none)                                                                                 { ret topic.reject(l, BAD_WIDTH, word); }
+                if (!pushed(vector.push[Patterned](?x.widths, Patterned{pattern: res_bits.ok, width: opt_width.some}))) { ret topic.reject(l, diag.MEMORY, nil); }
+            }
+            i = i + 1;
+        }
+        if (x.widths.len == 0) { ret topic.reject(l, topic.MISSING, "by"); }
+    }
+    or {
+        var w:        str               = nil;
+        val err_wide: err[diag.Refusal] = topic.needed(l, "width", ?w);
+        if (sel err_wide.err) { ret err_wide; }
+        val opt_width: opt[Width] = width_of(a, w);
+        if (sel opt_width.none)                                                                         { ret topic.reject(l, BAD_WIDTH, w); }
+        if (!pushed(vector.push[Patterned](?x.widths, Patterned{pattern: nil, width: opt_width.some}))) { ret topic.reject(l, diag.MEMORY, nil); }
+    }
+    if (!pushed(vector.push[Access](?e.accesses, x))) { ret topic.reject(l, diag.MEMORY, nil); }
+    ret err[diag.Refusal].ok{};
+}
+
+fun control_line(l: *topic.Line, e: *Effect) err[diag.Refusal] {
+    if (e.controlled) { ret topic.reject(l, TWICE, l.key.data[1]); }
+    var transfer:   str               = nil;
+    var target:     str               = nil;
+    val err_needed: err[diag.Refusal] = topic.needed(l, "transfer", ?transfer);
+    if (sel err_needed.err) { ret err_needed; }
+    val err_needed_target: err[diag.Refusal] = topic.needed(l, "target", ?target);
+    if (sel err_needed_target.err) { ret err_needed_target; }
+    var err_kind: err[diag.Refusal] = control.untrapped(l);
+    if (str_equals(transfer, "jump"))     { e.transfer = effect.JUMP; }
+    or (str_equals(transfer, "call"))     { e.transfer = effect.CALL; }
+    or (str_equals(transfer, "return"))   { e.transfer = effect.RETURN; }
+    or (str_equals(transfer, "trap"))     { err_kind = control.trap(l, ?e.transfer); }
+    or                                    { ret topic.reject(l, BAD_TRANSFER, transfer); }
+    if (sel err_kind.err)                 { ret err_kind; }
+    if (str_equals(target, "direct"))     { e.target = effect.DIRECT; }
+    or (str_equals(target, "indirect"))   { e.target = effect.INDIRECT; }
+    or (str_equals(target, "untargeted")) { e.target = effect.UNTARGETED; }
+    or                                    { ret topic.reject(l, BAD_TARGET, target); }
+    val conditional: str = topic.optional(l, "conditional", "no");
+    e.conditional = str_equals(conditional, "yes");
+    e.arg         = topic.optional(l, "arg", nil);
+    e.controlled  = true;
+    ret err[diag.Refusal].ok{};
+}
+
+val ORDER_NAMES: [4]str = [4]str{"before", "after", "field", "bits"};
+
+# order or ordered line `l` read into `out`
+fun order_line(l: *topic.Line, out: *Effects) err[diag.Refusal] {
+    if (topic.is(l, "ordered", 2)) {
+        val err_req: err[diag.Refusal] = gen_order.required(l);
+        if (sel err_req.err)                                        { ret err_req; }
+        if (!pushed(vector.push[str](?out.ordered, l.key.data[1]))) { ret topic.reject(l, diag.MEMORY, nil); }
+        ret err[diag.Refusal].ok{};
+    }
+    val err_words: err[diag.Refusal] = topic.known(l, ?ORDER_NAMES[0], 4);
+    if (sel err_words.err) { ret err_words; }
+    var o:        Order             = Order{key: l.key.data[1], stated: gen_order.Stated{before: effect.NO_KINDS, after: effect.NO_KINDS, field: nil, mask: 0, value: 0, width: 0}};
+    val err_read: err[diag.Refusal] = gen_order.read(l, ?o.stated);
+    if (sel err_read.err)                            { ret err_read; }
+    if (!pushed(vector.push[Order](?out.orders, o))) { ret topic.reject(l, diag.MEMORY, nil); }
+    ret err[diag.Refusal].ok{};
+}
+
+# the effects topic of the data tree `tree`
+pub fun read(a: *A.Allocator, tree: *source.Tree) res[Effects, diag.Refusal] {
+    val res_read: res[topic.Topic, diag.Refusal] = topic.read(a, tree, TOPIC);
+    if (sel res_read.err) { ret res[Effects, diag.Refusal].err{res_read.err}; }
+    var t:           topic.Topic       = res_read.ok;
+    val err_checked: err[diag.Refusal] = topic.check(?t, nil, topic.unstated);
+    if (sel err_checked.err) { ret res[Effects, diag.Refusal].err{err_checked.err}; }
+    var out: Effects = Effects{effects: vector.init[Effect](a), by: map.init[str, u32](a), orders: vector.init[Order](a), ordered: vector.init[str](a)};
+    var i:   usize   = 0;
+    for (i < t.facts.len) {
+        var l:        topic.Line        = topic.Line{fact: nil, key: vector.init[str](a), ws: vector.init[str](a)};
+        val err_read: err[diag.Refusal] = topic.line(a, ?t.facts.data[i], ?l);
+        if (sel err_read.err) { ret res[Effects, diag.Refusal].err{err_read.err}; }
+        if (l.key.len != 2)   { ret refused(?l, BAD_KIND, nil); }
+        if (topic.is(?l, "order", 2) || topic.is(?l, "ordered", 2)) {
+            val err_ordered: err[diag.Refusal] = order_line(?l, ?out);
+            if (sel err_ordered.err) { ret res[Effects, diag.Refusal].err{err_ordered.err}; }
+            i = i + 1;
+            cnt;
+        }
+        val res_made: res[*Effect, A.Error] = effect_of(a, ?out, l.key.data[1]);
+        if (sel res_made.err) { ret refused(?l, diag.MEMORY, nil); }
+        val e:        *Effect           = res_made.ok;
+        var err_done: err[diag.Refusal] = err[diag.Refusal].ok{};
+        if (topic.is(?l, "flags", 2)) {
+            val opt_only: opt[str] = topic.only(?l);
+            if (e.flagged)         { ret refused(?l, TWICE, l.key.data[1]); }
+            if (sel opt_only.none) { ret refused(?l, topic.MISSING, "role"); }
+            val opt_role_named: opt[operand.Role] = role_named(opt_only.some);
+            if (sel opt_role_named.none) { ret refused(?l, BAD_ROLE, opt_only.some); }
+            e.flags_read    = opt_role_named.some != operand.WRITE;
+            e.flags_written = opt_role_named.some != operand.READ;
+            e.flagged       = true;
+        }
+        or (topic.is(?l, "implicit", 2)) {
+            if (e.implied) { ret refused(?l, TWICE, l.key.data[1]); }
+            val opt_value:         opt[str] = topic.value(?l.ws, "read");
+            val opt_value_written: opt[str] = topic.value(?l.ws, "written");
+            if (sel opt_value.some && !list(a, opt_value.some, ?e.read))                    { ret refused(?l, diag.MEMORY, nil); }
+            if (sel opt_value_written.some && !list(a, opt_value_written.some, ?e.written)) { ret refused(?l, diag.MEMORY, nil); }
+            if (e.read.len == 0 && e.written.len == 0)                                      { ret refused(?l, topic.MISSING, "read"); }
+            e.implied = true;
+        }
+        or (topic.is(?l, "control", 2)) { err_done = control_line(?l, e); }
+        or (topic.is(?l, "memory", 2))  { err_done = access_line(a, ?l, e); }
+        or (topic.is(?l, "offset", 2)) {
+            var st: relation.Stated = relation.Stated{to: nil, from: nil, base: nil, formed: nil, by: nil, shift: nil, step: 0, negated: false, constant: 0};
+            err_done = relation.read(?l, 0, ?st);
+            if ((sel err_done.ok) && !pushed(vector.push[relation.Stated](?e.offsets, st))) { ret refused(?l, diag.MEMORY, nil); }
+        }
+        or (topic.is(?l, "latency", 2)) {
+            val opt_only: opt[str] = topic.only(?l);
+            if (e.timed)                             { ret refused(?l, TWICE, l.key.data[1]); }
+            if (sel opt_only.none)                   { ret refused(?l, topic.MISSING, "latency"); }
+            if (str_equals(opt_only.some, "one"))    { e.latency = effect.ONE; }
+            or (str_equals(opt_only.some, "few"))    { e.latency = effect.FEW; }
+            or (str_equals(opt_only.some, "many"))   { e.latency = effect.MANY; }
+            or (str_equals(opt_only.some, "serial")) { e.latency = effect.SERIAL; }
+            or                                       { ret refused(?l, BAD_LATENCY, opt_only.some); }
+            e.timed = true;
+        }
+        or                    { ret refused(?l, BAD_KIND, l.key.data[0]); }
+        if (sel err_done.err) { ret res[Effects, diag.Refusal].err{err_done.err}; }
+        i = i + 1;
+    }
+    ret res[Effects, diag.Refusal].ok{out};
+}
+
+# the effect of instruction `name`, none when the topic states none
+pub fun of(e: *Effects, name: str) opt[*Effect] {
+    val opt_name_entry: opt[*u32] = map.get[str, u32](?e.by, ?name);
+    if (sel opt_name_entry.none) { ret opt[*Effect].none{}; }
+    ret opt[*Effect].some{?e.effects.data[@opt_name_entry.some]};
+}

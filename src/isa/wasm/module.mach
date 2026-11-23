@@ -1,0 +1,1463 @@
+# a wasm module read from its text into mink's neutral object
+#
+# a module's text is `(module $id? field*)`, or its fields alone (WebAssembly Specification release 3.0, tag wg-3.0,
+# 6.3-text.modules.spectec). its identifiers name entries of index spaces every field fills, so a field may name what
+# a later one defines: the reader takes the fields in passes.
+#   - the names of the type fields, so a type may name itself, then the type fields, so a type is numbered in its
+#     field's order
+#   - each definition and import in text order, its index in its space and its type, and the types its type uses
+#     imply added after the last as the text gives them: a function's own, then those of its body's instructions
+#     (`masc.isa.wasm.body.imply`)
+#   - the exports in text order, an inline `(export "n")` as the export field it abbreviates, and the start function
+#   - each global's and table's initializer and each segment's offset and items, in their index order
+#   - the function bodies, each read through the stream entered at its function
+# an inline `(import "m" "n")` is the import it abbreviates, a table's inline `(elem ...)` the table of as many
+# entries and an active segment of them right after it, and a memory's inline `(data ...)` the memory of as many pages
+# and an active segment of it.
+#
+# the module is stated through `masc.isa.wasm.object` as each entry is read, and finished into mink's neutral object,
+# which mink writes as the module. where the binary leaves a choice the text does not make, the reader makes it: an
+# active element segment writes its table's index for a table other than the first or for items of a type other than
+# funcref, and its items as expressions unless they are a `(ref func)` list, and an active data segment writes its
+# memory's index for a memory other than the first. a module writes its data count where a body names a data segment.
+# what mink's facts cannot state is refused, never skipped: a type of the gc proposal and a memory's page size.
+#
+# the text is the module's own form (`MODULE`): the printer (`masc.isa.wasm.print`) writes the fields of a module read
+# as mink's neutral object, and this reader reads them back to one, which mink writes to the same bytes.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.fail.Fail;
+use mink.base.table.Id;
+use mink_arch:    mink.catalog.arch;
+use catalog_kind: mink.catalog.kind;
+use mink.format.wasm.fact;
+use mink_object: mink.model.object;
+
+use masc_codec: masc.codec;
+use masc.core.diagnostic;
+use masc.core.dispatch;
+use masc.core.field;
+use masc.core.form;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.state;
+use masc.core.stream;
+use core_syntax: masc.core.syntax;
+use syntax_read: masc.syntax.read;
+
+use wasm_body:    masc.isa.wasm.body;
+use wasm_codec:   masc.isa.wasm.codec;
+use wasm_field:   masc.isa.wasm.field;
+use wasm_kind:    masc.isa.wasm.kind;
+use wasm_leb:     masc.isa.wasm.leb;
+use wasm_object:  masc.isa.wasm.object;
+use wasm_print:   masc.isa.wasm.print;
+use wasm_stream:  masc.isa.wasm.stream;
+use wasm_syntax:  masc.isa.wasm.syntax;
+use wasm_text:    masc.isa.wasm.text;
+use wasm_valtype: masc.isa.wasm.valtype;
+
+use masc.isa.wasm.gen_row;
+use masc.isa.wasm.gen_row_index;
+
+pub val NOT_A_FIELD:  str = "expected a module field";
+pub val UNREAD_FIELD: str = "module field the text format does not define";
+pub val GC_TYPE:      str = "type of the gc proposal, which the set has no rows of";
+pub val NO_FUNC_TYPE: str = "expected `(func` and its params and results";
+pub val NOT_CLOSED:   str = "expected `)`";
+pub val NO_STRING:    str = "expected a string";
+pub val BAD_ESCAPE:   str = "malformed string escape";
+pub val NO_LIMIT:     str = "expected a size";
+pub val LIMIT_RANGE:  str = "size past its address type's range";
+pub val NO_EXTERN:    str = "expected `(func`, `(table`, `(memory`, `(global` or `(tag` and an index";
+pub val TYPE_RANGE:   str = "type index past what the stream's code of a value type holds";
+pub val NO_REFTYPE:   str = "expected a reference type";
+pub val AFTER_MODULE: str = "text after the module";
+pub val PAGE_SIZE:    str = "memory page size, which is no wasm 3.0 feature";
+pub val TWO_STARTS:   str = "module with two start functions";
+pub val NO_ITEM:      str = "expected an element segment's item";
+pub val NOT_TEXT:     str = "module of binary or quoted text, which is no module text";
+pub val FAILED:       str = "the module's object does not take this field";
+pub val UNFINISHED:   str = "the object does not finish the module";
+
+# the kinds of import and export, by the byte the binary spells each by (WebAssembly 3.0, 5.5.5 Import Section)
+val FUNC:   u8 = 0;
+val TABLE:  u8 = 1;
+val MEMORY: u8 = 2;
+val GLOBAL: u8 = 3;
+val TAG:    u8 = 4;
+
+# a module field: its keyword, the offset past it and the offset of the `)` closing it, and the kind and index of what
+# it defines, which its inline exports name
+rec Field {
+    keyword: wasm_text.Token;
+    at:      usize;
+    end:     usize;
+    kind:    u8;
+    index:   u32;
+    defines: bool;
+}
+
+# a defined function's field, its index among the functions the module defines, and its type
+rec Defined {
+    field: u32;
+    index: u32;
+    type:  u32;
+}
+
+# what a segment's items or a global's or a table's initializer is read from: its field, the offset its contents start
+# at, and the table, memory or entry it is of. an inline segment is of its table's or its memory's field, and an inline
+# element segment's items are of its table's reference type, by its stream code. a global's is of its value type, by
+# masc's code, and its mutability
+rec Pending {
+    field:   u32;
+    at:      usize;
+    of:      u32;
+    inline:  bool;
+    type:    u32;
+    value:   i64;
+    mutable: bool;
+}
+
+# what a read keeps while it reads
+rec Job {
+    a:        *A.Allocator;
+    text:     *u8;
+    origin:   diagnostic.Position;
+    codec:    *dispatch.Codec;
+    ctx:      *state.Context;
+    fields:   vector.Vector[Field];
+    funcs:    vector.Vector[Defined];
+    globals:  vector.Vector[Pending];
+    tables:   vector.Vector[Pending];
+    elements: vector.Vector[Pending];
+    datas:    vector.Vector[Pending];
+    start:    opt[u32];
+    started:  bool;
+    out:      *wasm_object.Module;
+}
+
+fun refuse(j: *Job, message: str, at: usize, len: usize) err[diagnostic.Diagnostic] {
+    ret err[diagnostic.Diagnostic].err{diagnostic.refusal(message, j.origin, j.text, at, len)};
+}
+
+fun at_token(j: *Job, message: str, t: wasm_text.Token) err[diagnostic.Diagnostic] {
+    if (t.kind == wasm_text.BROKEN) { ret refuse(j, t.why, t.at, t.len); }
+    ret refuse(j, message, t.at, t.len);
+}
+
+fun refused[T](j: *Job, message: str, at: usize, len: usize) res[T, diagnostic.Diagnostic] {
+    ret res[T, diagnostic.Diagnostic].err{diagnostic.refusal(message, j.origin, j.text, at, len)};
+}
+
+# a refusal of mink's at `at`
+fun failure(j: *Job, f: Fail, at: usize) diagnostic.Diagnostic {
+    var d: diagnostic.Diagnostic = diagnostic.refusal(FAILED, j.origin, j.text, at, 1);
+    d.cause = opt[Fail].some{f};
+    ret d;
+}
+
+fun failed(j: *Job, f: Fail, at: usize) err[diagnostic.Diagnostic] {
+    ret err[diagnostic.Diagnostic].err{failure(j, f, at)};
+}
+
+fun appended(j: *Job, got: err[Fail], at: usize) err[diagnostic.Diagnostic] {
+    if (sel got.err) { ret failed(j, got.err, at); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun closed(j: *Job, l: *wasm_text.Lexer) err[diagnostic.Diagnostic] {
+    val t: wasm_text.Token = wasm_text.next(l);
+    if (t.kind != wasm_text.CLOSE) { ret at_token(j, NOT_CLOSED, t); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a syntax reader over the text from the lexer's position to its end, for the instruction syntax's readers
+fun reader(j: *Job, l: *wasm_text.Lexer) core_syntax.Reader {
+    ret core_syntax.Reader{
+        text:    j.text,
+        start:   l.at,
+        at:      l.at,
+        end:     l.end,
+        origin:  diagnostic.advance(j.origin, j.text, l.at),
+        codec:   nil,
+        ctx:     j.ctx,
+        syntax:  ?wasm_syntax.SYNTAX,
+        modes:   nil,
+        symbols: nil,
+        context: nil,
+        row:     nil,
+        pool:    nil,
+        cap:     0,
+        used:    0,
+        bytes:   nil,
+        room:    0,
+        taken:   0,
+        refused: field.Admissions{at: nil, cap: 0, used: 0},
+    };
+}
+
+# the value type at the lexer, by the instruction syntax's spelling, its stream code
+fun value_type(j: *Job, l: *wasm_text.Lexer) res[u32, diagnostic.Diagnostic] {
+    var r: core_syntax.Reader = reader(j, l);
+    syntax_read.skip(?r);
+    val at:               usize                           = r.at;
+    val res_valtype_read: res[i64, diagnostic.Diagnostic] = wasm_syntax.valtype_read(?r);
+    if (sel res_valtype_read.err)                          { ret res[u32, diagnostic.Diagnostic].err{res_valtype_read.err}; }
+    if (!wasm_valtype.held_by_stream(res_valtype_read.ok)) { ret refused[u32](j, TYPE_RANGE, at, r.at - at); }
+    l.at = r.at;
+    ret res[u32, diagnostic.Diagnostic].ok{wasm_valtype.stream_code(res_valtype_read.ok)};
+}
+
+# whether a value type of stream code `code` is a reference type
+fun reference(code: u32) bool {
+    ret code != wasm_stream.I32 && code != wasm_stream.I64 && code != 0x7D && code != 0x7C && code != 0x7B;
+}
+
+# the reference type at the lexer, its stream code
+fun ref_type(j: *Job, l: *wasm_text.Lexer) res[u32, diagnostic.Diagnostic] {
+    val t:              wasm_text.Token                 = wasm_text.ahead(l);
+    val res_value_type: res[u32, diagnostic.Diagnostic] = value_type(j, l);
+    if (sel res_value_type.err)        { ret res_value_type; }
+    if (!reference(res_value_type.ok)) { ret refused[u32](j, NO_REFTYPE, t.at, t.len); }
+    ret res_value_type;
+}
+
+# the index in space `space` the atom at the lexer names, a number or an identifier the stream holds
+fun index(j: *Job, l: *wasm_text.Lexer, space: u16) res[u32, diagnostic.Diagnostic] {
+    var r: core_syntax.Reader = reader(j, l);
+    syntax_read.skip(?r);
+    val res_index_read: res[u32, diagnostic.Diagnostic] = wasm_syntax.index_read(?r, space);
+    if (sel res_index_read.err) { ret res_index_read; }
+    l.at = r.at;
+    ret res_index_read;
+}
+
+# whether an index, a number or an identifier, is at the lexer
+fun indexed(j: *Job, l: *wasm_text.Lexer) bool {
+    val t: wasm_text.Token = wasm_text.ahead(l);
+    if (t.kind != wasm_text.ATOM) { ret false; }
+    val c: u8 = j.text[t.at];
+    ret c == '$' || (c >= '0' && c <= '9');
+}
+
+# a type use at the lexer, its type index, a type it implies added after the last, each param's name onto `names` when
+# it is not nil
+fun type_use(j: *Job, l: *wasm_text.Lexer, names: *vector.Vector[View]) res[u32, diagnostic.Diagnostic] {
+    var r:            core_syntax.Reader                   = reader(j, l);
+    val res_type_use: res[opt[u32], diagnostic.Diagnostic] = wasm_syntax.type_use(?r, false, true, names);
+    if (sel res_type_use.err)     { ret res[u32, diagnostic.Diagnostic].err{res_type_use.err}; }
+    if (sel res_type_use.ok.none) { ret refused[u32](j, NO_FUNC_TYPE, l.at, 1); }
+    l.at = r.at;
+    ret res[u32, diagnostic.Diagnostic].ok{res_type_use.ok.some};
+}
+
+# the identifier at the lexer, passed, less its `$`, empty for none
+fun identifier(j: *Job, l: *wasm_text.Lexer) View {
+    val t: wasm_text.Token = wasm_text.ahead(l);
+    if (!wasm_text.identifier(l, t)) { ret View{data: nil, len: 0}; }
+    val passed: wasm_text.Token = wasm_text.next(l);
+    ret View{data: ?j.text[t.at + 1], len: t.len - 1};
+}
+
+# the bytes of the string at the lexer onto `out`, its escapes decoded (6.0-text.lexical.spectec, Tstring)
+fun string(j: *Job, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    val t: wasm_text.Token = wasm_text.next(l);
+    if (t.kind != wasm_text.STRING) { ret at_token(j, NO_STRING, t); }
+    val got: wasm_text.Escape = wasm_text.unescape(j.text, t.at + 1, t.at + t.len - 1, out);
+    if (sel got.bad)    { ret refuse(j, BAD_ESCAPE, got.bad, 2); }
+    if (sel got.memory) { ret refuse(j, field.MEMORY, t.at, t.len); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the strings at the lexer, joined onto `out`, as a data segment's are
+fun strings(j: *Job, l: *wasm_text.Lexer, out: *vector.Vector[u8]) err[diagnostic.Diagnostic] {
+    for (wasm_text.ahead(l).kind == wasm_text.STRING) {
+        val err_string: err[diagnostic.Diagnostic] = string(j, l, out);
+        if (sel err_string.err) { ret err_string; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the bytes of the string at the lexer, held by the module
+fun name_of(j: *Job, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
+    val at:    usize             = l.at;
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    val err_read: err[diagnostic.Diagnostic] = string(j, l, ?bytes);
+    if (sel err_read.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{err_read.err}; }
+    ret held(j, ?bytes, at);
+}
+
+# the bytes of `bytes` held by the module
+fun held(j: *Job, bytes: *vector.Vector[u8], at: usize) res[wasm_object.Span, diagnostic.Diagnostic] {
+    val res_hold: res[wasm_object.Span, Fail] = wasm_object.hold(j.out, bytes.data, bytes.len);
+    if (sel res_hold.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{failure(j, res_hold.err, at)}; }
+    ret res[wasm_object.Span, diagnostic.Diagnostic].ok{res_hold.ok};
+}
+
+# the module's fields, each by its keyword and its extent
+fun fields(j: *Job, l: *wasm_text.Lexer) err[diagnostic.Diagnostic] {
+    var wrapped: bool = false;
+    if (wasm_text.opens(l, "module")) {
+        wrapped = true;
+        val named: View            = identifier(j, l);
+        val after: wasm_text.Token = wasm_text.ahead(l);
+        if (wasm_text.is(l, after, "binary") || wasm_text.is(l, after, "quote")) { ret at_token(j, NOT_TEXT, after); }
+    }
+    for {
+        val t: wasm_text.Token = wasm_text.next(l);
+        if (t.kind == wasm_text.CLOSE && wrapped) {
+            val after: wasm_text.Token = wasm_text.next(l);
+            if (after.kind != wasm_text.END) { ret at_token(j, AFTER_MODULE, after); }
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (t.kind == wasm_text.END) {
+            if (wrapped) { ret refuse(j, NOT_CLOSED, t.at, 0); }
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (t.kind != wasm_text.OPEN) { ret at_token(j, NOT_A_FIELD, t); }
+        val k: wasm_text.Token = wasm_text.next(l);
+        if (k.kind != wasm_text.ATOM) { ret at_token(j, NOT_A_FIELD, k); }
+        val at: usize = l.at;
+        if (!wasm_text.skip(l)) { ret refuse(j, NOT_CLOSED, t.at, 1); }
+        val res_pushed: res[usize, A.Error] = vector.push[Field](?j.fields, Field{keyword: k, at: at, end: l.at - 1, kind: 0, index: 0, defines: false});
+        if (sel res_pushed.err) { ret refuse(j, field.MEMORY, t.at, 1); }
+    }
+}
+
+fun lexer(j: *Job, f: *Field) wasm_text.Lexer {
+    ret wasm_text.make(j.text, f.at, f.end + 1);
+}
+
+fun is(j: *Job, f: *Field, word: str) bool {
+    var l: wasm_text.Lexer = wasm_text.make(j.text, 0, 0);
+    ret wasm_text.is(?l, f.keyword, word);
+}
+
+# the value types of `(param ...)` or `(result ...)` lists at the lexer onto `out`
+fun lists(j: *Job, l: *wasm_text.Lexer, word: str, out: *vector.Vector[u32]) err[diagnostic.Diagnostic] {
+    for (wasm_text.opens(l, word)) {
+        val name: View = identifier(j, l);
+        for {
+            val t: wasm_text.Token = wasm_text.ahead(l);
+            if (t.kind == wasm_text.CLOSE) { brk; }
+            val res_value_type: res[u32, diagnostic.Diagnostic] = value_type(j, l);
+            if (sel res_value_type.err) { ret err[diagnostic.Diagnostic].err{res_value_type.err}; }
+            val res_pushed: res[usize, A.Error] = vector.push[u32](out, res_value_type.ok);
+            if (sel res_pushed.err) { ret refuse(j, field.MEMORY, t.at, t.len); }
+            if (name.len > 0)       { brk; }
+        }
+        val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+        if (sel err_shut.err) { ret err_shut; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a type field, `$id? (func (param ...)* (result ...)*)`, a type of the gc proposal refused
+fun type_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    var l:     wasm_text.Lexer = lexer(j, f);
+    val named: View            = identifier(j, ?l);
+    if (!wasm_text.opens(?l, "func")) {
+        val t: wasm_text.Token = wasm_text.ahead(?l);
+        if (t.kind == wasm_text.OPEN) { ret refuse(j, GC_TYPE, t.at, 1); }
+        ret at_token(j, NO_FUNC_TYPE, t);
+    }
+    var params:  vector.Vector[u32] = vector.init[u32](j.a);
+    var results: vector.Vector[u32] = vector.init[u32](j.a);
+    fin {
+        vector.dnit[u32](?params);
+        vector.dnit[u32](?results);
+    }
+    val err_lists: err[diagnostic.Diagnostic] = lists(j, ?l, "param", ?params);
+    if (sel err_lists.err) { ret err_lists; }
+    val err_results_listed: err[diagnostic.Diagnostic] = lists(j, ?l, "result", ?results);
+    if (sel err_results_listed.err) { ret err_results_listed; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    val res_added: res[u32, str] = wasm_stream.add_type(j.ctx.stream, params.data, params.len::u32, results.data, results.len::u32, View{data: nil, len: 0});
+    if (sel res_added.err) { ret refuse(j, res_added.err, f.keyword.at, f.keyword.len); }
+    ret closed(j, ?l);
+}
+
+# the lexer past a field's inline exports, which the export pass reads in text order
+fun past_exports(l: *wasm_text.Lexer) {
+    for (wasm_text.opens(l, "export")) { val shut: bool = wasm_text.skip(l); }
+}
+
+# the number at the lexer, within `most`
+fun number(j: *Job, l: *wasm_text.Lexer, most: u64) res[u64, diagnostic.Diagnostic] {
+    val t: wasm_text.Token = wasm_text.next(l);
+    if (t.kind != wasm_text.ATOM || j.text[t.at] < '0' || j.text[t.at] > '9') { ret refused[u64](j, NO_LIMIT, t.at, t.len); }
+    val res_natural: res[u64, str] = wasm_syntax.natural(j.text, t.at, t.at + t.len, most);
+    if (sel res_natural.err && res_natural.err == wasm_syntax.RANGE) { ret refused[u64](j, LIMIT_RANGE, t.at, t.len); }
+    if (sel res_natural.err)                                         { ret refused[u64](j, NO_LIMIT, t.at, t.len); }
+    ret res[u64, diagnostic.Diagnostic].ok{res_natural.ok};
+}
+
+fun numeric(j: *Job, l: *wasm_text.Lexer) bool {
+    val t: wasm_text.Token = wasm_text.ahead(l);
+    ret t.kind == wasm_text.ATOM && j.text[t.at] >= '0' && j.text[t.at] <= '9';
+}
+
+# an address type at the lexer, `i32` or `i64`, its code, i32 where none is stated
+fun address(j: *Job, l: *wasm_text.Lexer) u32 {
+    if (wasm_text.is(l, wasm_text.ahead(l), "i64")) {
+        val passed: wasm_text.Token = wasm_text.next(l);
+        ret wasm_stream.I64;
+    }
+    if (wasm_text.is(l, wasm_text.ahead(l), "i32")) { val passed: wasm_text.Token = wasm_text.next(l); }
+    ret wasm_stream.I32;
+}
+
+# limits at the lexer, `min max?`, each within `most`, of 64-bit indices for address type i64
+fun limits(j: *Job, l: *wasm_text.Lexer, code: u32, most: u64) res[fact.Limits, diagnostic.Diagnostic] {
+    val res_min: res[u64, diagnostic.Diagnostic] = number(j, l, most);
+    if (sel res_min.err) { ret res[fact.Limits, diagnostic.Diagnostic].err{res_min.err}; }
+    var out: fact.Limits = fact.Limits{min: res_min.ok, max: opt[u64].none{}, shared: false, wide: code == wasm_stream.I64};
+    if (numeric(j, l)) {
+        val res_max: res[u64, diagnostic.Diagnostic] = number(j, l, most);
+        if (sel res_max.err) { ret res[fact.Limits, diagnostic.Diagnostic].err{res_max.err}; }
+        out.max = opt[u64].some{res_max.ok};
+    }
+    ret res[fact.Limits, diagnostic.Diagnostic].ok{out};
+}
+
+# the limits of `n` entries or pages exactly, of 64-bit indices for address type i64, as an inline segment sizes its
+# table or memory
+fun exactly(n: u64, code: u32) fact.Limits {
+    ret fact.Limits{min: n, max: opt[u64].some{n}, shared: false, wide: code == wasm_stream.I64};
+}
+
+# the most pages a memory of address type `code` has, and the most entries a table has
+fun most_pages(code: u32) u64 {
+    if (code == wasm_stream.I64) { ret 1::u64 << 48; }
+    ret 1::u64 << 16;
+}
+
+fun most_entries(code: u32) u64 {
+    if (code == wasm_stream.I64) { ret ~0::u64; }
+    ret 0xFFFF_FFFF;
+}
+
+# a memory type at the lexer, `addrtype? limits shared?`, a page size refused
+fun memory_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[fact.Limits, diagnostic.Diagnostic] {
+    @code = address(j, l);
+    val res_limits: res[fact.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_pages(@code));
+    if (sel res_limits.err) { ret res_limits; }
+    var out: fact.Limits = res_limits.ok;
+    if (wasm_text.is(l, wasm_text.ahead(l), "shared")) {
+        val passed: wasm_text.Token = wasm_text.next(l);
+        out.shared = true;
+    }
+    if (wasm_text.ahead(l).kind == wasm_text.OPEN) { ret refused[fact.Limits](j, PAGE_SIZE, l.at, 1); }
+    ret res[fact.Limits, diagnostic.Diagnostic].ok{out};
+}
+
+# a table type at the lexer, `addrtype? limits reftype`
+fun table_type(j: *Job, l: *wasm_text.Lexer, code: *u32) res[wasm_object.TableType, diagnostic.Diagnostic] {
+    @code = address(j, l);
+    val res_limits: res[fact.Limits, diagnostic.Diagnostic] = limits(j, l, @code, most_entries(@code));
+    if (sel res_limits.err) { ret res[wasm_object.TableType, diagnostic.Diagnostic].err{res_limits.err}; }
+    val res_ref_type: res[u32, diagnostic.Diagnostic] = ref_type(j, l);
+    if (sel res_ref_type.err) { ret res[wasm_object.TableType, diagnostic.Diagnostic].err{res_ref_type.err}; }
+    ret res[wasm_object.TableType, diagnostic.Diagnostic].ok{wasm_object.TableType{elem: wasm_valtype.widened(res_ref_type.ok), limits: res_limits.ok, init: opt[wasm_object.Span].none{}}};
+}
+
+# a global type at the lexer, `valtype` or `(mut valtype)`, of no initializer
+fun global_type(j: *Job, l: *wasm_text.Lexer) res[wasm_object.Global, diagnostic.Diagnostic] {
+    val wrapped:        bool                            = wasm_text.opens(l, "mut");
+    val res_value_type: res[u32, diagnostic.Diagnostic] = value_type(j, l);
+    if (sel res_value_type.err) { ret res[wasm_object.Global, diagnostic.Diagnostic].err{res_value_type.err}; }
+    if (wrapped) {
+        val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+        if (sel err_shut.err) { ret res[wasm_object.Global, diagnostic.Diagnostic].err{err_shut.err}; }
+    }
+    ret res[wasm_object.Global, diagnostic.Diagnostic].ok{wasm_object.Global{value: wasm_valtype.widened(res_value_type.ok), mutable: wrapped, init: opt[wasm_object.Span].none{}}};
+}
+
+# the space a kind of import or export names, by the byte the binary spells the kind by
+fun space_of(kind: u8) u16 {
+    if (kind == FUNC)   { ret wasm_kind.FUNCS; }
+    if (kind == TABLE)  { ret wasm_kind.TABLES; }
+    if (kind == MEMORY) { ret wasm_kind.MEMORIES; }
+    if (kind == GLOBAL) { ret wasm_kind.GLOBALS; }
+    ret wasm_kind.TAGS;
+}
+
+val KIND_WORDS: [5]str = [5]str{"func", "table", "memory", "global", "tag"};
+
+# what an import of kind `kind` brings in, read at the lexer, defined in its space named `name`
+fun import_desc(j: *Job, l: *wasm_text.Lexer, kind: u8, name: View, at: usize) res[wasm_object.Desc, diagnostic.Diagnostic] {
+    var code: u32              = 0;
+    var desc: wasm_object.Desc = wasm_object.Desc.function{0};
+    if (kind == FUNC || kind == TAG) {
+        val res_typed: res[u32, diagnostic.Diagnostic] = type_use(j, l, nil);
+        if (sel res_typed.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{res_typed.err}; }
+        code = res_typed.ok;
+        if (kind == TAG) { desc = wasm_object.Desc.exception{code}; }
+        or               { desc = wasm_object.Desc.function{code}; }
+    }
+    or (kind == TABLE) {
+        val res_table_type: res[wasm_object.TableType, diagnostic.Diagnostic] = table_type(j, l, ?code);
+        if (sel res_table_type.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{res_table_type.err}; }
+        desc = wasm_object.Desc.table{res_table_type.ok};
+    }
+    or (kind == MEMORY) {
+        val res_memory_type: res[fact.Limits, diagnostic.Diagnostic] = memory_type(j, l, ?code);
+        if (sel res_memory_type.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{res_memory_type.err}; }
+        desc = wasm_object.Desc.memory{res_memory_type.ok};
+    }
+    or {
+        val res_global_type: res[wasm_object.Global, diagnostic.Diagnostic] = global_type(j, l);
+        if (sel res_global_type.err) { ret res[wasm_object.Desc, diagnostic.Diagnostic].err{res_global_type.err}; }
+        code = wasm_valtype.stream_code(res_global_type.ok.value);
+        desc = wasm_object.Desc.global{res_global_type.ok};
+    }
+    val res_defined: res[u32, str] = wasm_stream.define(j.ctx.stream, space_of(kind), code, name);
+    if (sel res_defined.err) { ret refused[wasm_object.Desc](j, res_defined.err, at, 1); }
+    ret res[wasm_object.Desc, diagnostic.Diagnostic].ok{desc};
+}
+
+# an import of kind `kind` from module `module` field `field_`, read at the lexer, the field's index set
+fun imported(j: *Job, f: *Field, l: *wasm_text.Lexer, module: wasm_object.Span, field_: wasm_object.Span, kind: u8, name: View) err[diagnostic.Diagnostic] {
+    val res_desc: res[wasm_object.Desc, diagnostic.Diagnostic] = import_desc(j, l, kind, name, f.keyword.at);
+    if (sel res_desc.err) { ret err[diagnostic.Diagnostic].err{res_desc.err}; }
+    f.kind    = kind;
+    f.index   = wasm_stream.count(j.ctx.stream, space_of(kind)) - 1;
+    f.defines = true;
+    ret appended(j, wasm_object.import(j.out, wasm_object.view(j.out, module), wasm_object.view(j.out, field_), res_desc.ok), f.keyword.at);
+}
+
+# an import field, `"m" "n" (kind $id? desc)`
+fun import_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    var l:          wasm_text.Lexer                              = lexer(j, f);
+    val res_module: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
+    if (sel res_module.err) { ret err[diagnostic.Diagnostic].err{res_module.err}; }
+    val res_field: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
+    if (sel res_field.err) { ret err[diagnostic.Diagnostic].err{res_field.err}; }
+    var k: usize = 0;
+    for (k < 5) {
+        if (wasm_text.opens(?l, KIND_WORDS[k])) {
+            val named:        View                       = identifier(j, ?l);
+            val err_imported: err[diagnostic.Diagnostic] = imported(j, f, ?l, res_module.ok, res_field.ok, k::u8, named);
+            if (sel err_imported.err) { ret err_imported; }
+            val err_inner: err[diagnostic.Diagnostic] = closed(j, ?l);
+            if (sel err_inner.err) { ret err_inner; }
+            ret closed(j, ?l);
+        }
+        k = k + 1;
+    }
+    ret at_token(j, NO_EXTERN, wasm_text.ahead(?l));
+}
+
+# an inline `(import "m" "n")` at the lexer, the import of kind `kind` it abbreviates read and true, false for none
+fun inline_import(j: *Job, f: *Field, l: *wasm_text.Lexer, kind: u8, name: View) res[bool, diagnostic.Diagnostic] {
+    if (!wasm_text.opens(l, "import")) { ret res[bool, diagnostic.Diagnostic].ok{false}; }
+    val res_module: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, l);
+    if (sel res_module.err) { ret res[bool, diagnostic.Diagnostic].err{res_module.err}; }
+    val res_field: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, l);
+    if (sel res_field.err) { ret res[bool, diagnostic.Diagnostic].err{res_field.err}; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+    if (sel err_shut.err) { ret res[bool, diagnostic.Diagnostic].err{err_shut.err}; }
+    val err_imported: err[diagnostic.Diagnostic] = imported(j, f, l, res_module.ok, res_field.ok, kind, name);
+    if (sel err_imported.err) { ret res[bool, diagnostic.Diagnostic].err{err_imported.err}; }
+    val err_done: err[diagnostic.Diagnostic] = closed(j, l);
+    if (sel err_done.err) { ret res[bool, diagnostic.Diagnostic].err{err_done.err}; }
+    ret res[bool, diagnostic.Diagnostic].ok{true};
+}
+
+# the definition `f` is, of kind `kind` and index `index`
+fun defines(f: *Field, kind: u8, index: u32) {
+    f.kind    = kind;
+    f.index   = index;
+    f.defines = true;
+}
+
+fun define(j: *Job, space: u16, code: u32, name: View, at: usize) res[u32, diagnostic.Diagnostic] {
+    val res_define: res[u32, str] = wasm_stream.define(j.ctx.stream, space, code, name);
+    if (sel res_define.err) { ret refused[u32](j, res_define.err, at, 1); }
+    ret res[u32, diagnostic.Diagnostic].ok{res_define.ok};
+}
+
+# a func field: an import, or a definition of its index and type, and the types its body implies
+fun func_field(j: *Job, b: *wasm_body.Reader, f: *Field, k: u32) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val kind:       u8                               = FUNC;
+    val res_inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
+    if (sel res_inline.err) { ret err[diagnostic.Diagnostic].err{res_inline.err}; }
+    if (res_inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
+    val res_typed: res[u32, diagnostic.Diagnostic] = type_use(j, ?l, nil);
+    if (sel res_typed.err) { ret err[diagnostic.Diagnostic].err{res_typed.err}; }
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.FUNCS, res_typed.ok, name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    defines(f, kind, res_index.ok);
+    val own:        usize                      = j.funcs.len;
+    val err_pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.function{res_typed.ok}), f.keyword.at);
+    if (sel err_pushed.err) { ret err_pushed; }
+    val res_noted: res[usize, A.Error] = vector.push[Defined](?j.funcs, Defined{field: k, index: own::u32, type: res_typed.ok});
+    if (sel res_noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
+    ret wasm_body.imply(b, ?l);
+}
+
+# a tag field: an import, or a definition of its type
+fun tag_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val kind:       u8                               = TAG;
+    val res_inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
+    if (sel res_inline.err) { ret err[diagnostic.Diagnostic].err{res_inline.err}; }
+    if (res_inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
+    val res_typed: res[u32, diagnostic.Diagnostic] = type_use(j, ?l, nil);
+    if (sel res_typed.err) { ret err[diagnostic.Diagnostic].err{res_typed.err}; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.TAGS, res_typed.ok, name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    defines(f, kind, res_index.ok);
+    ret appended(j, wasm_object.define(j.out, wasm_object.Desc.exception{res_typed.ok}), f.keyword.at);
+}
+
+# a global field: an import, or a definition of its type, its initializer read in its later pass
+fun global_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val kind:       u8                               = GLOBAL;
+    val res_inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
+    if (sel res_inline.err) { ret err[diagnostic.Diagnostic].err{res_inline.err}; }
+    if (res_inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
+    val res_type: res[wasm_object.Global, diagnostic.Diagnostic] = global_type(j, ?l);
+    if (sel res_type.err) { ret err[diagnostic.Diagnostic].err{res_type.err}; }
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.GLOBALS, wasm_valtype.stream_code(res_type.ok.value), name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    defines(f, kind, res_index.ok);
+    val res_noted: res[usize, A.Error] = vector.push[Pending](?j.globals, Pending{field: k, at: l.at, of: 0, inline: false, type: 0, value: res_type.ok.value, mutable: res_type.ok.mutable});
+    if (sel res_noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# how many items an inline `(elem ...)` holds: a `func` list's indices, or a reference type's expressions
+fun items_in(j: *Job, l: wasm_text.Lexer) u64 {
+    var copy: wasm_text.Lexer = l;
+    var n:    u64             = 0;
+    if (wasm_text.is(?copy, wasm_text.ahead(?copy), "func")) {
+        val passed: wasm_text.Token = wasm_text.next(?copy);
+        for (indexed(j, ?copy)) {
+            val one: wasm_text.Token = wasm_text.next(?copy);
+            n = n + 1;
+        }
+        ret n;
+    }
+    if (indexed(j, ?copy)) {
+        for (indexed(j, ?copy)) {
+            val one: wasm_text.Token = wasm_text.next(?copy);
+            n = n + 1;
+        }
+        ret n;
+    }
+    for {
+        val t: wasm_text.Token = wasm_text.next(?copy);
+        if (t.kind != wasm_text.OPEN && t.kind != wasm_text.ATOM) { brk; }
+        if (t.kind == wasm_text.OPEN) {
+            val passed: bool = wasm_text.skip(?copy);
+            n = n + 1;
+        }
+    }
+    ret n;
+}
+
+# a table field: an import, or a definition of its type and its initializer where it has one, read in its later pass,
+# or the table and the active segment its inline `(elem ...)` abbreviates, whose items are read in their later pass
+fun table_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val kind:       u8                               = TABLE;
+    val res_inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
+    if (sel res_inline.err) { ret err[diagnostic.Diagnostic].err{res_inline.err}; }
+    if (res_inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
+    var code: u32             = 0;
+    var type: wasm_object.TableType;
+    var elem: bool            = false;
+    var at:   usize           = 0;
+    val back: wasm_text.Lexer = l;
+    code = address(j, ?l);
+    if (!numeric(j, ?l)) {
+        val res_ref_type: res[u32, diagnostic.Diagnostic] = ref_type(j, ?l);
+        if (sel res_ref_type.err)         { ret err[diagnostic.Diagnostic].err{res_ref_type.err}; }
+        if (!wasm_text.opens(?l, "elem")) { ret at_token(j, NOT_CLOSED, wasm_text.ahead(?l)); }
+        at   = l.at;
+        elem = true;
+        val n: u64 = items_in(j, l);
+        type = wasm_object.TableType{elem: wasm_valtype.widened(res_ref_type.ok), limits: exactly(n, code), init: opt[wasm_object.Span].none{}};
+        val passed: bool = wasm_text.skip(?l);
+    }
+    or {
+        l = back;
+        val res_table_type: res[wasm_object.TableType, diagnostic.Diagnostic] = table_type(j, ?l, ?code);
+        if (sel res_table_type.err) { ret err[diagnostic.Diagnostic].err{res_table_type.err}; }
+        type = res_table_type.ok;
+    }
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.TABLES, code, name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    defines(f, kind, res_index.ok);
+    val position:   u32                        = wasm_object.defined_tables(j.out);
+    val err_pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.table{type}), f.keyword.at);
+    if (sel err_pushed.err) { ret err_pushed; }
+    if (!elem) {
+        if (wasm_text.ahead(?l).kind == wasm_text.CLOSE) { ret err[diagnostic.Diagnostic].ok{}; }
+        val res_noted: res[usize, A.Error] = vector.push[Pending](?j.tables, Pending{field: k, at: l.at, of: position, inline: false, type: 0, value: 0, mutable: false});
+        if (sel res_noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    ret segment(j, ?j.elements, wasm_kind.ELEMS, f, k, at, res_index.ok, wasm_valtype.stream_code(type.elem), View{data: nil, len: 0});
+}
+
+# a segment of the field `k` noted for its later pass and defined in `space`, its contents from `at`, of entry `of`
+fun segment(j: *Job, into: *vector.Vector[Pending], space: u16, f: *Field, k: u32, at: usize, of: u32, type: u32, name: View) err[diagnostic.Diagnostic] {
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, space, 0, name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    val res_noted: res[usize, A.Error] = vector.push[Pending](into, Pending{field: k, at: at, of: of, inline: !is(j, f, "elem") && !is(j, f, "data"), type: type, value: 0, mutable: false});
+    if (sel res_noted.err) { ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the bytes the strings at the lexer hold
+fun data_length(j: *Job, l: wasm_text.Lexer) res[u64, diagnostic.Diagnostic] {
+    var copy:  wasm_text.Lexer   = l;
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    val err_strings: err[diagnostic.Diagnostic] = strings(j, ?copy, ?bytes);
+    if (sel err_strings.err) { ret res[u64, diagnostic.Diagnostic].err{err_strings.err}; }
+    ret res[u64, diagnostic.Diagnostic].ok{bytes.len::u64};
+}
+
+# a memory field: an import, or a definition of its limits, or the memory and the active segment its inline
+# `(data ...)` abbreviates
+fun memory_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val kind:       u8                               = MEMORY;
+    val res_inline: res[bool, diagnostic.Diagnostic] = inline_import(j, f, ?l, kind, name);
+    if (sel res_inline.err) { ret err[diagnostic.Diagnostic].err{res_inline.err}; }
+    if (res_inline.ok)      { ret err[diagnostic.Diagnostic].ok{}; }
+    var code:   u32             = 0;
+    var limits: fact.Limits;
+    var data:   bool            = false;
+    var at:     usize           = 0;
+    val back:   wasm_text.Lexer = l;
+    code = address(j, ?l);
+    if (wasm_text.opens(?l, "data")) {
+        at   = l.at;
+        data = true;
+        val res_data_length: res[u64, diagnostic.Diagnostic] = data_length(j, l);
+        if (sel res_data_length.err) { ret err[diagnostic.Diagnostic].err{res_data_length.err}; }
+        limits = exactly((res_data_length.ok + 0xFFFF) / 0x1_0000, code);
+        val passed: bool = wasm_text.skip(?l);
+    }
+    or {
+        l = back;
+        val res_memory_type: res[fact.Limits, diagnostic.Diagnostic] = memory_type(j, ?l, ?code);
+        if (sel res_memory_type.err) { ret err[diagnostic.Diagnostic].err{res_memory_type.err}; }
+        limits = res_memory_type.ok;
+    }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    val res_index: res[u32, diagnostic.Diagnostic] = define(j, wasm_kind.MEMORIES, code, name, f.keyword.at);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    defines(f, kind, res_index.ok);
+    val err_pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.memory{limits}), f.keyword.at);
+    if (sel err_pushed.err) { ret err_pushed; }
+    if (!data)              { ret err[diagnostic.Diagnostic].ok{}; }
+    ret segment(j, ?j.datas, wasm_kind.DATAS, f, k, at, res_index.ok, 0, View{data: nil, len: 0});
+}
+
+# an elem or a data field's index defined by its name, its contents read in their later pass
+fun segment_field(j: *Job, f: *Field, k: u32) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    if (is(j, f, "elem")) { ret segment(j, ?j.elements, wasm_kind.ELEMS, f, k, l.at, 0, 0, name); }
+    ret segment(j, ?j.datas, wasm_kind.DATAS, f, k, l.at, 0, 0, name);
+}
+
+# what an export's `(func x)` and its kin name: the kind and the index in its space
+rec Extern {
+    kind:  u8;
+    index: u32;
+}
+
+fun extern(j: *Job, l: *wasm_text.Lexer) res[Extern, diagnostic.Diagnostic] {
+    var k: usize = 0;
+    for (k < 5) {
+        if (wasm_text.opens(l, KIND_WORDS[k])) {
+            val res_index: res[u32, diagnostic.Diagnostic] = index(j, l, space_of(k::u8));
+            if (sel res_index.err) { ret res[Extern, diagnostic.Diagnostic].err{res_index.err}; }
+            val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+            if (sel err_shut.err) { ret res[Extern, diagnostic.Diagnostic].err{err_shut.err}; }
+            ret res[Extern, diagnostic.Diagnostic].ok{Extern{kind: k::u8, index: res_index.ok}};
+        }
+        k = k + 1;
+    }
+    val t: wasm_text.Token = wasm_text.ahead(l);
+    ret refused[Extern](j, NO_EXTERN, t.at, t.len);
+}
+
+# an export field, `"n" (func x)`
+fun export_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    var l:         wasm_text.Lexer                              = lexer(j, f);
+    val res_named: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
+    if (sel res_named.err) { ret err[diagnostic.Diagnostic].err{res_named.err}; }
+    val res_extern: res[Extern, diagnostic.Diagnostic] = extern(j, ?l);
+    if (sel res_extern.err) { ret err[diagnostic.Diagnostic].err{res_extern.err}; }
+    val err_pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.export(j.out, wasm_object.view(j.out, res_named.ok), res_extern.ok.kind, res_extern.ok.index), f.keyword.at);
+    if (sel err_pushed.err) { ret err_pushed; }
+    ret closed(j, ?l);
+}
+
+# a definition's inline exports, `(export "n")*`, each an export of what it defines
+fun inline_exports(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    for (wasm_text.opens(?l, "export")) {
+        val res_named: res[wasm_object.Span, diagnostic.Diagnostic] = name_of(j, ?l);
+        if (sel res_named.err) { ret err[diagnostic.Diagnostic].err{res_named.err}; }
+        val err_pushed: err[diagnostic.Diagnostic] = appended(j, wasm_object.export(j.out, wasm_object.view(j.out, res_named.ok), f.kind, f.index), f.keyword.at);
+        if (sel err_pushed.err) { ret err_pushed; }
+        val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+        if (sel err_shut.err) { ret err_shut; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a start field, `x`, the module's one start function
+fun start_field(j: *Job, f: *Field) err[diagnostic.Diagnostic] {
+    if (j.started) { ret refuse(j, TWO_STARTS, f.keyword.at, f.keyword.len); }
+    var l:         wasm_text.Lexer                 = lexer(j, f);
+    val res_index: res[u32, diagnostic.Diagnostic] = index(j, ?l, wasm_kind.FUNCS);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    j.start   = opt[u32].some{res_index.ok};
+    j.started = true;
+    ret closed(j, ?l);
+}
+
+# the expression of the instructions at the lexer up to the `)` around them, held by the module
+fun expression(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
+    val at:    usize             = l.at;
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    val err_expression: err[diagnostic.Diagnostic] = wasm_body.expression(b, l, ?bytes);
+    if (sel err_expression.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{err_expression.err}; }
+    ret held(j, ?bytes, at);
+}
+
+# an offset at the lexer, `(offset instr*)` or one folded instruction, its expression
+fun offset(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) res[wasm_object.Span, diagnostic.Diagnostic] {
+    if (wasm_text.opens(l, "offset")) {
+        val res_expression: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, l);
+        if (sel res_expression.err) { ret res_expression; }
+        val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+        if (sel err_shut.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{err_shut.err}; }
+        ret res_expression;
+    }
+    val at:    usize             = l.at;
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    val err_folded_expression: err[diagnostic.Diagnostic] = wasm_body.folded_expression(b, l, ?bytes);
+    if (sel err_folded_expression.err) { ret res[wasm_object.Span, diagnostic.Diagnostic].err{err_folded_expression.err}; }
+    ret held(j, ?bytes, at);
+}
+
+# the expression `0` of address type `code`, an inline segment's offset: its const and its end, encoded
+fun zero(j: *Job, code: u32, at: usize) res[wasm_object.Span, diagnostic.Diagnostic] {
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    var value: [1]operand.Value = [1]operand.Value{operand.Value.immediate{0}};
+    var ins:   inst.Inst        = inst.Inst{row: ?gen_row.ROWS[gen_row_index.I32CONST], values: ?value[0], count: 1, form: form.PREFERRED};
+    if (code == wasm_stream.I64) { ins.row = ?gen_row.ROWS[gen_row_index.I64CONST]; }
+    var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](j.a);
+    fin { vector.dnit[field.Fixup](?fixups); }
+    val res_wrote: res[usize, field.Refusal] = masc_codec.encode(j.codec, j.ctx, ?ins, ?bytes, ?fixups);
+    if (sel res_wrote.err) { ret refused[wasm_object.Span](j, res_wrote.err.message, at, 1); }
+    var end:       inst.Inst                 = inst.Inst{row: ?gen_row.ROWS[gen_row_index.END], values: nil, count: 0, form: form.PREFERRED};
+    val res_ended: res[usize, field.Refusal] = masc_codec.encode(j.codec, j.ctx, ?end, ?bytes, ?fixups);
+    if (sel res_ended.err) { ret refused[wasm_object.Span](j, res_ended.err.message, at, 1); }
+    ret held(j, ?bytes, at);
+}
+
+# the address type of the table or memory `index` of space `space`
+fun address_of(j: *Job, space: u16, index: u32) u32 {
+    val opt_space: opt[u32] = wasm_stream.space(j.ctx.stream, space, index);
+    if (sel opt_space.some) { ret opt_space.some; }
+    ret wasm_stream.I32;
+}
+
+# a global's initializer, read in its index order, the global defined with it
+fun global_init(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
+    val f:              *Field                                       = ?j.fields.data[p.field];
+    var l:              wasm_text.Lexer                              = wasm_text.make(j.text, p.at, f.end + 1);
+    val res_expression: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, ?l);
+    if (sel res_expression.err) { ret err[diagnostic.Diagnostic].err{res_expression.err}; }
+    val g:           wasm_object.Global         = wasm_object.Global{value: p.value, mutable: p.mutable, init: opt[wasm_object.Span].some{res_expression.ok}};
+    val err_defined: err[diagnostic.Diagnostic] = appended(j, wasm_object.define(j.out, wasm_object.Desc.global{g}), f.keyword.at);
+    if (sel err_defined.err) { ret err_defined; }
+    ret closed(j, ?l);
+}
+
+# the initializer of the table `p` notes, the table defined at position `p.of`
+fun table_init(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
+    val f:              *Field                                       = ?j.fields.data[p.field];
+    var l:              wasm_text.Lexer                              = wasm_text.make(j.text, p.at, f.end + 1);
+    val res_expression: res[wasm_object.Span, diagnostic.Diagnostic] = expression(j, b, ?l);
+    if (sel res_expression.err) { ret err[diagnostic.Diagnostic].err{res_expression.err}; }
+    val err_stated: err[diagnostic.Diagnostic] = appended(j, wasm_object.initialize(j.out, p.of, res_expression.ok), f.keyword.at);
+    if (sel err_stated.err) { ret err_stated; }
+    ret closed(j, ?l);
+}
+
+# the function index an expression of one `ref.func` names, none for any other expression
+fun ref_func(j: *Job, bytes: *vector.Vector[u8]) opt[u32] {
+    var store_:     [4]operand.Value;
+    var room:       [4]requirement.Alternative;
+    var alts:       field.Admissions                       = field.Admissions{at: ?room[0], cap: 4, used: 0};
+    val res_decode: res[masc_codec.Decoded, field.Refusal] = masc_codec.decode(j.codec, j.ctx, bytes.data, bytes.len, 0, ?store_[0], 4, ?alts);
+    if (sel res_decode.err)                                             { ret opt[u32].none{}; }
+    if (res_decode.ok.inst.row != ?gen_row.ROWS[gen_row_index.REFFUNC]) { ret opt[u32].none{}; }
+    if (res_decode.ok.len + 1 != bytes.len)                             { ret opt[u32].none{}; }
+    if (!sel res_decode.ok.inst.values[0].id)                           { ret opt[u32].none{}; }
+    ret opt[u32].some{res_decode.ok.inst.values[0].id};
+}
+
+# what an element segment's items are: function indices of a `(ref func)` segment, or expressions of a reference type
+rec Items {
+    funcs:   bool;
+    type:    u32;
+    indices: vector.Vector[u32];
+    exprs:   vector.Vector[vector.Vector[u8]];
+}
+
+fun items_dnit(it: *Items) {
+    var i: usize = 0;
+    for (i < it.exprs.len) {
+        vector.dnit[u8](?it.exprs.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[vector.Vector[u8]](?it.exprs);
+    vector.dnit[u32](?it.indices);
+}
+
+# the function indices at the lexer onto `out`
+fun func_indices(j: *Job, l: *wasm_text.Lexer, out: *vector.Vector[u32]) err[diagnostic.Diagnostic] {
+    for (indexed(j, l)) {
+        val res_index: res[u32, diagnostic.Diagnostic] = index(j, l, wasm_kind.FUNCS);
+        if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+        val res_pushed: res[usize, A.Error] = vector.push[u32](out, res_index.ok);
+        if (sel res_pushed.err) { ret refuse(j, field.MEMORY, l.at, 1); }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the expression `ref.func x`, its end after it
+fun ref_expr(j: *Job, x: u32, out: *vector.Vector[u8], at: usize) err[diagnostic.Diagnostic] {
+    var value:  [1]operand.Value           = [1]operand.Value{operand.Value.id{x}};
+    var ins:    inst.Inst                  = inst.Inst{row: ?gen_row.ROWS[gen_row_index.REFFUNC], values: ?value[0], count: 1, form: form.PREFERRED};
+    var fixups: vector.Vector[field.Fixup] = vector.init[field.Fixup](j.a);
+    fin { vector.dnit[field.Fixup](?fixups); }
+    val res_wrote: res[usize, field.Refusal] = masc_codec.encode(j.codec, j.ctx, ?ins, out, ?fixups);
+    if (sel res_wrote.err) { ret refuse(j, res_wrote.err.message, at, 1); }
+    var end:       inst.Inst                 = inst.Inst{row: ?gen_row.ROWS[gen_row_index.END], values: nil, count: 0, form: form.PREFERRED};
+    val res_ended: res[usize, field.Refusal] = masc_codec.encode(j.codec, j.ctx, ?end, out, ?fixups);
+    if (sel res_ended.err) { ret refuse(j, res_ended.err.message, at, 1); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the reference type `(ref func)`, as the syntax holds it: its byte and its heap type above it
+val REF_FUNC: i64 = (wasm_valtype.FUNCREF::i64 - 0x80) * 0x100 + wasm_field.REF::i64;
+
+# an element segment's reference type at the lexer: `(ref func)` as `funcs`, or its stream code
+fun element_type(j: *Job, l: *wasm_text.Lexer, out: *Items) err[diagnostic.Diagnostic] {
+    var r: core_syntax.Reader = reader(j, l);
+    syntax_read.skip(?r);
+    val at:               usize                           = r.at;
+    val res_valtype_read: res[i64, diagnostic.Diagnostic] = wasm_syntax.valtype_read(?r);
+    if (sel res_valtype_read.err) { ret err[diagnostic.Diagnostic].err{res_valtype_read.err}; }
+    l.at = r.at;
+    if (res_valtype_read.ok == REF_FUNC) {
+        out.funcs = true;
+        out.type  = wasm_valtype.FUNCREF::u32;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (!wasm_valtype.held_by_stream(res_valtype_read.ok))         { ret refuse(j, TYPE_RANGE, at, r.at - at); }
+    if (!reference(wasm_valtype.stream_code(res_valtype_read.ok))) { ret refuse(j, NO_REFTYPE, at, r.at - at); }
+    out.type = wasm_valtype.stream_code(res_valtype_read.ok);
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# an element segment's items at the lexer: a `func` list's indices, or a reference type's `(item instr*)` or folded
+# instructions. `bare` reads a list of function indices with no `func` before it, as an active segment's text may
+# spell them, a `(ref func)` list. an inline segment's items are of its table's reference type `type`, a bare list of
+# them each a `ref.func`
+fun items(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer, bare: bool, type: opt[u32], out: *Items) err[diagnostic.Diagnostic] {
+    if (sel type.some) {
+        out.type = type.some;
+        if (indexed(j, l) || wasm_text.ahead(l).kind == wasm_text.CLOSE) {
+            var listed: vector.Vector[u32] = vector.init[u32](j.a);
+            fin { vector.dnit[u32](?listed); }
+            val err_func_indices: err[diagnostic.Diagnostic] = func_indices(j, l, ?listed);
+            if (sel err_func_indices.err) { ret err_func_indices; }
+            var i: usize = 0;
+            for (i < listed.len) {
+                var bytes:      vector.Vector[u8]          = vector.init[u8](j.a);
+                val err_wrote:  err[diagnostic.Diagnostic] = ref_expr(j, listed.data[i], ?bytes, l.at);
+                val res_pushed: res[usize, A.Error]        = vector.push[vector.Vector[u8]](?out.exprs, bytes);
+                if (sel err_wrote.err)  { ret err_wrote; }
+                if (sel res_pushed.err) { ret refuse(j, field.MEMORY, l.at, 1); }
+                i = i + 1;
+            }
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+    }
+    or (wasm_text.is(l, wasm_text.ahead(l), "func")) {
+        val passed: wasm_text.Token = wasm_text.next(l);
+        out.funcs = true;
+        ret func_indices(j, l, ?out.indices);
+    }
+    or (bare && (indexed(j, l) || wasm_text.ahead(l).kind == wasm_text.CLOSE)) {
+        out.funcs = true;
+        ret func_indices(j, l, ?out.indices);
+    }
+    or {
+        val err_typed: err[diagnostic.Diagnostic] = element_type(j, l, out);
+        if (sel err_typed.err) { ret err_typed; }
+    }
+    for (wasm_text.ahead(l).kind == wasm_text.OPEN) {
+        val at:             usize                      = l.at;
+        var bytes:          vector.Vector[u8]          = vector.init[u8](j.a);
+        var err_expression: err[diagnostic.Diagnostic] = err[diagnostic.Diagnostic].ok{};
+        if (wasm_text.opens(l, "item")) {
+            err_expression = wasm_body.expression(b, l, ?bytes);
+            if (!sel err_expression.err) { err_expression = closed(j, l); }
+        }
+        or { err_expression = wasm_body.folded_expression(b, l, ?bytes); }
+        if (sel err_expression.err) {
+            vector.dnit[u8](?bytes);
+            ret err_expression;
+        }
+        if (out.funcs) {
+            # a (ref func) segment's items are function indices, each an expression of one ref.func
+            val opt_ref_func: opt[u32] = ref_func(j, ?bytes);
+            vector.dnit[u8](?bytes);
+            if (sel opt_ref_func.none) { ret refuse(j, NO_ITEM, at, 1); }
+            val res_kept: res[usize, A.Error] = vector.push[u32](?out.indices, opt_ref_func.some);
+            if (sel res_kept.err) { ret refuse(j, field.MEMORY, at, 1); }
+            cnt;
+        }
+        val res_pushed: res[usize, A.Error] = vector.push[vector.Vector[u8]](?out.exprs, bytes);
+        if (sel res_pushed.err) { ret refuse(j, field.MEMORY, at, 1); }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# whether an offset, `(offset ...)` or a folded instruction, is at the lexer
+fun offset_ahead(j: *Job, b: *wasm_body.Reader, l: *wasm_text.Lexer) bool {
+    var copy: wasm_text.Lexer = @l;
+    if (wasm_text.next(?copy).kind != wasm_text.OPEN) { ret false; }
+    val t: wasm_text.Token = wasm_text.next(?copy);
+    ret wasm_text.is(l, t, "offset") || wasm_body.instruction(b, t);
+}
+
+# the segment modes a segment's text states
+val PASSIVE:  u8 = 0;
+val ACTIVE:   u8 = 1;
+val DECLARED: u8 = 2;
+
+# the element segment `p` notes, read in its index order: `declare`, or a table use and an offset for an active one,
+# then its items. an active segment writes its table's index for a table other than the first or for items of a type
+# other than funcref, and its items are expressions unless they are a `(ref func)` list
+fun element(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
+    val f:        *Field           = ?j.fields.data[p.field];
+    var l:        wasm_text.Lexer  = wasm_text.make(j.text, p.at, f.end + 1);
+    var mode:     u8               = PASSIVE;
+    var tab:      u32              = p.of;
+    var off:      wasm_object.Span = wasm_object.Span{at: 0, len: 0};
+    var opt_type: opt[u32]         = opt[u32].none{};
+    if (p.inline) {
+        mode = ACTIVE;
+        val res_zero: res[wasm_object.Span, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.TABLES, tab), f.keyword.at);
+        if (sel res_zero.err) { ret err[diagnostic.Diagnostic].err{res_zero.err}; }
+        off      = res_zero.ok;
+        opt_type = opt[u32].some{p.type};
+    }
+    or (wasm_text.is(?l, wasm_text.ahead(?l), "declare")) {
+        val passed: wasm_text.Token = wasm_text.next(?l);
+        mode = DECLARED;
+    }
+    or {
+        var used: bool = false;
+        if (wasm_text.opens(?l, "table")) {
+            val res_index: res[u32, diagnostic.Diagnostic] = index(j, ?l, wasm_kind.TABLES);
+            if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+            val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+            if (sel err_shut.err) { ret err_shut; }
+            tab  = res_index.ok;
+            used = true;
+        }
+        or (indexed(j, ?l)) {
+            val res_index: res[u32, diagnostic.Diagnostic] = index(j, ?l, wasm_kind.TABLES);
+            if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+            tab  = res_index.ok;
+            used = true;
+        }
+        if (used || offset_ahead(j, b, ?l)) {
+            val res_offset: res[wasm_object.Span, diagnostic.Diagnostic] = offset(j, b, ?l);
+            if (sel res_offset.err) { ret err[diagnostic.Diagnostic].err{res_offset.err}; }
+            off  = res_offset.ok;
+            mode = ACTIVE;
+        }
+    }
+    var it: Items = Items{funcs: false, type: 0, indices: vector.init[u32](j.a), exprs: vector.init[vector.Vector[u8]](j.a)};
+    fin { items_dnit(?it); }
+    val err_items: err[diagnostic.Diagnostic] = items(j, b, ?l, mode == ACTIVE, opt_type, ?it);
+    if (sel err_items.err) { ret err_items; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    var stated: wasm_object.Element = wasm_object.Element{mode: wasm_object.Mode.passive{}, type: wasm_valtype.FUNCREF::i64, items: wasm_object.Items.functions{vector.init[u32](j.a)}};
+    if (mode == DECLARED) { stated.mode = wasm_object.Mode.declarative{}; }
+    or (mode == ACTIVE) {
+        var opt_index: opt[u32] = opt[u32].none{};
+        if (tab != 0 || (!it.funcs && it.type != wasm_valtype.FUNCREF::u32)) { opt_index = opt[u32].some{tab}; }
+        stated.mode = wasm_object.Mode.active{wasm_object.At{index: opt_index, offset: off}};
+    }
+    if (it.funcs) {
+        stated.items = wasm_object.Items.functions{it.indices};
+        it.indices   = vector.init[u32](j.a);
+        ret appended(j, wasm_object.element(j.out, stated), f.keyword.at);
+    }
+    stated.type = wasm_valtype.widened(it.type);
+    var spans: vector.Vector[wasm_object.Span] = vector.init[wasm_object.Span](j.a);
+    var i:     usize                           = 0;
+    for (i < it.exprs.len) {
+        val res_held: res[wasm_object.Span, diagnostic.Diagnostic] = held(j, ?it.exprs.data[i], f.keyword.at);
+        if (sel res_held.err) {
+            vector.dnit[wasm_object.Span](?spans);
+            ret err[diagnostic.Diagnostic].err{res_held.err};
+        }
+        val res_pushed: res[usize, A.Error] = vector.push[wasm_object.Span](?spans, res_held.ok);
+        if (sel res_pushed.err) {
+            vector.dnit[wasm_object.Span](?spans);
+            ret refuse(j, field.MEMORY, f.keyword.at, f.keyword.len);
+        }
+        i = i + 1;
+    }
+    stated.items = wasm_object.Items.expressions{spans};
+    ret appended(j, wasm_object.element(j.out, stated), f.keyword.at);
+}
+
+# the data segment `p` notes, read in its index order: a memory use and an offset for an active one, then its strings.
+# an active segment writes its memory's index for a memory other than the first
+fun data(j: *Job, b: *wasm_body.Reader, p: *Pending) err[diagnostic.Diagnostic] {
+    val f:      *Field           = ?j.fields.data[p.field];
+    var l:      wasm_text.Lexer  = wasm_text.make(j.text, p.at, f.end + 1);
+    var active: bool             = false;
+    var mem:    u32              = p.of;
+    var off:    wasm_object.Span = wasm_object.Span{at: 0, len: 0};
+    if (p.inline) {
+        active = true;
+        val res_zero: res[wasm_object.Span, diagnostic.Diagnostic] = zero(j, address_of(j, wasm_kind.MEMORIES, mem), f.keyword.at);
+        if (sel res_zero.err) { ret err[diagnostic.Diagnostic].err{res_zero.err}; }
+        off = res_zero.ok;
+    }
+    or {
+        var used: bool = false;
+        if (wasm_text.opens(?l, "memory")) {
+            val res_index: res[u32, diagnostic.Diagnostic] = index(j, ?l, wasm_kind.MEMORIES);
+            if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+            val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+            if (sel err_shut.err) { ret err_shut; }
+            mem  = res_index.ok;
+            used = true;
+        }
+        or (indexed(j, ?l)) {
+            val res_index: res[u32, diagnostic.Diagnostic] = index(j, ?l, wasm_kind.MEMORIES);
+            if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+            mem  = res_index.ok;
+            used = true;
+        }
+        if (used || offset_ahead(j, b, ?l)) {
+            val res_offset: res[wasm_object.Span, diagnostic.Diagnostic] = offset(j, b, ?l);
+            if (sel res_offset.err) { ret err[diagnostic.Diagnostic].err{res_offset.err}; }
+            off    = res_offset.ok;
+            active = true;
+        }
+    }
+    var bytes: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?bytes); }
+    val err_strings: err[diagnostic.Diagnostic] = strings(j, ?l, ?bytes);
+    if (sel err_strings.err) { ret err_strings; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    var head: wasm_object.Head = wasm_object.Head.passive{};
+    if (active) {
+        var opt_index: opt[u32] = opt[u32].none{};
+        if (mem != 0) { opt_index = opt[u32].some{mem}; }
+        head = wasm_object.Head.active{wasm_object.At{index: opt_index, offset: off}};
+    }
+    val res_segment: res[Id[mink_object.Section], Fail] = wasm_object.segment(j.out, head, wasm_object.PLAIN, bytes.data, bytes.len);
+    if (sel res_segment.err) { ret failed(j, res_segment.err, f.keyword.at); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the locals at the lexer, `(local $id t)` or `(local t*)`, defined after the params, onto `types`
+fun locals(j: *Job, l: *wasm_text.Lexer, types: *vector.Vector[u32]) err[diagnostic.Diagnostic] {
+    for (wasm_text.opens(l, "local")) {
+        val name: View = identifier(j, l);
+        for {
+            val t: wasm_text.Token = wasm_text.ahead(l);
+            if (t.kind == wasm_text.CLOSE) { brk; }
+            val res_value_type: res[u32, diagnostic.Diagnostic] = value_type(j, l);
+            if (sel res_value_type.err) { ret err[diagnostic.Diagnostic].err{res_value_type.err}; }
+            val res_defined: res[u32, str] = wasm_stream.define(j.ctx.stream, wasm_kind.LOCALS, res_value_type.ok, name);
+            if (sel res_defined.err) { ret refuse(j, res_defined.err, t.at, t.len); }
+            val res_pushed: res[usize, A.Error] = vector.push[u32](types, res_value_type.ok);
+            if (sel res_pushed.err) { ret refuse(j, field.MEMORY, t.at, t.len); }
+            if (name.len > 0)       { brk; }
+        }
+        val err_shut: err[diagnostic.Diagnostic] = closed(j, l);
+        if (sel err_shut.err) { ret err_shut; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# value type of stream code `code` onto `out`: its byte, and a typed reference's heap type as an s33 after it
+fun put_value_type(out: *vector.Vector[u8], code: u32) {
+    val whole: i64 = wasm_valtype.widened(code);
+    val b:     u8  = (whole & 0xFF)::u8;
+    vector.push[u8](out, b);
+    if (b == wasm_field.REF || b == wasm_field.REF_NULL) { wasm_leb.put_signed(out, whole >> 8); }
+}
+
+# the locals vector of a body: each run of locals of one type as its count and its type
+fun local_runs(out: *vector.Vector[u8], types: *vector.Vector[u32]) {
+    var runs: u64   = 0;
+    var i:    usize = 0;
+    for (i < types.len) {
+        if (i == 0 || types.data[i] != types.data[i - 1]) { runs = runs + 1; }
+        i = i + 1;
+    }
+    wasm_leb.put_unsigned(out, runs);
+    i = 0;
+    for (i < types.len) {
+        var n: usize = i;
+        for (n < types.len && types.data[n] == types.data[i]) { n = n + 1; }
+        wasm_leb.put_unsigned(out, (n - i)::u64);
+        put_value_type(out, types.data[i]);
+        i = n;
+    }
+}
+
+# function `d`'s body: the stream entered at its type, its params named, its locals and its code, stated as its body
+fun body_of(j: *Job, b: *wasm_body.Reader, d: *Defined) err[diagnostic.Diagnostic] {
+    val type: u32             = d.type;
+    val f:    *Field          = ?j.fields.data[d.field];
+    var l:    wasm_text.Lexer = lexer(j, f);
+    val name: View            = identifier(j, ?l);
+    past_exports(?l);
+    val err_entered: err[str] = wasm_stream.enter(j.ctx.stream, type);
+    if (sel err_entered.err) { ret refuse(j, err_entered.err, l.at, 1); }
+    var names: vector.Vector[View] = vector.init[View](j.a);
+    fin { vector.dnit[View](?names); }
+    val res_typed: res[u32, diagnostic.Diagnostic] = type_use(j, ?l, ?names);
+    if (sel res_typed.err) { ret err[diagnostic.Diagnostic].err{res_typed.err}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        val err_named: err[str] = wasm_stream.name_local(j.ctx.stream, i::u32, names.data[i]);
+        if (sel err_named.err) { ret refuse(j, err_named.err, l.at, 1); }
+        i = i + 1;
+    }
+    var types: vector.Vector[u32] = vector.init[u32](j.a);
+    fin { vector.dnit[u32](?types); }
+    val err_declared: err[diagnostic.Diagnostic] = locals(j, ?l, ?types);
+    if (sel err_declared.err) { ret err_declared; }
+    var body: vector.Vector[u8] = vector.init[u8](j.a);
+    fin { vector.dnit[u8](?body); }
+    local_runs(?body, ?types);
+    val err_code: err[diagnostic.Diagnostic] = wasm_body.function(b, ?l, ?body);
+    if (sel err_code.err) { ret err_code; }
+    val err_shut: err[diagnostic.Diagnostic] = closed(j, ?l);
+    if (sel err_shut.err) { ret err_shut; }
+    val res_stated: res[Id[mink_object.Section], Fail] = wasm_object.body(j.out, d.index::usize, body.data, body.len);
+    if (sel res_stated.err) { ret failed(j, res_stated.err, f.keyword.at); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the module the `len` bytes of `source` spell, read under `ctx`, whose stream it begins and fills, as mink's neutral
+# object of a module for `arch`, which the caller releases
+# ---
+# origin: the position of the text's first byte
+pub fun read(a: *A.Allocator, source: *u8, len: usize, origin: diagnostic.Position, ctx: *state.Context, arch: *mink_arch.Arch) res[mink_object.Object, diagnostic.Diagnostic] {
+    var m:             wasm_object.Module         = wasm_object.init(a, arch, ?catalog_kind.MODULE);
+    val err_read_into: err[diagnostic.Diagnostic] = read_into(a, source, len, origin, ctx, ?m);
+    if (sel err_read_into.err) {
+        wasm_object.dnit(?m);
+        ret res[mink_object.Object, diagnostic.Diagnostic].err{err_read_into.err};
+    }
+    val res_finish: res[mink_object.Object, Fail] = wasm_object.finish(?m, ctx.stream);
+    if (sel res_finish.err) {
+        var d: diagnostic.Diagnostic = diagnostic.refusal(UNFINISHED, origin, source, 0, 0);
+        d.cause = opt[Fail].some{res_finish.err};
+        ret res[mink_object.Object, diagnostic.Diagnostic].err{d};
+    }
+    ret res[mink_object.Object, diagnostic.Diagnostic].ok{res_finish.ok};
+}
+
+# the module the text spells stated on `out`
+fun read_into(a: *A.Allocator, source: *u8, len: usize, origin: diagnostic.Position, ctx: *state.Context, out: *wasm_object.Module) err[diagnostic.Diagnostic] {
+    val codec: *dispatch.Codec = ?wasm_codec.CODEC;
+    wasm_stream.HOOKS.begin(ctx.stream);
+    # the fields are read from a copy whose comments are blanked, so the instruction syntax's readers pass them as
+    # the white space they are
+    val res_copied: res[*u8, A.Error] = wasm_text.blanked(a, source, len);
+    if (sel res_copied.err) { ret err[diagnostic.Diagnostic].err{diagnostic.refusal(field.MEMORY, origin, source, 0, 0)}; }
+    val text: *u8 = res_copied.ok;
+    fin { val err_freed: err[A.Error] = A.deallocate[u8](a, text, len + 1); }
+    var j: Job = Job{a: a, text: text, origin: origin, codec: codec, ctx: ctx, fields: vector.init[Field](a), funcs: vector.init[Defined](a), globals: vector.init[Pending](a), tables: vector.init[Pending](a), elements: vector.init[Pending](a), datas: vector.init[Pending](a), start: opt[u32].none{}, started: false, out: out};
+    fin {
+        vector.dnit[Field](?j.fields);
+        vector.dnit[Defined](?j.funcs);
+        vector.dnit[Pending](?j.globals);
+        vector.dnit[Pending](?j.tables);
+        vector.dnit[Pending](?j.elements);
+        vector.dnit[Pending](?j.datas);
+    }
+    var l:          wasm_text.Lexer            = wasm_text.make(text, 0, len);
+    val err_listed: err[diagnostic.Diagnostic] = fields(?j, ?l);
+    if (sel err_listed.err) { ret err_listed; }
+    var b:        wasm_body.Reader           = wasm_body.init(a, text, origin, codec, ctx);
+    val err_done: err[diagnostic.Diagnostic] = kept_requires(a, passes(?j, ?b));
+    wasm_body.dnit(?b);
+    ret err_done;
+}
+
+# `e` with what its refusal needed copied into `a`, as the reader's storage it lies in goes with the reader, and the
+# refusal outlives it. a copy `a` refuses leaves the refusal naming none
+fun kept_requires(a: *A.Allocator, e: err[diagnostic.Diagnostic]) err[diagnostic.Diagnostic] {
+    if (!sel e.err)              { ret e; }
+    if (e.err.requires.len == 0) { ret e; }
+    var d:            diagnostic.Diagnostic                  = e.err;
+    val res_allocate: res[*requirement.Alternative, A.Error] = A.allocate[requirement.Alternative](a, d.requires.len::usize);
+    if (sel res_allocate.err) {
+        d.requires = requirement.NO_ALTERNATIVES;
+        ret err[diagnostic.Diagnostic].err{d};
+    }
+    var i: u32 = 0;
+    for (i < d.requires.len) {
+        res_allocate.ok[i] = d.requires.at[i];
+        i                  = i + 1;
+    }
+    d.requires = requirement.Requirement{at: res_allocate.ok, len: d.requires.len};
+    ret err[diagnostic.Diagnostic].err{d};
+}
+
+# the type names, the fields in their passes and the sections
+fun passes(j: *Job, b: *wasm_body.Reader) err[diagnostic.Diagnostic] {
+    var k:     usize = 0;
+    var types: u32   = 0;
+    for (k < j.fields.len) {
+        val f: *Field = ?j.fields.data[k];
+        if (is(j, f, "type")) {
+            var l:         wasm_text.Lexer = lexer(j, f);
+            val err_named: err[str]        = wasm_stream.name_type(j.ctx.stream, types, identifier(j, ?l));
+            if (sel err_named.err) { ret refuse(j, err_named.err, f.keyword.at, f.keyword.len); }
+            types = types + 1;
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.fields.len) {
+        val f: *Field = ?j.fields.data[k];
+        if (is(j, f, "type")) {
+            val err_type_field: err[diagnostic.Diagnostic] = type_field(j, f);
+            if (sel err_type_field.err) { ret err_type_field; }
+        }
+        or (is(j, f, "rec")) { ret refuse(j, GC_TYPE, f.keyword.at, f.keyword.len); }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.fields.len) {
+        val f:                *Field                     = ?j.fields.data[k];
+        var err_import_field: err[diagnostic.Diagnostic] = err[diagnostic.Diagnostic].ok{};
+        if (is(j, f, "import"))                                             { err_import_field = import_field(j, f); }
+        or (is(j, f, "func"))                                               { err_import_field = func_field(j, b, f, k::u32); }
+        or (is(j, f, "table"))                                              { err_import_field = table_field(j, f, k::u32); }
+        or (is(j, f, "memory"))                                             { err_import_field = memory_field(j, f, k::u32); }
+        or (is(j, f, "global"))                                             { err_import_field = global_field(j, f, k::u32); }
+        or (is(j, f, "tag"))                                                { err_import_field = tag_field(j, f); }
+        or (is(j, f, "elem") || is(j, f, "data"))                           { err_import_field = segment_field(j, f, k::u32); }
+        or (!is(j, f, "type") && !is(j, f, "export") && !is(j, f, "start")) { err_import_field = refuse(j, UNREAD_FIELD, f.keyword.at, f.keyword.len); }
+        if (sel err_import_field.err)                                       { ret err_import_field; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.fields.len) {
+        val f:                *Field                     = ?j.fields.data[k];
+        var err_export_field: err[diagnostic.Diagnostic] = err[diagnostic.Diagnostic].ok{};
+        if (is(j, f, "export"))       { err_export_field = export_field(j, f); }
+        or (is(j, f, "start"))        { err_export_field = start_field(j, f); }
+        or (f.defines)                { err_export_field = inline_exports(j, f); }
+        if (sel err_export_field.err) { ret err_export_field; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.globals.len) {
+        val err_global_init: err[diagnostic.Diagnostic] = global_init(j, b, ?j.globals.data[k]);
+        if (sel err_global_init.err) { ret err_global_init; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.tables.len) {
+        val err_table_init: err[diagnostic.Diagnostic] = table_init(j, b, ?j.tables.data[k]);
+        if (sel err_table_init.err) { ret err_table_init; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.elements.len) {
+        val err_element: err[diagnostic.Diagnostic] = element(j, b, ?j.elements.data[k]);
+        if (sel err_element.err) { ret err_element; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.datas.len) {
+        val err_data: err[diagnostic.Diagnostic] = data(j, b, ?j.datas.data[k]);
+        if (sel err_data.err) { ret err_data; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < j.funcs.len) {
+        val err_body_of: err[diagnostic.Diagnostic] = body_of(j, b, ?j.funcs.data[k]);
+        if (sel err_body_of.err) { ret err_body_of; }
+        k = k + 1;
+    }
+    if (sel j.start.some) { wasm_object.start(j.out, j.start.some); }
+    if (b.datas)          { wasm_object.count_data(j.out); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a module's text, its fields, read here and printed by `masc.isa.wasm.print`
+pub val MODULE: stream.Module = stream.Module.printed{stream.Printed{print: wasm_print.module, read: read}};

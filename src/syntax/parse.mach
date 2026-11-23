@@ -1,0 +1,1162 @@
+# the instruction parser: instruction text read into an encoded instruction value
+#
+# the parser finds the candidates for the text's mnemonic in the syntax's
+# index and tries them in row order, a row's template and then each alias of
+# that row, the order of the encoder's preference, and takes the first whose
+# text matches and whose values the row admits under the selection. an alias
+# resolves to its base row's value. when no candidate takes the text, the
+# refusal is the one of the candidate that read it whole, or else of the one
+# that read furthest, at its column.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use masc.codec;
+use masc.core.diagnostic;
+use masc.core.field;
+use core_form: masc.core.form;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.query;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.source;
+use masc.core.state;
+use core_syntax: masc.core.syntax;
+use masc.syntax.alias;
+use masc.syntax.read;
+use seq: masc.syntax.sequence;
+
+# the refusal of an instruction directive's text that starts with the name of none of its formats
+pub val UNKNOWN_FORMAT: str = "the directive states no such instruction format";
+
+# the refusals of a row whose result the statement does not bind, and of a bound result no operand of the row takes
+pub val UNBOUND: str = "the statement binds the instruction's result to no name";
+pub val UNTAKEN: str = "the instruction takes the bound result as no operand";
+
+# the refusal of an operand the template writes again, spelled with another value than where it was first written
+pub val REPEATED: str = "the operand is written again with another value";
+
+# the refusal of a derived spelling, as casp's `<X(s+1)>`, that reads other than the value its derivation gives
+pub val DERIVED: str = "the operand is spelled as other than the value its derivation gives";
+
+# a name standing for an address read where the template spells a whole operand, which is no address
+pub val SPLIT: str = "the name stands for an address where the operand is no address";
+
+# a name standing for an address where the template modifies it, as sve's `mul vl` scales its offset
+pub val MODIFIED: str = "the name stands for an address the template modifies";
+
+# an operand written with no size that rows of more than one size read the text by
+pub val AMBIGUOUS_SIZE: str = "the operand states no size, and more than one size reads it";
+
+# how far a candidate got before its refusal, ordered so the refusal of one that got further outranks any that did not
+# ---
+# PARTIAL: its template did not read the whole text
+# READ:    it read the whole text and was refused before every operand was admitted on its own
+# FIT:     every operand was admitted on its own, a register whatever the view, and it was refused for the selection, its
+#          requirement or a register the view lacks, so its operands' classes select it over any candidate that refused
+#          one of them
+# JOINT:   every operand was admitted on its own and it was refused for what they hold together, so its operands' classes
+#          select it over any candidate that refused one of them alone
+def Depth: u8;
+
+val PARTIAL: Depth = 0;
+val READ:    Depth = 1;
+val FIT:     Depth = 2;
+val JOINT:   Depth = 3;
+
+# the refusal kept while candidates are tried
+# ---
+# held:    whether one is kept
+# depth:   how far its candidate got, the later of two at one depth outranking the other
+# refusal: the refusal
+# unmet:   whether the refusal is a candidate refused for admission, whose requirement becomes that of every such candidate
+# noted:   the depth of the candidates refused for admission whose requirements the reader holds
+# full:    whether the reader had no room for the requirement of a candidate refused for admission
+rec Best {
+    held:    bool;
+    depth:   Depth;
+    refusal: diagnostic.Diagnostic;
+    unmet:   bool;
+    noted:   Depth;
+    full:    bool;
+}
+
+# whether `d`, the refusal of a candidate that got to `depth`, was kept
+fun keep(best: *Best, d: diagnostic.Diagnostic, depth: Depth) bool {
+    if (best.held) {
+        if (best.depth > depth)                                                           { ret false; }
+        if (best.depth == depth && d.span.start.offset <= best.refusal.span.start.offset) { ret false; }
+    }
+    best.held    = true;
+    best.depth   = depth;
+    best.refusal = d;
+    best.unmet   = false;
+    ret true;
+}
+
+# the candidate starting at the instruction refused at `depth` for want of `required`, whose alternatives join those of
+# every other so refused at that depth, and outrank those of any refused at a shallower one
+fun keep_unmet(rd: *core_syntax.Reader, best: *Best, required: requirement.Requirement, at: usize, len: usize, depth: Depth) {
+    if (depth < best.noted) { ret; }
+    if (depth > best.noted) {
+        rd.refused.used = 0;
+        best.full       = false;
+        best.noted      = depth;
+    }
+    if (!field.note(?rd.refused, required)) {
+        best.full = true;
+        read.refused_short(rd, rd.refused.used::u64 + required.len::u64);
+    }
+    if (keep(best, read.refuse_unmet(rd, required, at, len), depth)) { best.unmet = true; }
+}
+
+# the candidate refused by walk at `at`: for want of its row's requirement, which joins those of every other candidate so
+# refused, or for what it names, as a register the selection lacks, whose requirement is that register's alone. one
+# whose operands walk admitted each on its own is kept at JOINT
+fun keep_refused(rd: *core_syntax.Reader, best: *Best, refusal: field.Refusal, at: usize) {
+    var depth: Depth = READ;
+    if (refusal.reach == field.TOGETHER) { depth = JOINT; }
+    if (sel refusal.cause.admission) {
+        keep_unmet(rd, best, refusal.requires, at, read.token(rd, at), depth);
+        ret;
+    }
+    var d: diagnostic.Diagnostic = read.refuse(rd, refusal.message, at, read.token(rd, at));
+    d.requires = refusal.requires;
+    keep(best, d, depth);
+}
+
+# one value of `desc` read at the position
+fun one(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    # a name the caller states the value of is read before the syntax reads the text as its own
+    if (r.named != nil) {
+        val opt_named: opt[err[diagnostic.Diagnostic]] = r.named.read(r.named.context, r, desc, out);
+        if (sel opt_named.some) { ret opt_named.some; }
+    }
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel shape.register) {
+        if (view_eq_str(format, core_syntax.NUMBER)) {
+            val res_numbered: res[register.Id, diagnostic.Diagnostic] = read.register_number(r, ?shape.register);
+            if (sel res_numbered.err) { ret err[diagnostic.Diagnostic].err{res_numbered.err}; }
+            @out = operand.Value.register{res_numbered.ok};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        # a tuple is written by its first member, as an even pair by its even register
+        if (read.tuples(r.codec.registers, ?shape.register)) {
+            val res_tuple_value: res[register.Id, diagnostic.Diagnostic] = read.tuple_value(r, ?shape.register);
+            if (sel res_tuple_value.err) { ret err[diagnostic.Diagnostic].err{res_tuple_value.err}; }
+            @out = operand.Value.register{res_tuple_value.ok};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        # the row admits the register through the view once its operands fit
+        val res_reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, false);
+        if (sel res_reg.err) { ret err[diagnostic.Diagnostic].err{res_reg.err}; }
+        @out = operand.Value.register{res_reg.ok};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (sel shape.enumerant) {
+        val res_enumeration: res[u32, diagnostic.Diagnostic] = read.enumeration(r, ?shape.enumerant);
+        if (sel res_enumeration.err) { ret err[diagnostic.Diagnostic].err{res_enumeration.err}; }
+        ret params(r, ?shape.enumerant, res_enumeration.ok, format, out);
+    }
+    if (sel shape.condition) {
+        val res_enumeration: res[u32, diagnostic.Diagnostic] = read.enumeration(r, ?shape.condition);
+        if (sel res_enumeration.err) { ret err[diagnostic.Diagnostic].err{res_enumeration.err}; }
+        @out = operand.Value.condition{res_enumeration.ok};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (sel shape.group) {
+        if (r.syntax.hooks.group == nil) { ret group(r, ?shape.group, format, out); }
+    }
+    val h: *core_syntax.Hook = core_syntax.hook(r.syntax, shape);
+    if (h == nil) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+    ret h.parse(r, desc, format, out);
+}
+
+# one value of `desc` read at the reader's position by the syntax's tables and hooks, as a raw encoding of a directive
+# is read alone, the reader advanced past it
+pub fun value(r: *core_syntax.Reader, desc: *operand.Operand, out: *operand.Value) err[diagnostic.Diagnostic] {
+    read.skip(r);
+    ret one(r, desc, View{data: "", len: 0}, out);
+}
+
+# the most members a group holds, and the most params an enumerant takes
+val GROUP_MEMBERS: u32 = 16;
+
+# the enumerant `value` of `e` with the params it takes read after it, each after the syntax's variadic text, into the
+# pool as one run
+fun params(r: *core_syntax.Reader, e: *operand.Enumeration, value: u32, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val count: u32 = operand.param_count(e, value);
+    if (count > GROUP_MEMBERS) { ret err[diagnostic.Diagnostic].err{read.refuse(r, field.STORAGE, r.at, 0)}; }
+    var held: [GROUP_MEMBERS]operand.Value;
+    var i:    u32 = 0;
+    for (i < count) {
+        if (!read.joined(r)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+        read.skip(r);
+        val err_param_one: err[diagnostic.Diagnostic] = one(r, operand.param(e, value, i), format, ?held[i]);
+        if (sel err_param_one.err) { ret err_param_one; }
+        i = i + 1;
+    }
+    var first: *operand.Value = nil;
+    i = 0;
+    for (i < count) {
+        val res_slot: res[*operand.Value, diagnostic.Diagnostic] = read.push(r, held[i]);
+        if (sel res_slot.err) { ret err[diagnostic.Diagnostic].err{res_slot.err}; }
+        if (i == 0)           { first = res_slot.ok; }
+        i = i + 1;
+    }
+    @out = operand.Value.enumerant{operand.Chosen{value: value, params: operand.Values{at: first, len: count}}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a group's members read in order, joined by the syntax's variadic text, into the pool as one run
+fun group(r: *core_syntax.Reader, g: *operand.Group, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (g.len > GROUP_MEMBERS) { ret err[diagnostic.Diagnostic].err{read.refuse(r, field.STORAGE, r.at, 0)}; }
+    var held: [GROUP_MEMBERS]operand.Value;
+    var i:    u32 = 0;
+    for (i < g.len) {
+        if (i > 0) {
+            if (!read.joined(r)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, read.EXPECTED, r.at, read.token(r, r.at))}; }
+            read.skip(r);
+        }
+        val err_format_one: err[diagnostic.Diagnostic] = one(r, ?g.at[i], format, ?held[i]);
+        if (sel err_format_one.err) { ret err_format_one; }
+        i = i + 1;
+    }
+    var first: *operand.Value = nil;
+    i = 0;
+    for (i < g.len) {
+        val res_slot: res[*operand.Value, diagnostic.Diagnostic] = read.push(r, held[i]);
+        if (sel res_slot.err) { ret err[diagnostic.Diagnostic].err{res_slot.err}; }
+        if (i == 0)           { first = res_slot.ok; }
+        i = i + 1;
+    }
+    @out = operand.Value.group{operand.Values{at: first, len: g.len}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# operand `desc`'s value read by its hole, a variadic operand as members joined by the syntax's text, or whole by the
+# syntax's variadic hook where the hole states a format. the members are counted first, so their run is reserved in the pool before what each holds within it, a group's members or an
+# enumerant's params, and the list's members are one run
+fun hole(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    if (desc.quantity != operand.VARIADIC)                { ret one(r, desc, format, out); }
+    if (format.len > 0 && r.syntax.hooks.variadic != nil) { ret r.syntax.hooks.variadic.parse(r, desc, format, out); }
+    val from:  usize = r.at;
+    val used:  u32   = r.used;
+    val taken: u32   = r.taken;
+    var count: u32   = 0;
+    for {
+        val back: usize = r.at;
+        if (count > 0) {
+            if (!read.joined(r)) { brk; }
+            read.skip(r);
+        }
+        var member:       operand.Value;
+        val err_desc_one: err[diagnostic.Diagnostic] = one(r, desc, format, ?member);
+        if (sel err_desc_one.err) {
+            r.at = back;
+            brk;
+        }
+        count = count + 1;
+    }
+    r.at    = from;
+    r.used  = used;
+    r.taken = taken;
+    if (count == 0) {
+        @out = operand.Value.list{operand.Values{at: nil, len: 0}};
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val res_first: res[*operand.Value, diagnostic.Diagnostic] = read.run(r, count);
+    if (sel res_first.err) { ret err[diagnostic.Diagnostic].err{res_first.err}; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (k > 0) {
+            val joined: bool = read.joined(r);
+            read.skip(r);
+        }
+        val err_desc_one: err[diagnostic.Diagnostic] = one(r, desc, format, ?res_first.ok[k]);
+        if (sel err_desc_one.err) { ret err_desc_one; }
+        k = k + 1;
+    }
+    @out = operand.Value.list{operand.Values{at: res_first.ok, len: count}};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the value a derived hole of `desc` spells read at the position: a register where `desc` is a tuple's, as casp's
+# `<X(s+1)>` spells its pair's second member, else a value of `desc` as its hole reads one
+fun derived_hole(r: *core_syntax.Reader, desc: *operand.Operand, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel shape.register) {
+        if (read.tuples(r.codec.registers, ?shape.register)) {
+            val res_reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, false);
+            if (sel res_reg.err) { ret err[diagnostic.Diagnostic].err{res_reg.err}; }
+            @out = operand.Value.register{res_reg.ok};
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+    }
+    ret hole(r, desc, View{data: nil, len: 0}, out);
+}
+
+# whether the piece after the one at `at` ends a word, so the text must too
+fun ends_word(template: str, at: usize) bool {
+    val next: core_syntax.Piece = core_syntax.piece(template, at);
+    ret next.kind == core_syntax.SPACE || next.kind == core_syntax.END || next.kind == core_syntax.OPEN || next.kind == core_syntax.CLOSE;
+}
+
+# whether the text starts with the template's mnemonic, a space of it read as any run of white space between a prefix
+# and its word, and ends a word there where the template's mnemonic does
+fun keyed(r: *core_syntax.Reader, template: str, from: usize) bool {
+    val key: View  = core_syntax.mnemonic(r.syntax.prefixes, template);
+    var i:   usize = from;
+    var k:   usize = 0;
+    for (k < key.len) {
+        val c: u8 = key.data[k];
+        if (c == ' ') {
+            if (i >= r.end || !read.is_blank(r.text[i])) { ret false; }
+            for (i < r.end && read.is_blank(r.text[i])) {
+                i = i + 1;
+            }
+        }
+        or {
+            if (i >= r.end || !read.same(r, r.text[i], c)) { ret false; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    if (key.len == 0) { ret true; }
+    ret !(read.word(key.data[key.len - 1]) && ends_word(template, key.len) && i < r.end && read.word(r.text[i]));
+}
+
+# whether template text `c` opens an address
+fun opens(c: u8) bool {
+    ret c == '[' || c == '(';
+}
+
+# whether template text `c` closes an address
+fun closes(c: u8) bool {
+    ret c == ']' || c == ')';
+}
+
+# `template` read over the whole text, hole n into `values[n]` by `descs[n]` at `spans[n]`
+# ---
+# ret: ok, or the refusal at the column the text stops matching
+fun match(r: *core_syntax.Reader, template: str, descs: **operand.Operand, values: *operand.Value, spans: *usize, best: *Best) err[diagnostic.Diagnostic] {
+    var at:    usize = 0;
+    var after: bool  = false;
+    var group: usize = 0;
+    var back:  usize = 0;
+    var used:  u32   = 0;
+    var open:  bool  = false;
+    # the operands a hole has read, so a later hole of one reads it again and must read the same value
+    var seen: u32 = 0;
+    var kept: u32 = 0;
+    read.skip(r);
+    if (r.at < r.lead) { r.at = r.lead; }
+    r.within = 0;
+    r.parts  = 0;
+    var ran:   u32 = 0;
+    var depth: u32 = 0;
+    for {
+        val p: core_syntax.Piece = core_syntax.piece(template, at);
+        at = p.at + p.len;
+        # a name standing for memory where the template opens an address, as aarch64's `[<1>, <[#]><2>]`, starts a
+        # run of its holes there
+        if (r.within == 0 && p.kind == core_syntax.TEXT && opens(template[p.at]) && r.named != nil) {
+            var from: usize = r.at;
+            for (from < r.end && read.is_blank(r.text[from])) {
+                from = from + 1;
+            }
+            if (from < r.end && r.named.address(r.named.context, r, from)) {
+                r.within = from;
+                r.parts  = 0;
+                depth    = 1;
+                cnt;
+            }
+        }
+        # a name standing for an address the template spells across several holes, as risc-v's `<2>(<1>)`, reads
+        # each of them, and the punctuation between them reads as written, to the comma, space or other text outside
+        # the address's brackets
+        if (r.within != 0) {
+            var ends: bool = false;
+            if (p.kind == core_syntax.TEXT) {
+                val c: u8 = template[p.at];
+                if (opens(c)) {
+                    depth = depth + 1;
+                    cnt;
+                }
+                if (depth > 0 && closes(c)) {
+                    depth = depth - 1;
+                    cnt;
+                }
+                # a word inside the brackets modifies the address, as sve's `mul vl`, which a name never stands for
+                if (depth > 0 && read.word(c)) { ret err[diagnostic.Diagnostic].err{read.refuse(r, MODIFIED, r.within, read.token(r, r.within))}; }
+                if (depth > 0)                 { cnt; }
+                ends = true;
+            }
+            or (p.kind == core_syntax.HOLE) {
+                if ((seen & (1::u32 << p.operand::u32)) == 0) { r.at = r.within; }
+                or                                            { ends = true; }
+            }
+            or (p.kind == core_syntax.END || depth == 0) {
+                ends = true;
+            }
+            if (ends) {
+                # a run of one hole is a whole operand, or an address of a base alone, which a name of an offset is not
+                if (ran < 2) { ret err[diagnostic.Diagnostic].err{read.refuse(r, SPLIT, r.within, read.token(r, r.within))}; }
+                r.within = 0;
+                r.parts  = 0;
+                ran      = 0;
+                depth    = 0;
+            }
+        }
+        # the marker after the mnemonic is the form's, read before any template was tried
+        if (r.at == r.marked) { r.at = r.at + r.skipped; }
+        var opt_failed: opt[diagnostic.Diagnostic] = opt[diagnostic.Diagnostic].none{};
+        if (p.kind == core_syntax.END) {
+            read.skip(r);
+            if (r.at == r.end) { ret err[diagnostic.Diagnostic].ok{}; }
+            opt_failed = opt[diagnostic.Diagnostic].some{read.refuse(r, read.UNEXPECTED, r.at, read.token(r, r.at))};
+        }
+        or (p.kind == core_syntax.SPACE) {
+            read.skip(r);
+            after = false;
+        }
+        or (p.kind == core_syntax.OPEN) {
+            open  = true;
+            group = at;
+            back  = r.at;
+            used  = r.used;
+            kept  = seen;
+        }
+        or (p.kind == core_syntax.CLOSE) {
+            open = false;
+        }
+        or (p.kind == core_syntax.TEXT) {
+            if (after) { read.skip(r); }
+            after = false;
+            val c: u8 = template[p.at];
+            if (read.peek(r) == 0 || !read.same(r, read.peek(r), c)) {
+                opt_failed = opt[diagnostic.Diagnostic].some{read.refuse(r, read.UNEXPECTED, r.at, read.token(r, r.at))};
+            }
+            or {
+                r.at = r.at + 1;
+                if (read.word(c) && ends_word(template, at) && read.word(read.peek(r))) {
+                    opt_failed = opt[diagnostic.Diagnostic].some{read.refuse(r, read.UNEXPECTED, r.at, read.token(r, r.at))};
+                }
+            }
+        }
+        or (p.kind == core_syntax.HOLE) {
+            val bit:     u32                    = 1::u32 << p.operand::u32;
+            val derived: core_syntax.Derivation = core_syntax.derivation(p.format);
+            if (!sel derived.none) {
+                # a derived spelling, as casp's `<X(s+1)>`, reads the value its derivation gives from the one read before
+                val at:               usize                      = r.at;
+                var again:            operand.Value              = operand.Value.none{};
+                val err_derived_hole: err[diagnostic.Diagnostic] = derived_hole(r, descs[p.operand], ?again);
+                if (sel err_derived_hole.err) { opt_failed = opt[diagnostic.Diagnostic].some{err_derived_hole.err}; }
+                or {
+                    var opt_given: opt[operand.Value] = opt[operand.Value].none{};
+                    if ((seen & bit) != 0) { opt_given = core_syntax.derive(r.codec.registers, descs[p.operand], derived, ?values[p.operand]); }
+                    var same: bool = false;
+                    if (sel opt_given.some) { same = operand.equal(?again, ?opt_given.some); }
+                    if (!same)              { opt_failed = opt[diagnostic.Diagnostic].some{read.refuse(r, DERIVED, at, r.at - at)}; }
+                }
+            }
+            or ((seen & bit) == 0) {
+                spans[p.operand] = r.at;
+                val err_hole: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?values[p.operand]);
+                if (sel err_hole.err) { opt_failed = opt[diagnostic.Diagnostic].some{err_hole.err}; }
+                seen = seen | bit;
+            }
+            or {
+                # an operand the template writes again, as sve's destructive `<Zdn>`, reads the value it read before
+                val at:       usize                      = r.at;
+                var again:    operand.Value              = operand.Value.none{};
+                val err_hole: err[diagnostic.Diagnostic] = hole(r, descs[p.operand], p.format, ?again);
+                if (sel err_hole.err) { opt_failed = opt[diagnostic.Diagnostic].some{err_hole.err}; }
+                or (!operand.equal(?again, ?values[p.operand])) {
+                    opt_failed = opt[diagnostic.Diagnostic].some{read.refuse(r, REPEATED, at, r.at - at)};
+                }
+            }
+            after = true;
+            if (r.within != 0) { ran = ran + 1; }
+        }
+        if (sel opt_failed.some) {
+            if (!open) { ret err[diagnostic.Diagnostic].err{opt_failed.some}; }
+            # an optional group that does not match is absent, its operands none
+            keep(best, opt_failed.some, PARTIAL);
+            r.at   = back;
+            r.used = used;
+            seen   = kept;
+            var q: core_syntax.Piece = core_syntax.piece(template, group);
+            for (q.kind != core_syntax.CLOSE && q.kind != core_syntax.END) {
+                if (q.kind == core_syntax.HOLE) { values[q.operand] = operand.Value.none{}; }
+                q = core_syntax.piece(template, q.at + q.len);
+            }
+            at   = q.at + q.len;
+            open = false;
+        }
+    }
+}
+
+# whether operand `op` has a hole in `template`
+fun written(template: str, op: u8) bool {
+    var p: core_syntax.Piece = core_syntax.piece(template, 0);
+    for (p.kind != core_syntax.END) {
+        if (p.kind == core_syntax.HOLE && p.operand == op) { ret true; }
+        p = core_syntax.piece(template, p.at + p.len);
+    }
+    ret false;
+}
+
+# the candidate `r`'s base row and values admitted, into the reader's pool: each operand on its own first, a register
+# whatever the view, then the candidate's requirements and the registers the view lacks, then what the operands hold
+# together, so a candidate is refused for the selection only when its operands fit it
+# ---
+# own:   the candidate's requirement beyond its row's, an alias's, none for a row's own template
+# spans: the offset each base operand was read at, the instruction's start for one the text does not hold
+fun admit(rd: *core_syntax.Reader, r: *row.Row, own: requirement.Requirement, values: *operand.Value, spans: *usize, best: *Best) opt[inst.Inst] {
+    var lacks:   bool = false;
+    var lacking: field.Refusal;
+    var k:       u32  = 0;
+    for (k < r.operands.len) {
+        val err_alone: err[field.Refusal] = codec.admits_operand(rd.codec, rd.ctx, r, k::u8, ?values[k]);
+        if (sel err_alone.err) {
+            if (!sel err_alone.err.cause.unavailable) {
+                keep_refused(rd, best, err_alone.err, spans[k]);
+                ret opt[inst.Inst].none{};
+            }
+            if (!lacks) {
+                lacking = err_alone.err;
+                lacks   = true;
+            }
+        }
+        k = k + 1;
+    }
+    if (!state.admits(rd.ctx, own)) {
+        keep_unmet(rd, best, own, rd.start, read.token(rd, rd.start), FIT);
+        ret opt[inst.Inst].none{};
+    }
+    if (!state.admits(rd.ctx, r.requires)) {
+        keep_unmet(rd, best, r.requires, rd.start, read.token(rd, rd.start), FIT);
+        ret opt[inst.Inst].none{};
+    }
+    if (lacks) {
+        val from: usize                 = spans[lacking.operand];
+        var d:    diagnostic.Diagnostic = read.refuse(rd, lacking.message, from, read.token(rd, from));
+        d.requires = lacking.requires;
+        keep(best, d, FIT);
+        ret opt[inst.Inst].none{};
+    }
+    var ins:          inst.Inst          = inst.Inst{row: r, values: values, count: r.operands.len, form: rd.form};
+    val err_admitted: err[field.Refusal] = codec.admits(rd.codec, rd.ctx, ?ins);
+    if (sel err_admitted.err) {
+        var at: usize = rd.start;
+        if (err_admitted.err.operand::u32 < r.operands.len) { at = spans[err_admitted.err.operand]; }
+        keep_refused(rd, best, err_admitted.err, at);
+        ret opt[inst.Inst].none{};
+    }
+    var i: u32 = 0;
+    for (i < r.operands.len) {
+        rd.pool[i] = values[i];
+        if (rd.spans != nil) { rd.spans[i] = spans[i]; }
+        i = i + 1;
+    }
+    ret opt[inst.Inst].some{inst.Inst{row: r, values: rd.pool, count: r.operands.len, form: rd.form}};
+}
+
+# the row `index` read by its own template
+fun by_row(rd: *core_syntax.Reader, index: u32, best: *Best) opt[inst.Inst] {
+    ret templated(rd, ?rd.codec.rows.at[index], rd.syntax.forms.at[index], best);
+}
+
+# row `r` read by `template`
+fun templated(rd: *core_syntax.Reader, r: *row.Row, template: str, best: *Best) opt[inst.Inst] {
+    var descs:  [operand.MAX_OPERANDS]*operand.Operand;
+    var values: [operand.MAX_OPERANDS]operand.Value;
+    var spans:  [operand.MAX_OPERANDS]usize;
+    var i:      u32 = 0;
+    for (i < r.operands.len) {
+        descs[i]  = ?r.operands.at[i];
+        spans[i]  = rd.start;
+        values[i] = operand.Value.none{};
+        i         = i + 1;
+    }
+    rd.at     = rd.start;
+    rd.used   = r.operands.len;
+    rd.values = ?values[0];
+    rd.row    = r;
+    val err_matched: err[diagnostic.Diagnostic] = match(rd, template, ?descs[0], ?values[0], ?spans[0], best);
+    rd.values = nil;
+    if (sel err_matched.err) {
+        keep(best, err_matched.err, PARTIAL);
+        ret opt[inst.Inst].none{};
+    }
+    # an operand the template does not write is the register the row fixes it to, or the result the statement binds
+    var taken: bool = false;
+    i = 0;
+    for (i < r.operands.len) {
+        if (!written(template, i::u8)) {
+            val opt_fixed: opt[register.Id] = query.fixed(rd.codec.registers, r.effect, i::u8);
+            if (sel opt_fixed.some) { values[i] = operand.Value.register{opt_fixed.some}; }
+            if (r.effect.values.defines::u32 == i + 1) {
+                if (sel rd.bound.none) {
+                    keep(best, read.refuse(rd, UNBOUND, rd.start, read.token(rd, rd.start)), READ);
+                    ret opt[inst.Inst].none{};
+                }
+                values[i] = rd.bound;
+                taken     = true;
+            }
+        }
+        i = i + 1;
+    }
+    if (!taken && !refuse_bound(rd, best)) { ret opt[inst.Inst].none{}; }
+    ret admit(rd, r, requirement.NO_ALTERNATIVES, ?values[0], ?spans[0], best);
+}
+
+# whether the statement binds no result, the refusal kept when it binds one that nothing takes
+fun refuse_bound(rd: *core_syntax.Reader, best: *Best) bool {
+    if (sel rd.bound.none) { ret true; }
+    keep(best, read.refuse(rd, UNTAKEN, rd.start, read.token(rd, rd.start)), READ);
+    ret false;
+}
+
+# the alias `a` read and resolved to its base row
+fun by_alias(rd: *core_syntax.Reader, a: *core_syntax.Alias, best: *Best) opt[inst.Inst] {
+    val r:      *row.Row = ?rd.codec.rows.at[a.row];
+    var descs:  [operand.MAX_OPERANDS]*operand.Operand;
+    var values: [operand.MAX_OPERANDS]operand.Value;
+    var spans:  [operand.MAX_OPERANDS]usize;
+    var k:      u8       = 0;
+    for (k < a.count) {
+        descs[k] = core_syntax.alias_operand(a, r, k);
+        spans[k] = rd.start;
+        k        = k + 1;
+    }
+    rd.at     = rd.start;
+    rd.used   = r.operands.len;
+    rd.values = nil;
+    rd.row    = r;
+    val err_matched: err[diagnostic.Diagnostic] = match(rd, a.template, ?descs[0], ?values[0], ?spans[0], best);
+    if (sel err_matched.err) {
+        keep(best, err_matched.err, PARTIAL);
+        ret opt[inst.Inst].none{};
+    }
+    # an alias takes no bound result, which only a row's own spelling places
+    if (!refuse_bound(rd, best)) { ret opt[inst.Inst].none{}; }
+    # a derived alias's own values are admitted by its own operands, since its derivation gives the row others
+    if (a.derive != nil) {
+        k = 0;
+        for (k < a.count) {
+            val err_own: err[field.Refusal] = codec.admits_value(rd.codec, rd.ctx, descs[k], ?values[k], k);
+            if (sel err_own.err) {
+                keep_refused(rd, best, err_own.err, spans[k]);
+                ret opt[inst.Inst].none{};
+            }
+            k = k + 1;
+        }
+    }
+    # a value the alias excludes though its operand admits it is refused at that operand, and the next candidate is tried
+    val excluded: u8 = alias.excluded(a, ?values[0]);
+    if (excluded != field.NO_OPERAND) {
+        keep(best, read.refuse(rd, field.EXCLUDED, spans[excluded], read.token(rd, spans[excluded])), READ);
+        ret opt[inst.Inst].none{};
+    }
+    var base:  [operand.MAX_OPERANDS]operand.Value;
+    var where: [operand.MAX_OPERANDS]usize;
+    if (!alias.resolve(rd.codec, a, ?values[0], ?base[0])) {
+        keep(best, read.refuse(rd, read.UNEXPECTED, rd.start, read.token(rd, rd.start)), READ);
+        ret opt[inst.Inst].none{};
+    }
+    var j: u32 = 0;
+    for (j < r.operands.len) {
+        val src: core_syntax.Source = a.sources.at[j];
+        where[j] = rd.start;
+        if (sel src.operand) { where[j] = spans[src.operand]; }
+        if (sel src.flipped) { where[j] = spans[src.flipped.operand]; }
+        if (sel src.masked)  { where[j] = spans[src.masked.operand]; }
+        if (sel src.bits)    { where[j] = spans[src.bits.operand]; }
+        j = j + 1;
+    }
+    ret admit(rd, r, a.requires, ?base[0], ?where[0], best);
+}
+
+# whether candidate `a` is tried after candidate `b`
+fun later(a: core_syntax.Candidate, b: core_syntax.Candidate) bool {
+    ret a.row > b.row || (a.row == b.row && a.alias > b.alias);
+}
+
+# byte `depth` of the key of entry `i`, in lower case when the syntax folds
+fun key_byte(rd: *core_syntax.Reader, i: u32, depth: usize) u8 {
+    val c: u8 = rd.syntax.index.at[i].key[depth];
+    if (rd.syntax.fold) { ret core_syntax.lower(c); }
+    ret c;
+}
+
+# the first entry of `lo` up to `hi` whose key byte `depth` is `c` or above, or above when `above`
+fun narrow(rd: *core_syntax.Reader, lo: u32, hi: u32, depth: usize, c: u8, above: bool) u32 {
+    var l: u32 = lo;
+    var h: u32 = hi;
+    for (l < h) {
+        val mid: u32 = l + (h - l) / 2;
+        val k:   u8  = key_byte(rd, mid, depth);
+        if (k < c || (above && k == c)) { l = mid + 1; }
+        or                              { h = mid; }
+    }
+    ret l;
+}
+
+# the first candidate of entry `e` after `last`, or its first when none has been tried
+fun within(ix: *core_syntax.Index, e: *core_syntax.Entry, started: bool, last: core_syntax.Candidate, out: *core_syntax.Candidate) bool {
+    var lo: u32 = 0;
+    var hi: u32 = e.len;
+    for (started && lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (later(ix.candidates[e.first + mid], last)) { hi = mid; }
+        or                                             { lo = mid + 1; }
+    }
+    if (lo >= e.len) { ret false; }
+    @out = ix.candidates[e.first + lo];
+    ret true;
+}
+
+# the most index entries whose keys start one text. each is a prefix of the next, so they are no more than the
+# longest key is long, and the longest such run of any set's index is five
+val MAX_KEYS: u32 = 16;
+
+# the entries whose key starts the text at `head`, into `keys` in ascending order, answering how many there are, which
+# is more than MAX_KEYS when `keys` holds only the first of them
+fun keys_at(rd: *core_syntax.Reader, head: usize, keys: *u32) u32 {
+    val ix:    *core_syntax.Index = ?rd.syntax.index;
+    var lo:    u32                = 0;
+    var hi:    u32                = ix.len;
+    var depth: usize              = 0;
+    var at:    usize              = head;
+    var n:     u32                = 0;
+    for (lo < hi) {
+        # the entry whose key ends here sorts before every longer key
+        if (ix.at[lo].key[depth] == 0) {
+            if (n < MAX_KEYS) { keys[n] = lo; }
+            n  = n + 1;
+            lo = lo + 1;
+        }
+        if (lo >= hi || at >= rd.end) { brk; }
+        var b: u8 = rd.text[at];
+        # a run of white space reads as the one space of a key joining a prefix to its word
+        if (read.is_blank(b)) { b = ' '; }
+        if (rd.syntax.fold)   { b = core_syntax.lower(b); }
+        val first: u32 = narrow(rd, lo, hi, depth, b, false);
+        hi    = narrow(rd, first, hi, depth, b, true);
+        lo    = first;
+        depth = depth + 1;
+        at    = at + 1;
+        if (b == ' ') {
+            for (at < rd.end && read.is_blank(rd.text[at])) {
+                at = at + 1;
+            }
+        }
+    }
+    ret n;
+}
+
+# the next candidate to try, the earliest after `last` of the `count` entries `keys` names
+# ---
+# started: whether `last` is set, false for the first candidate
+# ret:     whether there is one, then in `out`
+fun next(rd: *core_syntax.Reader, keys: *u32, count: u32, started: bool, last: core_syntax.Candidate, out: *core_syntax.Candidate) bool {
+    val ix:    *core_syntax.Index = ?rd.syntax.index;
+    var found: bool               = false;
+    var i:     u32                = 0;
+    for (i < count) {
+        var c: core_syntax.Candidate;
+        if (within(ix, ?ix.at[keys[i]], started, last, ?c) && (!found || later(@out, c))) {
+            @out  = c;
+            found = true;
+        }
+        i = i + 1;
+    }
+    ret found;
+}
+
+# whether the text at `at` is `marker`, a whole token
+fun spells(rd: *core_syntax.Reader, at: usize, marker: str) bool {
+    val len: usize = str_len(marker);
+    if (len == 0 || at + len > rd.end) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (!read.same(rd, rd.text[at + i], marker[i])) { ret false; }
+        i = i + 1;
+    }
+    ret !(read.word(marker[len - 1]) && at + len < rd.end && read.word(rd.text[at + len]));
+}
+
+# the reader with no form markers read, as a statement that spells none starts
+fun unmarked(rd: *core_syntax.Reader) {
+    rd.form    = core_form.PREFERRED;
+    rd.lead    = rd.start;
+    rd.marked  = rd.end;
+    rd.skipped = 0;
+}
+
+# the form markers at the reader's position read into its form: those before the mnemonic, the reader left past them at
+# `lead`, then the one its mnemonic ends with, which `marked` and `skipped` hop
+fun markers(rd: *core_syntax.Reader) {
+    val forms: *core_form.FormFields = ?rd.codec.forms;
+    unmarked(rd);
+    var moved: bool = true;
+    for (moved) {
+        moved = false;
+        var i: u32 = 0;
+        for (i < forms.len && !moved) {
+            val f: *core_form.FormField = ?forms.at[i];
+            if (f.marker != nil && !f.suffix && spells(rd, rd.at, f.marker)) {
+                rd.form = core_form.with(rd.form, f);
+                rd.at   = rd.at + str_len(f.marker);
+                read.skip(rd);
+                moved = true;
+            }
+            i = i + 1;
+        }
+    }
+    rd.lead = rd.at;
+    val end: usize = read.mnemonic_end(rd, rd.at);
+    var i:   u32   = 0;
+    for (i < forms.len) {
+        val f:   *core_form.FormField = ?forms.at[i];
+        val len: usize                = str_len(f.marker);
+        if (f.marker != nil && f.suffix && len > 0 && end >= rd.at + len + 1 && spells(rd, end - len, f.marker)) {
+            rd.form    = core_form.with(rd.form, f);
+            rd.marked  = end - len;
+            rd.skipped = len;
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# the instruction at the reader's text, read in its syntax
+# ---
+# rd:  the reader over the instruction's text, its pool holding the values first and then list members
+# ret: the instruction, its values in the pool, or the refusal at its column
+pub fun instruction(rd: *core_syntax.Reader) res[inst.Inst, diagnostic.Diagnostic] {
+    var best:      Best = Best{held: false, depth: PARTIAL, refusal: diagnostic.Diagnostic{message: read.UNKNOWN_MNEMONIC, span: diagnostic.Span{start: rd.origin, len: 0}, requires: requirement.NO_ALTERNATIVES}, unmet: false, noted: PARTIAL, full: false};
+    var keyed_any: bool = false;
+    rd.at           = rd.start;
+    rd.refused.used = 0;
+    read.skip(rd);
+    markers(rd);
+    val head:    usize = rd.at;
+    var last:    core_syntax.Candidate;
+    var current: core_syntax.Candidate;
+    var started: bool  = false;
+    # the first instruction read with an operand of no size, held while the candidates after it are tried for one of
+    # another size
+    var opt_held: opt[inst.Inst] = opt[inst.Inst].none{};
+    var kept:     [operand.MAX_OPERANDS]operand.Value;
+    var where:    [operand.MAX_OPERANDS]usize;
+    var keys:     [MAX_KEYS]u32;
+    val count:    u32            = keys_at(rd, head, ?keys[0]);
+    if (count > MAX_KEYS) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)}; }
+    for (next(rd, ?keys[0], count, started, last, ?current)) {
+        started = true;
+        last    = current;
+        var base: u32 = current.row;
+        if (current.alias != 0) { base = rd.syntax.aliases.at[current.alias - 1].row; }
+        val r: *row.Row = ?rd.codec.rows.at[base];
+        if (rd.cap < r.operands.len) {
+            read.pool_short(rd, r.operands.len::u64);
+            ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)};
+        }
+        var opt_by_row: opt[inst.Inst] = opt[inst.Inst].none{};
+        rd.unsized = false;
+        if (current.alias == 0) {
+            if ((r.flags & row.DECODE_ONLY) != 0 || !keyed(rd, rd.syntax.forms.at[current.row], head)) { cnt; }
+            keyed_any  = true;
+            opt_by_row = by_row(rd, current.row, ?best);
+        }
+        or {
+            val a: *core_syntax.Alias = ?rd.syntax.aliases.at[current.alias - 1];
+            if (!keyed(rd, a.template, head)) { cnt; }
+            keyed_any  = true;
+            opt_by_row = by_alias(rd, a, ?best);
+        }
+        if (sel opt_by_row.some) {
+            if (sel opt_held.some) {
+                if (!same_sizes(opt_held.some.row, opt_by_row.some.row)) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, AMBIGUOUS_SIZE, head, read.mnemonic_end(rd, head) - head)}; }
+            }
+            or (!rd.unsized) { ret res[inst.Inst, diagnostic.Diagnostic].ok{opt_by_row.some}; }
+            or {
+                var k: u32 = 0;
+                for (k < opt_by_row.some.count) {
+                    kept[k] = opt_by_row.some.values[k];
+                    if (rd.spans != nil) { where[k] = rd.spans[k]; }
+                    k = k + 1;
+                }
+                opt_held = opt_by_row;
+            }
+        }
+    }
+    if (sel opt_held.some) {
+        var k: u32 = 0;
+        for (k < opt_held.some.count) {
+            rd.pool[k] = kept[k];
+            if (rd.spans != nil) { rd.spans[k] = where[k]; }
+            k = k + 1;
+        }
+        ret res[inst.Inst, diagnostic.Diagnostic].ok{inst.Inst{row: opt_held.some.row, values: rd.pool, count: opt_held.some.count, form: opt_held.some.form}};
+    }
+    if (!keyed_any) { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, read.UNKNOWN_MNEMONIC, head, read.mnemonic_end(rd, head) - head)}; }
+    if (best.full)  { ret res[inst.Inst, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)}; }
+    if (best.unmet) { best.refusal.requires = field.noted(?rd.refused); }
+    ret res[inst.Inst, diagnostic.Diagnostic].err{best.refusal};
+}
+
+# whether rows `a` and `b` access memory of the same sizes, so text of no size that both read reads as either alike
+fun same_sizes(a: *row.Row, b: *row.Row) bool {
+    if (a.operands.len != b.operands.len) { ret false; }
+    var k: u32 = 0;
+    for (k < a.operands.len) {
+        val x: *operand.Operand = ?a.operands.at[k];
+        val y: *operand.Operand = ?b.operands.at[k];
+        if ((sel x.shape.memory || sel y.shape.memory) && x.width != y.width) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# a format of a source dialect's instruction directive that took a text, and the instruction it states
+# ---
+# format: the format
+# inst:   its row and values, the values in the reader's pool
+pub rec Taken {
+    format: *source.Format;
+    inst:   inst.Inst;
+}
+
+# the text at the reader read by whichever one of `formats` takes it whole, as risc-v's `.insn` reads what follows it,
+# the formats tried in order and those whose name the text does not start with passed over
+# ---
+# rd:  the reader over the directive's operands, its pool holding the values first and then list members
+# ret: the format and the instruction it states, or the refusal of the format that read furthest
+pub fun format(rd: *core_syntax.Reader, formats: source.Formats) res[Taken, diagnostic.Diagnostic] {
+    var best:      Best = Best{held: false, depth: PARTIAL, refusal: diagnostic.Diagnostic{message: UNKNOWN_FORMAT, span: diagnostic.Span{start: rd.origin, len: 0}, requires: requirement.NO_ALTERNATIVES}, unmet: false, noted: PARTIAL, full: false};
+    var keyed_any: bool = false;
+    rd.at           = rd.start;
+    rd.refused.used = 0;
+    unmarked(rd);
+    read.skip(rd);
+    val head: usize = rd.at;
+    var i:    u32   = 0;
+    for (i < formats.len) {
+        val f: *source.Format = ?formats.at[i];
+        i = i + 1;
+        if (!keyed(rd, f.template, head)) { cnt; }
+        if (rd.cap < f.row.operands.len) {
+            read.pool_short(rd, f.row.operands.len::u64);
+            ret res[Taken, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)};
+        }
+        keyed_any = true;
+        val opt_templated: opt[inst.Inst] = templated(rd, f.row, f.template, ?best);
+        if (sel opt_templated.some) { ret res[Taken, diagnostic.Diagnostic].ok{Taken{format: f, inst: opt_templated.some}}; }
+    }
+    if (!keyed_any) { ret res[Taken, diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FORMAT, head, read.token(rd, head))}; }
+    if (best.full)  { ret res[Taken, diagnostic.Diagnostic].err{read.refuse(rd, field.STORAGE, head, 0)}; }
+    if (best.unmet) { best.refusal.requires = field.noted(?rd.refused); }
+    ret res[Taken, diagnostic.Diagnostic].err{best.refusal};
+}
+
+# the first of the syntax's sequence spellings in mnemonic order whose mnemonic is `word` or sorts after it, a binary
+# search, len when none is. the caller checks the mnemonic is `word`
+fun named_first(rd: *core_syntax.Reader, word: View) u32 {
+    val qs: *core_syntax.Sequences = ?rd.syntax.sequences;
+    var lo: u32                    = 0;
+    var hi: u32                    = qs.len;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (core_syntax.compare(rd.syntax, core_syntax.mnemonic(rd.syntax.prefixes, qs.at[qs.named[mid]].template), word) < 0) { lo = mid + 1; }
+        or                                                                                                                     { hi = mid; }
+    }
+    ret lo;
+}
+
+# the sequence spelling `q` read and its instructions admitted, into `out`
+fun by_sequence(rd: *core_syntax.Reader, q: *core_syntax.Sequence, best: *Best, out: *relax.Expansion) bool {
+    if (!state.admits(rd.ctx, q.requires)) {
+        keep_unmet(rd, best, q.requires, rd.start, read.token(rd, rd.start), READ);
+        ret false;
+    }
+    var descs:  [operand.MAX_OPERANDS]*operand.Operand;
+    var values: [operand.MAX_OPERANDS]operand.Value;
+    var spans:  [operand.MAX_OPERANDS]usize;
+    var k:      u32 = 0;
+    for (k < q.operands.len) {
+        descs[k] = ?q.operands.at[k];
+        spans[k] = rd.start;
+        k        = k + 1;
+    }
+    rd.at       = rd.start;
+    rd.used     = q.operands.len;
+    rd.sequence = true;
+    val err_matched: err[diagnostic.Diagnostic] = match(rd, q.template, ?descs[0], ?values[0], ?spans[0], best);
+    rd.sequence = false;
+    if (sel err_matched.err) {
+        keep(best, err_matched.err, PARTIAL);
+        ret false;
+    }
+    if (!refuse_bound(rd, best)) { ret false; }
+    if (!seq.expand(q, ?values[0], core_syntax.OWN, out)) {
+        keep(best, read.refuse(rd, read.UNEXPECTED, rd.start, read.token(rd, rd.start)), READ);
+        ret false;
+    }
+    var i: u32 = 0;
+    for (i < out.count) {
+        var ins:          inst.Inst          = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
+        val err_admitted: err[field.Refusal] = codec.admits(rd.codec, rd.ctx, ?ins);
+        if (sel err_admitted.err) {
+            keep_refused(rd, best, err_admitted.err, rd.start);
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (rd.spans != nil) { sequence_spans(rd, q, ?spans[0]); }
+    ret true;
+}
+
+# the macro `mac` read and expanded into `out`, false when the text is no macro's or its values expand to no instruction
+fun by_macro(rd: *core_syntax.Reader, mac: *core_syntax.Macro, best: *Best, out: *relax.Expansion) bool {
+    if (!state.admits(rd.ctx, mac.requires)) { ret false; }
+    var descs:  [operand.MAX_OPERANDS]*operand.Operand;
+    var values: [operand.MAX_OPERANDS]operand.Value;
+    var spans:  [operand.MAX_OPERANDS]usize;
+    var k:      u32 = 0;
+    for (k < mac.operands.len) {
+        descs[k] = ?mac.operands.at[k];
+        spans[k] = rd.start;
+        k        = k + 1;
+    }
+    rd.at       = rd.start;
+    rd.used     = mac.operands.len;
+    rd.sequence = true;
+    val err_matched: err[diagnostic.Diagnostic] = match(rd, mac.template, ?descs[0], ?values[0], ?spans[0], best);
+    rd.sequence = false;
+    rd.at       = rd.start;
+    if (sel err_matched.err || !refuse_bound(rd, best)) { ret false; }
+    out.count = 0;
+    if (!mac.expand(rd, ?values[0], out)) {
+        out.count = 0;
+        ret false;
+    }
+    var i: u32 = 0;
+    for (i < out.count) {
+        var ins:          inst.Inst          = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
+        val err_admitted: err[field.Refusal] = codec.admits(rd.codec, rd.ctx, ?ins);
+        if (sel err_admitted.err) {
+            out.count = 0;
+            ret false;
+        }
+        i = i + 1;
+    }
+    if (rd.spans != nil) {
+        var n: u32 = 0;
+        for (n < out.count * operand.MAX_OPERANDS) {
+            rd.spans[n] = rd.start;
+            n           = n + 1;
+        }
+    }
+    ret true;
+}
+
+# where each value of the steps of sequence `q` was read, its own operands' from `spans`, into the reader's spans
+fun sequence_spans(rd: *core_syntax.Reader, q: *core_syntax.Sequence, spans: *usize) {
+    var i: u32 = 0;
+    for (i < q.steps.len) {
+        val step: *core_syntax.Step = ?q.steps.at[i];
+        var k:    u32               = 0;
+        for (k < step.parts.len) {
+            val part: core_syntax.Part = step.parts.at[k];
+            var at:   usize            = rd.start;
+            if (sel part.operand) { at = spans[part.operand]; }
+            if (sel part.symbol)  { at = spans[part.symbol.operand]; }
+            rd.spans[i * operand.MAX_OPERANDS + k] = at;
+            k                                      = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the statement at the reader's text, read in its syntax: what the syntax's statement hook reads around it, then the
+# instructions of a sequence spelling, or one instruction
+# ---
+# rd:  the reader over the statement's text, its pool holding list members. the hook's text is passed, so the
+#      instruction starts after it, and the result it binds is left in `bound`
+# out: the instructions read, in order
+# ret: ok, or the refusal at its column
+pub fun statement(rd: *core_syntax.Reader, out: *relax.Expansion) err[diagnostic.Diagnostic] {
+    rd.at    = rd.start;
+    rd.bound = operand.Value.none{};
+    if (rd.syntax.statement != nil) {
+        read.skip(rd);
+        val err_around: err[diagnostic.Diagnostic] = rd.syntax.statement(rd);
+        if (sel err_around.err) { ret err_around; }
+        rd.origin = diagnostic.advance(rd.origin, ?rd.text[rd.start], rd.at - rd.start);
+        rd.start  = rd.at;
+    }
+    var best:      Best = Best{held: false, depth: PARTIAL, refusal: diagnostic.Diagnostic{message: read.UNKNOWN_MNEMONIC, span: diagnostic.Span{start: rd.origin, len: 0}, requires: requirement.NO_ALTERNATIVES}, unmet: false, noted: PARTIAL, full: false};
+    var keyed_any: bool = false;
+    var moded:     bool = false;
+    rd.at           = rd.start;
+    rd.refused.used = 0;
+    unmarked(rd);
+    read.skip(rd);
+    val head: usize                  = rd.at;
+    val word: View                   = read.span(rd, head, read.mnemonic_end(rd, head) - head);
+    val qs:   *core_syntax.Sequences = ?rd.syntax.sequences;
+    var i:    u32                    = named_first(rd, word);
+    for (i < qs.len && core_syntax.compare(rd.syntax, core_syntax.mnemonic(rd.syntax.prefixes, qs.at[qs.named[i]].template), word) == 0) {
+        val q: *core_syntax.Sequence = ?qs.at[qs.named[i]];
+        i = i + 1;
+        if (!keyed(rd, q.template, head)) { cnt; }
+        if (!mode.holds(rd.modes, q.when)) {
+            moded = true;
+            cnt;
+        }
+        keyed_any = true;
+        if (by_sequence(rd, q, ?best, out)) { ret err[diagnostic.Diagnostic].ok{}; }
+    }
+    if (keyed_any) {
+        if (best.unmet) { best.refusal.requires = field.noted(?rd.refused); }
+        ret err[diagnostic.Diagnostic].err{best.refusal};
+    }
+    if (moded) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, read.OTHER_MODE, head, word.len)}; }
+    var m: u32 = 0;
+    for (m < rd.syntax.macros.len) {
+        val mac: *core_syntax.Macro = ?rd.syntax.macros.at[m];
+        m = m + 1;
+        if (!keyed(rd, mac.template, head)) { cnt; }
+        if (by_macro(rd, mac, ?best, out))  { ret err[diagnostic.Diagnostic].ok{}; }
+    }
+    val res_one: res[inst.Inst, diagnostic.Diagnostic] = instruction(rd);
+    if (sel res_one.err) { ret err[diagnostic.Diagnostic].err{res_one.err}; }
+    out.count           = 1;
+    out.steps[0].row    = res_one.ok.row;
+    out.steps[0].marker = operand.NO_FIXUP;
+    out.steps[0].form   = res_one.ok.form;
+    var k: u32 = 0;
+    for (k < res_one.ok.count) {
+        out.steps[0].values[k] = res_one.ok.values[k];
+        k                      = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}

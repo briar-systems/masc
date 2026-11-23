@@ -1,0 +1,493 @@
+# the relaxation rows of an instruction set
+#
+# a relaxation names a row and its relative operand, and the longer forms the
+# builder rewrites the row as when the operand's target is out of range or
+# only the linker knows it: one or more rows, each operand's value taken from
+# the row it replaces, a fixed register or immediate, or the target. a row
+# whose longer form differs by context has a form for each, and the first
+# whose every row the context admits is taken: x86 jmp rel8, one row at every
+# code width, becomes jmp rel16 in 16-bit code and jmp rel32 in 32- and
+# 64-bit code, and a risc-v beq becomes bne past a jal to the target. a form's steps that do not take the target are written in the
+# shortest form the caller's `Shorten` gives, as risc-v's inverted branch is
+# c.bnez when the selection holds C. the builder only ever replaces a row by
+# its longer form, and the set's check refuses a chain of relaxations that
+# does not end, so its fixed point terminates.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.collections.vector;
+
+use masc_codec: masc.codec;
+use masc.core.dispatch;
+use masc.core.field;
+use masc.core.form;
+use masc.core.index;
+use masc.core.inst;
+use masc.core.invert;
+use masc.core.operand;
+use masc.core.register;
+use masc.core.row;
+use masc.core.state;
+
+# where one operand of the longer form takes its value from
+# ---
+# operand:   the value of this operand of the row relaxed
+# flipped:   an operand of the row relaxed with bits flipped, as its inverse states it
+# shifted:   an immediate operand of the row relaxed plus a constant, as its inverse states it
+# target:    the target of the relaxed operand, measured from this instruction
+# past:      a target just past the end of the longer form, as an inverted branch skips the far jump
+# register:  the register at this row of the file, as x0 of a risc-v jal
+# immediate: this immediate
+# none:      no value, for an absent optional operand
+pub tag Source: u8 {
+    operand: u8;
+    flipped: invert.Flip;
+    shifted: invert.Shift;
+    target;
+    past;
+    register:  u32;
+    immediate: i64;
+    none;
+}
+
+# sources as a pointer to static sources and a count
+pub rec Sources {
+    at:  *Source;
+    len: u32;
+}
+
+pub val NO_SOURCES: Sources = Sources{at: nil, len: 0};
+
+# one instruction of a longer form
+# ---
+# row:    the row it encodes, by its index in the set's rows
+# values: where each of its operands takes its value from, one per operand of the row
+pub rec Step {
+    row:    u32;
+    values: Sources;
+}
+
+# steps as a pointer to static steps and a count
+pub rec Steps {
+    at:  *Step;
+    len: u32;
+}
+
+pub val NO_STEPS: Steps = Steps{at: nil, len: 0};
+
+# longer forms as a pointer to static forms, each its steps, and a count
+pub rec Forms {
+    at:  *Steps;
+    len: u32;
+}
+
+pub val NO_FORMS: Forms = Forms{at: nil, len: 0};
+
+# a row's longer forms, for when its relative operand's target is out of range
+# ---
+# row:     the row relaxed, by its index in the set's rows
+# operand: its relative operand whose range decides
+# forms:   the instructions it becomes, exactly one of each form's sources the target, the first form whose every row
+#          the context admits taken
+pub rec Relaxation {
+    row:     u32;
+    operand: u8;
+    forms:   Forms;
+}
+
+# relaxations as a pointer to static relaxations and a count, with the index that finds one by the key of its row
+# ---
+# keys: one entry per relaxation, under the key of the row it relaxes, whose row is the relaxation's place in `at`
+pub rec Relaxations {
+    at:   *Relaxation;
+    len:  u32;
+    keys: index.Index;
+}
+
+# the relaxations of a set with none
+pub val NO_RELAXATIONS: Relaxations = Relaxations{at: nil, len: 0, keys: index.NO_ENTRIES};
+
+# the most instructions an expansion holds
+pub val MAX_STEPS: u32 = 8;
+
+# one instruction of an expansion
+# ---
+# row:    the row it encodes
+# values: its operand values, one per operand of the row
+# marker: the nameless marker fixup kind its span states beside it, operand.NO_FIXUP for none. a marker that names a
+#         symbol is an operand of its row, never this
+# form:   its encoding form, PREFERRED for the set's preference
+pub rec Emitted {
+    row:    *row.Row;
+    values: [operand.MAX_OPERANDS]operand.Value;
+    marker: operand.FixupKind;
+    form:   form.Form;
+}
+
+# the instructions a relaxation or a pseudo instruction becomes
+pub rec Expansion {
+    steps: [MAX_STEPS]Emitted;
+    count: u32;
+}
+
+# how a step of a longer form that does not take the target is written shorter, as the builder writes an instruction
+# in the shortest form its view admits
+# ---
+# context: the caller's state, handed back to `shorter`
+# shorter: the shorter form of an instruction into its out, answering whether it has one, nil to write every step as
+#          its form states it
+pub rec Shorten {
+    context: ptr;
+    shorter: fun(ptr, *inst.Inst, *Emitted) bool;
+}
+
+# every step written as its form states it
+pub val AS_IS: Shorten = Shorten{context: nil, shorter: nil};
+
+# why `grown` refused: a level past one that became several steps, or a form `expand` refused
+pub val CHAIN:  str = "relaxation grows a step of a longer form";
+pub val REFUSE: str = "longer form refused";
+
+# the relaxation of row `r`, found by the row's key through the relaxations' index
+pub fun find(all: Relaxations, r: *row.Row) opt[*Relaxation] {
+    val opt_find: opt[u32] = index.find(?all.keys, r.key);
+    if (sel opt_find.none) { ret opt[*Relaxation].none{}; }
+    ret opt[*Relaxation].some{?all.at[opt_find.some]};
+}
+
+# the form of `rx` the context takes: its first whose every row the context admits, none when it admits none
+pub fun form_of(codec: *dispatch.Codec, ctx: *state.Context, rx: *Relaxation) opt[*Steps] {
+    var f: u32 = 0;
+    for (f < rx.forms.len) {
+        val form:   *Steps = ?rx.forms.at[f];
+        var admits: bool   = true;
+        var i:      u32    = 0;
+        for (i < form.len && admits) {
+            admits = state.admits(ctx, codec.rows.at[form.at[i].row].requires);
+            i      = i + 1;
+        }
+        if (admits) { ret opt[*Steps].some{form}; }
+        f = f + 1;
+    }
+    ret opt[*Steps].none{};
+}
+
+# whether a target `distance` bytes from the start of an instruction of `rx`'s row is past the range of its relative operand
+# ---
+# length: the length of the instruction being relaxed, which the caller has from encoding it, since a set's lengths
+#         are the lengths of its encodings and no sum of field widths
+pub fun far(codec: *dispatch.Codec, rx: *Relaxation, distance: i64, length: usize) bool {
+    val r:    *row.Row         = ?codec.rows.at[rx.row];
+    val desc: *operand.Operand = ?r.operands.at[rx.operand];
+    if (!sel desc.shape.relative) { ret false; }
+    var offset: i64 = distance;
+    if (desc.shape.relative.anchor == operand.END) { offset = distance - length::i64; }
+    val opt_why: opt[str] = masc_codec.unrepresentable(?desc.shape.relative.offset, offset);
+    ret sel opt_why.some && str_equals(opt_why.some, field.OUT_OF_RANGE);
+}
+
+# where a step stands in its form
+# ---
+# known: whether the lengths of the steps are known, a target being measured from them
+# at:    the bytes before the step
+# len:   the step's own length
+# total: the length of the whole form
+rec Place {
+    known: bool;
+    at:    usize;
+    len:   usize;
+    total: usize;
+}
+
+# the value of one source of the step of row `step`, its target the relaxed operand's value as given when `distance` is none
+fun source_value(codec: *dispatch.Codec, rx: *Relaxation, src: Source, from: *inst.Inst, distance: opt[i64], place: Place, step: *row.Row, k: u32, out: *operand.Value) bool {
+    if (sel src.operand) {
+        @out = from.values[src.operand];
+        ret true;
+    }
+    if (sel src.flipped) {
+        @out = invert.flip_value(?from.values[src.flipped.operand], src.flipped);
+        ret !sel out.none;
+    }
+    if (sel src.shifted) {
+        @out = invert.shift_value(?step.operands.at[k], ?from.values[src.shifted.operand], src.shifted);
+        ret !sel out.none;
+    }
+    if (sel src.register) {
+        if (codec.registers == nil || src.register >= codec.registers.register_count) { ret false; }
+        @out = operand.Value.register{register.id_of(?codec.registers.registers[src.register])};
+        ret true;
+    }
+    if (sel src.immediate) {
+        @out = operand.Value.immediate{src.immediate};
+        ret true;
+    }
+    if (sel src.none) {
+        @out = operand.Value.none{};
+        ret true;
+    }
+    if (sel src.target && sel distance.none) {
+        @out = from.values[rx.operand];
+        ret true;
+    }
+    val desc: *operand.Operand = ?step.operands.at[k];
+    if (!sel desc.shape.relative) { ret false; }
+    # before the lengths are known a target is provisionally zero, enough to measure a step that does not depend on it
+    var from_here: i64 = 0;
+    if (place.known) {
+        from_here = place.total::i64 - place.at::i64;
+        if (sel distance.some) {
+            if (sel src.target) { from_here = distance.some - place.at::i64; }
+        }
+        if (desc.shape.relative.anchor == operand.END) { from_here = from_here - place.len::i64; }
+    }
+    @out = operand.Value.relative{from_here};
+    ret true;
+}
+
+# whether step `s` takes the target
+fun takes_target(s: *Step) bool {
+    var k: u32 = 0;
+    for (k < s.values.len) {
+        if (sel s.values.at[k].target) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# every operand of every step of `rx`'s form, the targets measured from `lens`, and each step that does not take the
+# target written as `shorten` shortens it
+fun fill(codec: *dispatch.Codec, rx: *Relaxation, form: *Steps, from: *inst.Inst, distance: opt[i64], lens: *usize, known: bool, shorten: Shorten, out: *Expansion) bool {
+    var total: usize = 0;
+    var i:     u32   = 0;
+    for (i < form.len) {
+        total = total + lens[i];
+        i     = i + 1;
+    }
+    var at: usize = 0;
+    i = 0;
+    for (i < form.len) {
+        val s:    *Step    = ?form.at[i];
+        val step: *row.Row = ?codec.rows.at[s.row];
+        out.steps[i].row    = step;
+        out.steps[i].marker = operand.NO_FIXUP;
+        val place: Place = Place{known: known, at: at, len: lens[i], total: total};
+        var k:     u32   = 0;
+        for (k < step.operands.len) {
+            if (!source_value(codec, rx, s.values.at[k], from, distance, place, step, k, ?out.steps[i].values[k])) { ret false; }
+            k = k + 1;
+        }
+        if (shorten.shorter != nil && !takes_target(s)) {
+            var given:  inst.Inst = inst.Inst{row: step, values: ?out.steps[i].values[0], count: step.operands.len};
+            var packed: Emitted;
+            if (shorten.shorter(shorten.context, ?given, ?packed)) {
+                packed.marker = operand.NO_FIXUP;
+                out.steps[i]  = packed;
+            }
+        }
+        at = at + lens[i];
+        i  = i + 1;
+    }
+    out.count = form.len;
+    ret true;
+}
+
+# what measuring a form's steps found
+# ---
+# encoded: whether every step encoded
+# changed: whether any step's length differs from the one measured before
+rec Measure {
+    encoded: bool;
+    changed: bool;
+}
+
+# the length of each step of `out` encoded, into `lens`
+fun measure(codec: *dispatch.Codec, ctx: *state.Context, out: *Expansion, lens: *usize, scratch: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) Measure {
+    var got: Measure = Measure{encoded: true, changed: false};
+    var i:   u32     = 0;
+    for (i < out.count) {
+        val start:    usize                     = scratch.len;
+        val marks:    usize                     = fixups.len;
+        var step:     inst.Inst                 = inst.Inst{row: out.steps[i].row, values: ?out.steps[i].values[0], count: out.steps[i].row.operands.len};
+        val res_done: res[usize, field.Refusal] = masc_codec.encode(codec, ctx, ?step, scratch, fixups);
+        vector.truncate[u8](scratch, start);
+        vector.truncate[field.Fixup](fixups, marks);
+        if (sel res_done.err) {
+            got.encoded = false;
+            ret got;
+        }
+        got.changed = got.changed || lens[i] != res_done.ok;
+        lens[i]     = res_done.ok;
+        i           = i + 1;
+    }
+    ret got;
+}
+
+# the instructions row `from.row` becomes under the form of `rx` the context takes, for a target `distance` bytes from
+# its start
+# ---
+# ctx:      the context, whose form of `rx` is taken
+# distance: the target's distance, folded into the step that takes it, or none to leave that step the relaxed
+#           operand's value as given, a symbol the linker resolves
+# shorten:  how a step that does not take the target is written shorter, AS_IS for as the form states it
+# out:      the steps, each operand's value taken from the row relaxed, a fixed register or immediate, or the target
+# scratch:  room to encode a step in, which is left as it was found
+# fixups:   room for the fixups of that encoding, left as found
+# ret:      whether the context takes a form, every source gave a value, every step encoded and the steps' lengths
+#           settled
+#
+# a step's length is the length of its encoding, found by encoding it, and a
+# target past the form is measured from those lengths, so a step written
+# shorter moves it. the lengths are measured again until none changes, within
+# a round per step and one more, or the form is refused.
+# a step whose own length depends on its target, as x86's rel8 and rel32 do,
+# is not settled here: the encoding is measured with the target zero, and the
+# relaxation's layout loop, which repeats until no length changes, owns that.
+pub fun expand(codec: *dispatch.Codec, ctx: *state.Context, rx: *Relaxation, from: *inst.Inst, distance: opt[i64], shorten: Shorten, out: *Expansion, scratch: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) bool {
+    val opt_taken: opt[*Steps] = form_of(codec, ctx, rx);
+    if (sel opt_taken.none) { ret false; }
+    val form: *Steps = opt_taken.some;
+    if (form.len > MAX_STEPS) { ret false; }
+    var lens: [MAX_STEPS]usize;
+    var i:    u32 = 0;
+    for (i < form.len) {
+        lens[i] = 0;
+        i       = i + 1;
+    }
+    if (!fill(codec, rx, form, from, distance, ?lens[0], false, shorten, out)) { ret false; }
+    val first: Measure = measure(codec, ctx, out, ?lens[0], scratch, fixups);
+    if (!first.encoded) { ret false; }
+    var round: u32 = 0;
+    for (round <= form.len) {
+        if (!fill(codec, rx, form, from, distance, ?lens[0], true, shorten, out)) { ret false; }
+        # a step is measured with its target zero, so a target out of its range still measures
+        var probe: Expansion = @out;
+        var n:     u32       = 0;
+        for (n < form.len) {
+            val s: *Step = ?form.at[n];
+            var k: u32   = 0;
+            for (k < s.values.len) {
+                if (sel s.values.at[k].target && sel probe.steps[n].values[k].relative) { probe.steps[n].values[k] = operand.Value.relative{0}; }
+                k = k + 1;
+            }
+            n = n + 1;
+        }
+        val again: Measure = measure(codec, ctx, ?probe, ?lens[0], scratch, fixups);
+        if (!again.encoded) { ret false; }
+        if (!again.changed) { ret true; }
+        round = round + 1;
+    }
+    ret false;
+}
+
+# the step of `form` that takes the target
+pub fun target_step(form: *Steps) u32 {
+    var i: u32 = 0;
+    for (i < form.len) {
+        if (takes_target(?form.at[i])) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the form `ins` takes after `levels` of the set's relaxations, each a relaxation of the single step the level before
+# became, into `out`, with the index of the step that takes the target in `target`
+# ---
+# all:      the set's relaxations
+# distance: the target's distance from the start of `ins`, folded into the step that takes it, or none to leave it the
+#           relaxed operand's value as given
+# ret:      none, or why it was refused: CHAIN for a level past one that became several steps, REFUSE for a row with
+#           no relaxation or a form `expand` refuses
+pub fun grown(codec: *dispatch.Codec, ctx: *state.Context, all: Relaxations, ins: *inst.Inst, levels: u32, distance: opt[i64], shorten: Shorten, out: *Expansion, target: *u32, scratch: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) opt[str] {
+    out.count           = 1;
+    out.steps[0].row    = ins.row;
+    out.steps[0].marker = operand.NO_FIXUP;
+    var k: u32 = 0;
+    for (k < ins.count) {
+        out.steps[0].values[k] = ins.values[k];
+        k                      = k + 1;
+    }
+    @target = 0;
+    var held:  [operand.MAX_OPERANDS]operand.Value;
+    var from:  inst.Inst = @ins;
+    var level: u32       = 0;
+    for (level < levels) {
+        if (out.count != 1) { ret opt[str].some{CHAIN}; }
+        val opt_find: opt[*Relaxation] = find(all, out.steps[0].row);
+        if (sel opt_find.none) { ret opt[str].some{REFUSE}; }
+        if (level > 0) {
+            k = 0;
+            for (k < out.steps[0].row.operands.len) {
+                held[k] = out.steps[0].values[k];
+                k       = k + 1;
+            }
+            from = inst.Inst{row: out.steps[0].row, values: ?held[0], count: out.steps[0].row.operands.len};
+        }
+        val opt_taken: opt[*Steps] = form_of(codec, ctx, opt_find.some);
+        if (sel opt_taken.none)                                                                 { ret opt[str].some{REFUSE}; }
+        if (!expand(codec, ctx, opt_find.some, ?from, distance, shorten, out, scratch, fixups)) { ret opt[str].some{REFUSE}; }
+        @target = target_step(opt_taken.some);
+        level   = level + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether step `target` of the form `out` reaches a target `reach` bytes from the form's start, none for a target
+# only the linker knows: it does when its row has no relaxation, or its relaxed operand holds no symbol, or the target
+# is known and in range. a symbol only the linker knows is out of reach, so a branch to it grows as far as its
+# relaxations go. none is answered when a step does not encode
+pub fun reaches(codec: *dispatch.Codec, ctx: *state.Context, all: Relaxations, out: *Expansion, target: u32, reach: opt[i64], scratch: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) opt[bool] {
+    val step:     *Emitted         = ?out.steps[target];
+    val opt_find: opt[*Relaxation] = find(all, step.row);
+    if (sel opt_find.none) { ret opt[bool].some{true}; }
+    val op: u8 = opt_find.some.operand;
+    if (sel reach.none) { ret opt[bool].some{!sel step.values[op].symbol}; }
+    var lens: [MAX_STEPS]usize;
+    var i:    u32 = 0;
+    for (i < out.count) {
+        lens[i] = 0;
+        i       = i + 1;
+    }
+    # measured with the target zero, as a length is the length of an encoding, and left as given
+    val held: operand.Value = step.values[op];
+    step.values[op] = operand.Value.relative{0};
+    val sized: Measure = measure(codec, ctx, out, ?lens[0], scratch, fixups);
+    step.values[op] = held;
+    if (!sized.encoded) { ret opt[bool].none{}; }
+    var at: i64 = 0;
+    i = 0;
+    for (i < target) {
+        at = at + lens[i]::i64;
+        i  = i + 1;
+    }
+    ret opt[bool].some{!far(codec, opt_find.some, reach.some - at, lens[target])};
+}
+
+# how many relaxations row `r` can grow by in any context, following the step of each form that takes the target, the
+# deepest of them, which the set's check bounds by refusing a chain that does not end
+pub fun depth(all: Relaxations, codec: *dispatch.Codec, r: *row.Row) u32 {
+    ret deepest(all, codec, r, all.len + 1);
+}
+
+# the depth of `r` within `left` relaxations
+fun deepest(all: Relaxations, codec: *dispatch.Codec, r: *row.Row, left: u32) u32 {
+    if (left == 0) { ret 0; }
+    val opt_find: opt[*Relaxation] = find(all, r);
+    if (sel opt_find.none) { ret 0; }
+    var most: u32 = 0;
+    var f:    u32 = 0;
+    for (f < opt_find.some.forms.len) {
+        val form: *Steps = ?opt_find.some.forms.at[f];
+        val n:    u32    = deepest(all, codec, ?codec.rows.at[form.at[target_step(form)].row], left - 1);
+        if (n > most) { most = n; }
+        f = f + 1;
+    }
+    ret most + 1;
+}

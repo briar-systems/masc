@@ -1,0 +1,596 @@
+# the x86 assembly syntax, intel's, with no register prefix
+#
+# every row's template and the index by mnemonic are generated from XED (gen_syntax): the prefix words, the mnemonic
+# and the operands comma separated, in XED's order but where the overlay's operands topic states another, evex's opmask
+# and `{z}` in braces after the operand they decorate, and a rounding control or `{sae}` after the last operand that is
+# no immediate. what is written here is what the generator cannot state, the hooks of the operands the framework does
+# not spell from a table:
+#   immediates  the core's decimal expressions, a negative value as `-16`, so an immediate that decodes signed prints signed and one that decodes either way
+#               prints unsigned, and a register's name is never read as a symbol
+#   memory      `<size> ptr <segment>:[<base> + <scale>*<index> + <displacement>]{1to<n>}`, each part absent when the
+#               address has none, the displacement subtracted when negative and dropped when zero beside a register.
+#               the size is the word of the bits the operand accesses (byte, word, dword, fword, qword, tbyte, xmmword,
+#               ymmword, zmmword), of one element under a broadcast, none for bits no word names or for an address
+#               computed but never accessed, as lea's, or the word the template's hole format names, `-` for none,
+#               where the overlay's operand type is another than the access, as a prefetch's byte. memory written with no
+#               size reads as the code width's for call, jmp, push and pop, and else as the one size the rows that
+#               read the text take, refused where they take more than one, so `add eax, [rax]` reads and
+#               `add [rax], 1` is refused. a size word on memory that states no width, `-` or an address never
+#               accessed, is read and ignored, as `lea rax, qword ptr [rcx]` and `lgdt fword ptr [rax]`, and one
+#               naming another width than a stated one is refused. rip is the base of a rip-relative address, eip of one whose operand addresses
+#               by 32-bit registers alone, as enqcmd's 67 row, and the segment a string operand fixes is written, as
+#               es of `es:[di]`. the displacement may name a symbol and its addend, as `[rip + ext + 8]`, whose fixup
+#               the ModRM kind chooses: pc-relative from the instruction's end for a rip-relative address, as
+#               R_X86_64_PC32 ext-4, else absolute
+# relative targets are the core's expression of their offset. registers are written by name, x87's as st(1), and read
+# without regard to case.
+#
+# a symbol takes a relocation specifier after it, under each format, after a bare name, and without regard to case: `@PLT` on a call's or a jump's
+# target, and on a displacement or a 32-bit immediate the got, plt, tls and tlsdesc kinds, `@GOTPCREL`, `@GOT`,
+# `@GOTOFF`, `@TPOFF`, `@DTPOFF`, `@GOTTPOFF`, `@TLSGD`, `@TLSLD`, `@TLSDESC` and `@TLSCALL`, and i386's `@NTPOFF`,
+# `@INDNTPOFF`, `@GOTNTPOFF` and `@TLSLDM`, each bound on the architectures that relocate it
+# (masc.isa.x86.fixup), and on a 64-bit immediate `@GOT`, `@GOTOFF`, `@PLTOFF`, `@TPOFF` and `@DTPOFF`. a
+# displacement reads them whichever field holds it, a ModRM displacement or an a0 to a3 move's address, and its
+# address chooses the relocation (PLACEMENTS). under mach-o `@GOTPCREL` and `@TLVP` are read, and under coff
+# `@SECREL32` and `@IMGREL`, each its own format's (masc.isa.x86.fixup). no `@GOTPCRELX` and no `@DTPMOD` is read.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use mink_format: mink.catalog.format;
+
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.register;
+use core_syntax: masc.core.syntax;
+use masc.syntax.expr;
+use masc.syntax.read;
+use masc.syntax.write;
+
+use x86_field: masc.isa.x86.field;
+use x86_fixup: masc.isa.x86.fixup;
+use masc.isa.x86.gen_syntax;
+
+pub val NO_SIZE:      str = "memory operand states no size, or another than the instruction's";
+pub val NOT_SCALE:    str = "the index scale is none of 1, 2, 4 and 8";
+pub val NO_ADDRESS:   str = "memory operand is no address the syntax reads";
+pub val TWO_PARTS:    str = "memory operand names its base, index or displacement twice";
+pub val NEGATED:      str = "memory operand subtracts a symbol";
+pub val NO_BROADCAST: str = "memory operand broadcasts no element count it admits";
+
+# a size word and the width it names
+# ---
+# word: the word
+# bits: the width
+rec Size {
+    word: str;
+    bits: u16;
+}
+
+val SIZE_COUNT: u32 = 9;
+
+val SIZES: [SIZE_COUNT]Size = [SIZE_COUNT]Size{
+    Size{word: "byte", bits: 8},
+    Size{word: "word", bits: 16},
+    Size{word: "dword", bits: 32},
+    Size{word: "fword", bits: 48},
+    Size{word: "qword", bits: 64},
+    Size{word: "tbyte", bits: 80},
+    Size{word: "xmmword", bits: 128},
+    Size{word: "ymmword", bits: 256},
+    Size{word: "zmmword", bits: 512},
+};
+
+fun size_word(bits: u16) str {
+    var i: u32 = 0;
+    for (i < SIZE_COUNT) {
+        if (SIZES[i].bits == bits) { ret SIZES[i].word; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether `v` is `word`
+fun spells(word: str, v: View) bool {
+    if (str_len(word) != v.len) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (word[i] != v.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the bits the size word of a memory operand written under hole format `format` names, 0 for none: the format names
+# the word, `-` names none, and no format the word of the bits the operand accesses, an element of them under a
+# broadcast of 2^`broadcast` elements, none for bits no word names, as fxsave's 512 bytes, or for none, as lea's
+fun sized(desc: *operand.Operand, format: View, broadcast: u8) u16 {
+    if (format.len == 1 && format.data[0] == '-') { ret 0; }
+    if (format.len > 0) {
+        var i: u32 = 0;
+        for (i < SIZE_COUNT) {
+            if (spells(SIZES[i].word, format)) { ret SIZES[i].bits; }
+            i = i + 1;
+        }
+        ret 0;
+    }
+    val bits: u16 = desc.width >> broadcast::u16;
+    if (size_word(bits) == nil) { ret 0; }
+    ret bits;
+}
+
+# whether memory operand `desc` written under hole format `format` states a width a size word must name: a format naming
+# a word, or no format and a width the operand accesses, as fxsave's 512 bytes, which no word names. a format of `-`
+# and an address computed but never accessed, as lea's, state none
+fun stated(desc: *operand.Operand, format: View) bool {
+    if (format.len == 1 && format.data[0] == '-') { ret false; }
+    if (format.len > 0)                           { ret true; }
+    ret desc.width != 0;
+}
+
+# a register's name is no symbol, so `mov ah, sil` is never a move of the address sil
+fun immediate_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val at:      usize                                   = r.at;
+    val res_reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, false);
+    r.at = at;
+    if (sel res_reg.ok) { ret refused(r, read.EXPECTED, at); }
+    ret expr.IMMEDIATE.parse(r, desc, format, out);
+}
+
+val IMMEDIATE: core_syntax.Hook = core_syntax.Hook{parse: immediate_parse, print: expr.IMMEDIATE.print};
+
+# whether `reg` is the instruction pointer, which a rip-relative address names as its base
+fun is_ip(file: *register.File, reg: register.Id) bool {
+    val opt_named: opt[register.Id] = register.named(file, view("rip", 3), true);
+    ret sel opt_named.some && opt_named.some == reg;
+}
+
+# whether memory operand `desc` addresses by 32-bit registers alone, a row's own 67 in 64-bit code, whose
+# rip-relative address is written as eip's, as enqcmd's `[eip + 1]`
+fun narrow_ip(file: *register.File, desc: *operand.Operand) bool {
+    if (!sel desc.shape.memory) { ret false; }
+    val classes:    operand.Classes = desc.shape.memory.base.classes;
+    val opt_narrow: opt[u16]        = register.class_named(file, "gpr32");
+    if (classes.len == 0) { ret false; }
+    if (sel opt_narrow.some) {
+        var i: u32 = 0;
+        for (i < classes.len) {
+            if (classes.at[i] != opt_narrow.some) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    ret false;
+}
+
+# the one segment a string operand's shape fixes, as es of a string destination, which no prefix overrides, NONE for an
+# operand whose segment is free
+fun fixed_segment(desc: *operand.Operand) register.Id {
+    if (!sel desc.shape.memory) { ret register.NONE; }
+    val seg: operand.Register = desc.shape.memory.segment;
+    if (seg.count != 1 || seg.classes.len != 1) { ret register.NONE; }
+    ret register.make(seg.classes.at[0], seg.first::u16);
+}
+
+# the default fixup kind a memory operand's symbol reads and writes its specifiers under: a ModRM displacement's for
+# any displacement, an a0 to a3 move's 64-bit address too, since the address and not the field chooses the
+# relocation, and none for an operand of no displacement, as a string operand's
+fun displaced(desc: *operand.Operand) operand.FixupKind {
+    if (!sel desc.shape.memory)                           { ret operand.NO_FIXUP; }
+    if (desc.shape.memory.disp.fixup == operand.NO_FIXUP) { ret operand.NO_FIXUP; }
+    ret x86_fixup.ABS32;
+}
+
+fun memory_print(w: *core_syntax.Writer, desc: *operand.Operand, format: View, value: *operand.Value) err[field.Refusal] {
+    if (!sel value.memory) { ret write.refuse(w, write.NO_SPELLING, field.NO_OPERAND); }
+    val a:    operand.Address = value.memory;
+    val bits: u16             = sized(desc, format, a.broadcast);
+    if (bits != 0) {
+        val err_worded: err[field.Refusal] = write.text(w, size_word(bits));
+        if (sel err_worded.err) { ret err_worded; }
+        val err_ptr_word: err[field.Refusal] = write.text(w, " ptr ");
+        if (sel err_ptr_word.err) { ret err_ptr_word; }
+    }
+    var segment: register.Id = a.segment;
+    if (segment == register.NONE) { segment = fixed_segment(desc); }
+    if (segment != register.NONE) {
+        val err_seg: err[field.Refusal] = write.register_name(w, segment, field.NO_OPERAND);
+        if (sel err_seg.err) { ret err_seg; }
+        val err_colon: err[field.Refusal] = write.text(w, ":");
+        if (sel err_colon.err) { ret err_colon; }
+    }
+    val err_open: err[field.Refusal] = write.text(w, "[");
+    if (sel err_open.err) { ret err_open; }
+    var plus: bool = false;
+    if (a.mode == operand.RELATIVE_PC) {
+        var named: str = "rip";
+        if (narrow_ip(w.codec.registers, desc)) { named = "eip"; }
+        val err_text: err[field.Refusal] = write.text(w, named);
+        if (sel err_text.err) { ret err_text; }
+        plus = true;
+    }
+    or (a.base != register.NONE) {
+        val err_base: err[field.Refusal] = write.register_name(w, a.base, field.NO_OPERAND);
+        if (sel err_base.err) { ret err_base; }
+        plus = true;
+    }
+    if (a.index != register.NONE) {
+        if (plus) {
+            val err_joined: err[field.Refusal] = write.text(w, " + ");
+            if (sel err_joined.err) { ret err_joined; }
+        }
+        if (a.scale != 0) {
+            val err_scaled: err[field.Refusal] = write.decimal(w, (1::i64 << a.scale::i64));
+            if (sel err_scaled.err) { ret err_scaled; }
+            val err_times: err[field.Refusal] = write.text(w, "*");
+            if (sel err_times.err) { ret err_times; }
+        }
+        val err_index: err[field.Refusal] = write.register_name(w, a.index, field.NO_OPERAND);
+        if (sel err_index.err) { ret err_index; }
+        plus = true;
+    }
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        if (plus) {
+            val err_joined: err[field.Refusal] = write.text(w, " + ");
+            if (sel err_joined.err) { ret err_joined; }
+        }
+        # a symbol stating the kind its address takes by default reads back bare, as a rip-relative one's pc32
+        var sym: operand.Symbol = a.symbol;
+        if (sym.fixup == operand.value_fixup(desc, value)) { sym.fixup = operand.NO_FIXUP; }
+        val err_named: err[field.Refusal] = expr.print_symbol(w, sym, displaced(desc), field.NO_OPERAND);
+        if (sel err_named.err) { ret err_named; }
+    }
+    or (a.disp != 0 || !plus) {
+        var d: i64 = a.disp;
+        if (plus) {
+            var joint: str = " + ";
+            if (d < 0) {
+                joint = " - ";
+                d     = 0 - d;
+            }
+            val err_joined: err[field.Refusal] = write.text(w, joint);
+            if (sel err_joined.err) { ret err_joined; }
+        }
+        val err_disp: err[field.Refusal] = write.decimal(w, d);
+        if (sel err_disp.err) { ret err_disp; }
+    }
+    val err_close: err[field.Refusal] = write.text(w, "]");
+    if (sel err_close.err || a.broadcast == 0) { ret err_close; }
+    val err_text: err[field.Refusal] = write.text(w, "{1to");
+    if (sel err_text.err) { ret err_text; }
+    val err_count: err[field.Refusal] = write.decimal(w, 1::i64 << a.broadcast::i64);
+    if (sel err_count.err) { ret err_count; }
+    ret write.text(w, "}");
+}
+
+# the broadcast `{1to<n>}` after a memory operand, n's log into `out`, 0 when the text holds none there
+fun broadcast_of(r: *core_syntax.Reader, out: *u8) err[diagnostic.Diagnostic] {
+    @out = 0;
+    val at: usize = r.at;
+    if (!read.take(r, "{1to")) { ret err[diagnostic.Diagnostic].ok{}; }
+    val res_number: res[i64, diagnostic.Diagnostic] = read.number(r);
+    if (sel res_number.err) { ret err[diagnostic.Diagnostic].err{res_number.err}; }
+    var log: u8 = 0;
+    for (log < 7 && (1::i64 << log::i64) != res_number.ok) {
+        log = log + 1;
+    }
+    if (log == 0 || log == 7 || !read.take(r, "}")) { ret refused(r, NO_BROADCAST, at); }
+    @out = log;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the word at the reader's position read when it is `text`, ending at a word boundary
+fun take_word(r: *core_syntax.Reader, text: str) bool {
+    val at:  usize = r.at;
+    val len: usize = str_len(text);
+    if (!read.starts(r, at, text, len) || !read.bounded(r, at, len, text[len - 1])) { ret false; }
+    r.at = at + len;
+    ret true;
+}
+
+# the size word of the memory operand at the reader's position and its `ptr`, 0 when there is none. the `ptr` may be
+# left out before the operand's bracket or segment, as mach's asm blocks write `qword [rcx]`
+fun size_of(r: *core_syntax.Reader) u16 {
+    val at: usize = r.at;
+    var i:  u32   = 0;
+    for (i < SIZE_COUNT) {
+        if (take_word(r, SIZES[i].word)) {
+            read.skip(r);
+            if (take_word(r, "ptr")) {
+                read.skip(r);
+                ret SIZES[i].bits;
+            }
+            if (opens_memory(r)) { ret SIZES[i].bits; }
+            r.at = at;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the segment overrides a memory operand may open with
+val SEGMENTS: [6]str = [6]str{"es:", "cs:", "ss:", "ds:", "fs:", "gs:"};
+
+# whether a memory operand opens at the reader's position: its bracket, or a segment override before it
+fun opens_memory(r: *core_syntax.Reader) bool {
+    if (read.starts(r, r.at, "[", 1)) { ret true; }
+    var i: usize = 0;
+    for (i < 6) {
+        if (read.starts(r, r.at, SEGMENTS[i], 3)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun refused(r: *core_syntax.Reader, message: str, at: usize) err[diagnostic.Diagnostic] {
+    ret err[diagnostic.Diagnostic].err{read.refuse(r, message, at, read.token(r, at))};
+}
+
+# the log of scale `n`, none for a scale other than 1, 2, 4 and 8
+fun scale_of(n: i64) opt[u8] {
+    if (n == 1) { ret opt[u8].some{0}; }
+    if (n == 2) { ret opt[u8].some{1}; }
+    if (n == 4) { ret opt[u8].some{2}; }
+    if (n == 8) { ret opt[u8].some{3}; }
+    ret opt[u8].none{};
+}
+
+# a displacement term that is no number and no register, as `ext`: the expression's one term, a symbol whose addend
+# the address's numbers add to once it is read, or a constant a name equates to, under the displacement's fixup kind
+fun displacement(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *bool, fixup: operand.FixupKind) err[diagnostic.Diagnostic] {
+    val at:        usize                                 = r.at;
+    val res_unary: res[expr.Expr, diagnostic.Diagnostic] = expr.unary(r, fixup);
+    if (sel res_unary.err) { ret err[diagnostic.Diagnostic].err{res_unary.err}; }
+    val got: expr.Expr = res_unary.ok;
+    if (sel got.difference) { ret err[diagnostic.Diagnostic].err{read.refuse(r, expr.DIFFERENCE, at, r.at - at)}; }
+    if (sel got.symbol) {
+        if (negative)                         { ret refused(r, NEGATED, at); }
+        if (a.symbol.id != operand.NO_SYMBOL) { ret refused(r, TWO_PARTS, at); }
+        a.symbol = got.symbol;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (sel got.constant) {
+        if (@seen) { ret refused(r, TWO_PARTS, at); }
+        @seen = true;
+        if (negative) { a.disp = 0 - got.constant; }
+        or            { a.disp = got.constant; }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a term of the address: a register, a register times a scale, a scale times a register, a number, or a displacement
+# naming a symbol, added or, for a number or a constant, subtracted
+fun term(r: *core_syntax.Reader, a: *operand.Address, negative: bool, seen: *bool, fixup: operand.FixupKind, eip: bool) err[diagnostic.Diagnostic] {
+    val at: usize = r.at;
+    # eip names the instruction pointer of an operand that addresses by 32-bit registers alone
+    if (eip && !negative && read.take(r, "eip")) {
+        if (a.base != register.NONE || a.mode == operand.RELATIVE_PC) { ret refused(r, TWO_PARTS, at); }
+        a.mode = operand.RELATIVE_PC;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val c: u8 = read.peek(r);
+    if (c >= '0' && c <= '9') {
+        val res_number: res[i64, diagnostic.Diagnostic] = read.number(r);
+        if (sel res_number.err) { ret err[diagnostic.Diagnostic].err{res_number.err}; }
+        read.skip(r);
+        if (read.take(r, "*")) {
+            read.skip(r);
+            val opt_scale_of: opt[u8] = scale_of(res_number.ok);
+            if (sel opt_scale_of.none)                { ret refused(r, NOT_SCALE, at); }
+            if (negative || a.index != register.NONE) { ret refused(r, TWO_PARTS, at); }
+            val res_reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, true);
+            if (sel res_reg.err) { ret err[diagnostic.Diagnostic].err{res_reg.err}; }
+            a.index = res_reg.ok;
+            a.scale = opt_scale_of.some;
+            ret err[diagnostic.Diagnostic].ok{};
+        }
+        if (@seen) { ret refused(r, TWO_PARTS, at); }
+        @seen = true;
+        if (negative) { a.disp = 0 - res_number.ok; }
+        or            { a.disp = res_number.ok; }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val res_reg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, true);
+    if (sel res_reg.err) {
+        r.at = at;
+        ret displacement(r, a, negative, seen, fixup);
+    }
+    if (negative) { ret refused(r, NO_ADDRESS, at); }
+    read.skip(r);
+    if (read.take(r, "*")) {
+        read.skip(r);
+        val res_number: res[i64, diagnostic.Diagnostic] = read.number(r);
+        if (sel res_number.err) { ret err[diagnostic.Diagnostic].err{res_number.err}; }
+        val opt_scale_of: opt[u8] = scale_of(res_number.ok);
+        if (sel opt_scale_of.none)    { ret refused(r, NOT_SCALE, at); }
+        if (a.index != register.NONE) { ret refused(r, TWO_PARTS, at); }
+        a.index = res_reg.ok;
+        a.scale = opt_scale_of.some;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (is_ip(r.codec.registers, res_reg.ok)) {
+        if (a.base != register.NONE || a.mode == operand.RELATIVE_PC) { ret refused(r, TWO_PARTS, at); }
+        a.mode = operand.RELATIVE_PC;
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    if (a.base == register.NONE && a.mode != operand.RELATIVE_PC) { a.base = res_reg.ok; }
+    or (a.index == register.NONE)                                 { a.index = res_reg.ok; }
+    or                                                            { ret refused(r, TWO_PARTS, at); }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun memory_parse(r: *core_syntax.Reader, desc: *operand.Operand, format: View, out: *operand.Value) err[diagnostic.Diagnostic] {
+    val at:   usize           = r.at;
+    val bits: u16             = size_of(r);
+    var a:    operand.Address = operand.Address{base: register.NONE, index: register.NONE, scale: 0, disp: 0, segment: register.NONE, mode: operand.OFFSET, symbol: operand.Symbol{id: operand.NO_SYMBOL, addend: 0, fixup: operand.NO_FIXUP}, extend: 0, broadcast: 0};
+    if (read.peek(r) != '[') {
+        val res_seg: res[register.Id, diagnostic.Diagnostic] = read.register_value(r, true);
+        if (sel res_seg.err) { ret err[diagnostic.Diagnostic].err{res_seg.err}; }
+        read.skip(r);
+        if (!read.take(r, ":")) { ret refused(r, NO_ADDRESS, r.at); }
+        read.skip(r);
+        # a string operand's fixed segment is the operand's own, as it decodes
+        if (res_seg.ok != fixed_segment(desc)) { a.segment = res_seg.ok; }
+    }
+    if (!read.take(r, "[")) { ret refused(r, NO_ADDRESS, r.at); }
+    read.skip(r);
+    val fixup:    operand.FixupKind = displaced(desc);
+    var seen:     bool              = false;
+    var negative: bool              = false;
+    val narrow:   bool              = narrow_ip(r.codec.registers, desc);
+    # an address of a displacement alone may be negative, as `[-1]`
+    if (read.take(r, "-")) {
+        negative = true;
+        read.skip(r);
+    }
+    for {
+        val err_term: err[diagnostic.Diagnostic] = term(r, ?a, negative, ?seen, fixup, narrow);
+        if (sel err_term.err) { ret err_term; }
+        read.skip(r);
+        if (read.take(r, "]")) { brk; }
+        if (read.take(r, "+")) { negative = false; }
+        or (read.take(r, "-")) { negative = true; }
+        or                     { ret refused(r, NO_ADDRESS, r.at); }
+        read.skip(r);
+    }
+    var spread:          u8                         = 0;
+    val err_spread_read: err[diagnostic.Diagnostic] = broadcast_of(r, ?spread);
+    if (sel err_spread_read.err) { ret err_spread_read; }
+    if (spread != 0) {
+        var admitted: u8 = 0;
+        if (sel desc.shape.memory)           { admitted = desc.shape.memory.broadcasts; }
+        if (((admitted >> spread) & 1) == 0) { ret refused(r, NO_BROADCAST, at); }
+        a.broadcast = spread;
+    }
+    val own: u16 = sized(desc, format, spread);
+    # a size word on memory of no stated width, as lea's address or lgdt's pseudo-descriptor, is read and ignored
+    if (bits != 0 && !stated(desc, format)) {}
+    or (bits == 0 && own != 0) {
+        # call's, jmp's, push's and pop's memory of no size is the code width's, as `push [rax]` is qword, and any
+        # other's the one size the rows that read the text take
+        if (pointer_sized(r)) {
+            if (own != x86_field.width(r.ctx)::u16) { ret refused(r, NO_SIZE, at); }
+        }
+        or { r.unsized = true; }
+    }
+    or (bits != own) { ret refused(r, NO_SIZE, at); }
+    # a symbolic displacement carries the address's number as its addend
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        a.symbol.addend = a.symbol.addend + a.disp;
+        a.disp          = 0;
+    }
+    @out = operand.Value.memory{a};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+val MEMORY: core_syntax.Hook = core_syntax.Hook{parse: memory_parse, print: memory_print};
+
+val POINTER_COUNT: u32 = 4;
+
+val POINTER_SIZED: [POINTER_COUNT]str = [POINTER_COUNT]str{"call", "jmp", "push", "pop"};
+
+# whether the row the reader reads is one whose memory of no size is the code width's
+fun pointer_sized(r: *core_syntax.Reader) bool {
+    if (r.row == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < POINTER_COUNT) {
+        if (str_equals(r.row.mnemonic, POINTER_SIZED[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the words that select rows of their own before a mnemonic, as `lock add`, `rep movsb`, `repz cmpsb`, apx's
+# `{nf} add` and `addr16 loop`, a 67 the operands do not show
+val PREFIX_COUNT: u32 = 9;
+
+val PREFIX_WORDS: [PREFIX_COUNT]str = [PREFIX_COUNT]str{"lock", "rep", "repe", "repz", "repne", "repnz", "{nf}", "addr16", "addr32"};
+
+# the formats whose dialects read each format's specifiers
+val ELF_ONLY:   [1]*mink_format.Format = [1]*mink_format.Format{?mink_format.ELF};
+val ELF:        core_syntax.Formats    = core_syntax.Formats{at: ?ELF_ONLY[0], len: 1};
+val MACHO_ONLY: [1]*mink_format.Format = [1]*mink_format.Format{?mink_format.MACHO};
+val MACHO:      core_syntax.Formats    = core_syntax.Formats{at: ?MACHO_ONLY[0], len: 1};
+val COFF_ONLY:  [1]*mink_format.Format = [1]*mink_format.Format{?mink_format.COFF};
+val COFF:       core_syntax.Formats    = core_syntax.Formats{at: ?COFF_ONLY[0], len: 1};
+
+val SPECIFIER_COUNT: u32 = 44;
+
+# the specifiers of each format: elf's `@PLT` on a branch target, its 32-bit kinds on a displacement and on a 32-bit
+# immediate, plain and sign-extended, and its 64-bit kinds on a 64-bit immediate, mach-o's `@GOTPCREL` and `@TLVP` and
+# coff's `@SECREL32` and `@IMGREL` on a displacement and a 32-bit immediate
+val SPECIFIERS: [SPECIFIER_COUNT]core_syntax.Specifier = [SPECIFIER_COUNT]core_syntax.Specifier{
+    core_syntax.Specifier{template: "<0>@PLT", operand: x86_fixup.BRANCH32, fixup: x86_fixup.PLT, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@PLT", operand: x86_fixup.ABS32, fixup: x86_fixup.PLT, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTPCREL", operand: x86_fixup.ABS32, fixup: x86_fixup.GOTPCREL, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOT", operand: x86_fixup.ABS32, fixup: x86_fixup.GOT, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.GOTOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.TPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@NTPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.NTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@DTPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.DTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTTPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.GOTTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSGD", operand: x86_fixup.ABS32, fixup: x86_fixup.TLSGD, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSLD", operand: x86_fixup.ABS32, fixup: x86_fixup.TLSLD, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSLDM", operand: x86_fixup.ABS32, fixup: x86_fixup.TLSLDM, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@INDNTPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.INDNTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTNTPOFF", operand: x86_fixup.ABS32, fixup: x86_fixup.GOTNTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSDESC", operand: x86_fixup.ABS32, fixup: x86_fixup.TLSDESC, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSCALL", operand: x86_fixup.ABS32, fixup: x86_fixup.TLSCALL, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@PLT", operand: x86_fixup.ABS32S, fixup: x86_fixup.PLT, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTPCREL", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOTPCREL, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOT", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOT, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOTOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.TPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@NTPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.NTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@DTPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.DTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTTPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOTTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSGD", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLSGD, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSLD", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLSLD, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSLDM", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLSLDM, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@INDNTPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.INDNTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTNTPOFF", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOTNTPOFF, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSDESC", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLSDESC, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TLSCALL", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLSCALL, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOT", operand: x86_fixup.ABS64, fixup: x86_fixup.GOT64, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTOFF", operand: x86_fixup.ABS64, fixup: x86_fixup.GOTOFF64, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@PLTOFF", operand: x86_fixup.ABS64, fixup: x86_fixup.PLTOFF64, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@TPOFF", operand: x86_fixup.ABS64, fixup: x86_fixup.TPOFF64, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@DTPOFF", operand: x86_fixup.ABS64, fixup: x86_fixup.DTPOFF64, fold: nil, formats: ELF},
+    core_syntax.Specifier{template: "<0>@GOTPCREL", operand: x86_fixup.ABS32, fixup: x86_fixup.GOT_PC32, fold: nil, formats: MACHO},
+    core_syntax.Specifier{template: "<0>@TLVP", operand: x86_fixup.ABS32, fixup: x86_fixup.TLV_PC32, fold: nil, formats: MACHO},
+    core_syntax.Specifier{template: "<0>@GOTPCREL", operand: x86_fixup.ABS32S, fixup: x86_fixup.GOT_PC32, fold: nil, formats: MACHO},
+    core_syntax.Specifier{template: "<0>@TLVP", operand: x86_fixup.ABS32S, fixup: x86_fixup.TLV_PC32, fold: nil, formats: MACHO},
+    core_syntax.Specifier{template: "<0>@SECREL32", operand: x86_fixup.ABS32, fixup: x86_fixup.SECREL32, fold: nil, formats: COFF},
+    core_syntax.Specifier{template: "<0>@IMGREL", operand: x86_fixup.ABS32, fixup: x86_fixup.IMAGE32, fold: nil, formats: COFF},
+    core_syntax.Specifier{template: "<0>@SECREL32", operand: x86_fixup.ABS32S, fixup: x86_fixup.SECREL32, fold: nil, formats: COFF},
+    core_syntax.Specifier{template: "<0>@IMGREL", operand: x86_fixup.ABS32S, fixup: x86_fixup.IMAGE32, fold: nil, formats: COFF},
+};
+
+# intel's syntax
+pub val SYNTAX: core_syntax.Syntax = core_syntax.Syntax{
+    name:       "intel",
+    forms:      core_syntax.Forms{at: ?gen_syntax.FORM_TEXT[0], len: gen_syntax.FORM_COUNT},
+    aliases:    core_syntax.Aliases{at: ?gen_syntax.ALIAS_ROWS[0], len: gen_syntax.ALIAS_COUNT},
+    index:      core_syntax.Index{at: ?gen_syntax.ENTRIES[0], len: gen_syntax.ENTRY_COUNT, candidates: ?gen_syntax.CANDIDATES[0], count: gen_syntax.CANDIDATE_COUNT},
+    specifiers: core_syntax.Specifiers{at: ?SPECIFIERS[0], len: SPECIFIER_COUNT},
+    hooks:      core_syntax.Hooks{immediate: ?IMMEDIATE, memory: ?MEMORY, list: nil, id: nil, literal: nil},
+    register:   "",
+    aliased:    false,
+    join:       ",",
+    variadic:   ", ",
+    fold:       true,
+    anonymous:  ".Ltmp",
+    own:        ".Ltmp",
+    prefixes:   core_syntax.Prefixes{at: ?PREFIX_WORDS[0], len: PREFIX_COUNT},
+};

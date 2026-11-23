@@ -1,0 +1,209 @@
+# the reader of one member of a gzip-compressed tar archive
+#
+# a source vendored as its upstream's release tarball, as AARCHMRS is, is a
+# file of its tree like any other, checked by the tree's checksum. a
+# generator takes the members it reads out of it here, inflating the
+# archive in memory only as far as the member it asks for, so nothing is
+# unpacked on disk. the archive is ustar, with gnu long names, as gnu and
+# posix tar write it. a pax header, a link or a member past 8 GiB is
+# refused rather than read wrongly.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_ends_with;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use deflate.gzip;
+use A: std.allocator;
+
+use gen.diag;
+use gen.source;
+
+pub val INFLATE:    str = "archive does not inflate";
+pub val TRUNCATED:  str = "archive ends inside a member";
+pub val HEADER:     str = "archive header checksum differs";
+pub val UNREAD:     str = "archive member is a pax header, a link or too large";
+pub val ABSENT:     str = "archive has no such member";
+pub val NO_RELEASE: str = "source holds no single .tar.gz release";
+
+val BLOCK: usize = 512;
+
+# the one .tar.gz release tree `t` holds, as a source vendored as its upstream's release tarball does, refused at `path`
+# when it holds none or several
+pub fun release(t: *source.Tree, path: str) res[*source.File, diag.Refusal] {
+    var archive: *source.File = nil;
+    var i:       usize        = 0;
+    for (i < t.files.len) {
+        if (str_ends_with(t.files.data[i].path, ".tar.gz")) {
+            if (archive != nil) { ret res[*source.File, diag.Refusal].err{diag.refusal(path, 0, NO_RELEASE, nil)}; }
+            archive = ?t.files.data[i];
+        }
+        i = i + 1;
+    }
+    if (archive == nil) { ret res[*source.File, diag.Refusal].err{diag.refusal(path, 0, NO_RELEASE, nil)}; }
+    ret res[*source.File, diag.Refusal].ok{archive};
+}
+
+# the inflating read of an archive
+# ---
+# z:    the decoder
+# src:  the archive's bytes
+# len:  how many it holds
+# at:   how many the decoder has consumed
+# done: whether the decoder has verified the whole stream
+rec Stream {
+    z:    gzip.Decompressor;
+    src:  *u8;
+    len:  usize;
+    at:   usize;
+    done: bool;
+}
+
+# `n` inflated bytes into `dst`, or none when the archive ends or does not inflate first
+fun read(s: *Stream, dst: *u8, n: usize) bool {
+    var got: usize = 0;
+    for (got < n) {
+        if (s.done) { ret false; }
+        var res_finish: res[gzip.Progress, gzip.InflateError];
+        if (s.at == s.len)      { res_finish = gzip.finish(?s.z, ?dst[got], n - got); }
+        or                      { res_finish = gzip.decompress(?s.z, ?s.src[s.at], s.len - s.at, ?dst[got], n - got); }
+        if (sel res_finish.err) { ret false; }
+        s.at = s.at + res_finish.ok.consumed;
+        got  = got + res_finish.ok.written;
+        if (res_finish.ok.status == gzip.DONE) { s.done = true; }
+    }
+    ret true;
+}
+
+# `n` inflated bytes passed over
+fun skip(s: *Stream, n: usize) bool {
+    var scratch: [4096]u8;
+    var left:    usize = n;
+    for (left > 0) {
+        var step: usize = left;
+        if (step > 4096)                 { step = 4096; }
+        if (!read(s, ?scratch[0], step)) { ret false; }
+        left = left - step;
+    }
+    ret true;
+}
+
+# the octal number in `len` bytes from `at`, ending at a nul or a space, none when a byte is neither
+fun octal(h: *u8, at: usize, len: usize) opt[u64] {
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (i < len && h[at + i] == ' ') { i = i + 1; }
+    for (i < len && h[at + i] != 0 && h[at + i] != ' ') {
+        val c: u8 = h[at + i];
+        if (c < '0' || c > '7') { ret opt[u64].none{}; }
+        v = v * 8 + (c - '0')::u64;
+        i = i + 1;
+    }
+    ret opt[u64].some{v};
+}
+
+# whether the header's checksum, its bytes summed with the checksum field as spaces, is the one it records
+fun checked(h: *u8) bool {
+    val opt_want: opt[u64] = octal(h, 148, 8);
+    if (sel opt_want.none) { ret false; }
+    var sum: u64   = 0;
+    var i:   usize = 0;
+    for (i < BLOCK) {
+        if (i >= 148 && i < 156) { sum = sum + ' '::u64; }
+        or                       { sum = sum + h[i]::u64; }
+        i = i + 1;
+    }
+    ret sum == opt_want.some;
+}
+
+# whether the nul-terminated text of at most `len` bytes from `at` of `h` is `name`, after `prefix` and a `/` when it has one
+fun named(h: *u8, at: usize, len: usize, prefix: *u8, prefix_len: usize, name: str) bool {
+    var k: usize = 0;
+    if (prefix_len > 0) {
+        for (k < prefix_len) {
+            if (name[k] != prefix[k]) { ret false; }
+            k = k + 1;
+        }
+        if (name[k] != '/') { ret false; }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < len && h[at + i] != 0) {
+        if (name[k] != h[at + i]) { ret false; }
+        i = i + 1;
+        k = k + 1;
+    }
+    ret name[k] == 0;
+}
+
+# how many bytes of `len` from `at` of `h` precede a nul
+fun text_len(h: *u8, at: usize, len: usize) usize {
+    var i: usize = 0;
+    for (i < len && h[at + i] != 0) { i = i + 1; }
+    ret i;
+}
+
+fun refuse(archive: *source.File, message: str, name: str) res[source.File, diag.Refusal] {
+    ret res[source.File, diag.Refusal].err{diag.refusal(archive.path, 0, message, name)};
+}
+
+fun scan(a: *A.Allocator, s: *Stream, archive: *source.File, name: str) res[source.File, diag.Refusal] {
+    var h:    [512]u8;
+    var long: bool  = false;
+    var want: usize = str_len(name);
+    for {
+        if (!read(s, ?h[0], BLOCK)) { ret refuse(archive, TRUNCATED, name); }
+        if (h[0] == 0)              { ret refuse(archive, ABSENT, name); }
+        if (!checked(?h[0]))        { ret refuse(archive, HEADER, name); }
+        val opt_size: opt[u64] = octal(?h[0], 124, 12);
+        if (sel opt_size.none) { ret refuse(archive, UNREAD, name); }
+        val len:    usize = opt_size.some::usize;
+        val padded: usize = (len + BLOCK - 1) / BLOCK * BLOCK;
+        val kind:   u8    = h[156];
+        if (kind == 'L') {
+            if (len > 4096) { ret refuse(archive, UNREAD, name); }
+            var path: [4096]u8;
+            if (!read(s, ?path[0], len) || !skip(s, padded - len)) { ret refuse(archive, TRUNCATED, name); }
+            long = text_len(?path[0], 0, len) == want && named(?path[0], 0, len, nil, 0, name);
+            cnt;
+        }
+        if (kind != '0' && kind != 0 && kind != '5') { ret refuse(archive, UNREAD, name); }
+        val posix:      bool  = h[257] == 'u' && h[258] == 's' && h[259] == 't' && h[260] == 'a' && h[261] == 'r' && h[262] == 0;
+        var prefix_len: usize = 0;
+        if (posix) { prefix_len = text_len(?h[0], 345, 155); }
+        val hit: bool = long || named(?h[0], 0, 100, ?h[345], prefix_len, name);
+        long = false;
+        if (hit && kind != '5') {
+            val res_allocate: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+            if (sel res_allocate.err)           { ret res[source.File, diag.Refusal].err{diag.refusal(archive.path, 0, diag.MEMORY, name)}; }
+            if (!read(s, res_allocate.ok, len)) { ret refuse(archive, TRUNCATED, name); }
+            res_allocate.ok[len] = 0;
+            val res_path: res[str, StrError] = str_join(a, archive.path, "/", name);
+            if (sel res_path.err) { ret res[source.File, diag.Refusal].err{diag.refusal(archive.path, 0, diag.MEMORY, name)}; }
+            ret res[source.File, diag.Refusal].ok{source.File{path: res_path.ok, data: res_allocate.ok, len: len}};
+        }
+        if (!skip(s, padded)) { ret refuse(archive, TRUNCATED, name); }
+    }
+}
+
+# member `name` of the gzip-compressed tar archive `archive`, its path the archive's and the member's, its bytes nul-terminated
+# ---
+# a:       allocator for the member, which outlives every reader of it
+# archive: the archive, a file of a source's tree
+# name:    the member's path in the archive
+# ret:     the member, or why it could not be read
+pub fun member(a: *A.Allocator, archive: *source.File, name: str) res[source.File, diag.Refusal] {
+    val res_made: res[gzip.Decompressor, gzip.InflateError] = gzip.init(a);
+    if (sel res_made.err) { ret refuse(archive, INFLATE, name); }
+    var s:         Stream                         = Stream{z: res_made.ok, src: archive.data, len: archive.len, at: 0, done: false};
+    val res_found: res[source.File, diag.Refusal] = scan(a, ?s, archive, name);
+    gzip.dnit(?s.z);
+    ret res_found;
+}

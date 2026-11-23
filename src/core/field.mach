@@ -1,0 +1,634 @@
+# the field-kind contract every instruction set fills in
+#
+# a row's encoding is a sequence of fields, each a use of one kind from its
+# set's field table. a kind writes its piece of the instruction into a byte
+# stream and reads it back, reporting its length by how far it moves. most
+# fields are units: a fixed width of bits holding fixed bits and slices of
+# operands, which `UNIT` and the `pack` and `unpack` helpers serve. a kind
+# whose length or presence depends on values, such as an x86 memory operand,
+# a legacy prefix run or a leb128, owns that logic itself. kinds read and
+# deposit operand parts, so fields can be walked in any order on decode.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.form;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.state;
+
+# the byte order units are written in
+pub def Order: u8;
+
+pub val LITTLE: Order = 0;
+pub val BIG:    Order = 1;
+
+# the operand index that names no operand
+pub val NO_OPERAND: u8 = 0xFF;
+
+# the field index of a fixup no field holds, as a marker's
+pub val NO_FIELD: u32 = 0xFFFF_FFFF;
+
+# a part of an operand a slice addresses
+# ---
+# NUMBER:      the number of a register, a memory base or a list's first member less its range's first, or the encoded bits of an immediate, relative target, enumerant, condition or id
+# CLASS:       the position of a register's class in its operand's class list, or a memory base's
+# INDEX:       a memory index's number less its range's first
+# INDEX_CLASS: the position of a memory index's class in its list
+# SCALE:       a memory index's scale as a power of two
+# DISP:        a memory displacement's encoded bits
+# SEGMENT:     a memory segment override's number less its range's first
+# MODE:        a memory operand's addressing mode
+# COUNT:       a list's, a literal's or a group's length
+# EXTEND:      the value of a memory index's extend among its operand's extends
+# BROADCAST:   a memory operand's broadcast, the element repeated 2^n times
+pub def Part: u8;
+
+pub val NUMBER:      Part = 0;
+pub val CLASS:       Part = 1;
+pub val INDEX:       Part = 2;
+pub val INDEX_CLASS: Part = 3;
+pub val SCALE:       Part = 4;
+pub val DISP:        Part = 5;
+pub val SEGMENT:     Part = 6;
+pub val MODE:        Part = 7;
+pub val COUNT:       Part = 8;
+pub val EXTEND:      Part = 9;
+pub val BROADCAST:   Part = 10;
+
+pub val PARTS: u32 = 11;
+
+# bits `lo` to `lo + len - 1` of an operand's part at bits `at` up of a unit
+# ---
+# operand: the operand index in the row
+# part:    the part of the operand
+# lo:      the lowest bit of the part taken
+# len:     how many bits are taken
+# at:      the bit of the unit the lowest bit lands on
+# invert:  whether the bits are stored inverted, as x86's vvvv and evex r'
+pub rec Slice {
+    operand: u8;
+    part:    Part;
+    lo:      u8;
+    len:     u8;
+    at:      u8;
+    invert:  bool;
+}
+
+# slices as a pointer to static slices and a count
+pub rec Slices {
+    at:  *Slice;
+    len: u32;
+}
+
+pub val NO_SLICES: Slices = Slices{at: nil, len: 0};
+
+# one field of a row's encoding
+# ---
+# kind:    the kind's row in the set's field table
+# width:   the bits of the field, a multiple of 8 up to 64 for a unit a kind packs, and up to 248 for a kind that writes
+#          its bytes itself with no fixed bits or slices
+# fixed:   the bits the row fixes, under mask
+# mask:    which bits of the unit are fixed
+# slices:  where operand parts land in the unit
+# operand: the operand a compound kind encodes whole, NO_OPERAND when none
+# param:   a parameter the kind defines, such as an aarch64 bitmask's widths
+# data:    a static record of the kind's own type that the kind reads, nil for a kind that reads none, as an x86 row's
+#          opcode, map, operand size and operand positions, which every field of the row points at so its facts have
+#          one owner. the kind's check holds a field to the record its kind reads
+pub rec Field {
+    kind:    u16;
+    width:   u8;
+    fixed:   u64;
+    mask:    u64;
+    slices:  Slices;
+    operand: u8;
+    param:   u64;
+    data:    ptr;
+}
+
+# fields as a pointer to static fields and a count
+pub rec Fields {
+    at:  *Field;
+    len: u32;
+}
+
+# what an encode or decode refused, which a reader branches on, the message being its wording alone
+# ---
+# admission:   the row, which the selection does not admit
+# unavailable: a register the instruction names or touches, which the selection does not hold
+# value:       anything else: a value, a field, the operand count or the stream
+# memory:      the allocator, which refused what the encode or decode needed with this error
+# storage:     the operand store, which must hold at least this many values, the operands and their list members, for
+#              the decode to go on. a decode retried with that many may report more, as a later list is read
+# noted:       the alternatives store, which must hold at least this many for the refusal to name every alternative the
+#              context does not admit
+pub tag Cause: u8 {
+    admission;
+    unavailable;
+    value;
+    memory:  A.Error;
+    storage: u32;
+    noted:   u32;
+}
+
+# why an encode or decode was refused
+# ---
+# message:  the diagnostic, one of the wordings below or a set's own
+# cause:    what it refused
+# operand:  the operand refused, NO_OPERAND when the refusal is not about one
+# at:       the byte offset in the stream the refusal is at
+# requires: what the context must hold to admit what was refused, `requirement.NO_ALTERNATIVES` for a refusal of a value
+# reach:    how far the walk got through the row's operands before it refused, ALONE unless every one was admitted
+pub rec Refusal {
+    message:  str;
+    cause:    Cause;
+    operand:  u8;
+    at:       usize;
+    requires: requirement.Requirement;
+    reach:    Reach;
+}
+
+# how far a walk got through a row's operands before a refusal, ordered so a refusal that got further is of a row that
+# fits the operands closer, which is how the rows tried for one text rank their refusals
+# ---
+# ALONE:    refused before every operand was admitted on its own, as the row itself or one operand's shape refuses
+# TOGETHER: every operand admitted on its own and refused for what they hold together, as a constraint they break, a
+#           register they touch or a field's admission of them
+pub def Reach: u8;
+
+pub val ALONE:    Reach = 0;
+pub val TOGETHER: Reach = 1;
+
+pub val OUT_OF_RANGE:   str = "the value is out of range";
+pub val MISALIGNED:     str = "the value is not a multiple of the operand's scale";
+pub val WRONG_CLASS:    str = "the register is of the wrong class";
+pub val NOT_FIXED:      str = "the operand takes only its fixed register";
+pub val WRONG_KIND:     str = "the operand is of the wrong kind";
+pub val NO_REGISTER:    str = "no register has this number in its class";
+pub val OUTSIDE_RANGE:  str = "the register is outside the operand's range";
+pub val EXCLUDED:       str = "the operand excludes this value";
+pub val UNAVAILABLE:    str = "the selection does not make this register available";
+pub val NOT_A_MEMBER:   str = "value is not one the operand names";
+pub val PARAMS:         str = "the enumerant's params are not the ones its members take";
+pub val FORM:           str = "the operand does not admit this addressing form";
+pub val FIXED_SEGMENT:  str = "the segment is stated, but the operand fixes it and its value leaves it out as it decodes";
+pub val NO_SYMBOL:      str = "operand admits no symbol";
+pub val UNMARKED:       str = "the marker symbol is not given its marker's fixup kind";
+pub val LIST_LENGTH:    str = "the list's length is out of range";
+pub val LITERAL_LENGTH: str = "the literal's length is out of range";
+pub val NUL_IN_STRING:  str = "string holds a nul byte";
+pub val NOT_ADJACENT:   str = "list members are not consecutive";
+pub val SHARED:         str = "operands share registers the row keeps apart";
+pub val OPERAND_COUNT:  str = "the instruction takes another number of operands";
+pub val MISMATCH:       str = "fixed bits do not match";
+pub val TRUNCATED:      str = "the stream ends inside the instruction";
+pub val LENGTH:         str = "the instruction's length disagrees with its fields";
+pub val RESHOWN:        str = "the shown values encode to another length than the instruction";
+pub val NO_ROW:         str = "no row encodes these bytes";
+pub val NOT_ADMITTED:   str = "the selection does not admit the instruction";
+pub val DECODE_ONLY:    str = "the row is decode-only";
+pub val STORAGE:        str = "the operand storage is exhausted";
+pub val MEMORY:         str = "out of memory";
+
+# a set's field kind: how one piece of an instruction is written and read
+# ---
+# name:     the name diagnostics and generators spell
+# admit:    nil, or refuses the operand values encode refuses beyond what each operand's shape admits, as a value one
+#           operand may take only for some value of another, without writing: the encoder it is handed has no output
+# encode:   writes the field for the instruction's operands
+# decode:   reads the field and deposits its operand parts
+# finish:   nil, or patches the field at the given offset once the instruction's length is known
+# complete: nil, or completes the parts the field decides once every field is read, given the offset it was read at,
+#           as a prefix whose presence decides which register the bits later fields deposit name
+# check:    nil, or what is wrong with a field of the kind in a row of the given operands and their count, none when
+#           nothing is, which the set's check asks of every field of every row, so a field whose parameters or record
+#           the kind cannot encode, as an x86 opcode whose ModRM names an immediate, is refused when the set registers
+pub rec Kind {
+    name:     str;
+    admit:    fun(*Encoder, *Field) err[Refusal];
+    encode:   fun(*Encoder, *Field) err[Refusal];
+    decode:   fun(*Decoder, *Field) err[Refusal];
+    finish:   fun(*Encoder, *Field, usize) err[Refusal];
+    complete: fun(*Decoder, *Field, usize) err[Refusal];
+    check:    fun(*Field, *operand.Operand, u32) opt[str];
+}
+
+# a set's field table
+# ---
+# kinds: the kinds, each field naming one by its index, held by pointer so a table can hold another module's kind
+# count: how many kinds there are
+# order: the byte order of its units
+pub rec Table {
+    kinds: **Kind;
+    count: u32;
+    order: Order;
+}
+
+# bytes to decode from
+pub rec Stream {
+    data:  *u8;
+    len:   usize;
+    order: Order;
+}
+
+# the encoded parts of one operand during a walk
+# ---
+# bits:     each part's bits
+# present:  one bit per part a value or a field set
+# symbolic: whether the value is a symbol, encoded as zero and left to a fixup
+# recorded: whether its fixup has been recorded
+# direct:   whether a kind wrote the decoded value itself
+# fixup:    the fixup kind a symbolic value takes
+# symbol:   the symbol a symbolic value refers to
+pub rec Parts {
+    bits:     [11]u64;
+    present:  u16;
+    symbolic: bool;
+    recorded: bool;
+    direct:   bool;
+    fixup:    operand.FixupKind;
+    symbol:   operand.Symbol;
+}
+
+# a symbolic operand left for the builder to resolve or relocate
+# ---
+# kind:    the set-local fixup kind
+# operand: the operand it fills
+# field:   the field holding it, NO_FIELD for a marker
+# offset:  the byte offset of the bytes it patches, from the instruction's start, 0 for a marker
+# symbol:  the symbol
+# addend:  added to the symbol's value
+pub rec Fixup {
+    kind:    operand.FixupKind;
+    operand: u8;
+    field:   u32;
+    offset:  usize;
+    symbol:  u32;
+    addend:  i64;
+}
+
+# the state an encode walk hands each kind
+# ---
+# ctx:      the context the instruction is encoded under, which a kind may read, as x86's operand size by its width
+# table:    the set's field table
+# operands: the row's operands
+# values:   the instruction's values, one per operand
+# parts:    the encoded parts, one per operand
+# count:    how many operands there are
+# form:     the instruction's encoding form, which a kind reads to choose among its encodings
+# out:      the stream written to, nil when a kind only admits
+# fixups:   where symbolic operands are recorded, nil when a kind only admits
+# start:    the instruction's offset in out
+# field:    the index of the field being encoded
+pub rec Encoder {
+    ctx:      *state.Context;
+    table:    *Table;
+    operands: *operand.Operand;
+    values:   *operand.Value;
+    parts:    *Parts;
+    count:    u32;
+    form:     *form.Form;
+    out:      *vector.Vector[u8];
+    fixups:   *vector.Vector[Fixup];
+    start:    usize;
+    field:    u32;
+}
+
+# the state a decode walk hands each kind
+# ---
+# ctx:      the context the instruction is decoded under, which a kind may read
+# table:    the set's field table
+# operands: the row's operands
+# values:   the decoded values, one per operand
+# parts:    the decoded parts, one per operand
+# count:    how many operands there are
+# form:     the encoding form read, PREFERRED until a kind writes the bits of an encoding the zero form would not choose
+# in:       the stream read from
+# start:    the instruction's offset in the stream
+# at:       the offset of the next byte to read
+# end:      the offset reads stop at, the stream's end until a field declares the length
+# declared: whether a field declared the instruction's length
+# pool:     storage for list members, after the operand values
+# used:     how many pool slots are taken
+# cap:      how many pool slots there are
+pub rec Decoder {
+    ctx:      *state.Context;
+    table:    *Table;
+    operands: *operand.Operand;
+    values:   *operand.Value;
+    parts:    *Parts;
+    count:    u32;
+    form:     *form.Form;
+    in:       Stream;
+    start:    usize;
+    at:       usize;
+    end:      usize;
+    declared: bool;
+    pool:     *operand.Value;
+    used:     u32;
+    cap:      u32;
+}
+
+# a refusal of `message` about `op` at byte `at`
+pub fun refusal(message: str, op: u8, at: usize) Refusal {
+    ret Refusal{message: message, cause: Cause.value{}, operand: op, at: at, requires: requirement.NO_ALTERNATIVES, reach: ALONE};
+}
+
+# a refusal of operand `op` at byte `at` by the allocator, which refused with `e`
+pub fun unallocated(e: A.Error, op: u8, at: usize) Refusal {
+    ret Refusal{message: MEMORY, cause: Cause.memory{e}, operand: op, at: at, requires: requirement.NO_ALTERNATIVES, reach: ALONE};
+}
+
+# a refusal of operand `op` at byte `at` by an operand store too small, which must hold `need` values for the decode to
+# go on, refused as a list length when the model cannot count that many
+pub fun exhausted(need: u64, op: u8, at: usize) Refusal {
+    if (need > 0xFFFF_FFFF) { ret refusal(LIST_LENGTH, op, at); }
+    ret Refusal{message: STORAGE, cause: Cause.storage{need::u32}, operand: op, at: at, requires: requirement.NO_ALTERNATIVES, reach: ALONE};
+}
+
+# a refusal at byte `at` by an alternatives store too small, which must hold `need` alternatives to name every one the
+# context does not admit, refused as a list length when the model cannot count that many
+pub fun crowded(need: u64, at: usize) Refusal {
+    if (need > 0xFFFF_FFFF) { ret refusal(LIST_LENGTH, NO_OPERAND, at); }
+    ret Refusal{message: STORAGE, cause: Cause.noted{need::u32}, operand: NO_OPERAND, at: at, requires: requirement.NO_ALTERNATIVES, reach: ALONE};
+}
+
+# a refusal at byte `at` of what the context does not admit, which it would have admitted holding `required`
+pub fun unadmitted(required: requirement.Requirement, at: usize) Refusal {
+    ret Refusal{message: NOT_ADMITTED, cause: Cause.admission{}, operand: NO_OPERAND, at: at, requires: required, reach: ALONE};
+}
+
+# a refusal of operand `op` at byte `at` naming a register the context does not admit, which it would have admitted
+# holding `required`
+pub fun unavailable(required: requirement.Requirement, op: u8, at: usize) Refusal {
+    ret Refusal{message: UNAVAILABLE, cause: Cause.unavailable{}, operand: op, at: at, requires: required, reach: ALONE};
+}
+
+# storage for the alternatives of the candidates a refusal names, filled by `note` and read by `noted`
+# ---
+# at:   the first slot
+# cap:  how many slots there are
+# used: how many are taken
+pub rec Admissions {
+    at:   *requirement.Alternative;
+    cap:  u32;
+    used: u32;
+}
+
+# whether atom lists `x` and `y` are one list
+fun same_ids(x: requirement.Ids, y: requirement.Ids) bool {
+    if (x.len != y.len) { ret false; }
+    var k: u32 = 0;
+    for (k < x.len) {
+        if (x.at[k] != y.at[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether `a` holds alternative `alt`
+fun listed(a: *Admissions, alt: requirement.Alternative) bool {
+    var i: u32 = 0;
+    for (i < a.used) {
+        if (same_ids(a.at[i].all, alt.all) && same_ids(a.at[i].none, alt.none)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# every alternative of `required` the storage does not hold yet added to it
+# ---
+# ret: false when the storage is full, with the alternatives that fit added
+pub fun note(a: *Admissions, required: requirement.Requirement) bool {
+    var i: u32 = 0;
+    for (i < required.len) {
+        if (!listed(a, required.at[i])) {
+            if (a.used == a.cap) { ret false; }
+            a.at[a.used] = required.at[i];
+            a.used       = a.used + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the alternatives noted so far, as one requirement
+pub fun noted(a: *Admissions) requirement.Requirement {
+    if (a.used == 0) { ret requirement.NO_ALTERNATIVES; }
+    ret requirement.Requirement{at: a.at, len: a.used};
+}
+
+# store `v` grown to hold `need` for a decode or read retried, doubled at least, so a need learned a list at a time is
+# retried a logarithmic number of times, and never past the count a store is given
+# ---
+# ret: whether it grew, false when it already holds `need`, as a retry that states no larger need would only fail again
+#      and is refused instead, or the allocator's error
+pub fun regrow[T](v: *vector.Vector[T], need: u32) res[bool, A.Error] {
+    if (need::usize <= v.cap) { ret res[bool, A.Error].ok{false}; }
+    var want: usize = need::usize;
+    if (want < v.cap * 2)   { want = v.cap * 2; }
+    if (want > 0xFFFF_FFFF) { want = 0xFFFF_FFFF; }
+    val res_ensure: res[usize, A.Error] = vector.ensure[T](v, want);
+    if (sel res_ensure.err) { ret res[bool, A.Error].err{res_ensure.err}; }
+    ret res[bool, A.Error].ok{true};
+}
+
+# a store's capacity as the count a decode or read is given, which never passes a u32
+pub fun counted(cap: usize) u32 {
+    if (cap > 0xFFFF_FFFF) { ret 0xFFFF_FFFF; }
+    ret cap::u32;
+}
+
+# the low `len` bits set
+pub fun ones(len: u8) u64 {
+    if (len >= 64) { ret ~0::u64; }
+    ret (1::u64 << len) - 1;
+}
+
+# whether `p` holds part `part`
+pub fun has(p: *Parts, part: Part) bool {
+    ret ((p.present >> part) & 1) != 0;
+}
+
+# the `bytes` bytes at `at` of `s` as one unit in its order
+pub fun read(s: *Stream, at: usize, bytes: u8) res[u64, Refusal] {
+    if (at > s.len || s.len - at < bytes::usize) { ret res[u64, Refusal].err{refusal(TRUNCATED, NO_OPERAND, s.len)}; }
+    var unit: u64 = 0;
+    var i:    u8  = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (s.order == BIG) { k = bytes - 1 - i; }
+        unit = unit | (s.data[at + i::usize]::u64 << (k::u64 * 8));
+        i    = i + 1;
+    }
+    ret res[u64, Refusal].ok{unit};
+}
+
+# the low `bytes` bytes of `unit` appended in the table's order
+pub fun put(enc: *Encoder, unit: u64, bytes: u8) err[Refusal] {
+    var i: u8 = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (enc.table.order == BIG) { k = bytes - 1 - i; }
+        val res_pushed: res[usize, A.Error] = vector.push[u8](enc.out, ((unit >> (k::u64 * 8)) & 0xFF)::u8);
+        if (sel res_pushed.err) { ret err[Refusal].err{unallocated(res_pushed.err, NO_OPERAND, enc.out.len)}; }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the `bytes` bytes at `offset` of the output overwritten with `unit` in the table's order
+pub fun patch(enc: *Encoder, offset: usize, unit: u64, bytes: u8) {
+    var i: u8 = 0;
+    for (i < bytes) {
+        var k: u8 = i;
+        if (enc.table.order == BIG) { k = bytes - 1 - i; }
+        enc.out.data[offset + i::usize] = ((unit >> (k::u64 * 8)) & 0xFF)::u8;
+        i                               = i + 1;
+    }
+}
+
+# the next `bytes` bytes as one unit, without consuming them
+pub fun peek(dec: *Decoder, bytes: u8) res[u64, Refusal] {
+    var bounded: Stream = dec.in;
+    bounded.len = dec.end;
+    ret read(?bounded, dec.at, bytes);
+}
+
+# the next `bytes` bytes as one unit, consumed
+pub fun get(dec: *Decoder, bytes: u8) res[u64, Refusal] {
+    val res_peek: res[u64, Refusal] = peek(dec, bytes);
+    if (sel res_peek.ok) { dec.at = dec.at + bytes::usize; }
+    ret res_peek;
+}
+
+# the fixup of symbolic operand `op` recorded at `offset` from the instruction's start, once per operand
+pub fun fixup(enc: *Encoder, op: u8, offset: usize) err[Refusal] {
+    val p: *Parts = ?enc.parts[op];
+    if (!p.symbolic || p.recorded) { ret err[Refusal].ok{}; }
+    val site:       Fixup               = Fixup{kind: p.fixup, operand: op, field: enc.field, offset: offset, symbol: p.symbol.id, addend: p.symbol.addend};
+    val res_pushed: res[usize, A.Error] = vector.push[Fixup](enc.fixups, site);
+    if (sel res_pushed.err) { ret err[Refusal].err{unallocated(res_pushed.err, op, enc.out.len)}; }
+    p.recorded = true;
+    ret err[Refusal].ok{};
+}
+
+# the unit of `f`: its fixed bits and its slices of the operands' parts. a
+# symbolic operand a slice takes is recorded as a fixup at the current offset
+pub fun pack(enc: *Encoder, f: *Field) res[u64, Refusal] {
+    var unit: u64 = f.fixed & f.mask;
+    var i:    u32 = 0;
+    for (i < f.slices.len) {
+        val s:    *Slice = ?f.slices.at[i];
+        val p:    *Parts = ?enc.parts[s.operand];
+        var bits: u64    = (p.bits[s.part] >> s.lo) & ones(s.len);
+        if (s.invert) { bits = bits ^ ones(s.len); }
+        unit = unit | (bits << s.at);
+        val err_noted: err[Refusal] = fixup(enc, s.operand, enc.out.len - enc.start);
+        if (sel err_noted.err) { ret res[u64, Refusal].err{err_noted.err}; }
+        i = i + 1;
+    }
+    ret res[u64, Refusal].ok{unit};
+}
+
+# `bits` deposited into part `part` of operand `op` at bit `lo`
+pub fun deposit(dec: *Decoder, op: u8, part: Part, bits: u64, lo: u8) {
+    val p: *Parts = ?dec.parts[op];
+    p.bits[part] = p.bits[part] | (bits << lo);
+    p.present    = p.present | (1::u16 << part);
+}
+
+# part `part` of operand `op` set to `bits` whatever was deposited before, as a kind that decides the whole part
+pub fun replace(dec: *Decoder, op: u8, part: Part, bits: u64) {
+    val p: *Parts = ?dec.parts[op];
+    p.bits[part] = bits;
+    p.present    = p.present | (1::u16 << part);
+}
+
+# part `part` of operand `op` absent, as a kind that finds the encoding holds no such part though a prefix deposited
+# bits of it
+pub fun clear(dec: *Decoder, op: u8, part: Part) {
+    val p: *Parts = ?dec.parts[op];
+    p.bits[part] = 0;
+    p.present    = p.present & ~(1::u16 << part);
+}
+
+# the unit of `f` read at `at`: its fixed bits checked and its slices deposited
+pub fun unpack(dec: *Decoder, f: *Field, unit: u64, at: usize) err[Refusal] {
+    if ((unit & f.mask) != (f.fixed & f.mask)) { ret err[Refusal].err{refusal(MISMATCH, NO_OPERAND, at)}; }
+    var i: u32 = 0;
+    for (i < f.slices.len) {
+        val s:    *Slice = ?f.slices.at[i];
+        var bits: u64    = (unit >> s.at) & ones(s.len);
+        if (s.invert) { bits = bits ^ ones(s.len); }
+        deposit(dec, s.operand, s.part, bits, s.lo);
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the instruction's end declared at `end`, as a spir-v word count declares it
+pub fun limit(dec: *Decoder, end: usize) err[Refusal] {
+    if (end > dec.in.len) { ret err[Refusal].err{refusal(TRUNCATED, NO_OPERAND, dec.in.len)}; }
+    if (end < dec.at)     { ret err[Refusal].err{refusal(LENGTH, NO_OPERAND, dec.at)}; }
+    dec.end      = end;
+    dec.declared = true;
+    ret err[Refusal].ok{};
+}
+
+# the next `len` bytes, consumed and borrowed from the stream, for a literal a kind places
+pub fun borrow(dec: *Decoder, len: usize) res[operand.Bytes, Refusal] {
+    if (dec.at > dec.end || dec.end - dec.at < len) { ret res[operand.Bytes, Refusal].err{refusal(TRUNCATED, NO_OPERAND, dec.end)}; }
+    val bytes: operand.Bytes = operand.Bytes{at: ?dec.in.data[dec.at], len: len::u32};
+    dec.at = dec.at + len;
+    ret res[operand.Bytes, Refusal].ok{bytes};
+}
+
+# operand `op` decoded as `value` by a kind itself, as a list, a variadic operand, a literal or an enumerant with its
+# params is
+pub fun place(dec: *Decoder, op: u8, value: operand.Value) {
+    dec.values[op]       = value;
+    dec.parts[op].direct = true;
+}
+
+# a run of `n` pool slots for operand `op` read from byte `at`, its members counted first so the run is reserved before
+# what each holds within it, refused with what the store must hold when the pool has fewer left
+pub fun reserve(dec: *Decoder, n: u64, op: u8, at: usize) res[*operand.Value, Refusal] {
+    if (n > (dec.cap - dec.used)::u64) { ret res[*operand.Value, Refusal].err{exhausted(dec.count::u64 + dec.used::u64 + n, op, at)}; }
+    val first: *operand.Value = ?dec.pool[dec.used];
+    dec.used = dec.used + n::u32;
+    ret res[*operand.Value, Refusal].ok{first};
+}
+
+# a pool slot holding `value`, for the members of a list a kind decodes
+pub fun push(dec: *Decoder, value: operand.Value) res[*operand.Value, Refusal] {
+    val res_slot: res[*operand.Value, Refusal] = reserve(dec, 1, NO_OPERAND, dec.at);
+    if (sel res_slot.ok) { @res_slot.ok = value; }
+    ret res_slot;
+}
+
+fun unit_encode(enc: *Encoder, f: *Field) err[Refusal] {
+    val res_unit: res[u64, Refusal] = pack(enc, f);
+    if (sel res_unit.err) { ret err[Refusal].err{res_unit.err}; }
+    ret put(enc, res_unit.ok, f.width / 8);
+}
+
+fun unit_decode(dec: *Decoder, f: *Field) err[Refusal] {
+    val at:       usize             = dec.at;
+    val res_unit: res[u64, Refusal] = get(dec, f.width / 8);
+    if (sel res_unit.err) { ret err[Refusal].err{res_unit.err}; }
+    ret unpack(dec, f, res_unit.ok, at);
+}
+
+# the kind of a fixed-width unit of fixed bits and slices, which every set's table can hold
+pub val UNIT: Kind = Kind{name: "unit", admit: nil, encode: unit_encode, decode: unit_decode, finish: nil, complete: nil, check: nil};

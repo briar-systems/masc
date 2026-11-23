@@ -1,0 +1,1082 @@
+# the encode and decode walks over a row's fields, and decode dispatch
+#
+# encoding admits each operand value into its encoded parts, refusing what
+# the row does not admit, then walks the fields in order and lets each kind
+# write its piece. decoding walks the same fields reading, then turns the
+# deposited parts back into values. both read one description, so they agree
+# by construction, and both refuse the forms a row's register constraints
+# reserve. a refused encode leaves the stream and the fixups as they
+# were, so a builder can try a mnemonic's rows in preference order.
+# decode finds its row through the codec's dispatch.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.bitset;
+use std.collections.vector;
+use std.math.bits;
+
+use masc.core.constraint;
+use masc.core.ct;
+use masc.core.diagnostic;
+use masc.core.dispatch;
+use masc.core.effect;
+use masc.core.field;
+use masc.core.form;
+use masc.core.inst;
+use masc.core.operand;
+use masc.core.quantity;
+use masc.core.query;
+use masc.core.register;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.state;
+
+# a decoded instruction and the bytes it took
+# ---
+# inst: the instruction, its values in the store the decode was given
+# len:  how many bytes it took
+pub rec Decoded {
+    inst: inst.Inst;
+    len:  usize;
+}
+
+# the operands an instruction admitted, or encoded with no check, holds its parts on the short path for, which holds nearly
+# every row
+val FEW: u32 = 4;
+
+fun refuse(message: str, op: u8) err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(message, op, 0)};
+}
+
+# `bits` stored as part `part` of `p`, marked present
+fun mark(p: *field.Parts, part: field.Part, bits: u64) {
+    p.bits[part] = bits;
+    p.present    = p.present | (1::u16 << part);
+}
+
+# why a SIGNED `imm` that extends to an operation's width cannot hold `d`: a number of that width in either reading
+# whose bits are not the extension of its low `imm.bits`
+fun extended(imm: *operand.Immediate, d: i64) opt[str] {
+    val e: u8 = imm.extends;
+    if (e < 64) {
+        if (d < -(1::i64 << (e - 1)::i64) || (d >= 0 && d::u64 > field.ones(e))) { ret opt[str].some{field.OUT_OF_RANGE}; }
+    }
+    val wide: u64 = d:~u64 & field.ones(e);
+    var low:  u64 = d:~u64 & field.ones(imm.bits);
+    if (imm.bits < 64 && ((low >> (imm.bits - 1)::u64) & 1) != 0) { low = low | ~field.ones(imm.bits); }
+    if ((low & field.ones(e)) != wide)                            { ret opt[str].some{field.OUT_OF_RANGE}; }
+    ret opt[str].none{};
+}
+
+# why `imm` cannot hold the operand value `v` whatever it excludes, none when it can
+pub fun unrepresentable(imm: *operand.Immediate, v: i64) opt[str] {
+    # a float is admitted when it is a bit pattern of its width, and its encoding kind refuses what it cannot represent
+    if (imm.format == operand.FLOAT) {
+        if (imm.bits < 64 && (v:~u64 & ~field.ones(imm.bits)) != 0) { ret opt[str].some{field.OUT_OF_RANGE}; }
+        ret opt[str].none{};
+    }
+    val d: i64 = v - imm.bias;
+    if (imm.scale > 0 && (d & field.ones(imm.scale)::i64) != 0) { ret opt[str].some{field.MISALIGNED}; }
+    if (imm.sign == operand.SIGNED && imm.extends != 0)         { ret extended(imm, d); }
+    if (imm.bits > 0 && imm.bits < 64) {
+        val half: i64 = 1::i64 << (imm.bits - 1)::i64;
+        if (imm.sign == operand.SIGNED) {
+            if (d < -half || d >= half) { ret opt[str].some{field.OUT_OF_RANGE}; }
+        }
+        or (imm.sign == operand.EITHER) {
+            if (d < -half || (d >= 0 && d::u64 > field.ones(imm.bits))) { ret opt[str].some{field.OUT_OF_RANGE}; }
+        }
+        or (d < 0 || d::u64 > field.ones(imm.bits)) {
+            ret opt[str].some{field.OUT_OF_RANGE};
+        }
+    }
+    ret opt[str].none{};
+}
+
+# the bits `imm` encodes `v` as
+fun immediate_bits(imm: *operand.Immediate, v: i64) u64 {
+    if (imm.format == operand.FLOAT) { ret v:~u64; }
+    ret (v - imm.bias):~u64 & field.ones(imm.bits);
+}
+
+# `v` admitted as `imm` into `part`
+fun admit_immediate(imm: *operand.Immediate, v: i64, p: *field.Parts, part: field.Part, op: u8) err[field.Refusal] {
+    val opt_bad: opt[str] = unrepresentable(imm, v);
+    if (sel opt_bad.some)               { ret refuse(opt_bad.some, op); }
+    if (operand.excludes_value(imm, v)) { ret refuse(field.EXCLUDED, op); }
+    mark(p, part, immediate_bits(imm, v));
+    ret err[field.Refusal].ok{};
+}
+
+# symbol `sym` into `part` of an operand whose default fixup kind is `fixup`
+fun place_symbol(fixup: operand.FixupKind, sym: operand.Symbol, p: *field.Parts, part: field.Part) {
+    p.symbolic = true;
+    p.symbol   = sym;
+    p.fixup    = fixup;
+    if (sym.fixup != operand.NO_FIXUP) { p.fixup = sym.fixup; }
+    mark(p, part, 0);
+}
+
+# symbol `sym` admitted into `part` of an operand whose default fixup kind is `fixup`
+fun admit_symbol(fixup: operand.FixupKind, sym: operand.Symbol, p: *field.Parts, part: field.Part, op: u8) err[field.Refusal] {
+    if (fixup == operand.NO_FIXUP)   { ret refuse(field.NO_SYMBOL, op); }
+    if (sym.id == operand.NO_SYMBOL) { ret refuse(field.WRONG_KIND, op); }
+    place_symbol(fixup, sym, p, part);
+    ret err[field.Refusal].ok{};
+}
+
+# whether the view holds `id`, refused at operand `op` and stream offset `at` when it does not
+fun available(v: *register.Available, id: register.Id, op: u8, at: usize) err[field.Refusal] {
+    val err_held: err[register.Absent] = register.admitted(v, id);
+    if (sel err_held.ok)              { ret err[field.Refusal].ok{}; }
+    if (sel err_held.err.unavailable) { ret err[field.Refusal].err{field.unavailable(err_held.err.unavailable.requires, op, at)}; }
+    ret err[field.Refusal].err{field.refusal(field.NO_REGISTER, op, at)};
+}
+
+# register `id` admitted as one of `r`, its number less the range's first into `number` and its class's position into `class`
+fun admit_register(codec: *dispatch.Codec, v: *register.Available, r: *operand.Register, id: register.Id, p: *field.Parts, number: field.Part, class: field.Part, op: u8) err[field.Refusal] {
+    if (id == register.NONE)    { ret refuse(field.WRONG_KIND, op); }
+    if (codec.registers == nil) { ret refuse(field.NO_REGISTER, op); }
+    val c: u16 = register.class_of(id);
+    if (c::u32 >= codec.registers.class_count) { ret refuse(field.NO_REGISTER, op); }
+    val at: i64 = operand.find(r.classes, c);
+    if (at < 0) { ret refuse(field.WRONG_CLASS, op); }
+    val n:     u32 = register.number_of(id)::u32;
+    val count: u32 = register.count_most(codec.registers, c)::u32;
+    if (n >= count)                    { ret refuse(field.NO_REGISTER, op); }
+    if (!operand.within(r, n, count))  { ret refuse(field.OUTSIDE_RANGE, op); }
+    if (operand.excludes_number(r, n)) { ret refuse(field.EXCLUDED, op); }
+    if (!r.unviewed) {
+        val err_held: err[field.Refusal] = available(v, id, op, 0);
+        if (sel err_held.err) { ret err_held; }
+    }
+    mark(p, number, (n - r.first)::u64);
+    mark(p, class, at::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# address `a` admitted as memory operand `m` into its parts: its mode, extend and broadcast among those `m` allows, its
+# base, index and segment admitted as registers of `m` the view holds, and its displacement as an immediate or a
+# symbol, refused at operand `op` at the first it does not admit
+fun admit_memory(codec: *dispatch.Codec, v: *register.Available, m: *operand.Memory, a: *operand.Address, p: *field.Parts, op: u8) err[field.Refusal] {
+    if ((a.mode == operand.RELATIVE_PC && (m.forms & operand.PCREL) == 0) || (a.mode == operand.PREINDEX && (m.forms & operand.PRE) == 0) || (a.mode == operand.POSTINDEX && (m.forms & operand.POST) == 0) || a.mode > operand.POSTINDEX_REGISTER) {
+        ret refuse(field.FORM, op);
+    }
+    if (a.mode == operand.POSTINDEX_REGISTER && ((m.forms & operand.POST_REGISTER) == 0 || a.index == register.NONE)) { ret refuse(field.FORM, op); }
+    if (a.broadcast != 0 && (a.broadcast >= 8 || ((m.broadcasts >> a.broadcast) & 1) == 0))                           { ret refuse(field.FORM, op); }
+    if (m.extends.count == 0) {
+        if (a.extend != 0) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.index == register.NONE || !operand.member(?m.extends, a.extend)) { ret refuse(field.FORM, op); }
+        mark(p, field.EXTEND, a.extend::u64);
+    }
+    if (a.broadcast != 0) { mark(p, field.BROADCAST, a.broadcast::u64); }
+    if (a.base == register.NONE) {
+        if (!(a.mode == operand.RELATIVE_PC || (a.mode == operand.OFFSET && (m.forms & operand.ABSOLUTE) != 0))) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.mode == operand.RELATIVE_PC) { ret refuse(field.FORM, op); }
+        val err_based: err[field.Refusal] = admit_register(codec, v, ?m.base, a.base, p, field.NUMBER, field.CLASS, op);
+        if (sel err_based.err) { ret err_based; }
+    }
+    if (a.index == register.NONE) {
+        if (a.scale != 0) { ret refuse(field.FORM, op); }
+    }
+    or {
+        if (a.scale >= 8 || ((m.scales >> a.scale) & 1) == 0) { ret refuse(field.FORM, op); }
+        val err_indexed: err[field.Refusal] = admit_register(codec, v, ?m.index, a.index, p, field.INDEX, field.INDEX_CLASS, op);
+        if (sel err_indexed.err) { ret err_indexed; }
+        mark(p, field.SCALE, a.scale::u64);
+    }
+    if (a.segment != register.NONE) {
+        # a segment of one register is the operand's own, so one value states it, as it decodes and reads
+        if (m.segment.count == 1) { ret refuse(field.FIXED_SEGMENT, op); }
+        var scratch:       field.Parts;
+        val err_segmented: err[field.Refusal] = admit_register(codec, v, ?m.segment, a.segment, ?scratch, field.SEGMENT, field.CLASS, op);
+        if (sel err_segmented.err) { ret err_segmented; }
+        mark(p, field.SEGMENT, scratch.bits[field.SEGMENT]);
+    }
+    if (a.symbol.id != operand.NO_SYMBOL) {
+        # a symbolic displacement carries its addend in the symbol
+        if (a.disp != 0) { ret refuse(field.FORM, op); }
+        val err_placed: err[field.Refusal] = admit_symbol(m.disp.fixup, a.symbol, p, field.DISP, op);
+        if (sel err_placed.err) { ret err_placed; }
+    }
+    or {
+        val err_placed: err[field.Refusal] = admit_immediate(?m.disp, a.disp, p, field.DISP, op);
+        if (sel err_placed.err) { ret err_placed; }
+    }
+    mark(p, field.MODE, a.mode::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# the register list `members` admitted as `l` into its parts: a length within `l`'s bounds, every member a register of
+# `l` the view holds, consecutive by `l`'s step where `l` asks it, the first member's number and class and the count
+# placed, refused at operand `op` at the first it does not admit
+fun admit_list(codec: *dispatch.Codec, v: *register.Available, l: *operand.List, members: operand.Values, p: *field.Parts, op: u8) err[field.Refusal] {
+    if (members.len < l.min::u32 || members.len > l.max::u32) { ret refuse(field.LIST_LENGTH, op); }
+    var first: register.Id = register.NONE;
+    var i:     u32         = 0;
+    for (i < members.len) {
+        val member: *operand.Value = ?members.at[i];
+        if (!sel member.register) { ret refuse(field.WRONG_KIND, op); }
+        var scratch:      field.Parts;
+        val err_admitted: err[field.Refusal] = admit_register(codec, v, ?l.member, member.register, ?scratch, field.NUMBER, field.CLASS, op);
+        if (sel err_admitted.err) { ret err_admitted; }
+        if (i == 0) {
+            if (operand.excludes_leading(l, register.number_of(member.register)::u32)) { ret refuse(field.EXCLUDED, op); }
+            mark(p, field.NUMBER, scratch.bits[field.NUMBER]);
+            mark(p, field.CLASS, scratch.bits[field.CLASS]);
+            first = member.register;
+        }
+        or (l.consecutive) {
+            val span: u64 = operand.span(?l.member, register.count_most(codec.registers, register.class_of(first))::u32)::u64;
+            if (register.class_of(member.register) != register.class_of(first) || scratch.bits[field.NUMBER] != (p.bits[field.NUMBER] + i::u64 * operand.step(l)) % span) {
+                ret refuse(field.NOT_ADJACENT, op);
+            }
+        }
+        i = i + 1;
+    }
+    mark(p, field.COUNT, members.len::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# register `id` of `r` into `number` and `class`, as `admit_register` places one it admits
+fun place_register(r: *operand.Register, id: register.Id, p: *field.Parts, number: field.Part, class: field.Part) {
+    mark(p, number, (register.number_of(id)::u32 - r.first)::u64);
+    mark(p, class, operand.find(r.classes, register.class_of(id))::u64);
+}
+
+# address `a` of `m` into its parts, as `admit_memory` places one it admits
+fun place_memory(m: *operand.Memory, a: *operand.Address, p: *field.Parts) {
+    if (m.extends.count != 0)    { mark(p, field.EXTEND, a.extend::u64); }
+    if (a.broadcast != 0)        { mark(p, field.BROADCAST, a.broadcast::u64); }
+    if (a.base != register.NONE) { place_register(?m.base, a.base, p, field.NUMBER, field.CLASS); }
+    if (a.index != register.NONE) {
+        place_register(?m.index, a.index, p, field.INDEX, field.INDEX_CLASS);
+        mark(p, field.SCALE, a.scale::u64);
+    }
+    if (a.segment != register.NONE)       { mark(p, field.SEGMENT, (register.number_of(a.segment)::u32 - m.segment.first)::u64); }
+    if (a.symbol.id != operand.NO_SYMBOL) { place_symbol(m.disp.fixup, a.symbol, p, field.DISP); }
+    or                                    { mark(p, field.DISP, immediate_bits(?m.disp, a.disp)); }
+    mark(p, field.MODE, a.mode::u64);
+}
+
+# one admitted value of `shape` into its parts, as `admit_one` places it
+fun place_one(shape: *operand.Shape, value: *operand.Value, p: *field.Parts) {
+    if (sel shape.register) {
+        if (sel value.register) { place_register(?shape.register, value.register, p, field.NUMBER, field.CLASS); }
+    }
+    or (sel shape.immediate) {
+        if (sel value.symbol)    { place_symbol(shape.immediate.fixup, value.symbol, p, field.NUMBER); }
+        or (sel value.immediate) { mark(p, field.NUMBER, immediate_bits(?shape.immediate, value.immediate)); }
+    }
+    or (sel shape.relative) {
+        if (sel value.symbol)   { place_symbol(shape.relative.offset.fixup, value.symbol, p, field.NUMBER); }
+        or (sel value.relative) { mark(p, field.NUMBER, immediate_bits(?shape.relative.offset, value.relative)); }
+    }
+    or (sel shape.memory) {
+        if (sel value.memory) { place_memory(?shape.memory, ?value.memory, p); }
+    }
+    or (sel shape.enumerant) {
+        if (sel value.enumerant) { mark(p, field.NUMBER, value.enumerant.value::u64); }
+    }
+    or (sel shape.condition) {
+        if (sel value.condition) { mark(p, field.NUMBER, value.condition::u64); }
+    }
+    or (sel shape.list) {
+        if (sel value.list) {
+            val members: operand.Values = value.list;
+            if (members.len > 0) {
+                if (sel members.at[0].register) { place_register(?shape.list.member, members.at[0].register, p, field.NUMBER, field.CLASS); }
+            }
+            mark(p, field.COUNT, members.len::u64);
+        }
+    }
+    or (sel shape.id) {
+        if (sel value.symbol) { place_symbol(shape.id.fixup, value.symbol, p, field.NUMBER); }
+        or (sel value.id)     { mark(p, field.NUMBER, value.id::u64); }
+    }
+    or (sel shape.marker) {
+        if (sel value.symbol) { place_symbol(shape.marker, value.symbol, p, field.NUMBER); }
+    }
+    or (sel shape.literal) {
+        if (sel value.literal) { mark(p, field.COUNT, value.literal.len::u64); }
+    }
+    or (sel shape.group) {
+        if (sel value.group) { mark(p, field.COUNT, value.group.len::u64); }
+    }
+}
+
+# operand value `value`, admitted before, against its row operand into its parts, as `admit` places it
+fun place(desc: *operand.Operand, value: *operand.Value, p: *field.Parts) {
+    if (sel value.none)                    { ret; }
+    if (desc.quantity != operand.VARIADIC) { place_one(?desc.shape, value, p); }
+    or (sel value.list)                    { mark(p, field.COUNT, value.list.len::u64); }
+}
+
+# one value admitted against `shape` into its parts
+fun admit_one(codec: *dispatch.Codec, ctx: *state.Context, shape: *operand.Shape, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+    val v: *register.Available = ctx.view;
+    if (sel shape.register) {
+        if (!sel value.register) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_register(codec, v, ?shape.register, value.register, p, field.NUMBER, field.CLASS, op);
+    }
+    if (sel shape.immediate) {
+        if (sel value.symbol)     { ret admit_symbol(shape.immediate.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.immediate) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_immediate(?shape.immediate, value.immediate, p, field.NUMBER, op);
+    }
+    if (sel shape.relative) {
+        if (sel value.symbol)    { ret admit_symbol(shape.relative.offset.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.relative) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_immediate(?shape.relative.offset, value.relative, p, field.NUMBER, op);
+    }
+    if (sel shape.memory) {
+        if (!sel value.memory) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_memory(codec, v, ?shape.memory, ?value.memory, p, op);
+    }
+    if (sel shape.enumerant) {
+        if (!sel value.enumerant) { ret refuse(field.WRONG_KIND, op); }
+        val c: operand.Chosen = value.enumerant;
+        if (!operand.member(?shape.enumerant, c.value)) { ret refuse(field.NOT_A_MEMBER, op); }
+        val err_needed: err[field.Refusal] = enumerant_admitted(ctx, ?shape.enumerant, c.value, op);
+        if (sel err_needed.err) { ret err_needed; }
+        # its params are admitted by their own shapes, and the set's kinds place them
+        if (c.params.len != operand.param_count(?shape.enumerant, c.value)) { ret refuse(field.PARAMS, op); }
+        var k: u32 = 0;
+        for (k < c.params.len) {
+            var scratch:      field.Parts;
+            val err_admitted: err[field.Refusal] = admit(codec, ctx, operand.param(?shape.enumerant, c.value, k), ?c.params.at[k], ?scratch, op);
+            if (sel err_admitted.err) { ret err_admitted; }
+            k = k + 1;
+        }
+        mark(p, field.NUMBER, c.value::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.condition) {
+        if (!sel value.condition)                               { ret refuse(field.WRONG_KIND, op); }
+        if (!operand.member(?shape.condition, value.condition)) { ret refuse(field.NOT_A_MEMBER, op); }
+        mark(p, field.NUMBER, value.condition::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.list) {
+        if (!sel value.list) { ret refuse(field.WRONG_KIND, op); }
+        ret admit_list(codec, v, ?shape.list, value.list, p, op);
+    }
+    if (sel shape.id) {
+        if (sel value.symbol)                          { ret admit_symbol(shape.id.fixup, value.symbol, p, field.NUMBER, op); }
+        if (!sel value.id)                             { ret refuse(field.WRONG_KIND, op); }
+        if (value.id::u64 > field.ones(shape.id.bits)) { ret refuse(field.OUT_OF_RANGE, op); }
+        mark(p, field.NUMBER, value.id::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.marker) {
+        if (!sel value.symbol)                  { ret refuse(field.WRONG_KIND, op); }
+        if (value.symbol.fixup != shape.marker) { ret refuse(field.UNMARKED, op); }
+        ret admit_symbol(shape.marker, value.symbol, p, field.NUMBER, op);
+    }
+    if (sel shape.literal) {
+        if (!sel value.literal) { ret refuse(field.WRONG_KIND, op); }
+        val bytes: operand.Bytes = value.literal;
+        if (bytes.len > shape.literal.max || (shape.literal.content == operand.NUMBER && bytes.len == 0)) { ret refuse(field.LITERAL_LENGTH, op); }
+        if (shape.literal.content == operand.STRING) {
+            var i: u32 = 0;
+            for (i < bytes.len) {
+                if (bytes.at[i] == 0) { ret refuse(field.NUL_IN_STRING, op); }
+                i = i + 1;
+            }
+        }
+        mark(p, field.COUNT, bytes.len::u64);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel shape.group) {
+        # a group's members are admitted by their own shapes, and the set's kinds place them
+        if (!sel value.group) { ret refuse(field.WRONG_KIND, op); }
+        val members: operand.Values = value.group;
+        if (members.len != shape.group.len) { ret refuse(field.WRONG_KIND, op); }
+        var i: u32 = 0;
+        for (i < shape.group.len) {
+            var scratch:      field.Parts;
+            val err_admitted: err[field.Refusal] = admit(codec, ctx, ?shape.group.at[i], ?members.at[i], ?scratch, op);
+            if (sel err_admitted.err) { ret err_admitted; }
+            i = i + 1;
+        }
+        mark(p, field.COUNT, members.len::u64);
+        ret err[field.Refusal].ok{};
+    }
+    ret refuse(field.WRONG_KIND, op);
+}
+
+# the enumerant `value` of `e` admitted under `ctx`: a member's requirement, or every set bit's of a mask, held, a
+# refusal naming operand `op`
+fun enumerant_admitted(ctx: *state.Context, e: *operand.Enumeration, value: u32, op: u8) err[field.Refusal] {
+    var i: u32 = 0;
+    for (i < e.count) {
+        val m:     *operand.Enumerant = ?e.members[i];
+        val named: bool               = m.value == value || (e.mask && m.value != 0 && (value & m.value) == m.value);
+        if (named && !state.admits(ctx, m.requires)) {
+            var refused: field.Refusal = field.unadmitted(m.requires, 0);
+            refused.operand = op;
+            ret err[field.Refusal].err{refused};
+        }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# operand `op`'s value admitted against its row operand into its parts
+fun admit(codec: *dispatch.Codec, ctx: *state.Context, desc: *operand.Operand, value: *operand.Value, p: *field.Parts, op: u8) err[field.Refusal] {
+    if (sel value.none) {
+        if (desc.quantity == operand.OPTIONAL) { ret err[field.Refusal].ok{}; }
+        ret refuse(field.WRONG_KIND, op);
+    }
+    if (desc.quantity != operand.VARIADIC) { ret admit_one(codec, ctx, ?desc.shape, value, p, op); }
+    if (!sel value.list)                   { ret refuse(field.WRONG_KIND, op); }
+    val members: operand.Values = value.list;
+    var i:       u32            = 0;
+    for (i < members.len) {
+        var scratch:      field.Parts;
+        val err_admitted: err[field.Refusal] = admit_one(codec, ctx, ?desc.shape, ?members.at[i], ?scratch, op);
+        if (sel err_admitted.err) { ret err_admitted; }
+        i = i + 1;
+    }
+    mark(p, field.COUNT, members.len::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# whether `value` is one operand `desc` admits under `ctx`, by its shape alone, as a derived alias's own operand that
+# no row holds, refused at operand `op`
+pub fun admits_value(codec: *dispatch.Codec, ctx: *state.Context, desc: *operand.Operand, value: *operand.Value, op: u8) err[field.Refusal] {
+    var parts: field.Parts;
+    ret admit(codec, ctx, desc, value, ?parts, op);
+}
+
+# the register operand `op` of `r` must be, none when the row does not fix it
+pub fun fixed(codec: *dispatch.Codec, r: *row.Row, op: u8) opt[register.Id] {
+    ret query.fixed(codec.registers, r.effect, op);
+}
+
+# operand `op` of `r` holding `value`, admitted as encode admits it into `parts`: the row's fixed register and the operand's shape
+fun admit_at(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, op: u8, value: *operand.Value, parts: *field.Parts) err[field.Refusal] {
+    val opt_held: opt[register.Id] = fixed(codec, r, op);
+    if (sel opt_held.some) {
+        val given: operand.Value = @value;
+        if (sel given.register && given.register != opt_held.some) { ret err[field.Refusal].err{field.refusal(field.NOT_FIXED, op, 0)}; }
+    }
+    ret admit(codec, ctx, ?r.operands.at[op], value, parts, op);
+}
+
+# whether operand `op` of `r` admits `value` under the context `ctx` as encode admits it, on its own, which is how an
+# instruction is refused an operand of the wrong kind as it is built
+pub fun admits_operand(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, op: u8, value: *operand.Value) err[field.Refusal] {
+    var parts: field.Parts;
+    ret admit_at(codec, ctx, r, op, value, ?parts);
+}
+
+# the row's own checks, every operand's admission of `ins` under `ctx` on its own and then what they refuse together, the
+# encoded parts into `parts`
+fun admit_all(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts) err[field.Refusal] {
+    val r: *row.Row = ins.row;
+    if ((r.flags & row.DECODE_ONLY) != 0) { ret err[field.Refusal].err{field.refusal(field.DECODE_ONLY, field.NO_OPERAND, 0)}; }
+    if (!state.admits(ctx, r.requires))   { ret err[field.Refusal].err{field.unadmitted(r.requires, 0)}; }
+    if (ins.count != r.operands.len)      { ret err[field.Refusal].err{field.refusal(field.OPERAND_COUNT, field.NO_OPERAND, 0)}; }
+    var i: u32 = 0;
+    for (i < r.operands.len) {
+        val err_admitted: err[field.Refusal] = admit_at(codec, ctx, r, i::u8, ?ins.values[i], ?parts[i]);
+        if (sel err_admitted.err) { ret err_admitted; }
+        i = i + 1;
+    }
+    ret together(jointly(codec, ctx, ins, parts));
+}
+
+# what the operands of `ins`, each admitted on its own, refuse together under `ctx`: the row's register constraints, the
+# registers it touches and its fields' kinds, the encoded parts into `parts`
+fun jointly(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts) err[field.Refusal] {
+    val err_held: err[field.Refusal] = kept(codec, ctx, ins.row, ins.values, 0);
+    if (sel err_held.err) { ret err_held; }
+    val err_touched: err[field.Refusal] = touches_held(codec, ctx.view, ins.row, ins.values, 0);
+    if (sel err_touched.err) { ret err_touched; }
+    ret kinds_admit(codec, ctx, ins, parts);
+}
+
+# `done` with its refusal marked as one of operands each admitted on its own
+fun together(done: err[field.Refusal]) err[field.Refusal] {
+    if (sel done.err) {
+        var refused: field.Refusal = done.err;
+        refused.reach = field.TOGETHER;
+        ret err[field.Refusal].err{refused};
+    }
+    ret done;
+}
+
+# what each field's kind refuses of the values of `ins` beyond their shapes, encoded into `parts`, without writing
+fun kinds_admit(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts) err[field.Refusal] {
+    val r:   *row.Row      = ins.row;
+    var enc: field.Encoder = field.Encoder{ctx: ctx, table: codec.fields, operands: r.operands.at, values: ins.values, parts: parts, count: r.operands.len, form: ?ins.form, out: nil, fixups: nil, start: 0, field: 0};
+    var j:   u32           = 0;
+    for (j < r.encoding.len) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.admit != nil) {
+            enc.field = j;
+            val err_done: err[field.Refusal] = kind.admit(?enc, f);
+            if (sel err_done.err) { ret err_done; }
+        }
+        j = j + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# the first row of `set` the view does not hold, none when it holds every one
+fun absent(v: *register.Available, set: effect.Set) opt[u32] {
+    var w: u32 = 0;
+    for (w < set.len) {
+        var left: u64 = set.words[w];
+        for (left != 0) {
+            val at: u32 = w * 64 + bits.ctz(left)::u32;
+            if (!bitset.get(?v.rows, at::usize)) { ret opt[u32].some{at}; }
+            left = left & (left - 1);
+        }
+        w = w + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# whether every register `r` holding `values` touches beyond its operands is one the view holds, refused at stream offset
+# `at` naming the first it does not, as an operand naming it is. a rule decides them by the values, so a value whose
+# registers the selection lacks, as a zcmp register list past x15 under the e base, is refused. the walks run it once
+# every operand is admitted or settled, so each has a value, an absent optional operand's being none, and the answer is
+# decided. one left open names an operand with no value, refused as one. registers no value decides are held to those
+# the row surely touches, since what it may touch beyond them is a reader's bound, not a fact of the encoding
+fun touches_held(codec: *dispatch.Codec, v: *register.Available, r: *row.Row, values: *operand.Value, at: usize) err[field.Refusal] {
+    if (codec.registers == nil) { ret err[field.Refusal].ok{}; }
+    val given:   operand.Values               = operand.Values{at: values, len: r.operands.len};
+    val found:   query.Answer[effect.Touched] = query.implicit(codec.registers, r.operands.at, r.effect, given);
+    var touched: effect.Touched               = query.must(r.effect);
+    if (sel found.decided) { touched = found.decided; }
+    or (sel found.undecided) {
+        val why: query.Undecided = found.undecided;
+        if (sel why.open) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, why.open.operand, at)}; }
+    }
+    val opt_lacking: opt[u32] = absent(v, touched.read);
+    if (sel opt_lacking.none) {
+        val opt_written: opt[u32] = absent(v, touched.written);
+        if (sel opt_written.none) { ret err[field.Refusal].ok{}; }
+        ret err[field.Refusal].err{field.unavailable(codec.registers.registers[opt_written.some].requires, deciding(codec.registers, r, given), at)};
+    }
+    ret err[field.Refusal].err{field.unavailable(codec.registers.registers[opt_lacking.some].requires, deciding(codec.registers, r, given), at)};
+}
+
+# the operand whose value chose the register rule of `r` that `values` meet, the first its terms test, field.NO_OPERAND
+# when no rule holds and the row's own registers are touched. rules are exclusive, so at most one is met
+fun deciding(file: *register.File, r: *row.Row, values: operand.Values) u8 {
+    val g: *effect.Registers = ?r.effect.implicit;
+    if (!sel g.ruled) { ret field.NO_OPERAND; }
+    val rules: effect.RegisterRules = g.ruled.rules;
+    var i:     u32                  = 0;
+    for (i < rules.len) {
+        val terms: effect.Terms = rules.at[i].terms;
+        if (terms.len > 0 && query.meets(file, terms, values)) { ret terms.at[0].operand; }
+        i = i + 1;
+    }
+    ret field.NO_OPERAND;
+}
+
+# whether the operand values `values` of `r` keep its register constraints under `ctx`, refused at stream offset `at`
+# when they break one. the walks know no grouping, so no stated group runs outside its class, and a form whose rule turns
+# on state the operands do not hold is admitted, as some state allows it. the narrowest element width the context's
+# state may set, the codec's element quantity, decides the rules between a width below it and the state's
+fun kept(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, values: *operand.Value, at: usize) err[field.Refusal] {
+    val found: constraint.Verdict = constraint.violated(codec.registers, r.constraints, r.operands.at, r.effect, operand.Values{at: values, len: r.operands.len}, unit_of(codec, ctx));
+    if (sel found.broken) { ret err[field.Refusal].err{field.refusal(field.SHARED, found.broken.side.operand, at)}; }
+    ret err[field.Refusal].ok{};
+}
+
+# the grouping the walks test at under `ctx`: no group's length and no element width stated, and the least element
+# width the codec's element quantity resolves to under the context
+pub fun unit_of(codec: *dispatch.Codec, ctx: *state.Context) constraint.Grouping {
+    var g:    constraint.Grouping = constraint.UNIT;
+    val file: *register.File      = codec.registers;
+    if (codec.element == 0 || file == nil || ctx.view == nil || codec.element::u32 > file.quantities.len) { ret g; }
+    val q:     u8             = codec.element - 1;
+    val least: quantity.Range = register.range(ctx.view, q);
+    g.least = (file.quantities.at[q].unit * least.least)::u16;
+    ret g;
+}
+
+# whether `ins` is admitted under the context `ctx` as encode admits it, without encoding it, which is how the parser
+# chooses among rows in the encoder's order of preference
+pub fun admits(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst) err[field.Refusal] {
+    # the parts start zero, and a row of few operands zeroes only what it uses
+    if (ins.row.operands.len <= FEW) {
+        var few: [FEW]field.Parts;
+        ret admit_all(codec, ctx, ins, ?few[0]);
+    }
+    var parts: [operand.MAX_OPERANDS]field.Parts;
+    ret admit_all(codec, ctx, ins, ?parts[0]);
+}
+
+# `ins` encoded onto `out`, its symbolic operands appended to `fixups`, a marker's after those fields hold
+# ---
+# ctx: the context it is encoded under, which must admit the row, and whose view of the codec's register file admits
+#      its registers
+# ret: the instruction's length, or the refusal with out and fixups left as they were
+pub fun encode(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) res[usize, field.Refusal] {
+    var parts:        [operand.MAX_OPERANDS]field.Parts;
+    val err_admitted: err[field.Refusal] = admit_all(codec, ctx, ins, ?parts[0]);
+    if (sel err_admitted.err) { ret res[usize, field.Refusal].err{err_admitted.err}; }
+    ret written(codec, ctx, ins, ?parts[0], out, fixups);
+}
+
+# `ins` encoded as `encode` encodes it when it admits it, which the caller knows it does, as a row selected under `ctx`
+# or an instruction it admitted before: nothing is checked, and only what a field's kind refuses is refused. an
+# instruction `encode` would refuse is the caller's bug, and encodes to whatever its fields make of it
+pub fun encode_admitted(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) res[usize, field.Refusal] {
+    # the parts start zero, and a row of few operands zeroes only what it uses
+    if (ins.row.operands.len <= FEW) {
+        var few: [FEW]field.Parts;
+        ret placed(codec, ctx, ins, ?few[0], out, fixups);
+    }
+    var parts: [operand.MAX_OPERANDS]field.Parts;
+    ret placed(codec, ctx, ins, ?parts[0], out, fixups);
+}
+
+# `ins`, its values admitted before, placed in the zero `parts` and written
+fun placed(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) res[usize, field.Refusal] {
+    val r: *row.Row = ins.row;
+    var i: u32      = 0;
+    for (i < r.operands.len) {
+        place(?r.operands.at[i], ?ins.values[i], ?parts[i]);
+        i = i + 1;
+    }
+    ret written(codec, ctx, ins, parts, out, fixups);
+}
+
+# `ins`, its operands' encoded parts `parts`, written field by field onto `out`, as `encode` states
+fun written(codec: *dispatch.Codec, ctx: *state.Context, ins: *inst.Inst, parts: *field.Parts, out: *vector.Vector[u8], fixups: *vector.Vector[field.Fixup]) res[usize, field.Refusal] {
+    val r:   *row.Row      = ins.row;
+    var enc: field.Encoder = field.Encoder{
+        ctx:      ctx,
+        table:    codec.fields,
+        operands: r.operands.at,
+        values:   ins.values,
+        parts:    parts,
+        count:    r.operands.len,
+        form:     ?ins.form,
+        out:      out,
+        fixups:   fixups,
+        start:    out.len,
+        field:    0,
+    };
+    val marked:     usize              = fixups.len;
+    var offsets:    [row.MAX_FIELDS]usize;
+    var opt_failed: opt[field.Refusal] = opt[field.Refusal].none{};
+    var j:          u32                = 0;
+    for (j < r.encoding.len && sel opt_failed.none) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        enc.field  = j;
+        offsets[j] = out.len;
+        val err_done: err[field.Refusal] = kind.encode(?enc, f);
+        if (sel err_done.err) { opt_failed = opt[field.Refusal].some{err_done.err}; }
+        j = j + 1;
+    }
+    j = 0;
+    for (j < r.encoding.len && sel opt_failed.none) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.finish != nil) {
+            enc.field = j;
+            val err_done: err[field.Refusal] = kind.finish(?enc, f, offsets[j]);
+            if (sel err_done.err) { opt_failed = opt[field.Refusal].some{err_done.err}; }
+        }
+        j = j + 1;
+    }
+    # no field holds a marker, so its fixup marks the instruction's start
+    var k: u32 = 0;
+    for (k < r.operands.len && sel opt_failed.none) {
+        if (sel r.operands.at[k].shape.marker) {
+            enc.field = field.NO_FIELD;
+            val err_done: err[field.Refusal] = field.fixup(?enc, k::u8, 0);
+            if (sel err_done.err) { opt_failed = opt[field.Refusal].some{err_done.err}; }
+        }
+        k = k + 1;
+    }
+    if (sel opt_failed.some) {
+        vector.truncate[u8](out, enc.start);
+        vector.truncate[field.Fixup](fixups, marked);
+        ret res[usize, field.Refusal].err{opt_failed.some};
+    }
+    ret res[usize, field.Refusal].ok{out.len - enc.start};
+}
+
+# the `len` bytes at `at` of `out`, an encoding of an instruction, written again as `shown` encodes under `ctx`, the
+# same row holding a number where the encoding holds a symbol, as a field the linker relocates holds the distance the
+# builder measured, so code read before the link goes where it will after. the fixups of `shown` are not kept, and on a
+# refusal `out` is left as it was, as it is for an encoding of another length
+pub fun rewrite(codec: *dispatch.Codec, ctx: *state.Context, shown: *inst.Inst, out: *vector.Vector[u8], at: usize, len: usize, fixups: *vector.Vector[field.Fixup]) err[field.Refusal] {
+    val end:      usize                     = out.len;
+    val marked:   usize                     = fixups.len;
+    val res_done: res[usize, field.Refusal] = encode(codec, ctx, shown, out, fixups);
+    vector.truncate[field.Fixup](fixups, marked);
+    if (sel res_done.err) { ret err[field.Refusal].err{res_done.err}; }
+    if (res_done.ok != len || at + len > end) {
+        vector.truncate[u8](out, end);
+        ret refuse(field.RESHOWN, field.NO_OPERAND);
+    }
+    var i: usize = 0;
+    for (i < len) {
+        out.data[at + i] = out.data[end + i];
+        i                = i + 1;
+    }
+    vector.truncate[u8](out, end);
+    ret err[field.Refusal].ok{};
+}
+
+# the position among `r`'s classes of the first that has a register numbered `number` from its range's first, 0 when none
+# has, which reads as no register
+fun class_by_number(codec: *dispatch.Codec, r: *operand.Register, number: u64) u64 {
+    val n: u64 = r.first::u64 + number;
+    if (n > 0xFFFF) { ret 0; }
+    var k: u32 = 0;
+    for (k < r.classes.len) {
+        val opt_held: opt[*register.Register] = register.row_of(codec.registers, register.make(r.classes.at[k], n::u16));
+        if (sel opt_held.some) { ret k::u64; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# the register of `r` encoded as `number` from its range's first, in the class at position `at` of its classes when a
+# field stated it (`stated`), else in the first of its classes that has a register of that number
+fun settle_register(codec: *dispatch.Codec, v: *register.Available, r: *operand.Register, stated: bool, at_stated: u64, number: u64, op: u8, offset: usize) res[register.Id, field.Refusal] {
+    var at: u64 = at_stated;
+    if (!stated)                  { at = class_by_number(codec, r, number); }
+    if (at >= r.classes.len::u64) { ret res[register.Id, field.Refusal].err{field.refusal(field.NO_REGISTER, op, offset)}; }
+    val c:     u16 = r.classes.at[at];
+    val count: u32 = register.count_most(codec.registers, c)::u32;
+    val n:     u64 = r.first::u64 + number;
+    if (n >= count::u64)                       { ret res[register.Id, field.Refusal].err{field.refusal(field.NO_REGISTER, op, offset)}; }
+    if (number >= operand.span(r, count)::u64) { ret res[register.Id, field.Refusal].err{field.refusal(field.OUTSIDE_RANGE, op, offset)}; }
+    if (operand.excludes_number(r, n::u32))    { ret res[register.Id, field.Refusal].err{field.refusal(field.EXCLUDED, op, offset)}; }
+    val id: register.Id = register.make(c, n::u16);
+    if (!r.unviewed) {
+        val err_held: err[field.Refusal] = available(v, id, op, offset);
+        if (sel err_held.err) { ret res[register.Id, field.Refusal].err{err_held.err}; }
+    }
+    ret res[register.Id, field.Refusal].ok{id};
+}
+
+# the value of the encoded bits `bits` of `imm`, refused at operand `op` and stream offset `offset` when the operand excludes it
+fun settle_immediate(imm: *operand.Immediate, bits: u64, op: u8, offset: usize) res[i64, field.Refusal] {
+    var raw: u64 = bits & field.ones(imm.bits);
+    var v:   i64 = raw:~i64;
+    if (imm.format != operand.FLOAT) {
+        if (imm.sign == operand.SIGNED && imm.bits > 0 && imm.bits < 64 && ((raw >> (imm.bits - 1)::u64) & 1) != 0) { raw = raw | ~field.ones(imm.bits); }
+        v = raw:~i64 + imm.bias;
+    }
+    if (operand.excludes_value(imm, v)) { ret res[i64, field.Refusal].err{field.refusal(field.EXCLUDED, op, offset)}; }
+    ret res[i64, field.Refusal].ok{v};
+}
+
+# operand `op`'s decoded parts turned into its value
+fun settle(codec: *dispatch.Codec, v: *register.Available, dec: *field.Decoder, op: u8) err[field.Refusal] {
+    val p:     *field.Parts     = ?dec.parts[op];
+    val desc:  *operand.Operand = ?dec.operands[op];
+    val at:    usize            = dec.start;
+    val shape: *operand.Shape   = ?desc.shape;
+    # an enumerant a kind placed with its params is a member taking exactly those
+    if (sel shape.enumerant) {
+        if (p.direct && desc.quantity != operand.VARIADIC) { ret placed_enumerant(dec, ?shape.enumerant, op); }
+    }
+    # an operand no field holds is implicit, an absent optional one is none, and kinds place literals and variadic operands themselves
+    if (p.direct || p.present == 0 || desc.quantity == operand.VARIADIC || sel shape.literal || sel shape.group) { ret err[field.Refusal].ok{}; }
+    if (sel shape.register) {
+        val res_reg: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.register, field.has(p, field.CLASS), p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+        if (sel res_reg.err) { ret err[field.Refusal].err{res_reg.err}; }
+        dec.values[op] = operand.Value.register{res_reg.ok};
+    }
+    or (sel shape.immediate) {
+        val res_imm: res[i64, field.Refusal] = settle_immediate(?shape.immediate, p.bits[field.NUMBER], op, at);
+        if (sel res_imm.err) { ret err[field.Refusal].err{res_imm.err}; }
+        dec.values[op] = operand.Value.immediate{res_imm.ok};
+    }
+    or (sel shape.relative) {
+        val res_rel: res[i64, field.Refusal] = settle_immediate(?shape.relative.offset, p.bits[field.NUMBER], op, at);
+        if (sel res_rel.err) { ret err[field.Refusal].err{res_rel.err}; }
+        dec.values[op] = operand.Value.relative{res_rel.ok};
+    }
+    or (sel shape.memory) {
+        var a: operand.Address;
+        if (field.has(p, field.NUMBER)) {
+            val res_base: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.memory.base, field.has(p, field.CLASS), p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+            if (sel res_base.err) { ret err[field.Refusal].err{res_base.err}; }
+            a.base = res_base.ok;
+        }
+        if (field.has(p, field.INDEX)) {
+            val res_index: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.memory.index, field.has(p, field.INDEX_CLASS), p.bits[field.INDEX_CLASS], p.bits[field.INDEX], op, at);
+            if (sel res_index.err) { ret err[field.Refusal].err{res_index.err}; }
+            a.index = res_index.ok;
+            a.scale = p.bits[field.SCALE]::u8;
+        }
+        if (field.has(p, field.SEGMENT)) {
+            val res_segment: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.memory.segment, true, 0, p.bits[field.SEGMENT], op, at);
+            if (sel res_segment.err) { ret err[field.Refusal].err{res_segment.err}; }
+            a.segment = res_segment.ok;
+        }
+        val res_disp: res[i64, field.Refusal] = settle_immediate(?shape.memory.disp, p.bits[field.DISP], op, at);
+        if (sel res_disp.err) { ret err[field.Refusal].err{res_disp.err}; }
+        a.disp = res_disp.ok;
+        a.mode = p.bits[field.MODE]::u8;
+        if (field.has(p, field.EXTEND)) {
+            if (!operand.member(?shape.memory.extends, p.bits[field.EXTEND]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+            a.extend = p.bits[field.EXTEND]::u32;
+        }
+        if (field.has(p, field.BROADCAST)) { a.broadcast = p.bits[field.BROADCAST]::u8; }
+        dec.values[op] = operand.Value.memory{a};
+    }
+    or (sel shape.enumerant) {
+        val chosen:   operand.Chosen     = operand.Chosen{value: p.bits[field.NUMBER]::u32, params: operand.NO_VALUES};
+        val err_held: err[field.Refusal] = settled_enumerant(dec, ?shape.enumerant, chosen, op);
+        if (sel err_held.err) { ret err_held; }
+        dec.values[op] = operand.Value.enumerant{chosen};
+    }
+    or (sel shape.condition) {
+        if (!operand.member(?shape.condition, p.bits[field.NUMBER]::u32)) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, at)}; }
+        dec.values[op] = operand.Value.condition{p.bits[field.NUMBER]::u32};
+    }
+    or (sel shape.list) {
+        # a list held by slices is consecutive from its first member, each a stride past the one before
+        val res_first: res[register.Id, field.Refusal] = settle_register(codec, v, ?shape.list.member, field.has(p, field.CLASS), p.bits[field.CLASS], p.bits[field.NUMBER], op, at);
+        if (sel res_first.err) { ret err[field.Refusal].err{res_first.err}; }
+        val class: u16 = register.class_of(res_first.ok);
+        val span:  u64 = operand.span(?shape.list.member, register.count_most(codec.registers, class)::u32)::u64;
+        # a list no field holds the count of has its one length
+        var len: u32 = p.bits[field.COUNT]::u32;
+        if (!field.has(p, field.COUNT))                             { len = shape.list.min::u32; }
+        if (len < shape.list.min::u32 || len > shape.list.max::u32) { ret err[field.Refusal].err{field.refusal(field.LIST_LENGTH, op, at)}; }
+        var members: *operand.Value = nil;
+        var i:       u32            = 0;
+        for (i < len) {
+            val number: u64 = shape.list.member.first::u64 + (p.bits[field.NUMBER] + i::u64 * operand.step(?shape.list)) % span;
+            if (operand.excludes_number(?shape.list.member, number::u32) || (i == 0 && operand.excludes_leading(?shape.list, number::u32))) {
+                ret err[field.Refusal].err{field.refusal(field.EXCLUDED, op, at)};
+            }
+            val member:   register.Id        = register.make(class, number::u16);
+            val err_held: err[field.Refusal] = available(v, member, op, at);
+            if (sel err_held.err) { ret err_held; }
+            val res_slot: res[*operand.Value, field.Refusal] = field.push(dec, operand.Value.register{member});
+            if (sel res_slot.err) { ret err[field.Refusal].err{res_slot.err}; }
+            if (i == 0)           { members = res_slot.ok; }
+            i = i + 1;
+        }
+        dec.values[op] = operand.Value.list{operand.Values{at: members, len: len}};
+    }
+    or (sel shape.id) {
+        dec.values[op] = operand.Value.id{p.bits[field.NUMBER]::u32};
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# the enumerant `c` decoded for operand `op` held to `e`: a member the context admits, with one param per operand it
+# takes, so a member taking params no kind placed is refused
+fun settled_enumerant(dec: *field.Decoder, e: *operand.Enumeration, c: operand.Chosen, op: u8) err[field.Refusal] {
+    if (!operand.member(e, c.value))                     { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, op, dec.start)}; }
+    if (c.params.len != operand.param_count(e, c.value)) { ret err[field.Refusal].err{field.refusal(field.PARAMS, op, dec.start)}; }
+    val err_needed: err[field.Refusal] = enumerant_admitted(dec.ctx, e, c.value, op);
+    if (sel err_needed.err) {
+        var refused: field.Refusal = err_needed.err;
+        refused.at = dec.start;
+        ret err[field.Refusal].err{refused};
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# the enumerant a kind placed for operand `op` held to `e`, as `settled_enumerant` holds one
+fun placed_enumerant(dec: *field.Decoder, e: *operand.Enumeration, op: u8) err[field.Refusal] {
+    val v: operand.Value = dec.values[op];
+    if (!sel v.enumerant) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, op, dec.start)}; }
+    ret settled_enumerant(dec, e, v.enumerant, op);
+}
+
+# one instruction of row `r` decoded from `data[at..len]`
+# ---
+# ctx:   the context it is decoded under, which must admit the row, and whose view admits its registers
+# store: storage for the operand values, then for list members
+# cap:   how many values store holds
+# ret:   the instruction, its values in store, and its length, or the refusal
+pub fun decode_row(codec: *dispatch.Codec, ctx: *state.Context, r: *row.Row, data: *u8, len: usize, at: usize, store: *operand.Value, cap: u32) res[Decoded, field.Refusal] {
+    if (!state.admits(ctx, r.requires)) { ret res[Decoded, field.Refusal].err{field.unadmitted(r.requires, at)}; }
+    val v:     *register.Available = ctx.view;
+    val count: u32                 = r.operands.len;
+    if (cap < count) { ret res[Decoded, field.Refusal].err{field.exhausted(count::u64, field.NO_OPERAND, at)}; }
+    var parts: [operand.MAX_OPERANDS]field.Parts;
+    var i:     u32 = 0;
+    for (i < count) {
+        store[i] = operand.Value.none{};
+        i        = i + 1;
+    }
+    var read: form.Form     = form.PREFERRED;
+    var dec:  field.Decoder = field.Decoder{
+        ctx:      ctx,
+        table:    codec.fields,
+        operands: r.operands.at,
+        values:   store,
+        parts:    ?parts[0],
+        count:    count,
+        form:     ?read,
+        in:       field.Stream{data: data, len: len, order: codec.fields.order},
+        start:    at,
+        at:       at,
+        end:      len,
+        declared: false,
+        pool:     ?store[count],
+        used:     0,
+        cap:      cap - count,
+    };
+    var offsets: [row.MAX_FIELDS]usize;
+    var j:       u32 = 0;
+    for (j < r.encoding.len) {
+        val f: *field.Field = ?r.encoding.at[j];
+        offsets[j] = dec.at;
+        val err_done: err[field.Refusal] = codec.fields.kinds[f.kind].decode(?dec, f);
+        if (sel err_done.err) { ret res[Decoded, field.Refusal].err{err_done.err}; }
+        j = j + 1;
+    }
+    # a kind completes the parts it decides once every field is read
+    j = 0;
+    for (j < r.encoding.len) {
+        val f:    *field.Field = ?r.encoding.at[j];
+        val kind: *field.Kind  = codec.fields.kinds[f.kind];
+        if (kind.complete != nil) {
+            val err_done: err[field.Refusal] = kind.complete(?dec, f, offsets[j]);
+            if (sel err_done.err) { ret res[Decoded, field.Refusal].err{err_done.err}; }
+        }
+        j = j + 1;
+    }
+    if (dec.declared && dec.at != dec.end) { ret res[Decoded, field.Refusal].err{field.refusal(field.LENGTH, field.NO_OPERAND, dec.at)}; }
+    i = 0;
+    for (i < count) {
+        val err_settled: err[field.Refusal] = settle(codec, v, ?dec, i::u8);
+        if (sel err_settled.err) { ret res[Decoded, field.Refusal].err{err_settled.err}; }
+        # an implicit fixed operand is its register, and an encoded one must be it
+        val opt_pinned: opt[register.Id] = fixed(codec, r, i::u8);
+        if (sel opt_pinned.some) {
+            val given: operand.Value = store[i];
+            if (sel given.none) { store[i] = operand.Value.register{opt_pinned.some}; }
+            or (!(sel given.register && given.register == opt_pinned.some)) {
+                ret res[Decoded, field.Refusal].err{field.refusal(field.NOT_FIXED, i::u8, at)};
+            }
+        }
+        i = i + 1;
+    }
+    val err_keeps: err[field.Refusal] = together(kept(codec, ctx, r, store, at));
+    if (sel err_keeps.err) { ret res[Decoded, field.Refusal].err{err_keeps.err}; }
+    val err_touched: err[field.Refusal] = together(touches_held(codec, v, r, store, at));
+    if (sel err_touched.err) { ret res[Decoded, field.Refusal].err{err_touched.err}; }
+    ret res[Decoded, field.Refusal].ok{Decoded{inst: inst.Inst{row: r, values: store, count: count, form: read}, len: dec.at - at}};
+}
+
+# the entry of `node` whose value is `key`
+fun search(d: *dispatch.Dispatch, node: *dispatch.Node, key: u64) opt[*dispatch.Entry] {
+    var lo: u32 = node.first;
+    var hi: u32 = node.first + node.count;
+    for (lo < hi) {
+        val mid: u32             = lo + (hi - lo) / 2;
+        val e:   *dispatch.Entry = ?d.entries[mid];
+        if (e.value == key) { ret opt[*dispatch.Entry].some{e}; }
+        if (e.value < key)  { lo = mid + 1; }
+        or                  { hi = mid; }
+    }
+    ret opt[*dispatch.Entry].none{};
+}
+
+# one instruction decoded from `data[at..len]`, its row found by the codec's dispatch
+# ---
+# ctx:   the context it is decoded under, whose admitted rows are candidates and which the dispatch keys read
+# store: storage for the operand values, then for list members
+# cap:   how many values store holds
+# alts:  storage for the alternatives of the candidates the context does not admit, one slot per distinct alternative
+# ret:   the first admitted candidate that decodes, or the first admitted candidate's refusal, or the requirements of
+#        every candidate when none is admitted. a candidate `store` is too small for ends the walk with what the store
+#        must hold, so a later candidate never stands in for one that fits a larger store, and `alts` too small for the
+#        requirements refuses with what it must hold
+pub fun decode(codec: *dispatch.Codec, ctx: *state.Context, data: *u8, len: usize, at: usize, store: *operand.Value, cap: u32, alts: *field.Admissions) res[Decoded, field.Refusal] {
+    alts.used = 0;
+    val d:      *dispatch.Dispatch = codec.dispatch;
+    var stream: field.Stream       = field.Stream{data: data, len: len, order: codec.fields.order};
+    var node:   *dispatch.Node     = ?d.nodes[0];
+    for {
+        val res_key: res[u64, field.Refusal] = d.keys[node.key].extract(ctx, ?stream, at);
+        if (sel res_key.err) { ret res[Decoded, field.Refusal].err{res_key.err}; }
+        val opt_found: opt[*dispatch.Entry] = search(d, node, res_key.ok);
+        if (sel opt_found.none) { ret res[Decoded, field.Refusal].err{field.refusal(field.NO_ROW, field.NO_OPERAND, at)}; }
+        val e: *dispatch.Entry = opt_found.some;
+        if (e.node != 0) {
+            node = ?d.nodes[e.node - 1];
+            cnt;
+        }
+        var opt_first: opt[field.Refusal] = opt[field.Refusal].none{};
+        var full:      bool               = false;
+        var need:      u64                = 0;
+        var i:         u32                = 0;
+        for (i < e.count) {
+            val r: *row.Row = ?codec.rows.at[d.candidates[e.first + i]];
+            if (state.admits(ctx, r.requires)) {
+                val res_decode_row: res[Decoded, field.Refusal] = decode_row(codec, ctx, r, data, len, at, store, cap);
+                if (sel res_decode_row.ok) { ret res_decode_row; }
+                if (sel res_decode_row.err) {
+                    if (sel res_decode_row.err.cause.storage) { ret res_decode_row; }
+                }
+                if (sel opt_first.none && sel res_decode_row.err) { opt_first = opt[field.Refusal].some{res_decode_row.err}; }
+            }
+            or {
+                if (!field.note(alts, r.requires)) { full = true; }
+                need = need + r.requires.len::u64;
+            }
+            i = i + 1;
+        }
+        if (sel opt_first.some) { ret res[Decoded, field.Refusal].err{opt_first.some}; }
+        if (full)               { ret res[Decoded, field.Refusal].err{field.crowded(need, at)}; }
+        val unmet: requirement.Requirement = field.noted(alts);
+        if (unmet.len == 0) { ret res[Decoded, field.Refusal].err{field.refusal(field.NO_ROW, field.NO_OPERAND, at)}; }
+        ret res[Decoded, field.Refusal].err{field.unadmitted(unmet, at)};
+    }
+}
+
+# one instruction decoded from `data[at..len]` as `decode` decodes it, into stores grown to what the instruction holds
+# ---
+# store: the operand values and then the list members, grown and the decode retried when it holds too few, its values
+#        valid until the next decode into it
+# alts:  the alternatives of the candidates the context does not admit, grown and the decode retried when it holds too
+#        few, the requirements a refusal names valid until the next decode into it
+# ret:   the instruction or the refusal as `decode` gives them, one of a store's size only when it states a need the
+#        store already holds
+pub fun decode_grown(codec: *dispatch.Codec, ctx: *state.Context, data: *u8, len: usize, at: usize, store: *vector.Vector[operand.Value], alts: *vector.Vector[requirement.Alternative]) res[Decoded, field.Refusal] {
+    if (store.cap < operand.MAX_OPERANDS::usize) {
+        val res_first: res[usize, A.Error] = vector.ensure[operand.Value](store, operand.MAX_OPERANDS::usize);
+        if (sel res_first.err) { ret res[Decoded, field.Refusal].err{field.unallocated(res_first.err, field.NO_OPERAND, at)}; }
+    }
+    # a decode is retried only while it states a need its stores do not hold
+    for {
+        var noted:      field.Admissions            = field.Admissions{at: alts.data, cap: field.counted(alts.cap), used: 0};
+        val res_decode: res[Decoded, field.Refusal] = decode(codec, ctx, data, len, at, store.data, field.counted(store.cap), ?noted);
+        var res_grown:  res[bool, A.Error]          = res[bool, A.Error].ok{false};
+        if (sel res_decode.err) {
+            if (sel res_decode.err.cause.storage) { res_grown = field.regrow[operand.Value](store, res_decode.err.cause.storage); }
+            if (sel res_decode.err.cause.noted)   { res_grown = field.regrow[requirement.Alternative](alts, res_decode.err.cause.noted); }
+        }
+        if (sel res_grown.err) { ret res[Decoded, field.Refusal].err{field.unallocated(res_grown.err, field.NO_OPERAND, at)}; }
+        if (!res_grown.ok)     { ret res_decode; }
+    }
+}

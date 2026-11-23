@@ -1,0 +1,1625 @@
+# the aarch64 generator
+#
+# it reads the register families masc writes under data/aarch64/registers and emits the aarch64 register file beside masc's
+# aarch64 modules: the quantities and the slots they bind, classes, register rows with their banks, views, tiles, za slices
+# and write extensions, the aliases, the
+# dwarf and codeview columns and the indexes over them. a family is a line of the source, and a row's bank, the offset, stride
+# and count of a tile and the number of every register in a debug format are derived here, so the table is never edited by hand.
+# the system registers are the rows of Arm's system register model (AARCHMRS Registers.json), one per encoding it names
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+
+use masc.core.register;
+
+use gen.diag;
+use gen.emit;
+use gen.handles;
+use gen.lines;
+use gen.set;
+use gen.source;
+use gen.storage;
+use gen.tar;
+
+use gen.isa.aarch64.system;
+
+pub val FAMILIES: str = "registers.txt";
+
+pub val BAD_RECORD:     str = "register record is not a quantity, slot, class, system, named, tile, slices, tuple, alias or link";
+pub val BAD_FIELDS:     str = "register record has the wrong number of fields";
+pub val BAD_NUMBER:     str = "field is not a number";
+pub val BAD_WIDTH:      str = "width is neither bits nor a slot";
+pub val BAD_NUMBERS:    str = "numbers are not a range inside the class's count";
+pub val BAD_KIND:       str = "kind is not a register kind";
+pub val BAD_EXTEND:     str = "extend is not keep, zeroes or ones";
+pub val BAD_FLAG:       str = "flag is not zero, stack, pc, accrued or unspelled";
+pub val BAD_SYSTEM:     str = "system register encoding is not an MRS or MSR one, op0 below 2";
+pub val SYSTEM_TWICE:   str = "system register name names two encodings, or two names of one direction one encoding";
+pub val TWO_SYSTEMS:    str = "register families state two system classes";
+pub val NO_SYSTEM:      str = "register families state a system class, and the generator is given no system register model";
+pub val BAD_REQUIRES:   str = "required atom is not one the register file names";
+pub val BAD_SLOT:       str = "slot names no quantity or no atom, or binds quantities of different units";
+pub val BAD_GAUGE:      str = "gauge names no quantity or no atom";
+pub val BAD_SLICES:     str = "slices name no tile class or a direction other than h or v";
+pub val BAD_BANK:       str = "bank is neither new, the class of a register of the same number, nor bits of one register's";
+pub val BAD_ELEMENT:    str = "tile element is not a power of two dividing the slot's unit";
+pub val UNKNOWN:        str = "name is not a quantity, slot, class or register";
+pub val NO_FILE:        str = "source has no register families";
+pub val CLASS_TWICE:    str = "class named twice";
+pub val BAD_TUPLE:      str = "tuple names no earlier class, an arity below two, no step, an order other than significance, address or apart, or a first register no class holds";
+pub val TUPLE_REQUIRES: str = "tuple's members differ in what they require";
+
+# the op0 of the first system register encoding a system class numbers, its numbers being o0:op1:CRn:CRm:op2 of an MRS
+# or MSR (DDI 0487, MRS: "op0 ... 2 + o0"), 15 bits
+pub val SYSTEM_OP0:   u32 = 2;
+pub val SYSTEM_COUNT: u32 = 0x8000;
+
+# a width, offset, stride or count: fixed plus per times the multiplier of the quantity one slot binds
+pub rec Quantity {
+    fixed: u32;
+    per:   u32;
+    scale: u8;
+}
+
+# the register named `register` measuring a quantity while the atom `when` holds, nil for always, each count of its
+# value standing for `count` bits of it
+pub rec Gauge {
+    when:     str;
+    register: str;
+    count:    u32;
+}
+
+# a quantity of `unit` bits times a power of two to `max`, measured by its gauges, none for a quantity no register reads
+pub rec Measure {
+    name:   str;
+    unit:   u32;
+    max:    u32;
+    gauges: vector.Vector[Gauge];
+}
+
+# slot `slot` bound to quantity `quantity` while the atom `when` holds, nil for always
+pub rec Bind {
+    slot:     u32;
+    when:     str;
+    quantity: u32;
+}
+
+# a slot a width names, the unit of every quantity it binds and the most multiplier any of them takes
+pub rec Slot {
+    name: str;
+    unit: u32;
+    max:  u32;
+}
+
+# one class of the source, a family of registers or the tiles of an array
+# ---
+# count:    the hardware numbers it spans, and `per` more for each unit of slot `per_slot`'s multiplier, as the slices of
+#           the za array, svl / 8 of them in each direction
+# of:       the class whose banks it shares, or -1 for banks of its own
+# base:     the bank of its first register, assigned once every class is read
+# dwarf:    the dwarf number of its first register, or -1
+# cv:       the codeview number of its first register, or -1
+# tile:     whether it is a tile class, whose rows are derived from its slot, element and count
+# slice:    0, or 1 for the horizontal and 2 for the vertical slices of the tiles of class `slice_of`, a row of the array
+#           or a column of elements of one tile
+# within:   the register whose bank the class's one register lies in, nil for none, as nzcv's flags in the nzcv
+#           system register, at bit `offset`
+# open:     whether every number below its count encodes on every machine, its rows naming some, as the system registers,
+#           which an MRS or MSR reaches by any encoding, trapping where none is implemented. an operand of it is unviewed
+# arity:    0, or the registers each of its tuples is of, a tuple numbered n for each of `tuples`, member k the register
+#           numbered n + k in the first of the classes `tuple_of` holding one
+# order:    a tuple class's order as masc.core.register names it, nil for a class of single registers
+# step:     a tuple class's alignment as masc.core.register states it, 0 for a class of single registers
+# tuples:   the numbers of a tuple class's tuples, each a multiple of its step but the zero register's
+# by_first: whether a tuple class names each tuple by its class and first member, `xps.x2`, rather than its members
+pub rec Class {
+    name:      str;
+    kind:      str;
+    width:     Quantity;
+    count:     u32;
+    first:     u32;
+    last:      u32;
+    pattern:   str;
+    of:        i64;
+    of_name:   str;
+    base:      u32;
+    extend:    str;
+    flags:     str;
+    requires:  str;
+    dwarf:     i64;
+    cv:        i64;
+    tile:      bool;
+    element:   u32;
+    per:       u32;
+    per_slot:  u8;
+    slice:     u8;
+    slice_of:  u32;
+    within:    str;
+    offset:    u32;
+    open:      bool;
+    unspelled: bool;
+    arity:     u32;
+    order:     str;
+    tuple_of:  vector.Vector[u32];
+    step:      u32;
+    tuples:    vector.Vector[u32];
+    by_first:  bool;
+}
+
+# one row of a class. a tuple's members are the rows it is of, in its class's order, and none for any other row
+pub rec Row {
+    name:      str;
+    class:     u32;
+    number:    u32;
+    bank:      u32;
+    offset:    Quantity;
+    stride:    Quantity;
+    count:     Quantity;
+    flags:     str;
+    requires:  str;
+    extend:    str;
+    dwarf:     i64;
+    cv:        i64;
+    unspelled: bool;
+    members:   vector.Vector[u32];
+}
+
+pub rec Alias {
+    name:     str;
+    register: str;
+    line:     lines.Line;
+}
+
+# a `named` record: the flags and debug numbers of one register a family states no pattern for, as a system register
+pub rec Named {
+    register:  str;
+    flags:     str;
+    unspelled: bool;
+    dwarf:     i64;
+    cv:        i64;
+    line:      lines.Line;
+}
+
+pub rec Families {
+    alloc:    *A.Allocator;
+    measures: vector.Vector[Measure];
+    slots:    vector.Vector[Slot];
+    binds:    vector.Vector[Bind];
+    classes:  vector.Vector[Class];
+    aliases:  vector.Vector[Alias];
+    named:    vector.Vector[Named];
+    rows:     vector.Vector[Row];
+    link:     str;
+    system:   *system.Model;
+}
+
+fun memory(l: *lines.Line) diag.Refusal {
+    ret lines.refuse(l, diag.MEMORY, nil);
+}
+
+fun owned(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    val res_str_copy_slice: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel res_str_copy_slice.err) { ret res[str, diag.Refusal].err{memory(l)}; }
+    ret res[str, diag.Refusal].ok{res_str_copy_slice.ok};
+}
+
+fun decimal(l: *lines.Line, v: View) res[u32, diag.Refusal] {
+    if (v.len == 0 || v.len > 9) { ret res[u32, diag.Refusal].err{lines.refuse(l, BAD_NUMBER, nil)}; }
+    var n: u32   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] < '0' || v.data[i] > '9') { ret res[u32, diag.Refusal].err{lines.refuse(l, BAD_NUMBER, nil)}; }
+        n = n * 10 + (v.data[i] - '0')::u32;
+        i = i + 1;
+    }
+    ret res[u32, diag.Refusal].ok{n};
+}
+
+# the number a debug field gives its class's first register, -1 for `-`
+fun debug(l: *lines.Line, v: View) res[i64, diag.Refusal] {
+    if (view_eq_str(v, "-")) { ret res[i64, diag.Refusal].ok{-1}; }
+    val res_decimal: res[u32, diag.Refusal] = decimal(l, v);
+    if (sel res_decimal.err) { ret res[i64, diag.Refusal].err{res_decimal.err}; }
+    ret res[i64, diag.Refusal].ok{res_decimal.ok::i64};
+}
+
+fun measure_named(f: *Families, v: View) opt[u32] {
+    var i: usize = 0;
+    for (i < f.measures.len) {
+        if (view_eq_str(v, f.measures.data[i].name)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the slot named `name`, as an effect's access width names one
+pub fun slot(f: *Families, name: str) opt[u8] {
+    var i: usize = 0;
+    for (i < f.slots.len) {
+        if (str_equals(name, f.slots.data[i].name)) { ret opt[u8].some{i::u8}; }
+        i = i + 1;
+    }
+    ret opt[u8].none{};
+}
+
+fun slot_named(f: *Families, v: View) opt[u8] {
+    var i: usize = 0;
+    for (i < f.slots.len) {
+        if (view_eq_str(v, f.slots.data[i].name)) { ret opt[u8].some{i::u8}; }
+        i = i + 1;
+    }
+    ret opt[u8].none{};
+}
+
+# a width: bits, a slot for one unit of its quantity per multiplier, or a slot and `/8` for an eighth of that
+fun width(f: *Families, l: *lines.Line, v: View) res[Quantity, diag.Refusal] {
+    if (v.len > 0 && v.data[0] >= '0' && v.data[0] <= '9') {
+        val res_decimal: res[u32, diag.Refusal] = decimal(l, v);
+        if (sel res_decimal.err) { ret res[Quantity, diag.Refusal].err{res_decimal.err}; }
+        ret res[Quantity, diag.Refusal].ok{Quantity{fixed: res_decimal.ok, per: 0, scale: 0}};
+    }
+    var name: View = v;
+    var div:  u32  = 1;
+    if (v.len > 2 && v.data[v.len - 2] == '/' && v.data[v.len - 1] == '8') {
+        name.len = v.len - 2;
+        div      = 8;
+    }
+    val opt_slot_named: opt[u8] = slot_named(f, name);
+    if (sel opt_slot_named.none) { ret res[Quantity, diag.Refusal].err{lines.refuse(l, BAD_WIDTH, nil)}; }
+    ret res[Quantity, diag.Refusal].ok{Quantity{fixed: 0, per: f.slots.data[opt_slot_named.some].unit / div, scale: opt_slot_named.some}};
+}
+
+fun kind(l: *lines.Line, v: View) res[str, diag.Refusal] {
+    if (view_eq_str(v, "general"))   { ret res[str, diag.Refusal].ok{"register.GENERAL"}; }
+    if (view_eq_str(v, "float"))     { ret res[str, diag.Refusal].ok{"register.FLOAT"}; }
+    if (view_eq_str(v, "vector"))    { ret res[str, diag.Refusal].ok{"register.VECTOR"}; }
+    if (view_eq_str(v, "predicate")) { ret res[str, diag.Refusal].ok{"register.PREDICATE"}; }
+    if (view_eq_str(v, "flags"))     { ret res[str, diag.Refusal].ok{"register.FLAGS"}; }
+    if (view_eq_str(v, "system"))    { ret res[str, diag.Refusal].ok{"register.SYSTEM"}; }
+    ret res[str, diag.Refusal].err{lines.refuse(l, BAD_KIND, nil)};
+}
+
+fun extend(l: *lines.Line, v: View) res[str, diag.Refusal] {
+    if (view_eq_str(v, "keep"))   { ret res[str, diag.Refusal].ok{"register.KEEP"}; }
+    if (view_eq_str(v, "zeroes")) { ret res[str, diag.Refusal].ok{"register.ZEROES"}; }
+    if (view_eq_str(v, "ones"))   { ret res[str, diag.Refusal].ok{"register.ONES"}; }
+    ret res[str, diag.Refusal].err{lines.refuse(l, BAD_EXTEND, nil)};
+}
+
+# whether the flags list `v` names `flag`
+fun flagged(v: View, flag: str) bool {
+    var at: usize = 0;
+    for (at <= v.len) {
+        var end: usize = at;
+        for (end < v.len && v.data[end] != ',') {
+            end = end + 1;
+        }
+        if (view_eq_str(View{data: ?v.data[at], len: end - at}, flag)) { ret true; }
+        at = end + 1;
+    }
+    ret false;
+}
+
+# the flags of a comma list as an expression, `0` for `-`
+fun flags(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    var out: str   = "0";
+    var at:  usize = 0;
+    if (view_eq_str(v, "-")) { ret res[str, diag.Refusal].ok{out}; }
+    var first: bool = true;
+    for (at <= v.len) {
+        var end: usize = at;
+        for (end < v.len && v.data[end] != ',') {
+            end = end + 1;
+        }
+        val one:  View = View{data: ?v.data[at], len: end - at};
+        var flag: str  = nil;
+        if (view_eq_str(one, "zero"))      { flag = "register.ZERO"; }
+        or (view_eq_str(one, "stack"))     { flag = "register.STACK"; }
+        or (view_eq_str(one, "pc"))        { flag = "register.PC"; }
+        or (view_eq_str(one, "accrued"))   { flag = "register.ACCRUED"; }
+        or (view_eq_str(one, "unspelled")) { flag = "register.UNSPELLED"; }
+        if (flag == nil)                   { ret res[str, diag.Refusal].err{lines.refuse(l, BAD_FLAG, nil)}; }
+        if (first)                         { out = flag; }
+        or {
+            val res_joined: res[str, StrError] = str_join(a, out, " | ", flag);
+            if (sel res_joined.err) { ret res[str, diag.Refusal].err{memory(l)}; }
+            out = res_joined.ok;
+        }
+        first = false;
+        at    = end + 1;
+    }
+    ret res[str, diag.Refusal].ok{out};
+}
+
+# whether an extension token names one: a streaming mode or a catalog extension, lowercase letters and digits
+fun extension_named(v: View) bool {
+    if (view_eq_str(v, "streaming=off") || view_eq_str(v, "streaming=on")) { ret true; }
+    if (v.len == 0)                                                        { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        val c: u8 = v.data[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the id a named extension token has, a catalog extension's constant its name in capitals
+fun extension_id(f: *emit.File, token: str) str {
+    if (str_equals(token, "streaming=off")) { ret "aarch64_extension.STREAMING_OFF"; }
+    if (str_equals(token, "streaming=on"))  { ret "aarch64_extension.STREAMING_ON"; }
+    ret emit.concat(f, "gen_extension.", emit.ident(f, token));
+}
+
+# `-` or the extensions of which one must be held, each named, as the text the rows carry
+fun requires(a: *A.Allocator, l: *lines.Line, v: View) res[str, diag.Refusal] {
+    if (view_eq_str(v, "-")) { ret res[str, diag.Refusal].ok{nil}; }
+    var at: usize = 0;
+    for (at <= v.len) {
+        var end: usize = at;
+        for (end < v.len && v.data[end] != '|') {
+            end = end + 1;
+        }
+        if (!extension_named(View{data: ?v.data[at], len: end - at})) { ret res[str, diag.Refusal].err{lines.refuse(l, BAD_REQUIRES, nil)}; }
+        at = end + 1;
+    }
+    ret owned(a, l, v);
+}
+
+# `a-b` or `a` as the first and last number of a class
+fun numbers(l: *lines.Line, v: View, count: u32, first: *u32, last: *u32) err[diag.Refusal] {
+    var dash: usize = v.len;
+    var i:    usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == '-') { dash = i; }
+        i = i + 1;
+    }
+    val res_decimal: res[u32, diag.Refusal] = decimal(l, View{data: v.data, len: dash});
+    if (sel res_decimal.err) { ret err[diag.Refusal].err{res_decimal.err}; }
+    var hi: u32 = res_decimal.ok;
+    if (dash < v.len) {
+        val res_decimal: res[u32, diag.Refusal] = decimal(l, View{data: ?v.data[dash + 1], len: v.len - dash - 1});
+        if (sel res_decimal.err) { ret err[diag.Refusal].err{res_decimal.err}; }
+        hi = res_decimal.ok;
+    }
+    if (hi < res_decimal.ok || hi >= count) { ret err[diag.Refusal].err{lines.refuse(l, BAD_NUMBERS, nil)}; }
+    @first = res_decimal.ok;
+    @last  = hi;
+    ret err[diag.Refusal].ok{};
+}
+
+fun pushed(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+fun class_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 13) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var c: Class;
+    c.per      = 0;
+    c.per_slot = 0;
+    c.slice    = 0;
+    val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+    c.name = res_name.ok;
+    val res_kind: res[str, diag.Refusal] = kind(l, t.data[2]);
+    if (sel res_kind.err) { ret err[diag.Refusal].err{res_kind.err}; }
+    c.kind = res_kind.ok;
+    val res_width: res[Quantity, diag.Refusal] = width(f, l, t.data[3]);
+    if (sel res_width.err) { ret err[diag.Refusal].err{res_width.err}; }
+    c.width = res_width.ok;
+    val res_decimal: res[u32, diag.Refusal] = decimal(l, t.data[4]);
+    if (sel res_decimal.err) { ret err[diag.Refusal].err{res_decimal.err}; }
+    c.count = res_decimal.ok;
+    val err_numbers: err[diag.Refusal] = numbers(l, t.data[5], c.count, ?c.first, ?c.last);
+    if (sel err_numbers.err) { ret err_numbers; }
+    val res_pattern: res[str, diag.Refusal] = owned(f.alloc, l, t.data[6]);
+    if (sel res_pattern.err) { ret err[diag.Refusal].err{res_pattern.err}; }
+    c.pattern = res_pattern.ok;
+    c.of      = -1;
+    val bank: View = t.data[7];
+    if (bank.len > 3 && view_eq_str(View{data: bank.data, len: 3}, "in:")) {
+        var plus: usize = 3;
+        for (plus < bank.len && bank.data[plus] != '+') {
+            plus = plus + 1;
+        }
+        if (plus == 3 || plus >= bank.len - 1 || c.first != c.last) { ret err[diag.Refusal].err{lines.refuse(l, BAD_BANK, nil)}; }
+        val res_within: res[str, diag.Refusal] = owned(f.alloc, l, View{data: ?bank.data[3], len: plus - 3});
+        if (sel res_within.err) { ret err[diag.Refusal].err{res_within.err}; }
+        val res_decimal: res[u32, diag.Refusal] = decimal(l, View{data: ?bank.data[plus + 1], len: bank.len - plus - 1});
+        if (sel res_decimal.err) { ret err[diag.Refusal].err{res_decimal.err}; }
+        c.within = res_within.ok;
+        c.offset = res_decimal.ok;
+    }
+    or (!view_eq_str(bank, "new")) {
+        if (t.data[7].len < 4 || !view_eq_str(View{data: t.data[7].data, len: 3}, "of:")) { ret err[diag.Refusal].err{lines.refuse(l, BAD_BANK, nil)}; }
+        val res_owned: res[str, diag.Refusal] = owned(f.alloc, l, View{data: ?t.data[7].data[3], len: t.data[7].len - 3});
+        if (sel res_owned.err) { ret err[diag.Refusal].err{res_owned.err}; }
+        c.of_name = res_owned.ok;
+    }
+    val res_extend: res[str, diag.Refusal] = extend(l, t.data[8]);
+    if (sel res_extend.err) { ret err[diag.Refusal].err{res_extend.err}; }
+    c.extend = res_extend.ok;
+    val res_flags: res[str, diag.Refusal] = flags(f.alloc, l, t.data[9]);
+    if (sel res_flags.err) { ret err[diag.Refusal].err{res_flags.err}; }
+    c.flags     = res_flags.ok;
+    c.unspelled = flagged(t.data[9], "unspelled");
+    val res_requires: res[str, diag.Refusal] = requires(f.alloc, l, t.data[10]);
+    if (sel res_requires.err) { ret err[diag.Refusal].err{res_requires.err}; }
+    c.requires = res_requires.ok;
+    val res_debug: res[i64, diag.Refusal] = debug(l, t.data[11]);
+    if (sel res_debug.err) { ret err[diag.Refusal].err{res_debug.err}; }
+    c.dwarf = res_debug.ok;
+    val res_debug_data: res[i64, diag.Refusal] = debug(l, t.data[12]);
+    if (sel res_debug_data.err) { ret err[diag.Refusal].err{res_debug_data.err}; }
+    c.cv = res_debug_data.ok;
+    if (!pushed(vector.push[Class](?f.classes, c))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the class whose name is `v`, -1 for none
+fun class_index(f: *Families, v: View) i64 {
+    var i: usize = 0;
+    for (i < f.classes.len) {
+        if (view_eq_str(v, f.classes.data[i].name)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# `tuple <class> <of> <numbers> <arity> <step> <order> <named>`: a class of tuples of `arity` registers of the classes
+# `of`, one numbered n for each n of each comma-separated range of `numbers` by `step`, its kind and slot its first
+# such class's, its count the largest of theirs and its width the first's taken `arity` times, unspelled, as its rows
+# are spelled by their members, and each named by its members under `members` or its class and first under `first`
+fun tuple_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 8) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var c:        Class;
+    val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+    c.name     = res_name.ok;
+    c.tuple_of = vector.init[u32](f.alloc);
+    val of: View  = t.data[2];
+    var at: usize = 0;
+    for (at <= of.len) {
+        var end: usize = at;
+        for (end < of.len && of.data[end] != ',') {
+            end = end + 1;
+        }
+        val k: i64 = class_index(f, View{data: ?of.data[at], len: end - at});
+        if (k < 0 || f.classes.data[k::usize].arity != 0)   { ret err[diag.Refusal].err{lines.refuse(l, BAD_TUPLE, nil)}; }
+        if (!pushed(vector.push[u32](?c.tuple_of, k::u32))) { ret err[diag.Refusal].err{memory(l)}; }
+        at = end + 1;
+    }
+    val base:  *Class = ?f.classes.data[c.tuple_of.data[0]];
+    var count: u32    = 0;
+    var j:     usize  = 0;
+    for (j < c.tuple_of.len) {
+        if (f.classes.data[c.tuple_of.data[j]].count > count) { count = f.classes.data[c.tuple_of.data[j]].count; }
+        j = j + 1;
+    }
+    val res_decimal: res[u32, diag.Refusal] = decimal(l, t.data[4]);
+    if (sel res_decimal.err) { ret err[diag.Refusal].err{res_decimal.err}; }
+    c.arity = res_decimal.ok;
+    val res_decimal_data: res[u32, diag.Refusal] = decimal(l, t.data[5]);
+    if (sel res_decimal_data.err) { ret err[diag.Refusal].err{res_decimal_data.err}; }
+    c.step = res_decimal_data.ok;
+    if (view_eq_str(t.data[6], "significance"))                                        { c.order = "register.SIGNIFICANCE"; }
+    or (view_eq_str(t.data[6], "address"))                                             { c.order = "register.ADDRESS"; }
+    or (view_eq_str(t.data[6], "apart"))                                               { c.order = "register.APART"; }
+    if (c.order == nil || c.arity < 2 || c.arity > 255 || c.step == 0 || c.step > 255) { ret err[diag.Refusal].err{lines.refuse(l, BAD_TUPLE, nil)}; }
+    c.by_first = view_eq_str(t.data[7], "first");
+    if (!c.by_first && !view_eq_str(t.data[7], "members")) { ret err[diag.Refusal].err{lines.refuse(l, BAD_TUPLE, nil)}; }
+    c.tuples = vector.init[u32](f.alloc);
+    val ns: View = t.data[3];
+    at = 0;
+    for (at <= ns.len) {
+        var end: usize = at;
+        for (end < ns.len && ns.data[end] != ',') {
+            end = end + 1;
+        }
+        var lo:          u32               = 0;
+        var hi:          u32               = 0;
+        val err_numbers: err[diag.Refusal] = numbers(l, View{data: ?ns.data[at], len: end - at}, count, ?lo, ?hi);
+        if (sel err_numbers.err) { ret err_numbers; }
+        for (lo <= hi) {
+            if (!pushed(vector.push[u32](?c.tuples, lo))) { ret err[diag.Refusal].err{memory(l)}; }
+            lo = lo + c.step;
+        }
+        at = end + 1;
+    }
+    c.kind      = base.kind;
+    c.width     = Quantity{fixed: base.width.fixed * c.arity, per: base.width.per * c.arity, scale: base.width.scale};
+    c.count     = count;
+    c.of        = -1;
+    c.extend    = "register.UNSTATED";
+    c.flags     = "register.UNSPELLED";
+    c.unspelled = true;
+    c.dwarf     = -1;
+    c.cv        = -1;
+    if (!pushed(vector.push[Class](?f.classes, c))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun tile_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 7) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var c: Class;
+    c.per      = 0;
+    c.per_slot = 0;
+    c.slice    = 0;
+    val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+    c.name = res_name.ok;
+    val opt_slot_named: opt[u8] = slot_named(f, t.data[2]);
+    if (sel opt_slot_named.none) { ret err[diag.Refusal].err{lines.refuse(l, UNKNOWN, nil)}; }
+    val unit: u32 = f.slots.data[opt_slot_named.some].unit;
+    c.width = Quantity{fixed: 0, per: unit, scale: opt_slot_named.some};
+    val res_decimal: res[u32, diag.Refusal] = decimal(l, t.data[3]);
+    if (sel res_decimal.err)                                                                               { ret err[diag.Refusal].err{res_decimal.err}; }
+    if (res_decimal.ok == 0 || (res_decimal.ok & (res_decimal.ok - 1)) != 0 || unit % res_decimal.ok != 0) { ret err[diag.Refusal].err{lines.refuse(l, BAD_ELEMENT, nil)}; }
+    c.element = res_decimal.ok;
+    val res_decimal_data: res[u32, diag.Refusal] = decimal(l, t.data[4]);
+    if (sel res_decimal_data.err)                  { ret err[diag.Refusal].err{res_decimal_data.err}; }
+    if (res_decimal_data.ok != res_decimal.ok / 8) { ret err[diag.Refusal].err{lines.refuse(l, BAD_ELEMENT, nil)}; }
+    c.count = res_decimal_data.ok;
+    c.first = 0;
+    c.last  = res_decimal_data.ok - 1;
+    val res_pattern: res[str, diag.Refusal] = owned(f.alloc, l, t.data[5]);
+    if (sel res_pattern.err) { ret err[diag.Refusal].err{res_pattern.err}; }
+    c.pattern = res_pattern.ok;
+    c.kind    = "register.TILE";
+    c.extend  = "register.KEEP";
+    c.flags   = "0";
+    c.of      = -1;
+    c.dwarf   = -1;
+    c.cv      = -1;
+    c.tile    = true;
+    val res_requires: res[str, diag.Refusal] = requires(f.alloc, l, t.data[6]);
+    if (sel res_requires.err) { ret err[diag.Refusal].err{res_requires.err}; }
+    c.requires = res_requires.ok;
+    if (!pushed(vector.push[Class](?f.classes, c))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# a `slices <class> <tile> <direction> <pattern> <requires>` record: the horizontal (`h`) or vertical (`v`) slices of
+# the tiles of tile class `tile`, numbered slice-major as slice s of tile t is number s * tiles + t, so a horizontal
+# slice's number is its row of the array and every number below the class's count exists at every multiplier. there
+# are svl / 8 in each direction whatever the element: tiles of e / 8 times svl / e slices
+fun slices_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 6) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var c:        Class;
+    val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+    c.name = res_name.ok;
+    var of: i64   = -1;
+    var i:  usize = 0;
+    for (i < f.classes.len) {
+        if (f.classes.data[i].tile && view_eq_str(t.data[2], f.classes.data[i].name)) { of = i::i64; }
+        i = i + 1;
+    }
+    if (of < 0) { ret err[diag.Refusal].err{lines.refuse(l, BAD_SLICES, nil)}; }
+    val tile: *Class = ?f.classes.data[of];
+    if (view_eq_str(t.data[3], "h")) { c.slice = 1; }
+    or (view_eq_str(t.data[3], "v")) { c.slice = 2; }
+    or                               { ret err[diag.Refusal].err{lines.refuse(l, BAD_SLICES, nil)}; }
+    c.slice_of = of::u32;
+    c.width    = tile.width;
+    if (c.slice == 2) { c.width = Quantity{fixed: tile.element, per: 0, scale: 0}; }
+    c.element  = tile.element;
+    c.count    = 0;
+    c.per      = tile.width.per / 8;
+    c.per_slot = tile.width.scale;
+    c.first    = 0;
+    c.last     = c.per * f.slots.data[tile.width.scale].max - 1;
+    val res_pattern: res[str, diag.Refusal] = owned(f.alloc, l, t.data[4]);
+    if (sel res_pattern.err) { ret err[diag.Refusal].err{res_pattern.err}; }
+    c.pattern = res_pattern.ok;
+    c.kind    = "register.TILE";
+    c.extend  = "register.KEEP";
+    c.flags   = "0";
+    c.of      = -1;
+    c.dwarf   = -1;
+    c.cv      = -1;
+    c.tile    = false;
+    val res_requires: res[str, diag.Refusal] = requires(f.alloc, l, t.data[5]);
+    if (sel res_requires.err) { ret err[diag.Refusal].err{res_requires.err}; }
+    c.requires = res_requires.ok;
+    if (!pushed(vector.push[Class](?f.classes, c))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# a `system <class> <width>` record: the class of the system registers, numbered by the encoding an MRS or MSR names
+# them by, its rows those the system register model names
+fun system_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 3) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    var i: usize = 0;
+    for (i < f.classes.len) {
+        if (f.classes.data[i].open) { ret err[diag.Refusal].err{lines.refuse(l, TWO_SYSTEMS, nil)}; }
+        i = i + 1;
+    }
+    var c:        Class;
+    val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+    c.name = res_name.ok;
+    val res_width: res[Quantity, diag.Refusal] = width(f, l, t.data[2]);
+    if (sel res_width.err) { ret err[diag.Refusal].err{res_width.err}; }
+    c.width    = res_width.ok;
+    c.kind     = "register.SYSTEM";
+    c.count    = SYSTEM_COUNT;
+    c.first    = 0;
+    c.last     = SYSTEM_COUNT - 1;
+    c.extend   = "register.KEEP";
+    c.flags    = "0";
+    c.of       = -1;
+    c.dwarf    = -1;
+    c.cv       = -1;
+    c.requires = nil;
+    c.open     = true;
+    if (!pushed(vector.push[Class](?f.classes, c))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# a `named <register> <flags> <dwarf> <codeview>` record
+fun named_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 5) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    val res_reg: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+    if (sel res_reg.err) { ret err[diag.Refusal].err{res_reg.err}; }
+    val res_flags: res[str, diag.Refusal] = flags(f.alloc, l, t.data[2]);
+    if (sel res_flags.err) { ret err[diag.Refusal].err{res_flags.err}; }
+    val res_debug: res[i64, diag.Refusal] = debug(l, t.data[3]);
+    if (sel res_debug.err) { ret err[diag.Refusal].err{res_debug.err}; }
+    val res_debug_data: res[i64, diag.Refusal] = debug(l, t.data[4]);
+    if (sel res_debug_data.err)                                                                                                                                                                    { ret err[diag.Refusal].err{res_debug_data.err}; }
+    if (!pushed(vector.push[Named](?f.named, Named{register: res_reg.ok, flags: res_flags.ok, unspelled: flagged(t.data[2], "unspelled"), dwarf: res_debug.ok, cv: res_debug_data.ok, line: @l}))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# a `gauge <quantity> <requirement> <register> <count>` record: the register measuring the quantity while the
+# requirement holds, `-` for always, each count of its value standing for `count` bits of it
+fun gauge_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 5) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    val opt_measure_named: opt[u32] = measure_named(f, t.data[1]);
+    if (sel opt_measure_named.none) { ret err[diag.Refusal].err{lines.refuse(l, BAD_GAUGE, nil)}; }
+    var when: str = nil;
+    if (!view_eq_str(t.data[2], "-")) {
+        if (!extension_named(t.data[2])) { ret err[diag.Refusal].err{lines.refuse(l, BAD_GAUGE, nil)}; }
+        val res_owned: res[str, diag.Refusal] = owned(f.alloc, l, t.data[2]);
+        if (sel res_owned.err) { ret err[diag.Refusal].err{res_owned.err}; }
+        when = res_owned.ok;
+    }
+    val res_reg: res[str, diag.Refusal] = owned(f.alloc, l, t.data[3]);
+    if (sel res_reg.err) { ret err[diag.Refusal].err{res_reg.err}; }
+    val res_count: res[u32, diag.Refusal] = decimal(l, t.data[4]);
+    if (sel res_count.err) { ret err[diag.Refusal].err{res_count.err}; }
+    val m: *Measure = ?f.measures.data[opt_measure_named.some];
+    if (!pushed(vector.push[Gauge](?m.gauges, Gauge{when: when, register: res_reg.ok, count: res_count.ok}))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# a `slot <name> <requirement> <quantity>` record: the slot named, made at its first record, bound to the quantity while
+# the requirement holds, `-` for always
+fun slot_line(f: *Families, l: *lines.Line, t: *vector.Vector[View]) err[diag.Refusal] {
+    if (t.len != 4) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+    val opt_measure_named: opt[u32] = measure_named(f, t.data[3]);
+    if (sel opt_measure_named.none) { ret err[diag.Refusal].err{lines.refuse(l, BAD_SLOT, nil)}; }
+    val m:         *Measure = ?f.measures.data[opt_measure_named.some];
+    val opt_found: opt[u8]  = slot_named(f, t.data[1]);
+    var at:        usize    = f.slots.len;
+    if (sel opt_found.some) { at = opt_found.some::usize; }
+    or {
+        val res_name: res[str, diag.Refusal] = owned(f.alloc, l, t.data[1]);
+        if (sel res_name.err)                                                                    { ret err[diag.Refusal].err{res_name.err}; }
+        if (!pushed(vector.push[Slot](?f.slots, Slot{name: res_name.ok, unit: m.unit, max: 0}))) { ret err[diag.Refusal].err{memory(l)}; }
+    }
+    val slot: *Slot = ?f.slots.data[at];
+    if (slot.unit != m.unit) { ret err[diag.Refusal].err{lines.refuse(l, BAD_SLOT, nil)}; }
+    if (m.max > slot.max)    { slot.max = m.max; }
+    var when: str = nil;
+    if (!view_eq_str(t.data[2], "-")) {
+        if (!extension_named(t.data[2])) { ret err[diag.Refusal].err{lines.refuse(l, BAD_SLOT, nil)}; }
+        val res_owned: res[str, diag.Refusal] = owned(f.alloc, l, t.data[2]);
+        if (sel res_owned.err) { ret err[diag.Refusal].err{res_owned.err}; }
+        when = res_owned.ok;
+    }
+    if (!pushed(vector.push[Bind](?f.binds, Bind{slot: at::u32, when: when, quantity: opt_measure_named.some}))) { ret err[diag.Refusal].err{memory(l)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+fun read(a: *A.Allocator, t: *source.Tree, f: *Families) err[diag.Refusal] {
+    val opt_file: opt[*source.File] = source.find(t, FAMILIES);
+    if (sel opt_file.none) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, NO_FILE, nil)}; }
+    val res_read: res[vector.Vector[lines.Line], diag.Refusal] = lines.read(a, opt_file.some, '#');
+    if (sel res_read.err) { ret err[diag.Refusal].err{res_read.err}; }
+    var ls: vector.Vector[lines.Line] = res_read.ok;
+    var i:  usize                     = 0;
+    for (i < ls.len) {
+        val l:          *lines.Line                            = ?ls.data[i];
+        val res_tokens: res[vector.Vector[View], diag.Refusal] = lines.tokens(a, l);
+        if (sel res_tokens.err) { ret err[diag.Refusal].err{res_tokens.err}; }
+        var tokens:   vector.Vector[View] = res_tokens.ok;
+        var err_done: err[diag.Refusal]   = err[diag.Refusal].ok{};
+        if (view_eq_str(tokens.data[0], "quantity")) {
+            if (tokens.len != 4) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+            val res_name: res[str, diag.Refusal] = owned(a, l, tokens.data[1]);
+            if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+            val res_unit: res[u32, diag.Refusal] = decimal(l, tokens.data[2]);
+            if (sel res_unit.err) { ret err[diag.Refusal].err{res_unit.err}; }
+            val res_max: res[u32, diag.Refusal] = decimal(l, tokens.data[3]);
+            if (sel res_max.err)                                                                                                                           { ret err[diag.Refusal].err{res_max.err}; }
+            if (!pushed(vector.push[Measure](?f.measures, Measure{name: res_name.ok, unit: res_unit.ok, max: res_max.ok, gauges: vector.init[Gauge](a)}))) { ret err[diag.Refusal].err{memory(l)}; }
+        }
+        or (view_eq_str(tokens.data[0], "gauge"))  { err_done = gauge_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "slot"))   { err_done = slot_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "class"))  { err_done = class_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "system")) { err_done = system_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "named"))  { err_done = named_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "tile"))   { err_done = tile_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "slices")) { err_done = slices_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "tuple"))  { err_done = tuple_line(f, l, ?tokens); }
+        or (view_eq_str(tokens.data[0], "alias")) {
+            if (tokens.len != 3) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+            val res_name: res[str, diag.Refusal] = owned(a, l, tokens.data[1]);
+            if (sel res_name.err) { ret err[diag.Refusal].err{res_name.err}; }
+            val res_reg: res[str, diag.Refusal] = owned(a, l, tokens.data[2]);
+            if (sel res_reg.err)                                                                                   { ret err[diag.Refusal].err{res_reg.err}; }
+            if (!pushed(vector.push[Alias](?f.aliases, Alias{name: res_name.ok, register: res_reg.ok, line: @l}))) { ret err[diag.Refusal].err{memory(l)}; }
+        }
+        or (view_eq_str(tokens.data[0], "link")) {
+            if (tokens.len != 2 || f.link != nil) { ret err[diag.Refusal].err{lines.refuse(l, BAD_FIELDS, nil)}; }
+            val res_reg: res[str, diag.Refusal] = owned(a, l, tokens.data[1]);
+            if (sel res_reg.err) { ret err[diag.Refusal].err{res_reg.err}; }
+            f.link = res_reg.ok;
+        }
+        or                    { ret err[diag.Refusal].err{lines.refuse(l, BAD_RECORD, nil)}; }
+        if (sel err_done.err) { ret err_done; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the name a pattern gives number `n`, its `%` replaced by the decimal digits
+fun spell(a: *A.Allocator, pattern: str, n: u32) res[str, StrError] {
+    var digits: [12]u8;
+    val len:    usize = format.put_i64(?digits[0], n::i64);
+    digits[len] = 0;
+    var at: usize = 0;
+    for (pattern[at] != 0 && pattern[at] != '%') {
+        at = at + 1;
+    }
+    if (pattern[at] == 0) { ret str_copy_slice(a, pattern, 0, at); }
+    val res_head: res[str, StrError] = str_copy_slice(a, pattern, 0, at);
+    if (sel res_head.err) { ret res_head; }
+    ret str_join(a, res_head.ok, ?digits[0], ?pattern[at + 1]);
+}
+
+# the rows of open class `c`, the class at `ci`, one per encoding the system register model names and in the order of
+# their numbers: named as its MRS accessor names it, else as its MSR one, a name of the other direction an alias, and
+# in the bank of the register or array element its name is the name of, else of the one its MRS accessor reads, else
+# of the one its MSR accessor writes
+fun system_rows(f: *Families, ci: u32, c: *Class) err[diag.Refusal] {
+    val m:     *system.Model      = f.system;
+    val first: u32                = SYSTEM_OP0 << 14;
+    var order: vector.Vector[u64] = vector.init[u64](f.alloc);
+    var k:     usize              = 0;
+    for (k < m.accessors.len) {
+        val a: *system.Accessor = ?m.accessors.data[k];
+        if (a.number < first || a.number - first >= c.count)                             { ret err[diag.Refusal].err{diag.refusal(system.REGISTERS, 0, BAD_SYSTEM, a.name)}; }
+        if (!pushed(vector.push[u64](?order, ((a.number - first)::u64 << 32) | k::u64))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+        k = k + 1;
+    }
+    sort.sort[u64](order.data, order.len);
+    var i: usize = 0;
+    for (i < order.len) {
+        val n:       u32   = (order.data[i] >> 32)::u32;
+        var read:    str   = nil;
+        var write:   str   = nil;
+        var storage: u32   = 0;
+        var owned:   bool  = false;
+        var j:       usize = i;
+        for (j < order.len && (order.data[j] >> 32)::u32 == n) {
+            val a: *system.Accessor = ?m.accessors.data[(order.data[j] & 0xFFFF_FFFF)::usize];
+            if (a.read) {
+                if (read != nil && !str_equals(read, a.name)) { ret err[diag.Refusal].err{diag.refusal(system.REGISTERS, 0, SYSTEM_TWICE, a.name)}; }
+                if (read == nil && !owned)                    { storage = a.storage; }
+                read = a.name;
+            }
+            or {
+                if (write != nil && !str_equals(write, a.name)) { ret err[diag.Refusal].err{diag.refusal(system.REGISTERS, 0, SYSTEM_TWICE, a.name)}; }
+                if (read == nil && write == nil && !owned)      { storage = a.storage; }
+                write = a.name;
+            }
+            if (a.own && !owned) {
+                storage = a.storage;
+                owned   = true;
+            }
+            j = j + 1;
+        }
+        var r: Row;
+        r.name = read;
+        if (read == nil) { r.name = write; }
+        r.class     = ci;
+        r.number    = n;
+        r.bank      = c.base + storage;
+        r.offset    = Quantity{fixed: 0, per: 0, scale: 0};
+        r.stride    = Quantity{fixed: 0, per: 0, scale: 0};
+        r.count     = Quantity{fixed: 1, per: 0, scale: 0};
+        r.flags     = c.flags;
+        r.unspelled = c.unspelled;
+        r.requires  = nil;
+        r.extend    = c.extend;
+        r.dwarf     = -1;
+        r.cv        = -1;
+        if (!pushed(vector.push[Row](?f.rows, r))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+        if (read != nil && write != nil && !str_equals(read, write)) {
+            val line: lines.Line = lines.Line{file: system.REGISTERS, number: 0, text: View{data: write, len: str_len(write)}};
+            if (!pushed(vector.push[Alias](?f.aliases, Alias{name: write, register: read, line: line}))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+        }
+        i = j;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the row of each class that lies within another register's bank placed there, in the bank of the spelled register of
+# another class its family names, at the bit it states
+fun place_within(f: *Families) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < f.rows.len) {
+        val r: *Row   = ?f.rows.data[i];
+        val c: *Class = ?f.classes.data[r.class];
+        if (c.within != nil) {
+            var found: bool  = false;
+            var j:     usize = 0;
+            for (j < f.rows.len && !found) {
+                val o: *Row = ?f.rows.data[j];
+                if (o.class != r.class && str_equals(o.name, c.within)) {
+                    r.bank   = o.bank;
+                    r.offset = Quantity{fixed: c.offset, per: 0, scale: 0};
+                    found    = true;
+                }
+                j = j + 1;
+            }
+            if (!found) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, UNKNOWN, c.within)}; }
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the flags and debug numbers `named` records state, each of the row its name spells
+fun name_rows(f: *Families) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < f.named.len) {
+        val x:     *Named = ?f.named.data[i];
+        var found: bool   = false;
+        var j:     usize  = 0;
+        for (j < f.rows.len && !found) {
+            val r: *Row = ?f.rows.data[j];
+            if (!r.unspelled && str_equals(r.name, x.register)) {
+                r.flags     = x.flags;
+                r.unspelled = x.unspelled;
+                r.dwarf     = x.dwarf;
+                r.cv        = x.cv;
+                found       = true;
+            }
+            j = j + 1;
+        }
+        if (!found) { ret err[diag.Refusal].err{lines.refuse(?x.line, UNKNOWN, x.register)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the banks of every class, then the rows of every class in the order of the classes, which is the order of their identities
+fun expand(f: *Families) err[diag.Refusal] {
+    var i:    usize = 0;
+    var next: u32   = 0;
+    var tile: u32   = 0;
+    var held: bool  = false;
+    for (i < f.classes.len) {
+        val c: *Class = ?f.classes.data[i];
+        var j: usize  = 0;
+        for (j < i) {
+            if (str_equals(f.classes.data[j].name, c.name)) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, CLASS_TWICE, c.name)}; }
+            j = j + 1;
+        }
+        if (c.of_name != nil) {
+            var found: bool = false;
+            j = 0;
+            for (j < f.classes.len) {
+                if (str_equals(f.classes.data[j].name, c.of_name)) {
+                    c.of  = j::i64;
+                    found = true;
+                }
+                j = j + 1;
+            }
+            if (!found) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, UNKNOWN, c.of_name)}; }
+            val o: *Class = ?f.classes.data[c.of];
+            if (o.of_name != nil || o.first > c.first || o.last < c.last || o.tile) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, BAD_BANK, c.name)}; }
+        }
+        or (c.slice != 0) { c.base = f.classes.data[c.slice_of].base; }
+        or (c.tile) {
+            if (!held) {
+                tile = next;
+                held = true;
+                next = next + 1;
+            }
+            c.base = tile;
+        }
+        or (c.within != nil || c.arity != 0) { c.base = 0; }
+        or (c.open) {
+            if (f.system == nil) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, NO_SYSTEM, c.name)}; }
+            c.base = next;
+            next   = next + f.system.storages;
+        }
+        or {
+            c.base = next;
+            next   = next + c.last - c.first + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < f.classes.len) {
+        val c: *Class = ?f.classes.data[i];
+        if (c.open) {
+            val err_opened: err[diag.Refusal] = system_rows(f, i::u32, c);
+            if (sel err_opened.err) { ret err_opened; }
+            i = i + 1;
+            cnt;
+        }
+        if (c.arity != 0) {
+            val err_tupled: err[diag.Refusal] = tuple_rows(f, i::u32, c);
+            if (sel err_tupled.err) { ret err_tupled; }
+            i = i + 1;
+            cnt;
+        }
+        var n: u32 = c.first;
+        for (n <= c.last) {
+            var r:           Row;
+            val res_spelled: res[str, StrError] = spell(f.alloc, c.pattern, n);
+            if (sel res_spelled.err) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+            r.name      = res_spelled.ok;
+            r.class     = i::u32;
+            r.number    = n;
+            r.count     = Quantity{fixed: 1, per: 0, scale: 0};
+            r.flags     = c.flags;
+            r.unspelled = c.unspelled;
+            r.requires  = c.requires;
+            r.extend    = c.extend;
+            r.dwarf     = -1;
+            r.cv        = -1;
+            if (c.dwarf >= 0) { r.dwarf = c.dwarf + (n - c.first)::i64; }
+            if (c.cv >= 0)    { r.cv = c.cv + (n - c.first)::i64; }
+            if (c.tile) {
+                val unit: u32 = c.width.per;
+                r.bank   = c.base;
+                r.offset = Quantity{fixed: 0, per: unit * n, scale: c.width.scale};
+                r.stride = Quantity{fixed: 0, per: unit * c.count, scale: c.width.scale};
+                r.count  = Quantity{fixed: 0, per: unit / c.element, scale: c.width.scale};
+            }
+            or (c.slice == 1) {
+                # horizontal slice n is row n of the array
+                val tile: *Class = ?f.classes.data[c.slice_of];
+                r.bank   = tile.base;
+                r.offset = Quantity{fixed: 0, per: tile.width.per * n, scale: tile.width.scale};
+                r.stride = Quantity{fixed: 0, per: 0, scale: 0};
+            }
+            or (c.slice == 2) {
+                # vertical slice s of tile t is element s of each of the tile's rows
+                val tile:  *Class = ?f.classes.data[c.slice_of];
+                val unit:  u32    = tile.width.per;
+                val tiles: u32    = tile.count;
+                r.bank   = tile.base;
+                r.offset = Quantity{fixed: (n / tiles) * tile.element, per: unit * (n % tiles), scale: tile.width.scale};
+                r.stride = Quantity{fixed: 0, per: unit * tiles, scale: tile.width.scale};
+                r.count  = Quantity{fixed: 0, per: unit / tile.element, scale: tile.width.scale};
+            }
+            or (c.of >= 0)                             { r.bank = f.classes.data[c.of].base + (n - f.classes.data[c.of].first); }
+            or                                         { r.bank = c.base + (n - c.first); }
+            if (!pushed(vector.push[Row](?f.rows, r))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the row of the register numbered `n` in the first of tuple class `c`'s member classes holding one, -1 for none
+fun member_row(f: *Families, c: *Class, n: u32) i64 {
+    var k: usize = 0;
+    for (k < c.tuple_of.len) {
+        var j: usize = 0;
+        for (j < f.rows.len) {
+            if (f.rows.data[j].class == c.tuple_of.data[k] && f.rows.data[j].number == n) { ret j::i64; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    ret -1;
+}
+
+# the rows of tuple class `c`, the class at `ci`, read after every row its members are: tuple n of each of its numbers,
+# named by its members joined by `:` or by its class and first member, numbered as its first member, existing where its members do and reading zero
+# where its first does, every member then the first
+fun tuple_rows(f: *Families, ci: u32, c: *Class) err[diag.Refusal] {
+    var t: usize = 0;
+    for (t < c.tuples.len) {
+        val n:    u32 = c.tuples.data[t];
+        val lead: i64 = member_row(f, c, n);
+        if (lead < 0) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, BAD_TUPLE, c.name)}; }
+        val head: Row  = f.rows.data[lead::usize];
+        val zero: bool = holds_flag(head.flags, "register.ZERO");
+        var r:    Row;
+        r.name      = head.name;
+        r.class     = ci;
+        r.number    = n;
+        r.bank      = head.bank;
+        r.flags     = "register.UNSPELLED";
+        r.unspelled = true;
+        r.requires  = head.requires;
+        r.extend    = "register.UNSTATED";
+        r.dwarf     = -1;
+        r.cv        = -1;
+        r.members   = vector.init[u32](f.alloc);
+        if (zero) { r.flags = "register.ZERO | register.UNSPELLED"; }
+        if (c.by_first) {
+            val res_joined: res[str, StrError] = str_join(f.alloc, c.name, ".", head.name);
+            if (sel res_joined.err) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+            r.name = res_joined.ok;
+        }
+        var k: u32 = 0;
+        for (k < c.arity) {
+            var m: i64 = lead;
+            if (!zero) { m = member_row(f, c, n + k); }
+            if (m < 0) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, BAD_TUPLE, c.name)}; }
+            val req: str = f.rows.data[m::usize].requires;
+            if (!((req == nil && head.requires == nil) || (req != nil && head.requires != nil && str_equals(req, head.requires)))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, TUPLE_REQUIRES, c.name)}; }
+            if (!pushed(vector.push[u32](?r.members, m::u32)))                                                                     { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+            if (k > 0 && !c.by_first) {
+                val res_joined: res[str, StrError] = str_join(f.alloc, r.name, ":", f.rows.data[m::usize].name);
+                if (sel res_joined.err) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+                r.name = res_joined.ok;
+            }
+            k = k + 1;
+        }
+        if (!pushed(vector.push[Row](?f.rows, r))) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, c.name)}; }
+        t = t + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# whether the flags expression `flags` names `flag`, its terms joined by ` | `
+fun holds_flag(flags: str, flag: str) bool {
+    val len:  usize = str_len(flags);
+    val want: usize = str_len(flag);
+    var at:   usize = 0;
+    for (at + want <= len) {
+        var same: bool  = true;
+        var k:    usize = 0;
+        for (k < want && same) {
+            if (flags[at + k] != flag[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same && (at + want == len || flags[at + want] == ' ')) { ret true; }
+        at = at + 1;
+    }
+    ret false;
+}
+
+# the register the `link` record names flagged LINK, the one a call leaves the return address in
+fun link(f: *Families) err[diag.Refusal] {
+    if (f.link == nil) { ret err[diag.Refusal].ok{}; }
+    var i: usize = 0;
+    for (i < f.rows.len) {
+        val r: *Row = ?f.rows.data[i];
+        if (str_equals(r.name, f.link)) {
+            if (str_equals(r.flags, "0")) {
+                r.flags = "register.LINK";
+                ret err[diag.Refusal].ok{};
+            }
+            val res_joined: res[str, StrError] = str_join(f.alloc, r.flags, " | ", "register.LINK");
+            if (sel res_joined.err) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, diag.MEMORY, f.link)}; }
+            r.flags = res_joined.ok;
+            ret err[diag.Refusal].ok{};
+        }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, UNKNOWN, f.link)};
+}
+
+fun number(n: i64) emit.Value {
+    ret emit.Value.number{n};
+}
+
+fun name(s: str) emit.Value {
+    ret emit.Value.name{s};
+}
+
+fun quantity(f: *emit.File, q: Quantity) emit.Value {
+    val r: *emit.Record = emit.record(f, "quantity.Scaled");
+    emit.member(f, r, "fixed", number(q.fixed::i64));
+    emit.member(f, r, "per", number(q.per::i64));
+    emit.member(f, r, "scale", number(q.scale::i64));
+    ret emit.Value.record{r};
+}
+
+# the name an extension requirement is declared under, its alternatives joined by `_`
+fun requirement_name(f: *emit.File, spec: str) str {
+    ret emit.ident(f, spec);
+}
+
+# `spec` declared as arrays, one id array per extension it names and the alternatives, once each
+fun declare_requirement(f: *emit.File, spec: str, seen: *vector.Vector[str]) err[diag.Refusal] {
+    if (known(seen, spec)) { ret err[diag.Refusal].ok{}; }
+    vector.push[str](seen, spec);
+    val alts: *emit.Array = emit.array(f, "requirement.Alternative");
+    val len:  usize       = str_len(spec);
+    var at:   usize       = 0;
+    for (at <= len) {
+        var end: usize = at;
+        for (end < len && spec[end] != '|') {
+            end = end + 1;
+        }
+        val res_token: res[str, StrError] = str_copy_slice(f.alloc, spec, at, end - at);
+        if (sel res_token.err) { ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, spec)}; }
+        val label: str = emit.concat(f, "ID_", emit.ident(f, res_token.ok));
+        if (!known(seen, label)) {
+            vector.push[str](seen, label);
+            val ids: *emit.Array = emit.array(f, "requirement.Id");
+            emit.item(f, ids, name(extension_id(f, res_token.ok)));
+            emit.declare(f, label, nil, emit.Value.array{ids});
+        }
+        val r: *emit.Record = emit.record(f, "requirement.Ids");
+        emit.member(f, r, "at", emit.element(f, label, 0));
+        emit.member(f, r, "len", number(1));
+        val alt: *emit.Record = emit.record(f, "requirement.Alternative");
+        emit.member(f, alt, "all", emit.Value.record{r});
+        emit.member(f, alt, "none", name("requirement.NO_IDS"));
+        emit.item(f, alts, emit.Value.record{alt});
+        at = end + 1;
+    }
+    emit.declare(f, emit.concat(f, "REQUIRES_", requirement_name(f, spec)), nil, emit.Value.array{alts});
+    ret err[diag.Refusal].ok{};
+}
+
+fun known(seen: *vector.Vector[str], text: str) bool {
+    var i: usize = 0;
+    for (i < seen.len) {
+        if (str_equals(seen.data[i], text)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun requirement_value(f: *emit.File, spec: str) emit.Value {
+    if (spec == nil) { ret name("requirement.NO_ALTERNATIVES"); }
+    var n: u32   = 1;
+    var i: usize = 0;
+    for (spec[i] != 0) {
+        if (spec[i] == '|') { n = n + 1; }
+        i = i + 1;
+    }
+    val r: *emit.Record = emit.record(f, "requirement.Requirement");
+    emit.member(f, r, "at", emit.element(f, emit.concat(f, "REQUIRES_", requirement_name(f, spec)), 0));
+    emit.member(f, r, "len", number(n::i64));
+    ret emit.Value.record{r};
+}
+
+# a column of one debug format: the number of every row, and the rows by number
+fun column(c: *set.Context, f: *emit.File, fam: *Families, tag: str, format: str, cv: bool, out: *emit.Array) err[diag.Refusal] {
+    val numbers: *emit.Array        = emit.array(f, "u32");
+    var order:   vector.Vector[u64] = vector.init[u64](c.alloc);
+    var i:       usize              = 0;
+    for (i < fam.rows.len) {
+        var n: i64 = fam.rows.data[i].dwarf;
+        if (cv)    { n = fam.rows.data[i].cv; }
+        if (n < 0) { emit.item(f, numbers, name("register.UNNUMBERED")); }
+        or {
+            emit.item(f, numbers, number(n));
+            if (!pushed(vector.push[u64](?order, (n::u64 << 32) | i::u64))) { ret err[diag.Refusal].err{diag.refusal(nil, 0, diag.MEMORY, tag)}; }
+        }
+        i = i + 1;
+    }
+    sort.sort[u64](order.data, order.len);
+    val numbered: *emit.Array = emit.array(f, "index.Number");
+    i = 0;
+    for (i < order.len) {
+        val r: *emit.Record = emit.record(f, "index.Number");
+        emit.member(f, r, "key", number((order.data[i] >> 32)::i64));
+        emit.member(f, r, "row", number((order.data[i] & 0xFFFF_FFFF)::i64));
+        emit.item(f, numbered, emit.Value.record{r});
+        if (i > 0 && (order.data[i - 1] >> 32) == (order.data[i] >> 32)) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, emit.KEY_TWICE, tag)}; }
+        i = i + 1;
+    }
+    val rows:    str = emit.concat(f, tag, "_NUMBERS");
+    val ordered: str = emit.concat(f, tag, "_NUMBERED");
+    emit.declare(f, rows, nil, emit.Value.array{numbers});
+    emit.declare(f, ordered, nil, emit.Value.array{numbered});
+    val col: *emit.Record = emit.record(f, "register.Column");
+    emit.member(f, col, "format", name(format));
+    emit.member(f, col, "numbers", emit.element(f, rows, 0));
+    emit.member(f, col, "len", number(fam.rows.len::i64));
+    val idx: *emit.Record = emit.record(f, "index.Numbers");
+    emit.member(f, idx, "at", emit.element(f, ordered, 0));
+    emit.member(f, idx, "len", number(order.len::i64));
+    emit.member(f, col, "numbered", emit.Value.record{idx});
+    emit.item(f, out, emit.Value.record{col});
+    ret err[diag.Refusal].ok{};
+}
+
+# the system register model of the AARCHMRS release `archive`
+pub fun system_model(a: *A.Allocator, archive: *source.File) res[*system.Model, diag.Refusal] {
+    val res_member: res[source.File, diag.Refusal] = tar.member(a, archive, system.REGISTERS);
+    if (sel res_member.err) { ret res[*system.Model, diag.Refusal].err{res_member.err}; }
+    val res_file: res[*source.File, A.Error] = A.allocate[source.File](a, 1);
+    if (sel res_file.err) { ret res[*system.Model, diag.Refusal].err{diag.refusal(system.REGISTERS, 0, diag.MEMORY, nil)}; }
+    @res_file.ok = res_member.ok;
+    val res_read: res[system.Model, diag.Refusal] = system.read(a, res_file.ok);
+    if (sel res_read.err) { ret res[*system.Model, diag.Refusal].err{res_read.err}; }
+    val res_allocate: res[*system.Model, A.Error] = A.allocate[system.Model](a, 1);
+    if (sel res_allocate.err) { ret res[*system.Model, diag.Refusal].err{diag.refusal(system.REGISTERS, 0, diag.MEMORY, nil)}; }
+    @res_allocate.ok = res_read.ok;
+    ret res[*system.Model, diag.Refusal].ok{res_allocate.ok};
+}
+
+# the register families of tree `t` with their rows, banks and debug numbers derived, the classes and the rows in the
+# order the file states them, which is each one's index in the register file. `sys` is the system register model a
+# system class's rows come from, nil for families that state none
+pub fun families(a: *A.Allocator, t: *source.Tree, sys: *system.Model) res[Families, diag.Refusal] {
+    var fam: Families;
+    fam.alloc    = a;
+    fam.measures = vector.init[Measure](a);
+    fam.slots    = vector.init[Slot](a);
+    fam.binds    = vector.init[Bind](a);
+    fam.classes  = vector.init[Class](a);
+    fam.aliases  = vector.init[Alias](a);
+    fam.named    = vector.init[Named](a);
+    fam.rows     = vector.init[Row](a);
+    fam.link     = nil;
+    fam.system   = sys;
+    val err_read_it: err[diag.Refusal] = read(a, t, ?fam);
+    if (sel err_read_it.err) { ret res[Families, diag.Refusal].err{err_read_it.err}; }
+    val err_expanded: err[diag.Refusal] = expand(?fam);
+    if (sel err_expanded.err) { ret res[Families, diag.Refusal].err{err_expanded.err}; }
+    val err_renamed: err[diag.Refusal] = name_rows(?fam);
+    if (sel err_renamed.err) { ret res[Families, diag.Refusal].err{err_renamed.err}; }
+    val err_placed: err[diag.Refusal] = place_within(?fam);
+    if (sel err_placed.err) { ret res[Families, diag.Refusal].err{err_placed.err}; }
+    val err_linked: err[diag.Refusal] = link(?fam);
+    if (sel err_linked.err) { ret res[Families, diag.Refusal].err{err_linked.err}; }
+    ret res[Families, diag.Refusal].ok{fam};
+}
+
+# the storage facts of the families as a register file: quantities, slot bindings, class widths and row footprints
+fun stored(a: *A.Allocator, fam: *Families) res[register.File, diag.Refusal] {
+    val res_made: res[register.File, diag.Refusal] = storage.file_make(a, fam.measures.len::u32, fam.binds.len::u32, fam.classes.len::u32, fam.rows.len::u32);
+    if (sel res_made.err) { ret res_made; }
+    val file: register.File = res_made.ok;
+    var i:    usize         = 0;
+    for (i < fam.measures.len) {
+        val m: *Measure = ?fam.measures.data[i];
+        file.quantities.at[i] = storage.powers(m.name, m.unit, m.max);
+        i                     = i + 1;
+    }
+    i = 0;
+    for (i < fam.binds.len) {
+        file.bindings.at[i] = storage.binding(fam.binds.data[i].slot, fam.binds.data[i].quantity);
+        i                   = i + 1;
+    }
+    i = 0;
+    for (i < fam.classes.len) {
+        val k: *Class = ?fam.classes.data[i];
+        file.classes[i].name  = k.name;
+        file.classes[i].width = storage.scaled(k.width.fixed, k.width.per, k.width.scale);
+        file.classes[i].arity = k.arity::u8;
+        i                     = i + 1;
+    }
+    i = 0;
+    for (i < fam.rows.len) {
+        val x: *Row = ?fam.rows.data[i];
+        file.registers[i] = register.Register{
+            name:    x.name,
+            class:   x.class::u16,
+            number:  x.number::u16,
+            bank:    x.bank::u16,
+            offset:  storage.scaled(x.offset.fixed, x.offset.per, x.offset.scale),
+            stride:  storage.scaled(x.stride.fixed, x.stride.per, x.stride.scale),
+            count:   storage.scaled(x.count.fixed, x.count.per, x.count.scale),
+            places:  register.ONE_PLACE,
+            reach:   register.Reach.bank{},
+            members: register.Rows{at: x.members.data, len: x.members.len::u32},
+        };
+        i = i + 1;
+    }
+    val err_indexed: err[diag.Refusal] = storage.index_rows(a, ?res_made.ok);
+    if (sel err_indexed.err) { ret res[register.File, diag.Refusal].err{err_indexed.err}; }
+    ret res_made;
+}
+
+# the aarch64 register file generated from the register families
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    val mrs: *source.Tree = set.input(c, "aarchmrs");
+    if (mrs == nil) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, NO_SYSTEM, nil)}; }
+    val res_archive: res[*source.File, diag.Refusal] = tar.release(mrs, "aarchmrs");
+    if (sel res_archive.err) { ret err[diag.Refusal].err{res_archive.err}; }
+    val res_sys: res[*system.Model, diag.Refusal] = system_model(c.alloc, res_archive.ok);
+    if (sel res_sys.err) { ret err[diag.Refusal].err{res_sys.err}; }
+    val res_families: res[Families, diag.Refusal] = families(c.alloc, c.tree, res_sys.ok);
+    if (sel res_families.err) { ret err[diag.Refusal].err{res_families.err}; }
+    var fam:        Families                      = res_families.ok;
+    val res_opened: res[*emit.File, diag.Refusal] = set.table(c, "register");
+    if (sel res_opened.err) { ret err[diag.Refusal].err{res_opened.err}; }
+    val f: *emit.File = res_opened.ok;
+    emit.uses(f, "masc.isa.aarch64.gen_extension");
+    emit.uses(f, "aarch64_extension: masc.isa.aarch64.extension");
+    emit.uses(f, "masc.isa.aarch64.gen_extension");
+    emit.uses(f, "masc.core.index");
+    emit.uses(f, "masc.core.register");
+    emit.uses(f, "masc.core.quantity");
+    emit.uses(f, "masc.core.requirement");
+
+    var seen: vector.Vector[str] = vector.init[str](c.alloc);
+    var i:    usize              = 0;
+    for (i < fam.binds.len) {
+        if (fam.binds.data[i].when != nil) {
+            val err_declared: err[diag.Refusal] = declare_requirement(f, fam.binds.data[i].when, ?seen);
+            if (sel err_declared.err) { ret err_declared; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < fam.measures.len) {
+        var k: usize = 0;
+        for (k < fam.measures.data[i].gauges.len) {
+            val when: str = fam.measures.data[i].gauges.data[k].when;
+            if (when != nil) {
+                val err_declared: err[diag.Refusal] = declare_requirement(f, when, ?seen);
+                if (sel err_declared.err) { ret err_declared; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val gauges:     *emit.Array = emit.array(f, "quantity.Gauge");
+    val quantities: *emit.Array = emit.array(f, "quantity.Quantity");
+    i = 0;
+    for (i < fam.measures.len) {
+        val m:     *Measure     = ?fam.measures.data[i];
+        val range: *emit.Record = emit.record(f, "quantity.Range");
+        emit.member(f, range, "least", number(1));
+        emit.member(f, range, "most", number(m.max::i64));
+        val r: *emit.Record = emit.record(f, "quantity.Quantity");
+        emit.member(f, r, "name", emit.Value.text{m.name});
+        emit.member(f, r, "unit", number(m.unit::i64));
+        emit.member(f, r, "domain", emit.Value.variant{emit.variant(f, "quantity.Domain.powers", emit.Value.record{range})});
+        emit.member(f, r, "bounds", name("quantity.NO_BOUNDS"));
+        if (m.gauges.len == 0) { emit.member(f, r, "gauges", name("quantity.NO_GAUGES")); }
+        or {
+            val first: u32   = emit.length(gauges);
+            var k:     usize = 0;
+            for (k < m.gauges.len) {
+                val gm:  *Gauge = ?m.gauges.data[k];
+                var row: i64    = -1;
+                var j:   usize  = 0;
+                for (j < fam.rows.len) {
+                    if (str_equals(fam.rows.data[j].name, gm.register)) { row = j::i64; }
+                    j = j + 1;
+                }
+                if (row < 0) { ret err[diag.Refusal].err{diag.refusal(FAMILIES, 0, UNKNOWN, gm.register)}; }
+                val g: *emit.Record = emit.record(f, "quantity.Gauge");
+                emit.member(f, g, "row", number(row));
+                emit.member(f, g, "count", number(gm.count::i64));
+                emit.member(f, g, "when", requirement_value(f, gm.when));
+                emit.item(f, gauges, emit.Value.record{g});
+                k = k + 1;
+            }
+            val sp: *emit.Record = emit.record(f, "quantity.Gauges");
+            emit.member(f, sp, "at", emit.element(f, "GAUGES", first));
+            emit.member(f, sp, "len", number(m.gauges.len::i64));
+            emit.member(f, r, "gauges", emit.Value.record{sp});
+        }
+        emit.item(f, quantities, emit.Value.record{r});
+        i = i + 1;
+    }
+    emit.declare_array(f, "GAUGES", gauges);
+    emit.declare(f, "QUANTITIES", nil, emit.Value.array{quantities});
+    val bindings: *emit.Array = emit.array(f, "quantity.Binding");
+    i = 0;
+    for (i < fam.binds.len) {
+        val x: *emit.Record = emit.record(f, "quantity.Binding");
+        emit.member(f, x, "slot", number(fam.binds.data[i].slot::i64));
+        emit.member(f, x, "when", requirement_value(f, fam.binds.data[i].when));
+        emit.member(f, x, "quantity", number(fam.binds.data[i].quantity::i64));
+        emit.item(f, bindings, emit.Value.record{x});
+        i = i + 1;
+    }
+    emit.declare(f, "BINDINGS", nil, emit.Value.array{bindings});
+
+    var taken:   map.Map[str, str] = map.init[str, str](c.alloc);
+    val classes: *emit.Array       = emit.array(f, "register.Class");
+    val names:   *emit.Array       = emit.keyed(f, "index.Entry");
+    i = 0;
+    for (i < fam.classes.len) {
+        val k: *Class       = ?fam.classes.data[i];
+        val r: *emit.Record = emit.record(f, "register.Class");
+        emit.member(f, r, "name", emit.Value.text{k.name});
+        emit.member(f, r, "kind", name(k.kind));
+        emit.member(f, r, "width", quantity(f, k.width));
+        var counted: Quantity = Quantity{fixed: k.count, per: 0, scale: 0};
+        if (k.per != 0) { counted = Quantity{fixed: k.count, per: k.per, scale: k.per_slot}; }
+        emit.member(f, r, "count", quantity(f, counted));
+        if (k.arity != 0) {
+            emit.member(f, r, "arity", number(k.arity::i64));
+            emit.member(f, r, "order", name(k.order));
+            emit.member(f, r, "step", number(k.step::i64));
+        }
+        emit.item(f, classes, emit.Value.record{r});
+        val e: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, e, "key", emit.Value.text{k.name});
+        emit.member(f, e, "row", number(i::i64));
+        emit.entry(f, names, k.name, emit.Value.record{e});
+        val err_handled: err[diag.Refusal] = handles.class(f, ?taken, k.name, i::u32);
+        if (sel err_handled.err) { ret err_handled; }
+        i = i + 1;
+    }
+    emit.declare(f, "CLASSES", nil, emit.Value.array{classes});
+    emit.declare(f, "CLASS_NAMES", nil, emit.Value.array{names});
+
+    i = 0;
+    for (i < fam.rows.len) {
+        if (fam.rows.data[i].requires != nil) {
+            val err_declared: err[diag.Refusal] = declare_requirement(f, fam.rows.data[i].requires, ?seen);
+            if (sel err_declared.err) { ret err_declared; }
+        }
+        i = i + 1;
+    }
+    val rows:    *emit.Array = emit.array(f, "register.Register");
+    var members: emit.Pool   = emit.pool(f, "u32");
+    val spelled: *emit.Array = emit.keyed(f, "index.Entry");
+    var named:   usize       = 0;
+    i = 0;
+    for (i < fam.rows.len) {
+        val x: *Row         = ?fam.rows.data[i];
+        val r: *emit.Record = emit.record(f, "register.Register");
+        emit.member(f, r, "name", emit.Value.text{x.name});
+        emit.member(f, r, "class", number(x.class::i64));
+        emit.member(f, r, "number", number(x.number::i64));
+        emit.member(f, r, "bank", number(x.bank::i64));
+        emit.member(f, r, "offset", quantity(f, x.offset));
+        emit.member(f, r, "stride", quantity(f, x.stride));
+        emit.member(f, r, "count", quantity(f, x.count));
+        # no aarch64 register's storage is chosen at run time, and every write extension reaches its whole bank
+        emit.member(f, r, "places", name("register.ONE_PLACE"));
+        emit.member(f, r, "flags", name(x.flags));
+        emit.member(f, r, "requires", requirement_value(f, x.requires));
+        emit.member(f, r, "extend", name(x.extend));
+        emit.member(f, r, "reach", emit.Value.variant{emit.bare(f, "register.Reach.bank")});
+        if (x.members.len > 0) {
+            var held: vector.Vector[emit.Value] = vector.init[emit.Value](c.alloc);
+            var k:    usize                     = 0;
+            for (k < x.members.len) {
+                vector.push[emit.Value](?held, number(x.members.data[k]::i64));
+                k = k + 1;
+            }
+            val m: *emit.Record = emit.record(f, "register.Rows");
+            emit.member(f, m, "at", emit.element(f, "MEMBERS", emit.pooled(f, ?members, held.data, held.len::u32)));
+            emit.member(f, m, "len", number(held.len::i64));
+            emit.member(f, r, "members", emit.Value.record{m});
+        }
+        emit.item(f, rows, emit.Value.record{r});
+        val err_handled: err[diag.Refusal] = handles.row(f, ?taken, x.name, x.class::u16, x.number::u16);
+        if (sel err_handled.err) { ret err_handled; }
+        # a row no syntax spells is not in the name index
+        if (!x.unspelled) {
+            val e: *emit.Record = emit.record(f, "index.Entry");
+            emit.member(f, e, "key", emit.Value.text{x.name});
+            emit.member(f, e, "row", number(i::i64));
+            emit.entry(f, spelled, x.name, emit.Value.record{e});
+            named = named + 1;
+        }
+        i = i + 1;
+    }
+    emit.declare(f, "REGISTERS", nil, emit.Value.array{rows});
+    if (emit.length(members.array) > 0) { emit.declare(f, "MEMBERS", nil, emit.Value.array{members.array}); }
+
+    var order: vector.Vector[u64] = vector.init[u64](c.alloc);
+    i = 0;
+    for (i < fam.aliases.len) {
+        val a:   *Alias = ?fam.aliases.data[i];
+        var row: i64    = -1;
+        var j:   usize  = 0;
+        for (j < fam.rows.len) {
+            if (str_equals(fam.rows.data[j].name, a.register)) { row = j::i64; }
+            j = j + 1;
+        }
+        if (row < 0)                                                      { ret err[diag.Refusal].err{lines.refuse(?a.line, UNKNOWN, a.register)}; }
+        if (!pushed(vector.push[u64](?order, (row::u64 << 32) | i::u64))) { ret err[diag.Refusal].err{lines.refuse(?a.line, diag.MEMORY, nil)}; }
+        i = i + 1;
+    }
+    sort.sort[u64](order.data, order.len);
+    val aliases: *emit.Array = emit.array(f, "register.Alias");
+    i = 0;
+    for (i < order.len) {
+        val a: *Alias       = ?fam.aliases.data[(order.data[i] & 0xFFFF_FFFF)::usize];
+        val r: *emit.Record = emit.record(f, "register.Alias");
+        emit.member(f, r, "name", emit.Value.text{a.name});
+        emit.member(f, r, "register", number((order.data[i] >> 32)::i64));
+        emit.item(f, aliases, emit.Value.record{r});
+        val e: *emit.Record = emit.record(f, "index.Entry");
+        emit.member(f, e, "key", emit.Value.text{a.name});
+        emit.member(f, e, "row", number(fam.rows.len::i64 + i::i64));
+        emit.entry(f, spelled, a.name, emit.Value.record{e});
+        i = i + 1;
+    }
+    emit.declare(f, "ALIASES", nil, emit.Value.array{aliases});
+    emit.declare(f, "NAMES", nil, emit.Value.array{spelled});
+
+    val columns:   *emit.Array       = emit.array(f, "register.Column");
+    val err_dwarf: err[diag.Refusal] = column(c, f, ?fam, "DWARF", "register.DWARF", false, columns);
+    if (sel err_dwarf.err) { ret err_dwarf; }
+    val err_codeview: err[diag.Refusal] = column(c, f, ?fam, "CODEVIEW", "register.CODEVIEW", true, columns);
+    if (sel err_codeview.err) { ret err_codeview; }
+    emit.declare(f, "COLUMNS", nil, emit.Value.array{columns});
+
+    val file: *emit.Record = emit.record(f, "register.File");
+    val qs:   *emit.Record = emit.record(f, "quantity.Quantities");
+    emit.member(f, qs, "at", emit.element(f, "QUANTITIES", 0));
+    emit.member(f, qs, "len", number(fam.measures.len::i64));
+    emit.member(f, file, "quantities", emit.Value.record{qs});
+    val bs: *emit.Record = emit.record(f, "quantity.Bindings");
+    emit.member(f, bs, "at", emit.element(f, "BINDINGS", 0));
+    emit.member(f, bs, "len", number(fam.binds.len::i64));
+    emit.member(f, file, "bindings", emit.Value.record{bs});
+    emit.member(f, file, "slot_count", number(fam.slots.len::i64));
+    emit.member(f, file, "classes", emit.element(f, "CLASSES", 0));
+    emit.member(f, file, "class_count", number(fam.classes.len::i64));
+    val cn: *emit.Record = emit.record(f, "index.Index");
+    emit.member(f, cn, "at", emit.element(f, "CLASS_NAMES", 0));
+    emit.member(f, cn, "len", number(fam.classes.len::i64));
+    emit.member(f, file, "class_names", emit.Value.record{cn});
+    emit.member(f, file, "registers", emit.element(f, "REGISTERS", 0));
+    emit.member(f, file, "register_count", number(fam.rows.len::i64));
+    emit.member(f, file, "aliases", emit.element(f, "ALIASES", 0));
+    emit.member(f, file, "alias_count", number(fam.aliases.len::i64));
+    val nm: *emit.Record = emit.record(f, "index.Index");
+    emit.member(f, nm, "at", emit.element(f, "NAMES", 0));
+    emit.member(f, nm, "len", number((named + fam.aliases.len)::i64));
+    emit.member(f, file, "names", emit.Value.record{nm});
+    emit.member(f, file, "columns", emit.element(f, "COLUMNS", 0));
+    emit.member(f, file, "column_count", number(2));
+    val res_facts: res[register.File, diag.Refusal] = stored(c.alloc, ?fam);
+    if (sel res_facts.err) { ret err[diag.Refusal].err{res_facts.err}; }
+    val err_stated: err[diag.Refusal] = storage.generate(f, ?res_facts.ok, ?taken, file);
+    if (sel err_stated.err) { ret err_stated; }
+    emit.declare(f, "FILE", "register.File", emit.Value.record{file});
+    # every register row, a bit each, as an encoding no row states may touch any
+    val count: u32         = fam.rows.len::u32;
+    val every: *emit.Array = emit.array(f, "u64");
+    var word:  u32         = 0;
+    for (word < (count + 63) / 64) {
+        var bits: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        val left: u32 = count - word * 64;
+        if (left < 64) { bits = (1::u64 << left::u64) - 1; }
+        emit.item(f, every, emit.Value.hex{bits});
+        word = word + 1;
+    }
+    emit.declare(f, "EVERY", nil, emit.Value.array{every});
+    emit.declare(f, "EVERY_WORDS", "u32", number(((count + 63) / 64)::i64));
+    ret err[diag.Refusal].ok{};
+}

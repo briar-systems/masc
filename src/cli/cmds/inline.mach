@@ -1,0 +1,211 @@
+# `masc inline`: read a file as one inline assembly block and write it as an object file
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.args;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.asm;
+use masc.asm.model;
+use masc.build;
+use build_refusal: masc.build.refusal;
+use build_state:   masc.build.state;
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.core.diagnostic;
+use masc.core.operand;
+use masc.core.register;
+use masc.emit;
+use masc.inline;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+
+val F_OPERAND: args.Flag = args.Flag{long: "operand", short: 0, value: "name=register", repeat: true, negatable: false, help: "an operand the block names, placed in the register"};
+
+val FLAG_COUNT: usize                  = 12;
+val FLAGS:      [FLAG_COUNT]*args.Flag = [FLAG_COUNT]*args.Flag{?context.HELP, ?context.TARGET, ?context.ENV, ?context.ABI, ?context.ISA, ?context.EXT, ?context.CODE_MODEL, ?context.SYNTAX, ?F_OPERAND, ?context.OUTPUT, ?context.VERBOSE, ?context.QUIET};
+
+pub val COMMAND: args.Command = args.Command{
+    name:        "inline",
+    help:        "assemble one inline assembly block into an object file",
+    usage:       "<input> -t <sys-arch> -o <path>",
+    flags:       Slice[*args.Flag]{data: ?FLAGS[0], size: FLAG_COUNT},
+    operand_min: 1,
+    operand_max: 1,
+};
+
+# the most operands a block declares, and the longest name one has
+val MAX_OPERANDS: usize = 16;
+val MAX_NAME:     usize = 32;
+
+# the operands `--operand` declares
+# ---
+# names:     each operand's name, terminated
+# operands:  each operand, its name in `names`
+# locations: where each lies, the register it names
+# count:     how many
+rec Declared {
+    names:     [MAX_OPERANDS][MAX_NAME]u8;
+    operands:  [MAX_OPERANDS]inline.Operand;
+    locations: [MAX_OPERANDS]inline.Location;
+    count:     usize;
+}
+
+# the file the line names read as one inline assembly block, its operands placed as `--operand` declares them, and
+# written as the object file `--output` names, by mink's built-in formats
+# ---
+# r:   the run, its line read against this command
+# ret: the command's exit code
+pub fun run(r: *Run) render.Exit {
+    ret inline_with(r, mink_registry.builtin());
+}
+
+# the declaration `spelled`, `name=register`, read into `d` under the target `t`, a refusal rendered as false
+fun declared(r: *Run, t: *target.Target, spelled: str, d: *Declared) bool {
+    if (d.count == MAX_OPERANDS) {
+        render.quoted(?r.err, "inline.operand", "the block declares more operands than masc reads, at", spelled);
+        ret false;
+    }
+
+    var n: usize = 0;
+    for (spelled[n] != 0 && spelled[n] != '=') { n = n + 1; }
+    if (spelled[n] != '=' || n == 0 || spelled[n + 1] == 0) {
+        render.quoted(?r.err, "inline.operand", "an operand is declared as name=register, not", spelled);
+        ret false;
+    }
+    if (n >= MAX_NAME) {
+        render.quoted(?r.err, "inline.operand", "the operand's name is longer than masc reads", spelled);
+        ret false;
+    }
+
+    val opt_reg: opt[register.Id] = context.register_named(r, t, ?spelled[n + 1]);
+    if (sel opt_reg.none) { ret false; }
+
+    val k: usize = d.count;
+    var i: usize = 0;
+    for (i < n) {
+        d.names[k][i] = spelled[i];
+        i             = i + 1;
+    }
+    d.names[k][n]  = 0;
+    d.operands[k]  = inline.Operand{name: ?d.names[k][0], constraint: inline.Constraint.class{register.class_of(opt_reg.some)}, role: operand.READ_WRITE};
+    d.locations[k] = operand.Value.register{opt_reg.some};
+    d.count        = k + 1;
+    ret true;
+}
+
+# the block the line names assembled as `run` assembles it, by the formats `formats`
+fun inline_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
+    val path:    str  = context.operand(r, 0);
+    val output:  str  = args.value(r.line, ?context.OUTPUT);
+    val verbose: bool = context.verbosity(r) > 0;
+
+    val out: str = output;
+    if (out == nil) { ret context.refuse(r, "cli.flag_missing", "the command needs the flag", "--output"); }
+
+    var o:          context.Output;
+    val opt_opened: opt[render.Exit] = context.output_init(r, ?o);
+    if (sel opt_opened.some) { ret opt_opened.some; }
+
+    var d:    Declared;
+    var each: args.Values = args.values(r.line, ?F_OPERAND);
+    d.count = 0;
+    for {
+        val opt_hit: opt[args.Hit] = args.next_value(?each);
+        if (sel opt_hit.none) { brk; }
+        if (!declared(r, ?o.t, opt_hit.some.value, ?d)) {
+            context.output_dnit(?o);
+            ret render.USER;
+        }
+    }
+
+    var source: vector.Vector[u8];
+    val loaded: render.Exit = context.load(r, path, ?source);
+    if (loaded != render.SUCCESS) {
+        context.output_dnit(?o);
+        ret loaded;
+    }
+
+    val exit: render.Exit = encoded(r, formats, ?o, path, ?source, ?d, out, verbose);
+    vector.dnit[u8](?source);
+    context.output_dnit(?o);
+    ret exit;
+}
+
+# the block the file `path` holds, its bytes `source`, parsed with the operands `d` and encoded at the start of the
+# object's first section, the object written at `out`
+fun encoded(r: *Run, formats: *mink_registry.Registry, o: *context.Output, path: str, source: *vector.Vector[u8], d: *Declared, out: str, verbose: bool) render.Exit {
+    val text_of:    View                                  = View{data: source.data, len: source.len};
+    val res_parsed: res[inline.Block, inline.Diagnostics] = inline.parse(r.a, text_of, diagnostic.START, o.t.set, ?o.t.context, o.format, inline.Operands{at: ?d.operands[0], len: d.count::u32});
+    if (sel res_parsed.err) {
+        var i: u32 = 0;
+        for (i < res_parsed.err.len) {
+            context.diagnosed(r, "inline.refused", path, source.data, source.len, ?o.t.context, ?res_parsed.err.at[i]);
+            i = i + 1;
+        }
+        inline.diagnostics_dnit(r.a, res_parsed.err);
+        ret render.USER;
+    }
+
+    var block:    inline.Block                        = res_parsed.ok;
+    val res_made: res[model.Assembler, model.Refusal] = asm.init(r.a, o.t.set, ?o.t.context, target.assembler(?o.t, formats, o.dialect, model.NO_LAYERS, path));
+    if (sel res_made.err) {
+        inline.dnit(?block);
+        context.refused_source(r, path, source.data, source.len, ?res_made.err);
+        ret render.USER;
+    }
+
+    var m:        model.Assembler            = res_made.ok;
+    val b:        *build_state.Builder       = model.builder(?m);
+    val err_done: err[build_refusal.Refusal] = inline.encode(?block, inline.Locations{at: ?d.locations[0], len: d.count::u32}, b, nil, nil);
+    inline.dnit(?block);
+    if (sel err_done.err) {
+        unencoded(r, b, path, ?err_done.err);
+        model.dnit(?m);
+        ret render.USER;
+    }
+
+    val res_finished: res[*mink_object.Object, model.Refusal] = model.finish(?m);
+    if (sel res_finished.err) {
+        model.dnit(?m);
+        context.refused_source(r, path, source.data, source.len, ?res_finished.err);
+        ret render.USER;
+    }
+
+    val res_taken: res[mink_object.Object, build_refusal.Refusal] = build.take(b);
+    if (sel res_taken.err) {
+        unencoded(r, b, path, ?res_taken.err);
+        model.dnit(?m);
+        ret render.USER;
+    }
+    model.dnit(?m);
+    var object: mink_object.Object = res_taken.ok;
+    ret context.saved_object(r, formats, ?object, o.format, path, out, verbose);
+}
+
+# the builder's refusal `why` to encode the block of the file `path`, worded by the emit api
+fun unencoded(r: *Run, b: *build_state.Builder, path: str, why: *build_refusal.Refusal) {
+    render.begin(?r.err, "inline.encode");
+    if (!r.err.failed) {
+        val err_spelled: err[A.Error] = emit.spell(b, why, ?r.err.out);
+        if (sel err_spelled.err) { r.err.failed = true; }
+    }
+    text.put(?r.err, " in '");
+    text.put(?r.err, path);
+    text.put(?r.err, "'\n");
+}

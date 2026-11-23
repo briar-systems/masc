@@ -1,0 +1,1157 @@
+# the syntax rows every instruction set fills in
+#
+# a syntax spells each row of a set by one template: its mnemonic, its
+# operands in their written order and the text between them. the printer
+# and the parser in `masc.syntax` both read the template, the register
+# file's names and aliases, and each enumeration's members, so no spelling
+# is written twice. an alias is a further template over a base row, with
+# where each base operand's value comes from, the values its operands exclude
+# beyond those the operands they read as do, the condition under which it
+# applies and its preference for printing. a sequence spelling is a template
+# over several rows, as risc-v's `call`, each step's operands taken from its
+# operands or fixed, so the printer writes such instructions as one statement
+# and the parser reads it back to them. specifiers spell the fixup kinds
+# a symbol takes, and hooks spell what differs per set: immediates, memory,
+# register lists, ids and literals. a set carries one or more syntaxes, its
+# established one first.
+#
+# a template is text with holes. `<n>` is operand n, and `<n:format>` hands
+# `format` to the operand's hook. a register has no hook, and its one format,
+# `<n:number>`, spells the register by its number within its operand's one
+# class rather than by its name, as aarch64's `za1v.s[w13, 3]` spells the tile
+# za1.s by its 1 beside the slice's direction. a template may write an operand
+# again, as sve's destructive `add z0.s, p0/m, z0.s, z1.s` writes `<Zdn>`
+# twice: it prints at each hole, and the parser refuses a later spelling that
+# reads another value. a later hole may instead spell a value derived from
+# the operand's, its format a derivation: `<n:+k>` a register k numbers past
+# or an immediate k more, and `<n:=c>` the register of the same number in
+# class c, or in the first of `c,d,...` that holds it. it prints the derived value as a hole of no format would, and the
+# parser reads it so and refuses another value. `<[` and `]>` enclose an
+# optional group, printed when every operand in it is present and read when
+# the text holds it, so a group of optional operands is absent exactly when
+# they are none, and a group with no operand, as aarch64's `<[#]>`, is printed
+# and optional to read. a space prints as one space and reads any run of white
+# space, white space is also read before text that follows a hole, and every
+# other character is itself.
+#
+# a template's mnemonic is its text before the first space, hole or group,
+# its leading words that are the syntax's prefixes joined to it, each by the
+# one space after it, as x86's `lock add` and `rep movsb`, whose rows are
+# rows of their own. a syntax indexes its rows and aliases by mnemonic, the
+# keys sorted and each entry naming its candidates in the order the parser
+# tries them, so the parser reaches a mnemonic's candidates by search rather
+# than by scan, a joined one by its whole key. the text joins a prefix to the
+# word after it by any run of white space.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink_format: mink.catalog.format;
+
+use masc.core.diagnostic;
+use masc.core.dispatch;
+use masc.core.field;
+use core_form: masc.core.form;
+use masc.core.index;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.query;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.requirement;
+use masc.core.row;
+use masc.core.state;
+
+# what a piece of a template is
+# ---
+# END:    the end of the template
+# TEXT:   a character that is itself
+# SPACE:  a space
+# HOLE:   an operand
+# OPEN:   the start of an optional group
+# CLOSE:  the end of an optional group
+# BROKEN: a `<` that opens nothing well formed
+pub def Kind: u8;
+
+pub val END:    Kind = 0;
+pub val TEXT:   Kind = 1;
+pub val SPACE:  Kind = 2;
+pub val HOLE:   Kind = 3;
+pub val OPEN:   Kind = 4;
+pub val CLOSE:  Kind = 5;
+pub val BROKEN: Kind = 6;
+
+# one piece of a template
+# ---
+# kind:    what it is
+# at:      its offset in the template
+# len:     its length in the template
+# operand: a hole's operand
+# format:  a hole's format, empty when it has none
+pub rec Piece {
+    kind:    Kind;
+    at:      usize;
+    len:     usize;
+    operand: u8;
+    format:  View;
+}
+
+# the format of a register hole that spells the register by its number within its operand's one class
+pub val NUMBER: str = "number";
+
+# how a hole spells a value derived from its operand's rather than the value itself, by its format's first character
+# ---
+# none:   the value itself, a format that starts with neither `+` nor `=`
+# past:   `+k`, the value k on: a tuple's member k, as aarch64 casp's pair `<Xs>, <X(s+1)>` whose x30 pairs with xzr
+#         and sysp's `xzr, xzr` whose zero pair is xzr twice, a register k numbers past in the first of the operand's
+#         classes that holds that number, or an immediate k more, as sme's slice range `za.d[w8, 0:1]`
+# class:  `=c` or `=c,d,...`, the register of the same number in the first of the named classes that holds it, as
+#         aarch64 sqincb's `<Xdn>, <Wdn>` written `<n:=w,wzr>`, whose xzr spells wzr
+# broken: a format starting as a derivation that is none well formed: no k from 1 to MAX_PAST, or an empty class name
+pub tag Derivation: u8 {
+    none;
+    past:  u32;
+    class: View;
+    broken;
+}
+
+# the most a `+k` derivation steps
+pub val MAX_PAST: u32 = 0xFFFF;
+
+# the derivation `format` states
+pub fun derivation(format: View) Derivation {
+    if (format.len == 0 || (format.data[0] != '+' && format.data[0] != '=')) { ret Derivation.none{}; }
+    if (format.len == 1)                                                     { ret Derivation.broken{}; }
+    if (format.data[0] == '=') {
+        val names: View  = View{data: ?format.data[1], len: format.len - 1};
+        var at:    usize = 0;
+        for (at <= names.len) {
+            val name: View = class_name(names, at);
+            if (name.len == 0) { ret Derivation.broken{}; }
+            at = at + name.len + 1;
+        }
+        ret Derivation.class{names};
+    }
+    var k: u32   = 0;
+    var i: usize = 1;
+    for (i < format.len) {
+        val c: u8 = format.data[i];
+        if (c < '0' || c > '9') { ret Derivation.broken{}; }
+        k = k * 10 + (c - '0')::u32;
+        if (k > MAX_PAST) { ret Derivation.broken{}; }
+        i = i + 1;
+    }
+    if (k == 0) { ret Derivation.broken{}; }
+    ret Derivation.past{k};
+}
+
+# the value derivation `d` gives from `value` of `desc` over `file`, none where it gives none: a register past the
+# last any of the operand's classes holds, a class that holds no register of the number, or a value of another kind
+pub fun derive(file: *register.File, desc: *operand.Operand, d: Derivation, value: *operand.Value) opt[operand.Value] {
+    val shape: *operand.Shape = ?desc.shape;
+    if (sel value.immediate) {
+        if (sel d.past) {
+            if (sel shape.immediate) { ret opt[operand.Value].some{operand.Value.immediate{value.immediate + d.past::i64}}; }
+        }
+        ret opt[operand.Value].none{};
+    }
+    if (!sel value.register) { ret opt[operand.Value].none{}; }
+    if (!sel shape.register) { ret opt[operand.Value].none{}; }
+    val number: u32 = register.number_of(value.register)::u32;
+    if (sel d.past) {
+        val opt_row: opt[*register.Register] = register.row_of(file, value.register);
+        # a tuple's members follow its first, as casp's `<X(s+1)>` is its pair's second register
+        if (sel opt_row.some && register.tuple(opt_row.some)) {
+            val opt_member: opt[register.Id] = register.member(file, value.register, d.past);
+            if (sel opt_member.none) { ret opt[operand.Value].none{}; }
+            ret opt[operand.Value].some{operand.Value.register{opt_member.some}};
+        }
+        val n: u32 = number + d.past;
+        if (n > 0xFFFF) { ret opt[operand.Value].none{}; }
+        var i: u32 = 0;
+        for (i < shape.register.classes.len) {
+            val id:       register.Id = register.make(shape.register.classes.at[i], n::u16);
+            val opt_held: opt[u32]    = register.index_of(file, id);
+            if (sel opt_held.some) { ret opt[operand.Value].some{operand.Value.register{id}}; }
+            i = i + 1;
+        }
+        ret opt[operand.Value].none{};
+    }
+    if (sel d.class) {
+        var at: usize = 0;
+        for (at <= d.class.len) {
+            val name:             View     = class_name(d.class, at);
+            val opt_class_viewed: opt[u16] = register.class_viewed(file, name);
+            if (sel opt_class_viewed.some) {
+                val id:       register.Id = register.make(opt_class_viewed.some, number::u16);
+                val opt_held: opt[u32]    = register.index_of(file, id);
+                if (sel opt_held.some) { ret opt[operand.Value].some{operand.Value.register{id}}; }
+            }
+            at = at + name.len + 1;
+        }
+    }
+    ret opt[operand.Value].none{};
+}
+
+# the class name of a `=c,d,...` derivation's list `names` that starts at `at`, up to the next comma
+pub fun class_name(names: View, at: usize) View {
+    var end: usize = at;
+    for (end < names.len && names.data[end] != ',') { end = end + 1; }
+    ret View{data: ?names.data[at], len: end - at};
+}
+
+# the piece of `template` at `at`
+pub fun piece(template: str, at: usize) Piece {
+    var p: Piece = Piece{kind: END, at: at, len: 0, operand: 0, format: View{data: nil, len: 0}};
+    val c: u8    = template[at];
+    if (c == 0) { ret p; }
+    p.len = 1;
+    if (c == ' ') {
+        p.kind = SPACE;
+        ret p;
+    }
+    if (c == ']' && template[at + 1] == '>') {
+        p.kind = CLOSE;
+        p.len  = 2;
+        ret p;
+    }
+    if (c != '<') {
+        p.kind = TEXT;
+        ret p;
+    }
+    if (template[at + 1] == '[') {
+        p.kind = OPEN;
+        p.len  = 2;
+        ret p;
+    }
+    var i: usize = at + 1;
+    var n: u32   = 0;
+    for (template[i] >= '0' && template[i] <= '9' && n < operand.MAX_OPERANDS) {
+        n = n * 10 + (template[i] - '0')::u32;
+        i = i + 1;
+    }
+    p.kind = BROKEN;
+    if (i == at + 1 || n >= operand.MAX_OPERANDS) { ret p; }
+    var format: usize = i;
+    if (template[i] == ':') {
+        format = i + 1;
+        i      = format;
+        for (template[i] != 0 && template[i] != '>') {
+            i = i + 1;
+        }
+    }
+    if (template[i] != '>') { ret p; }
+    p.kind    = HOLE;
+    p.operand = n::u8;
+    p.len     = i + 1 - at;
+    p.format  = View{data: ?template[format], len: i - format};
+    ret p;
+}
+
+# a set's spelling of each of its rows, one template per row of its codec
+pub rec Forms {
+    at:  *str;
+    len: u32;
+}
+
+# the forms of a syntax of a set with no rows
+pub val NO_FORMS: Forms = Forms{at: nil, len: 0};
+
+# an enumerant, condition or immediate operand of an alias with bits flipped, as an inverted condition
+# ---
+# operand: the alias's operand
+# mask:    the bits flipped
+pub rec Flip {
+    operand: u8;
+    mask:    u32;
+}
+
+# bits of an operand of an alias that a base operand holds whole, as sys's op1, CRm and op2 of the operation dc names
+# ---
+# operand: the alias's operand, an immediate or an enumerant
+# lo:      the lowest bit of its value the base operand holds
+# len:     how many bits it holds
+pub rec Bits {
+    operand: u8;
+    lo:      u8;
+    len:     u8;
+}
+
+# an immediate operand of an alias that the base row's value holds with some bits fixed, as risc-v's `prefetch.i` over the offset of `ori`
+# ---
+# operand: the alias's operand, the base value with the mask's bits cleared
+# mask:    the bits the alias fixes
+# value:   what the base value holds in those bits
+pub rec Mask {
+    operand: u8;
+    mask:    u64;
+    value:   u64;
+}
+
+# where an alias takes one of its base row's operand values from
+# ---
+# operand:  the value of this operand of the alias
+# flipped:  an operand of the alias with bits flipped
+# masked:   an operand of the alias with the bits of a mask fixed to a value
+# bits:     bits of an operand of the alias, an immediate value of them
+# register: the register at this row of the file, as the x0 of risc-v's `j`
+# value:    this value, which holds no register
+# derived:  what the alias's derivation computes
+# fixed:    the value the base row fixes the operand to, the register its effect fixes or the one address its operand
+#           admits, as the al and es:[rdi] of x86's `stosb`
+pub tag Source: u8 {
+    operand:  u8;
+    flipped:  Flip;
+    masked:   Mask;
+    bits:     Bits;
+    register: u32;
+    value:    operand.Value;
+    derived;
+    fixed;
+}
+
+# sources as a pointer to static sources and a count, one per operand of the base row
+pub rec Sources {
+    at:  *Source;
+    len: u32;
+}
+
+# the values an alias operand excludes, in the shape of the exclusions of the operand it reads as
+# ---
+# register:  register numbers within a class, whichever class holds them, as operand.Register's
+# immediate: values compared as the operand's value, as operand.Immediate's
+# relative:  offsets compared as the target's value, as operand.Relative's offset
+# enumerant: values the enumeration admits, each compared whole whether or not the enumeration is a mask
+# condition: values the condition's enumeration admits, compared as an enumerant's
+pub tag Excluded: u8 {
+    register:  operand.Numbers;
+    immediate: operand.Integers;
+    relative:  operand.Integers;
+    enumerant: operand.Numbers;
+    condition: operand.Numbers;
+}
+
+# values an operand of an alias never takes though the operand it reads as admits them, as risc-v's `ssrdp`, whose rd is never x0
+# ---
+# operand:  the alias's operand
+# excluded: the values it excludes beyond those its operand excludes
+pub rec Exclusion {
+    operand:  u8;
+    excluded: Excluded;
+}
+
+# exclusions as a pointer to static exclusions and a count, in ascending order of operand, each operand at most once
+pub rec Exclusions {
+    at:  *Exclusion;
+    len: u32;
+}
+
+# the exclusions of an alias that excludes nothing beyond its operands
+pub val NO_EXCLUSIONS: Exclusions = Exclusions{at: nil, len: 0};
+
+# the operands of an alias that are not its base's, and the values it computes rather than states, as aarch64's `lsl`
+# over `ubfm`
+# ---
+# operands: the alias's operands, which its sources do not then give
+# base:     fills each derived base value from the alias's values, false when they have no base form. nil when no
+#           source is derived, as dc's operation whose bits sys's op1, CRm and op2 hold
+# alias:    fills each alias value no source gives from the base's values, false when the alias does not apply. nil
+#           when the sources give every value
+pub rec Derive {
+    operands: row.Operands;
+    base:     fun(*operand.Value, *operand.Value) bool;
+    alias:    fun(*operand.Value, *operand.Value) bool;
+}
+
+# a further spelling of a base row, as risc-v's `mv` of `addi` or aarch64's `cmp` of `subs`
+# ---
+# row:        the base row, by its index in the codec's rows
+# template:   its spelling over its own operands
+# count:      how many operands it has
+# sources:    where each base operand's value comes from, one per base operand
+# derive:     its own operands and what it computes, nil when its operands are its base's and its sources state
+#             everything
+# exclusions: the values its operands never take though the operands they read as admit them
+# requires:   the alternatives of extensions a selection must hold, any one fully, besides its base row's, as risc-v's `frflags` needs F
+# preference: 0 when it is only read, or its rank among the aliases of its base that apply, the highest printed
+#
+# an alias is admitted when the selection holds both its base row's requirement
+# and its own, the empty one adding nothing, and the reader and the printer
+# both ask. an alias applies to a base value when every source agrees with it,
+# its derivation, if any, accepts it, every value its base's bits assemble is
+# one its operand admits, and none of its values is one it excludes. the
+# reader refuses an excluded value as it refuses any other, and the printer
+# writes such a value by another spelling. the operands of an alias without a
+# derivation are the base operands its sources take them from, and a derived
+# alias's own operands admit the values the reader takes for them
+pub rec Alias {
+    row:        u32;
+    template:   str;
+    count:      u8;
+    sources:    Sources;
+    derive:     *Derive;
+    exclusions: Exclusions;
+    requires:   requirement.Requirement;
+    preference: u8;
+}
+
+# aliases as a pointer to static aliases and a count, in base row order
+pub rec Aliases {
+    at:  *Alias;
+    len: u32;
+}
+
+# the aliases of a syntax with none
+pub val NO_ALIASES: Aliases = Aliases{at: nil, len: 0};
+
+# the spelling of a fixup kind on a symbol, as `%pcrel_hi(<0>)`, `:lo12:<0>` or `<0>@PLT`
+# ---
+# template: its spelling around one hole, the expression it applies to. a
+#           template that starts with its hole binds the symbol before it, so
+#           an addend follows it, and any other template wraps the whole expression
+# operand:  the fixup kind an operand takes by default that it applies to, NO_FIXUP for an operand of none, as a marker
+# fixup:    the fixup kind it gives the symbol there
+# fold:     its value over a constant, nil when it refuses one
+# formats:  the object formats whose dialects alone read and write it, as mach-o's `<0>@PAGE`, none for every format's.
+#           a writer under one of them prefers it to a spelling of every format
+pub rec Specifier {
+    template: str;
+    operand:  operand.FixupKind;
+    fixup:    operand.FixupKind;
+    fold:     fun(i64) i64;
+    formats:  Formats;
+}
+
+# object formats as a pointer to static rows and a count, none for every format
+pub rec Formats {
+    at:  **mink_format.Format;
+    len: u32;
+}
+
+# whether specifier `s` belongs to some formats' dialects alone
+pub fun dialectal(s: *Specifier) bool {
+    ret s.formats.len != 0;
+}
+
+# whether specifier `s` is read and written under the dialect of format `f`, nil for text of no known format, which
+# reads only the specifiers of every format
+pub fun reads(s: *Specifier, f: *mink_format.Format) bool {
+    if (!dialectal(s)) { ret true; }
+    var i: u32 = 0;
+    for (i < s.formats.len) {
+        if (s.formats.at[i] == f) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the dialect of format `f` spells fixup kind `kind`, on an operand that takes it by default, by a specifier of
+# its own, as mach-o's `@PAGE` spells adrp's page, so a bare symbol there is no spelling of that dialect
+pub fun own_spelling(syntax: *Syntax, f: *mink_format.Format, kind: operand.FixupKind) bool {
+    if (syntax == nil || kind == operand.NO_FIXUP) { ret false; }
+    var i: u32 = 0;
+    for (i < syntax.specifiers.len) {
+        val s: *Specifier = ?syntax.specifiers.at[i];
+        if (s.operand == kind && s.fixup == kind && dialectal(s) && reads(s, f)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# specifiers as a pointer to static specifiers and a count
+pub rec Specifiers {
+    at:  *Specifier;
+    len: u32;
+}
+
+# the specifiers of a syntax with none
+pub val NO_SPECIFIERS: Specifiers = Specifiers{at: nil, len: 0};
+
+# a sequence operand's symbol given a fixup kind, as the target of risc-v's `call` takes the call pair's
+# ---
+# operand: the sequence's operand, a symbol of no specifier
+# fixup:   the fixup kind the step's symbol takes
+pub rec Relocation {
+    operand: u8;
+    fixup:   operand.FixupKind;
+}
+
+# the handle of the place a statement is written at, which its reader's caller binds to a label there, as `.`
+pub val HERE: u32 = 0xFFFF_FFFF;
+
+# the handle of the label at a sequence's first instruction that a part of it names, which the reader's caller binds to
+# a label there spelled by the syntax's own stem, as risc-v's `.Lpcrel_hi0`
+pub val OWN: u32 = 0xFFFF_FFFE;
+
+# where a step of a sequence spelling takes one operand value from
+# ---
+# operand:  the value of this operand of the sequence
+# symbol:   a symbol operand of the sequence, given a fixup kind
+# register: this register, by its identity
+# value:    this value, which holds no register
+# here:     the label at the sequence's first instruction, given this fixup kind, as the label risc-v's `%pcrel_lo`
+#           names in the low part of `lla`, which a parser names by OWN
+pub tag Part: u8 {
+    operand:  u8;
+    symbol:   Relocation;
+    register: register.Id;
+    value:    operand.Value;
+    here:     operand.FixupKind;
+}
+
+# parts as a pointer to static parts and a count, one per operand of the step's row
+pub rec Parts {
+    at:  *Part;
+    len: u32;
+}
+
+# one instruction of a sequence spelling
+# ---
+# row:   the row it writes
+# parts: where each of its operands takes its value from
+pub rec Step {
+    row:   *row.Row;
+    parts: Parts;
+}
+
+# steps as a pointer to static steps and a count
+pub rec Steps {
+    at:  *Step;
+    len: u32;
+}
+
+# a spelling of several instructions as one statement, as risc-v's `call <0>` of an auipc and a jalr that one
+# relocation covers. the printer writes such a sequence by it, and the parser reads it back to the same instructions
+# ---
+# template: its spelling over its own operands
+# operands: what each of its operands admits, as a row's do
+# steps:    the instructions it is, in order
+# when:     the assembler modes it holds under, as risc-v's `la` is a got load only under pic, mode.NO_SETTINGS for every one
+# requires: what the selection must hold for it, as the got load of `la` is an ld only at rv64 and an lw only at rv32,
+#           requirement.NO_ALTERNATIVES for every selection
+pub rec Sequence {
+    template: str;
+    operands: row.Operands;
+    steps:    Steps;
+    when:     mode.Settings;
+    requires: requirement.Requirement;
+}
+
+# a syntax's sequence spellings
+# ---
+# at:    the spellings in ascending order of their first step's row, and in the printer's preference among those
+# len:   how many there are
+# named: the index of each spelling in ascending order of mnemonic under the syntax's case rule, so the parser searches them
+pub rec Sequences {
+    at:    *Sequence;
+    len:   u32;
+    named: *u32;
+}
+
+# the longest spelling a syntax reserves for anonymous labels
+pub val MAX_ANONYMOUS: usize = 32;
+
+# the sequence spellings of a syntax with none
+pub val NO_SEQUENCES: Sequences = Sequences{at: nil, len: 0, named: nil};
+
+# the instructions a macro's values become, into `out`, or false when they are no instruction's, as a symbol where the
+# macro builds a constant
+# ---
+# reader: the reader the macro was read by, whose context and syntax the instructions are found under
+# values: the values of the macro's operands
+pub def Expand: fun(*Reader, *operand.Value, *relax.Expansion) bool;
+
+# a spelling of several instructions as one statement whose instructions its values decide, as risc-v's `li` of a
+# constant, which is one instruction to eight by the constant. a sequence spelling's steps are the same for every
+# value, so a macro states its expansion as a function instead. the parser reads it as it reads a sequence, and tries
+# the syntax's own spelling when it expands to nothing
+# ---
+# template: its spelling over its own operands
+# operands: what each of its operands admits, as a row's do
+# requires: what the selection must hold for it, requirement.NO_ALTERNATIVES for every selection
+# expand:   its instructions
+pub rec Macro {
+    template: str;
+    operands: row.Operands;
+    requires: requirement.Requirement;
+    expand:   Expand;
+}
+
+# a syntax's macros
+# ---
+# at:  the macros, in no order
+# len: how many there are
+pub rec Macros {
+    at:  *Macro;
+    len: u32;
+}
+
+# the macros of a syntax with none
+pub val NO_MACROS: Macros = Macros{at: nil, len: 0};
+
+# what a name in an operand resolves to
+# ---
+# constant: an absolute value, as a name `.equ` defines
+# symbol:   the caller's handle for a symbol, never operand.NO_SYMBOL
+# equated:  a symbol plus an addend, or the difference of two, as a name `.set` equates to `a + 4` or `a - b`
+pub tag Resolved: u8 {
+    constant: i64;
+    symbol:   u32;
+    equated:  Equated;
+}
+
+# what a name equated to an expression of symbols stands for
+# ---
+# plus:   the symbol added, never operand.NO_SYMBOL
+# minus:  the symbol subtracted, operand.NO_SYMBOL for none
+# addend: the constant added
+pub rec Equated {
+    plus:   u32;
+    minus:  u32;
+    addend: i64;
+}
+
+# how a name in an operand is spelled, which decides what it may stand for
+# ---
+# bare:   written as a name token, so `.` stands for the place and decimal digits then `b` or `f` for a numbered label's
+#         reference, as the caller's symbols read them
+# quoted: written in double quotes (`masc.syntax.name`), so it stands for the symbol of exactly its bytes, whatever
+#         they are
+pub tag Spelling: u8 {
+    bare;
+    quoted;
+}
+
+# the caller's symbols, which the parser names and the printer spells
+# ---
+# context: the caller's state, handed to both functions
+# resolve: what a name, of the spelling it is written in, is, or the message it is refused with
+# name:    the spelling of a symbol handle
+pub rec Symbols {
+    context: ptr;
+    resolve: fun(ptr, View, Spelling) res[Resolved, str];
+    name:    fun(ptr, u32) View;
+}
+
+# the state the parser hands a hook, positioned at the operand it reads
+# ---
+# text:      the source text
+# start:     the offset of the instruction's first byte
+# at:        the offset of the next byte to read
+# end:       the offset just past the instruction's text
+# origin:    the position of the instruction's first byte in its source
+# codec:     the set's codec
+# ctx:       the context the statement is read under, whose view of the register file names resolve through
+# syntax:    the syntax read
+# modes:     the assembler modes the statement is read under
+# symbols:   the caller's symbols
+# context:   the state the syntax's hooks keep across instructions, the caller's
+# row:       the base row whose spelling is read
+# pool:      storage for list and variadic members, after the operand values
+# cap:       how many pool slots there are
+# used:      how many pool slots are taken
+# bytes:     storage for literal bytes that cannot be borrowed from the text
+# room:      how many bytes there are
+# taken:     how many bytes are taken
+# refused:   the alternatives of every candidate refused for admission, so a refusal names them all
+# form:      the encoding form the instruction's markers state, which the parser sets as it reads them
+# lead:      the offset the instruction's text starts at past the markers before its mnemonic
+# marked:    the offset of the marker after its mnemonic, `end` for none
+# skipped:   the length of the marker after its mnemonic
+# bound:     the result the statement binds, which the syntax's statement hook reads, as spir-v's `%r =` binds the id the
+#            row's `effect.Values` defines. none when it binds none, as every machine set's statements
+# values:    the values of the row's operands its own template has read so far, by operand index, none for one not yet
+#            read, as a typed literal's hook reads the id its width names. nil while an alias or anything but a row's own
+#            template is read
+# unsized:   whether a hook read an operand that leaves its size to the row, as x86's `[rax]` written with no size, so the
+#            parser takes the row only where no candidate of another size reads the text too, so `add [rax], 1` is
+#            refused and `add eax, [rax]` reads
+# short:     what a read found the pool, the literal bytes and the refused alternatives too few for, which a caller grows
+#            them to and reads again
+# sequence:  whether the operands read are a sequence spelling's, as risc-v's `lla <0>, <1>`. such an operand holds a
+#            whole value that the sequence's steps split and specify themselves, so no row field holds part of it
+# format:    the object format whose dialect the text is, which admits its specifiers, nil for none known
+# specified: whether the expression read last named a specifier, which a hook whose operand takes its kind by a
+#            specifier alone reads, as aarch64's `:lo12:` or mach-o's `@PAGEOFF`
+# named:     the operands the caller names in the text, as an inline block's `{x}`, which the parser reads before the
+#            syntax reads an operand, nil for text that names none
+# spans:     where the reader leaves the offset each value of the statement it took was read at, by step and operand
+#            (`step * row.MAX_OPERANDS + operand`, `relax.MAX_STEPS` steps), the statement's start for a value the text
+#            does not hold, as a row's fixed register or a sequence's own label. nil when the caller asks none
+# within:    the offset of a name of `named` that stands for an address the template spells across several holes, as
+#            risc-v's `<2>(<1>)` or aarch64's `[<1>, <[#]><2>]` for `{m}`, which reads each later hole of the run and
+#            the punctuation between them as written, to the comma, space or other text outside its brackets. 0 when
+#            the reader is in no such run
+# parts:     the parts of the address of `within` its holes have read so far, of ADDRESS_BASE and ADDRESS_OFFSET, so a
+#            name reads each part once and a run that spells another, as an index register, is no address of a name
+pub rec Reader {
+    text:      *u8;
+    start:     usize;
+    at:        usize;
+    end:       usize;
+    origin:    diagnostic.Position;
+    codec:     *dispatch.Codec;
+    ctx:       *state.Context;
+    syntax:    *Syntax;
+    modes:     *mode.State;
+    symbols:   *Symbols;
+    context:   ptr;
+    row:       *row.Row;
+    pool:      *operand.Value;
+    cap:       u32;
+    used:      u32;
+    bytes:     *u8;
+    room:      u32;
+    taken:     u32;
+    refused:   field.Admissions;
+    form:      core_form.Form;
+    lead:      usize;
+    marked:    usize;
+    skipped:   usize;
+    bound:     operand.Value;
+    values:    *operand.Value;
+    unsized:   bool;
+    short:     Short;
+    sequence:  bool;
+    format:    *mink_format.Format;
+    specified: bool;
+    named:     *Named;
+    spans:     *usize;
+    within:    usize;
+    parts:     u8;
+}
+
+# the base register of an address a name stands for, which a run of its holes has read
+pub val ADDRESS_BASE: u8 = 1;
+
+# the displacement of an address a name stands for, which a run of its holes has read
+pub val ADDRESS_OFFSET: u8 = 2;
+
+# the operands a caller names in the text it hands the parser, as an inline block's `{x}`, which stand for a value the
+# caller states rather than one the text spells
+# ---
+# context: the caller's state, handed back to `read`
+# read:    the value the name at the reader's position stands for as operand `desc`, into the value given, the reader
+#          moved past the name; the refusal of the name as that operand; or none, the reader left where it was, when no
+#          name of the caller's is there, so the syntax reads the text as its own, as aarch64's `{v0.16b}` list
+# address: whether the name at the offset given stands for memory, so a template that spells an address across several
+#          holes inside its brackets, as aarch64's `[<1>, <[#]><2>]`, reads that name for each of them
+pub rec Named {
+    context: ptr;
+    read:    fun(ptr, *Reader, *operand.Operand, *operand.Value) opt[err[diagnostic.Diagnostic]];
+    address: fun(ptr, *Reader, usize) bool;
+}
+
+# the most pool slots, literal bytes and alternatives the reads of a reader found too few, 0 for a store that held every
+# read. a read retried with that many may find more, as a later list is read
+# ---
+# pool:         pool slots, its operand values and its members
+# bytes:        literal bytes
+# alternatives: the alternatives of the candidates refused for admission
+pub rec Short {
+    pool:         u32;
+    bytes:        u32;
+    alternatives: u32;
+}
+
+# what a reader reads a statement into, grown to what the statement takes and kept across statements
+# ---
+# pool:    the operand values and their members
+# bytes:   the literal bytes
+# refused: the alternatives of the candidates refused for admission
+pub rec Stores {
+    pool:    vector.Vector[operand.Value];
+    bytes:   vector.Vector[u8];
+    refused: vector.Vector[requirement.Alternative];
+}
+
+# empty stores, which allocate from `a` as a read grows them
+pub fun stores(a: *A.Allocator) Stores {
+    ret Stores{pool: vector.init[operand.Value](a), bytes: vector.init[u8](a), refused: vector.init[requirement.Alternative](a)};
+}
+
+# the storage of `s` given back
+pub fun dnit(s: *Stores) {
+    vector.dnit[operand.Value](?s.pool);
+    vector.dnit[u8](?s.bytes);
+    vector.dnit[requirement.Alternative](?s.refused);
+}
+
+# reader `r` set to read into `s` from empty, nothing yet found short
+pub fun over(r: *Reader, s: *Stores) {
+    r.pool    = s.pool.data;
+    r.cap     = field.counted(s.pool.cap);
+    r.used    = 0;
+    r.bytes   = s.bytes.data;
+    r.room    = field.counted(s.bytes.cap);
+    r.taken   = 0;
+    r.refused = field.Admissions{at: s.refused.data, cap: field.counted(s.refused.cap), used: 0};
+    r.short   = Short{pool: 0, bytes: 0, alternatives: 0};
+}
+
+# whether a read through `r` into `s` found a store short, each such store grown to what the read found it short of
+# by `field.regrow`, so a read is retried only while it states a need its stores do not hold
+# ---
+# ret: whether to read again, set over the grown stores by `over`, or the allocator's error when a store failed to grow
+pub fun regrown(r: *Reader, s: *Stores) res[bool, A.Error] {
+    val res_pool: res[bool, A.Error] = field.regrow[operand.Value](?s.pool, r.short.pool);
+    if (sel res_pool.err) { ret res[bool, A.Error].err{res_pool.err}; }
+    val res_bytes: res[bool, A.Error] = field.regrow[u8](?s.bytes, r.short.bytes);
+    if (sel res_bytes.err) { ret res[bool, A.Error].err{res_bytes.err}; }
+    val res_refused: res[bool, A.Error] = field.regrow[requirement.Alternative](?s.refused, r.short.alternatives);
+    if (sel res_refused.err) { ret res[bool, A.Error].err{res_refused.err}; }
+    ret res[bool, A.Error].ok{res_pool.ok || res_bytes.ok || res_refused.ok};
+}
+
+# the state the printer hands a hook
+# ---
+# out:      the text appended to
+# codec:    the set's codec
+# ctx:      the context the instruction is written under, which admits an alias, nil for one that admits none
+# syntax:   the syntax written
+# modes:    the assembler modes it is written for, which a sequence spelling must hold under to be written
+# symbols:  the caller's symbols
+# context:  the state the syntax's hooks keep across instructions, the caller's
+# row:      the base row whose value is printed
+# dot:      whether a relative target is written as its distance from the instruction's own address, as `.+8`, which
+#           reads back as that distance where a bare number would read as an address. a target
+#           measured from the instruction's end has no such spelling, since the writer knows no length
+# values:   the values of the instruction its row's own template writes, by operand index, as a typed literal's hook
+#           reads the id its width names. nil while an alias or a sequence is written
+# format:   the object format whose dialect the text is, which admits its specifiers, nil for none known
+# sequence: whether the operands written are a sequence spelling's, whose steps specify the symbols themselves
+pub rec Writer {
+    out:      *vector.Vector[u8];
+    codec:    *dispatch.Codec;
+    ctx:      *state.Context;
+    syntax:   *Syntax;
+    modes:    *mode.State;
+    symbols:  *Symbols;
+    context:  ptr;
+    row:      *row.Row;
+    dot:      bool;
+    values:   *operand.Value;
+    format:   *mink_format.Format;
+    sequence: bool;
+}
+
+# how one kind of operand is spelled
+# ---
+# parse: reads one value of the operand at the reader's position, its format given, or refuses the text
+# print: writes one value of the operand, its format given, or refuses a value it cannot spell
+pub rec Hook {
+    parse: fun(*Reader, *operand.Operand, View, *operand.Value) err[diagnostic.Diagnostic];
+    print: fun(*Writer, *operand.Operand, View, *operand.Value) err[field.Refusal];
+}
+
+# how a register no row's name spells is read and written, by its class and number in its identity, as aarch64's
+# S3_<op1>_C<n>_C<m>_<op2> system registers. the name table comes first: the hook reads only what no name spells and
+# writes only what no row names
+# ---
+# read:  the register the text at the reader's position spells, the reader advanced past it, or none with the reader
+#        left where it was. the hook admits what it reads under the reader's context, as the table's view does a row
+# write: the register onto the writer, or the refusal of operand `op` when it cannot spell it
+pub rec RegisterHook {
+    read:  fun(*Reader) opt[register.Id];
+    write: fun(*Writer, register.Id, u8) err[field.Refusal];
+}
+
+# the hooks of a syntax, each nil when no row of the set has such an operand.
+# enumerants and conditions are spelled from their one table and take no hook, and registers from theirs first
+# ---
+# immediate: immediates and relative targets
+# memory:    memory operands
+# list:      register lists
+# id:        ids
+# literal:   byte literals
+# register:  registers no row's name spells, nil for a set whose names spell every register
+# group:     groups read and written whole, as wat's blocktype `(type 1) (result i32)` of members the text may leave
+#            out and a try_table catch clause `(catch $e 0)`, which puts its members' values in the reader's pool as a
+#            group value. nil for a syntax that spells a group as its members in order, joined by its variadic text
+# variadic:  variadic operands whose hole states a format, read and written whole, as wat's select `(result i32 i64)
+#            (result)`, whose clauses each hold any count of its members, which puts the members' values in the
+#            reader's pool as one list value. nil for a syntax that spells every variadic operand as its members joined
+#            by its variadic text
+pub rec Hooks {
+    immediate: *Hook;
+    memory:    *Hook;
+    list:      *Hook;
+    id:        *Hook;
+    literal:   *Hook;
+    register:  *RegisterHook;
+    group:     *Hook;
+    variadic:  *Hook;
+}
+
+# a row's own spelling or an alias, as the parser tries it
+# ---
+# row:   the row, by its index in the codec's rows, of a row's own spelling, and for an alias the row it is tried
+#        with, its base row's unless the alias is tried after every row of a mnemonic, as a respelling of an
+#        unscaled load is after the scaled rows, then the last of them
+# alias: 0 for the row's own spelling, or 1 and the alias's index in the syntax's aliases, whose row is its base
+#
+# candidates are tried in ascending order of row and then alias, the order of
+# the encoder's preference
+pub rec Candidate {
+    row:   u32;
+    alias: u32;
+}
+
+# the candidates that share one mnemonic
+# ---
+# key:   the mnemonic
+# first: the offset of its first candidate in the index's candidates
+# len:   how many candidates it has, at least one
+pub rec Entry {
+    key:   str;
+    first: u32;
+    len:   u32;
+}
+
+# a syntax's rows and aliases by mnemonic
+# ---
+# at:         the entries as a pointer to static entries, strictly ascending by key under the syntax's case rule
+# len:        how many entries there are
+# candidates: every candidate as a pointer to static candidates, entry after entry, each row and alias once
+# count:      how many candidates there are
+pub rec Index {
+    at:         *Entry;
+    len:        u32;
+    candidates: *Candidate;
+    count:      u32;
+}
+
+# the index of a syntax with no rows or aliases
+pub val NO_ENTRIES: Index = Index{at: nil, len: 0, candidates: nil, count: 0};
+
+# the words a syntax joins to the word after them into one mnemonic, as x86's `lock`, `rep` and `{nf}`, which select
+# rows of their own rather than an encoding of one row, as a pointer to static words and a count. each is spelled as
+# its templates spell it and holds no white space
+pub rec Prefixes {
+    at:  *str;
+    len: u32;
+}
+
+# the prefixes of a syntax whose mnemonics are one word
+pub val NO_PREFIXES: Prefixes = Prefixes{at: nil, len: 0};
+
+# one assembly syntax of a set
+# ---
+# name:       the name it is chosen by, as `intel` or `att`
+# forms:      one template per row of the codec
+# aliases:    its alias rows
+# index:      its rows and aliases by mnemonic
+# specifiers: its specifiers
+# sequences:  its spellings of several instructions as one statement
+# macros:     its spellings of several instructions that their values decide, NO_MACROS for none
+# hooks:      its operand hooks
+# register:   the text before every register name, as at&t's `%`, empty for none
+# aliased:    whether a register is written by its first alias, as risc-v's abi names, rather than by its row's name
+# join:       the text between the members of a mask
+# variadic:   the text between the values of a variadic operand, between a group's members, and before each param of an
+#             enumerant. a text of white space alone reads as any run of white space, as a line break between wat's
+#             br_table labels
+# fold:       whether mnemonics, registers, enumerants and specifiers read without regard to ascii case
+# anonymous:  the spelling it reserves for a label with no name, its handle following, which no named label may start with,
+#             at most MAX_ANONYMOUS bytes
+# own:        the stem of the label at a sequence's first instruction that a part of it names, its number in the object
+#             following, as risc-v's `.Lpcrel_hi`, at most MAX_ANONYMOUS bytes. nil for a syntax whose sequences name none
+# statement:  how a statement is read where the syntax states more around its instructions than their rows, nil for a
+#             syntax whose statements are its rows alone, as every machine set's
+# lead:       what is written before an instruction's markers and mnemonic, as spir-v's `%r = `, nil for a syntax that
+#             writes nothing there, as every machine set's
+# prefixes:   the words it joins to the word after them into one mnemonic, NO_PREFIXES for none
+# number:     the text before an enumerant's value written by number, as aarch64's `#` in `dsb #12`, nil for a syntax
+#             whose enumerations admit no numbers
+# specified:  whether a symbol on an operand that takes this fixup kind by default is read only under a specifier, as
+#             risc-v's `%lo` and aarch64's `:lo12:`, nil for a syntax whose every such symbol reads bare
+pub rec Syntax {
+    name:       str;
+    forms:      Forms;
+    aliases:    Aliases;
+    index:      Index;
+    specifiers: Specifiers;
+    sequences:  Sequences;
+    macros:     Macros;
+    hooks:      Hooks;
+    register:   str;
+    aliased:    bool;
+    join:       str;
+    variadic:   str;
+    fold:       bool;
+    anonymous:  str;
+    own:        str;
+    statement:  Statement;
+    lead:       Lead;
+    prefixes:   Prefixes;
+    number:     str;
+    specified:  fun(operand.FixupKind) bool;
+}
+
+# whether a symbol on an operand of default fixup kind `kind` is read only under a specifier in the dialect of format
+# `f`: the syntax's own rule, or a specifier of that dialect's own spelling the kind (`own_spelling`)
+pub fun takes_specifier(syntax: *Syntax, f: *mink_format.Format, kind: operand.FixupKind) bool {
+    if (syntax == nil || kind == operand.NO_FIXUP)         { ret false; }
+    if (syntax.specified != nil && syntax.specified(kind)) { ret true; }
+    ret own_spelling(syntax, f, kind);
+}
+
+# what a syntax reads around a statement's instructions, from the reader's position, before the rows read them: spir-v's
+# `%r =` binding of the result id the row's `effect.Values` defines, and wat's folded forms and module fields, which
+# nest instructions in the order the stream does not hold them. it leaves the reader at what the rows read, with the
+# result it binds in `bound`, or refuses the text. a row's own spelling takes the bound result as its `defines` operand
+# when its template does not write that operand, and every other candidate refuses a bound result
+pub def Statement: fun(*Reader) err[diagnostic.Diagnostic];
+
+# what a syntax writes before an instruction, as spir-v's `%r = ` of the result id the row's `effect.Values` defines,
+# which its template then does not write, or the refusal of a value it cannot spell
+pub def Lead: fun(*Writer, *inst.Inst) err[field.Refusal];
+
+# a set's syntaxes as a pointer to static syntaxes and a count, its established syntax first
+pub rec Syntaxes {
+    at:  *Syntax;
+    len: u32;
+}
+
+pub val NO_SYNTAXES: Syntaxes = Syntaxes{at: nil, len: 0};
+
+# `c` in lower case when it is an ascii capital
+pub fun lower(c: u8) u8 {
+    ret index.lower(c);
+}
+
+# whether `c` is white space between the words of a mnemonic's text
+pub fun is_blank(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+# whether the `len` bytes of `text` from `at` spell one of `prefixes`, byte for byte as templates spell them
+pub fun prefixed(prefixes: Prefixes, text: *u8, at: usize, len: usize) bool {
+    var i: u32 = 0;
+    for (i < prefixes.len) {
+        val p: str   = prefixes.at[i];
+        var k: usize = 0;
+        for (k < len && p[k] != 0 && p[k] == text[at + k]) {
+            k = k + 1;
+        }
+        if (k == len && p[k] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the mnemonic of `template`: its text before the first space, hole or group, each leading word of `prefixes` joined
+# to the word after it by the space between them. empty when it starts with a space, hole or group
+pub fun mnemonic(prefixes: Prefixes, template: str) View {
+    var at:   usize = 0;
+    var word: usize = 0;
+    for {
+        val p: Piece = piece(template, at);
+        if (p.kind == TEXT) {
+            at = p.at + p.len;
+            cnt;
+        }
+        if (p.kind == SPACE && at > word && prefixed(prefixes, template, word, at - word) && piece(template, at + 1).kind == TEXT) {
+            at   = at + 1;
+            word = at;
+            cnt;
+        }
+        brk;
+    }
+    ret View{data: template, len: at};
+}
+
+# how mnemonic `a` orders against `b`, bytes in order and without regard to ascii case when the syntax folds, a run of
+# white space in either read as the one space between a prefix and its word
+pub fun compare(syntax: *Syntax, a: View, b: View) i64 {
+    var i: usize = 0;
+    var j: usize = 0;
+    for (i < a.len && j < b.len) {
+        var x: u8 = a.data[i];
+        var y: u8 = b.data[j];
+        if (is_blank(x) && is_blank(y)) {
+            for (i < a.len && is_blank(a.data[i])) {
+                i = i + 1;
+            }
+            for (j < b.len && is_blank(b.data[j])) {
+                j = j + 1;
+            }
+            cnt;
+        }
+        if (syntax.fold) {
+            x = lower(x);
+            y = lower(y);
+        }
+        if (x < y) { ret -1; }
+        if (x > y) { ret 1; }
+        i = i + 1;
+        j = j + 1;
+    }
+    if (i == a.len && j < b.len) { ret -1; }
+    if (i < a.len && j == b.len) { ret 1; }
+    ret 0;
+}
+
+# the template of candidate `c` of `syntax`
+pub fun template(syntax: *Syntax, c: Candidate) str {
+    if (c.alias == 0) { ret syntax.forms.at[c.row]; }
+    ret syntax.aliases.at[c.alias - 1].template;
+}
+
+# the syntax of `syntaxes` named `name`, as a directive or an option chooses one
+pub fun find(syntaxes: Syntaxes, name: str) opt[*Syntax] {
+    var i: u32 = 0;
+    for (i < syntaxes.len) {
+        if (str_equals(syntaxes.at[i].name, name)) { ret opt[*Syntax].some{?syntaxes.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Syntax].none{};
+}
+
+# the hook of `syntax` that spells `shape`, nil for a shape spelled from its table or a group spelled as its members
+pub fun hook(syntax: *Syntax, shape: *operand.Shape) *Hook {
+    if (sel shape.immediate || sel shape.relative || sel shape.marker) { ret syntax.hooks.immediate; }
+    if (sel shape.memory)                                              { ret syntax.hooks.memory; }
+    if (sel shape.list)                                                { ret syntax.hooks.list; }
+    if (sel shape.id)                                                  { ret syntax.hooks.id; }
+    if (sel shape.literal)                                             { ret syntax.hooks.literal; }
+    if (sel shape.group)                                               { ret syntax.hooks.group; }
+    ret nil;
+}
+
+# the value row `r` fixes its operand `j` to, the register its effect fixes or the one address the operand admits, none
+# for an operand it leaves free
+pub fun fixed_value(codec: *dispatch.Codec, r: *row.Row, j: u32) operand.Value {
+    val opt_fixed: opt[register.Id] = query.fixed(codec.registers, r.effect, j::u8);
+    if (sel opt_fixed.some) { ret operand.Value.register{opt_fixed.some}; }
+    val opt_alone: opt[operand.Value] = operand.address_alone(?r.operands.at[j]);
+    if (sel opt_alone.some) { ret opt_alone.some; }
+    ret operand.Value.none{};
+}
+
+# the operand an alias reads as its operand `k`, nil when neither its derivation nor a source gives one
+pub fun alias_operand(a: *Alias, base: *row.Row, k: u8) *operand.Operand {
+    if (a.derive != nil) {
+        if (k::u32 >= a.derive.operands.len) { ret nil; }
+        ret ?a.derive.operands.at[k];
+    }
+    var j: u32 = 0;
+    for (j < a.sources.len && j < base.operands.len) {
+        val src: Source = a.sources.at[j];
+        if ((sel src.operand && src.operand == k) || (sel src.flipped && src.flipped.operand == k) || (sel src.masked && src.masked.operand == k)) { ret ?base.operands.at[j]; }
+        j = j + 1;
+    }
+    ret nil;
+}

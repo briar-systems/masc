@@ -1,0 +1,377 @@
+# `masc walk`: check that a function of an object file keeps its secrets constant time
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char_digit_val;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.args;
+use std.collections.slice.Slice;
+
+use mink.base.fail;
+use mink.base.store;
+use mink.base.table;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.core.ct;
+use masc.core.register;
+use masc.core.requirement;
+use masc.core.state;
+use masc.disasm;
+use masc.tool.render;
+use masc.tool.target;
+use masc.tool.text;
+use masc.walk;
+
+val F_SYMBOL:  args.Flag = args.Flag{long: "symbol", short: 0, value: "name", repeat: false, negatable: false, help: "the function to walk"};
+val F_SECRET:  args.Flag = args.Flag{long: "secret", short: 0, value: "register", repeat: true, negatable: false, help: "a register holding a secret on entry"};
+val F_ACCESS:  args.Flag = args.Flag{long: "access", short: 0, value: "offset:n=secret|public", repeat: true, negatable: false, help: "what an access the walk does not place reads"};
+val F_PRIVATE: args.Flag = args.Flag{long: "private", short: 0, value: "offset:length", repeat: true, negatable: false, help: "a frame extent no unplaced access reaches"};
+val F_STATE:   args.Flag = args.Flag{long: "state", short: 0, value: "axis=value", repeat: true, negatable: false, help: "a state value each instruction's timing is classified under, as dit=on"};
+
+val FLAG_COUNT: usize                  = 13;
+val FLAGS:      [FLAG_COUNT]*args.Flag = [FLAG_COUNT]*args.Flag{?context.HELP, ?context.TARGET, ?context.ENV, ?context.ABI, ?context.ISA, ?context.EXT, ?context.CODE_MODEL, ?context.SYNTAX, ?F_SYMBOL, ?F_SECRET, ?F_ACCESS, ?F_PRIVATE, ?F_STATE};
+
+pub val COMMAND: args.Command = args.Command{
+    name:        "walk",
+    help:        "report the first secret a function leaks through timing",
+    usage:       "<input> -t <sys-arch> --symbol <name>",
+    flags:       Slice[*args.Flag]{data: ?FLAGS[0], size: FLAG_COUNT},
+    operand_min: 1,
+    operand_max: 1,
+};
+
+# the most secrets a walk is seeded with
+val MAX_SECRETS: usize = 32;
+
+# the function `--symbol` names in the object file the line names walked from the seeds `--secret`, `--access` and
+# `--private` state, each instruction's timing classified under the target's state with the `--state` values set, the
+# first secret it leaks through timing reported, by mink's built-in formats
+# ---
+# r:   the run, its line read against this command
+# ret: the command's exit code
+pub fun run(r: *Run) render.Exit {
+    ret walk_with(r, mink_registry.builtin());
+}
+
+# whether the view `v` holds the bytes of `s`
+fun named(v: View, s: str) bool {
+    if (v.len != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+
+    ret true;
+}
+
+# the number of decimal digits, or hexadecimal ones after 0x, starting at `at` in `s`, `at` moved past them, none for none
+# or one past a u64
+fun number_at(s: str, at: *usize) opt[u64] {
+    var i:    usize = @at;
+    var base: u64   = 10;
+    if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        base = 16;
+        i    = i + 2;
+    }
+
+    val first: usize = i;
+    var n:     u64   = 0;
+    for {
+        val d: i32 = char_digit_val(s[i]);
+        if (d < 0 || d::u64 >= base) { brk; }
+        val digit: u64 = d::u64;
+        if (n > (0xFFFF_FFFF_FFFF_FFFF - digit) / base) { ret opt[u64].none{}; }
+        n = n * base + digit;
+        i = i + 1;
+    }
+
+    if (i == first) { ret opt[u64].none{}; }
+    @at = i;
+    ret opt[u64].some{n};
+}
+
+# the access seed `s` states as offset:n=secret|public, the access by its operand n or by @n its position in the
+# footprint, none when it is not one
+fun access_of(s: str) opt[walk.Access] {
+    var i:             usize    = 0;
+    val opt_number_at: opt[u64] = number_at(s, ?i);
+    if (sel opt_number_at.none) { ret opt[walk.Access].none{}; }
+    if (s[i] != ':')            { ret opt[walk.Access].none{}; }
+    i = i + 1;
+    var indexed: bool = false;
+    if (s[i] == '@') {
+        indexed = true;
+        i       = i + 1;
+    }
+
+    val opt_access_number: opt[u64] = number_at(s, ?i);
+    if (sel opt_access_number.none) { ret opt[walk.Access].none{}; }
+    if (s[i] != '=')                { ret opt[walk.Access].none{}; }
+    val word:    str  = ?s[i + 1];
+    val spelled: View = View{data: word, len: str_len(word)};
+    var secret:  bool = false;
+    if (named(spelled, "secret"))  { secret = true; }
+    or (!named(spelled, "public")) { ret opt[walk.Access].none{}; }
+
+    var by: walk.Accessor = walk.Accessor.index{opt_access_number.some::u32};
+    if (indexed) {
+        if (opt_access_number.some > 0xFFFF_FFFF) { ret opt[walk.Access].none{}; }
+    }
+    or {
+        if (opt_access_number.some >= 0xFF) { ret opt[walk.Access].none{}; }
+        by = walk.Accessor.operand{opt_access_number.some::u8};
+    }
+
+    ret opt[walk.Access].some{walk.Access{at: opt_number_at.some, access: by, secret: secret}};
+}
+
+# the private frame extent `s` states as offset:length, the offset signed, none when it is not one
+fun private_of(s: str) opt[walk.Private] {
+    var i:        usize = 0;
+    var negative: bool  = false;
+    if (s[0] == '-') {
+        negative = true;
+        i        = 1;
+    }
+
+    val opt_offset: opt[u64] = number_at(s, ?i);
+    if (sel opt_offset.none)                     { ret opt[walk.Private].none{}; }
+    if (opt_offset.some > 0x7FFF_FFFF_FFFF_FFFF) { ret opt[walk.Private].none{}; }
+    if (s[i] != ':')                             { ret opt[walk.Private].none{}; }
+    i = i + 1;
+    val opt_length: opt[u64] = number_at(s, ?i);
+    if (sel opt_length.none)               { ret opt[walk.Private].none{}; }
+    if (s[i] != 0 || opt_length.some == 0) { ret opt[walk.Private].none{}; }
+
+    var at: i64 = opt_offset.some::i64;
+    if (negative) { at = 0 - at; }
+    ret opt[walk.Private].some{walk.Private{offset: at, length: opt_length.some, origin: walk.Origin.entry{}}};
+}
+
+# the timing context the line's `--state` values make of the target's context `t`, into `out`, a refusal rendered as
+# its exit code
+fun timing_of(r: *Run, t: *target.Target, out: *state.Context) opt[render.Exit] {
+    @out = t.context;
+    var each: args.Values = args.values(r.line, ?F_STATE);
+    for {
+        val opt_hit: opt[args.Hit] = args.next_value(?each);
+        if (sel opt_hit.none) { brk; }
+        val spelled:   str                 = opt_hit.some.value;
+        val opt_atom:  opt[requirement.Id] = state.lookup(t.context.selection.catalog, t.context.axes, spelled, 0, str_len(spelled));
+        var opt_place: opt[state.Placed]   = opt[state.Placed].none{};
+        if (sel opt_atom.some)  { opt_place = state.place(t.context.selection.catalog, t.context.axes, opt_atom.some); }
+        if (sel opt_place.none) { ret opt[render.Exit].some{context.refuse(r, "walk.state", "a state value is stated as axis=value of the target's axes, not", spelled)}; }
+        state.set(out, opt_place.some.axis, opt_place.some.value);
+    }
+
+    ret opt[render.Exit].none{};
+}
+
+# the code of the function `s`, placed at `at`, names in `o`, a refusal rendered as none
+fun placed_code(r: *Run, o: *mink_object.Object, t: *target.Target, s: *mink_object.Symbol, at: mink_object.Place, name: str) opt[walk.Code] {
+    if (sel s.size.none) {
+        render.quoted(?r.err, "walk.symbol", "the symbol states no size", name);
+        ret opt[walk.Code].none{};
+    }
+
+    val size:  u64                  = s.size.some;
+    val sec:   *mink_object.Section = table.at[mink_object.Section](?o.sections, at.section);
+    val bytes: store.Bytes          = mink_object.bytes(o, ?sec.contents);
+    if (bytes.data == nil || at.offset > bytes.len::u64 || size > bytes.len::u64 - at.offset) {
+        render.quoted(?r.err, "walk.symbol", "the symbol's code lies outside its section's bytes", name);
+        ret opt[walk.Code].none{};
+    }
+
+    ret opt[walk.Code].some{walk.Code{set: t.set, data: ?bytes.data[at.offset::usize], len: size::usize, sites: walk.NO_SITES}};
+}
+
+# the code of the function `name` defines in `o`, a refusal rendered as none
+fun code_of(r: *Run, o: *mink_object.Object, t: *target.Target, name: str) opt[walk.Code] {
+    val count: usize = table.count[mink_object.Symbol](?o.symbols);
+    var i:     usize = 0;
+    for (i < count) {
+        val s: *mink_object.Symbol = table.at[mink_object.Symbol](?o.symbols, table.nth[mink_object.Symbol](i));
+        i = i + 1;
+        if (!named(mink_object.name_of(o, s.name), name)) { cnt; }
+        if (sel s.def.placed)                             { ret placed_code(r, o, t, s, s.def.placed, name); }
+
+        render.quoted(?r.err, "walk.symbol", "the symbol is placed in no section", name);
+        ret opt[walk.Code].none{};
+    }
+
+    render.quoted(?r.err, "walk.symbol", "the object defines no symbol", name);
+    ret opt[walk.Code].none{};
+}
+
+# the function the line names walked as `run` walks it, the object read by the formats `formats`
+fun walk_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
+    val path:   str = context.operand(r, 0);
+    val symbol: str = args.value(r.line, ?F_SYMBOL);
+    if (symbol == nil) { ret context.refuse(r, "cli.flag_missing", "the command needs the flag", "--symbol"); }
+
+    var t:          target.Target;
+    val opt_opened: opt[render.Exit] = context.target_init(r, ?t);
+    if (sel opt_opened.some) { ret opt_opened.some; }
+
+    var seeds: [MAX_SECRETS]walk.Seed;
+    var n:     usize       = 0;
+    var each:  args.Values = args.values(r.line, ?F_SECRET);
+    for {
+        val opt_hit: opt[args.Hit] = args.next_value(?each);
+        if (sel opt_hit.none) { brk; }
+        if (n == MAX_SECRETS) {
+            target.dnit(?t);
+            ret context.refuse(r, "walk.secret", "the walk is seeded with more secrets than masc reads, at", opt_hit.some.value);
+        }
+
+        val opt_reg: opt[register.Id] = context.register_named(r, ?t, opt_hit.some.value);
+        if (sel opt_reg.none) {
+            target.dnit(?t);
+            ret render.USER;
+        }
+
+        seeds[n] = walk.Seed.register{opt_reg.some};
+        n        = n + 1;
+    }
+
+    var states: args.Values = args.values(r.line, ?F_ACCESS);
+    for {
+        val opt_hit: opt[args.Hit] = args.next_value(?states);
+        if (sel opt_hit.none) { brk; }
+        if (n == MAX_SECRETS) {
+            target.dnit(?t);
+            ret context.refuse(r, "walk.secret", "the walk is seeded with more secrets than masc reads, at", opt_hit.some.value);
+        }
+
+        val opt_access: opt[walk.Access] = access_of(opt_hit.some.value);
+        if (sel opt_access.none) {
+            target.dnit(?t);
+            ret context.refuse(r, "walk.access", "an access is stated as offset:n=secret|public or offset:@n=secret|public, not", opt_hit.some.value);
+        }
+
+        seeds[n] = walk.Seed.access{opt_access.some};
+        n        = n + 1;
+    }
+
+    var privates: args.Values = args.values(r.line, ?F_PRIVATE);
+    for {
+        val opt_hit: opt[args.Hit] = args.next_value(?privates);
+        if (sel opt_hit.none) { brk; }
+        if (n == MAX_SECRETS) {
+            target.dnit(?t);
+            ret context.refuse(r, "walk.secret", "the walk is seeded with more secrets than masc reads, at", opt_hit.some.value);
+        }
+
+        val opt_extent: opt[walk.Private] = private_of(opt_hit.some.value);
+        if (sel opt_extent.none) {
+            target.dnit(?t);
+            ret context.refuse(r, "walk.private", "a private frame extent is stated as offset:length, of a length not 0, not", opt_hit.some.value);
+        }
+
+        seeds[n] = walk.Seed.private{opt_extent.some};
+        n        = n + 1;
+    }
+
+    var timing:     state.Context;
+    val opt_timing: opt[render.Exit] = timing_of(r, ?t, ?timing);
+    if (sel opt_timing.some) {
+        target.dnit(?t);
+        ret opt_timing.some;
+    }
+
+    val res_disasm_opened: res[disasm.File, fail.Fail] = disasm.file_init(formats, r.a, path);
+    if (sel res_disasm_opened.err) {
+        target.dnit(?t);
+        ret context.failed(r, "object.read", res_disasm_opened.err);
+    }
+
+    var f:        disasm.File    = res_disasm_opened.ok;
+    var exit:     render.Exit    = render.USER;
+    val opt_code: opt[walk.Code] = code_of(r, ?f.object, ?t, symbol);
+    if (sel opt_code.some) {
+        var c:          walk.Code                  = opt_code.some;
+        var seeded:     walk.Secrets               = walk.Secrets{at: ?seeds[0], len: n::u32};
+        var public:     walk.Declassified          = walk.NO_DECLASSIFIED;
+        var calls:      walk.Calls                 = walk.NO_CALLS;
+        val res_walked: res[walk.Verdict, A.Error] = walk.check_timed(r.a, ?c, ?t.context, ?timing, ?seeded, ?public, ?calls, ?walk.NO_RESULTS);
+        if (sel res_walked.err) { exit = context.memory(r); }
+        or                      { exit = verdict(r, path, symbol, res_walked.ok); }
+    }
+
+    val err_closed: err[fail.Fail] = disasm.file_dnit(?f);
+    target.dnit(?t);
+    if (sel err_closed.err) {
+        if (exit == render.SUCCESS) { ret context.failed(r, "object.read", err_closed.err); }
+    }
+
+    ret exit;
+}
+
+# `path: symbol: ` before what the walk found
+fun head(t: *text.Text, path: str, symbol: str) {
+    text.put(t, path);
+    text.put(t, ": ");
+    text.put(t, symbol);
+    text.put(t, ": ");
+}
+
+# what the walk found of `symbol` in the file `path`
+fun verdict(r: *Run, path: str, symbol: str, v: walk.Verdict) render.Exit {
+    if (sel v.clear) {
+        head(?r.out, path, symbol);
+        text.put(?r.out, "constant time\n");
+        ret render.SUCCESS;
+    }
+    if (sel v.unguaranteed) {
+        head(?r.out, path, symbol);
+        text.put(?r.out, "constant time but for the timing of its instructions\n");
+        text.put(?r.err, "warning[walk.unguaranteed] ");
+        text.put(?r.err, ct.UNGUARANTEED);
+        text.byte(?r.err, '\n');
+        ret render.SUCCESS;
+    }
+    if (sel v.unread) {
+        render.begin(?r.err, "walk.unread");
+        text.put(?r.err, v.unread.message);
+        at(r, path, symbol, v.unread.offset);
+        ret render.USER;
+    }
+
+    if (sel v.refused) {
+        var found: walk.Finding = v.refused;
+        render.begin(?r.err, "walk.refused");
+        if (!r.err.failed) {
+            val err_spelled: err[A.Error] = ct.spell(?found.refusal, ?r.err.out);
+            if (sel err_spelled.err) { r.err.failed = true; }
+        }
+        at(r, path, symbol, found.offset);
+        ret render.USER;
+    }
+
+    ret render.INTERNAL;
+}
+
+# the end of a walk diagnostic: where in the function it is
+fun at(r: *Run, path: str, symbol: str, offset: u64) {
+    text.byte(?r.err, '\n');
+    text.put(?r.err, "  @ ");
+    text.put(?r.err, path);
+    text.put(?r.err, ", ");
+    text.put(?r.err, symbol);
+    text.put(?r.err, " + ");
+    text.decimal(?r.err, offset::i64);
+    text.byte(?r.err, '\n');
+}

@@ -1,0 +1,204 @@
+# the riscv field kinds, and the operand layouts rows are built from
+#
+# almost every riscv field is a slice of an operand's number: the split b, j,
+# s and compressed immediates are pieces of one encoded number, with the
+# implied zero low bit stated as the immediate's scale, and the register-prime
+# fields are a register range of x8 to x15 in three bits. those go through the
+# core's unit kind. a layout states the pieces and the operand shape once. the
+# operand's index and part are the row's, so a piece becomes a slice in
+# `layout.slices` when a row is written, and the generator emits those slices as
+# static rows.
+#
+# a kind exists only where slices cannot express the encoding:
+#   sregs       a unit that codes the two s-register operands of zcmp's
+#               cm.mva01s and cm.mvsa01 in three bits each, encoding them
+#               whole rather than through slices
+#   stack       zcmp's stack adjustment, whose two bits depend on the
+#               register list and the width
+#   raw         an `.insn` raw encoding longer than 64 bits, a literal number
+#               written whole and padded with zero bytes to the field's width
+#
+# the layouts, choices, positions and the values they exclude are the
+# generator's, read from the fields topic of its riscv overlay
+# (gen/data/riscv/fields.txt) with the citation of each, and written as
+# gen_field, which a consumer names. the kinds and the field table are
+# written here, and the topic states each kind's index in the table.
+#
+# the shift amount is five bits at rv32 and for the w forms, and six bits for
+# the rv64 forms. width is the xlen state, so the two forms are two rows that
+# require xlen=32 or xlen=64 and use `SHAMTW` or `SHAMTD`, which is how
+# riscv-opcodes states them too. no kind reads the width. the vector mask `vm`
+# is the enumerant `VM`, whose unmasked spelling is empty because the bit is
+# one when no mask is written. csr numbers are a twelve bit layout a row names
+# as an id of the csr space.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use alloc: std.allocator;
+
+use masc.core.field;
+use core_form: masc.core.form;
+use masc.core.operand;
+use masc.isa.riscv.gen_field;
+
+# an s register is x8, x9 or x18 to x23. its operand ranges over x8 to x23 and excludes x10 to x17, so its number
+# less x8 is 0, 1 or 10 to 15, coded 0 to 7
+fun sreg_code(n: u64) u64 {
+    if (n < 2) { ret n; }
+    ret n - 8;
+}
+
+fun sreg_number(code: u64) u64 {
+    if (code < 2) { ret code; }
+    ret code + 8;
+}
+
+# a sregs field's param, as the generator writes it: the operand coded at SREG7's bits in bits 0 to 7, and the one
+# coded at SREG2's in bits 8 to 15
+fun sreg_operand(param: u64, which: u64) u32 {
+    ret ((param >> (which * 8)) & 0xFF)::u32;
+}
+
+fun sregs_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val first:  u32 = sreg_operand(f.param, 0);
+    val second: u32 = sreg_operand(f.param, 1);
+    if (first >= enc.count || second >= enc.count) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, field.NO_OPERAND, enc.out.len)}; }
+    val res_unit: res[u64, field.Refusal] = field.pack(enc, f);
+    if (sel res_unit.err) { ret err[field.Refusal].err{res_unit.err}; }
+    val coded: u64 = res_unit.ok | (sreg_code(enc.parts[first].bits[field.NUMBER]) << gen_field.SREG7.at::u64) | (sreg_code(enc.parts[second].bits[field.NUMBER]) << gen_field.SREG2.at::u64);
+    ret field.put(enc, coded, f.width / 8);
+}
+
+fun sregs_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val first:  u32 = sreg_operand(f.param, 0);
+    val second: u32 = sreg_operand(f.param, 1);
+    if (first >= dec.count || second >= dec.count) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, field.NO_OPERAND, dec.at)}; }
+    val at:       usize                   = dec.at;
+    val res_unit: res[u64, field.Refusal] = field.get(dec, f.width / 8);
+    if (sel res_unit.err) { ret err[field.Refusal].err{res_unit.err}; }
+    val err_unpacked: err[field.Refusal] = field.unpack(dec, f, res_unit.ok, at);
+    if (sel err_unpacked.err) { ret err_unpacked; }
+    field.deposit(dec, first::u8, field.NUMBER, sreg_number((res_unit.ok >> gen_field.SREG7.at::u64) & field.ones(gen_field.SREG7.len)), 0);
+    field.deposit(dec, second::u8, field.NUMBER, sreg_number((res_unit.ok >> gen_field.SREG2.at::u64) & field.ones(gen_field.SREG2.len)), 0);
+    ret err[field.Refusal].ok{};
+}
+
+# a unit that codes two s registers in three bits each, at the bits of SREG7 and SREG2, with no slices
+pub val SREGS: field.Kind = field.Kind{name: "sregs", admit: nil, encode: sregs_encode, decode: sregs_decode, finish: nil, complete: nil, check: nil};
+
+# the stack adjustment base of each register list in bytes, 0 for the lists zcmp reserves
+val BASE32: [16]u8 = [16]u8{0, 0, 0, 0, 16, 16, 16, 16, 32, 32, 32, 32, 48, 48, 48, 64};
+val BASE64: [16]u8 = [16]u8{0, 0, 0, 0, 16, 16, 32, 32, 48, 48, 64, 64, 80, 80, 96, 112};
+
+# a stack field's param, as the generator writes it: the index of the register list operand in bits 0 to 7, bit 8 set
+# at rv64 and bit 9 set when the adjustment is written negative, as cm.push does. the field's operand is the
+# adjustment, an immediate whose bits hold the largest adjustment with its sign
+fun stack_base(list: u64, wide: bool) u64 {
+    if (list >= 16) { ret 0; }
+    if (wide)       { ret BASE64[list]::u64; }
+    ret BASE32[list]::u64;
+}
+
+# the bits of the adjustment operand's immediate, its sign the top one when written negative, 0 when it is not an immediate
+fun adjustment_bits(desc: *operand.Operand) u8 {
+    if (sel desc.shape.immediate) { ret desc.shape.immediate.bits; }
+    ret 0;
+}
+
+# the two bits of the adjustment for the values `enc` holds, refused at stream offset `at` when the list is one zcmp
+# reserves or the adjustment is not the list's base plus 0, 16, 32 or 48
+fun stack_step(enc: *field.Encoder, f: *field.Field, at: usize) res[u64, field.Refusal] {
+    val list: u32 = (f.param & 0xFF)::u32;
+    if (list >= enc.count) { ret res[u64, field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    val base: u64 = stack_base(enc.parts[list].bits[field.NUMBER], (f.param & 0x100) != 0);
+    if (base == 0) { ret res[u64, field.Refusal].err{field.refusal(field.NOT_A_MEMBER, list::u8, at)}; }
+    val bits: u8 = adjustment_bits(?enc.operands[f.operand]);
+    if (bits == 0 || bits >= 64) { ret res[u64, field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    var adjust: i64 = (enc.parts[f.operand].bits[field.NUMBER] & field.ones(bits))::i64;
+    if ((f.param & 0x200) != 0) {
+        if (adjust >= (1::i64 << (bits - 1)::i64)) { adjust = adjust - (1::i64 << bits::i64); }
+        adjust = 0 - adjust;
+    }
+    val step: i64 = adjust - base::i64;
+    if (step < 0 || step > 48) { ret res[u64, field.Refusal].err{field.refusal(field.OUT_OF_RANGE, f.operand, at)}; }
+    ret res[u64, field.Refusal].ok{(step / 16)::u64};
+}
+
+fun stack_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val res_step: res[u64, field.Refusal] = stack_step(enc, f, 0);
+    if (sel res_step.err) { ret err[field.Refusal].err{res_step.err}; }
+    ret err[field.Refusal].ok{};
+}
+
+fun stack_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val res_step: res[u64, field.Refusal] = stack_step(enc, f, enc.out.len);
+    if (sel res_step.err) { ret err[field.Refusal].err{res_step.err}; }
+    val res_unit: res[u64, field.Refusal] = field.pack(enc, f);
+    if (sel res_unit.err) { ret err[field.Refusal].err{res_unit.err}; }
+    ret field.put(enc, res_unit.ok | (res_step.ok << 2), f.width / 8);
+}
+
+fun stack_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:       usize                   = dec.at;
+    val res_unit: res[u64, field.Refusal] = field.get(dec, f.width / 8);
+    if (sel res_unit.err) { ret err[field.Refusal].err{res_unit.err}; }
+    val err_unpacked: err[field.Refusal] = field.unpack(dec, f, res_unit.ok, at);
+    if (sel err_unpacked.err) { ret err_unpacked; }
+    val list: u32 = (f.param & 0xFF)::u32;
+    if (list >= dec.count) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    val base: u64 = stack_base(dec.parts[list].bits[field.NUMBER], (f.param & 0x100) != 0);
+    if (base == 0) { ret err[field.Refusal].err{field.refusal(field.NOT_A_MEMBER, list::u8, at)}; }
+    val bits: u8 = adjustment_bits(?dec.operands[f.operand]);
+    if (bits == 0 || bits >= 64) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, at)}; }
+    var adjust: u64 = base + ((res_unit.ok >> 2) & 3) * 16;
+    if ((f.param & 0x200) != 0) { adjust = (0 - adjust::i64)::u64 & field.ones(bits); }
+    field.deposit(dec, f.operand, field.NUMBER, adjust, 0);
+    ret err[field.Refusal].ok{};
+}
+
+# zcmp's stack adjustment: the register list's base plus sixteen times two bits
+pub val STACK: field.Kind = field.Kind{name: "stack", admit: stack_admit, encode: stack_encode, decode: stack_decode, finish: nil, complete: nil, check: nil};
+
+# the literal number of operand `f.operand` in its bytes, least significant first, and zero bytes to the field's width,
+# refused when it is wider
+fun raw_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.literal) { ret err[field.Refusal].err{field.refusal(field.WRONG_KIND, f.operand, enc.out.len)}; }
+    val bytes: operand.Bytes = v.literal;
+    val width: u32           = f.width::u32 / 8;
+    if (bytes.len > width) { ret err[field.Refusal].err{field.refusal(field.LITERAL_LENGTH, f.operand, enc.out.len)}; }
+    var i: u32 = 0;
+    for (i < width) {
+        var b: u8 = 0;
+        if (i < bytes.len) { b = bytes.at[i]; }
+        val err_put: err[field.Refusal] = field.put(enc, b::u64, 1);
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun raw_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val res_borrow: res[operand.Bytes, field.Refusal] = field.borrow(dec, (f.width / 8)::usize);
+    if (sel res_borrow.err) { ret err[field.Refusal].err{res_borrow.err}; }
+    field.place(dec, f.operand, operand.Value.literal{res_borrow.ok});
+    ret err[field.Refusal].ok{};
+}
+
+# a raw encoding of a literal number, its bytes in order and zero padded to the field's width
+pub val RAW: field.Kind = field.Kind{name: "raw", admit: nil, encode: raw_encode, decode: raw_decode, finish: nil, complete: nil, check: nil};
+
+val KINDS: [4]*field.Kind = [4]*field.Kind{?field.UNIT, ?SREGS, ?STACK, ?RAW};
+
+# the riscv field table, its units little-endian
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 4, order: field.LITTLE};
+
+# the riscv form choices: only the core's exact form, which no marker spells, so an instruction a sequence writes full
+# length that would compress alone has no statement of its own (#224)
+val FORM_ROWS: [1]core_form.FormField = [1]core_form.FormField{core_form.FormField{name: "exact", mask: core_form.EXACT, value: core_form.EXACT, marker: nil, suffix: false}};
+
+pub val FORMS: core_form.FormFields = core_form.FormFields{at: ?FORM_ROWS[0], len: 1};

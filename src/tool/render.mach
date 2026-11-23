@@ -1,0 +1,282 @@
+# diagnostics and exit codes in the form of mach's command line
+#
+# a diagnostic is a headline naming its code and its wording, and, when it is
+# about text, the place and the line it points into:
+#
+#     error[asm.refused] unknown instruction
+#       @ a.s:3:5
+#     3 |     frob a0
+#       |     ^^^^
+#
+# a refusal of masc's own text is spelled by `unmet.spell_refusal`,
+# and a failure of mink's by `mink.diag.render`, so each wording has one
+# owner and this module only places it.
+
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.diag;
+use mink.base.fail;
+use mink.base.intern;
+use mink.base.store;
+use mink.base.table;
+use mink.bytes.reader;
+use mink.bytes.sink;
+use mink.catalog.arch;
+use mink.catalog.trait;
+use mink.model.object;
+
+use build_refusal: masc.build.refusal;
+use masc.core.diagnostic;
+use core_unmet: masc.core.unmet;
+use masc.tool.text;
+
+# how a command ends, the same codes in mach, mirl, masc and mink, kept so by hand
+# ---
+# SUCCESS:     it did what was asked
+# USER:        what it was asked was refused, or is valid and not done yet
+# INTERNAL:    masc or a library it builds on broke an invariant
+# ENVIRONMENT: the system refused storage, a file or a stream
+pub def Exit: i64;
+
+pub val SUCCESS:     Exit = 0;
+pub val USER:        Exit = 1;
+pub val INTERNAL:    Exit = 2;
+pub val ENVIRONMENT: Exit = 3;
+
+# the exit a failure of mink ends a command with
+pub fun exit_of(f: fail.Fail) Exit {
+    if (sel f.cause.io || sel f.cause.refused) { ret ENVIRONMENT; }
+    if (sel f.cause.internal)                  { ret INTERNAL; }
+    ret USER;
+}
+
+fun repeat(t: *text.Text, c: u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        text.byte(t, c);
+        i = i + 1;
+    }
+}
+
+# `error[code] `, which the caller's wording follows
+pub fun begin(t: *text.Text, code: str) {
+    text.put(t, "error[");
+    text.put(t, code);
+    text.put(t, "] ");
+}
+
+# `error[code] message` and a newline
+pub fun headline(t: *text.Text, code: str, message: str) {
+    begin(t, code);
+    text.put(t, message);
+    text.byte(t, '\n');
+}
+
+# `error[code] message 'subject'` and a newline, as mach names the word it refused
+pub fun quoted(t: *text.Text, code: str, message: str, subject: str) {
+    begin(t, code);
+    text.put(t, message);
+    text.put(t, " '");
+    text.put(t, subject);
+    text.put(t, "'\n");
+}
+
+# how many digits `n` has in decimal
+fun digits(n: u64) usize {
+    var count: usize = 1;
+    var m:     u64   = n;
+    for (m >= 10) {
+        m     = m / 10;
+        count = count + 1;
+    }
+    ret count;
+}
+
+# the place of `span` in `src[0..len]`, named `name`, the `@` in the gutter's bar column, and the line it starts on,
+# its bytes marked
+pub fun place(t: *text.Text, name: str, src: *u8, len: usize, span: diagnostic.Span) {
+    val width: usize = digits(span.start.line::u64);
+    repeat(t, ' ', width + 1);
+    text.put(t, "@ ");
+    text.put(t, name);
+    text.byte(t, ':');
+    text.decimal(t, span.start.line::i64);
+    text.byte(t, ':');
+    text.decimal(t, span.start.column::i64);
+    text.byte(t, '\n');
+    text.decimal(t, span.start.line::i64);
+    text.put(t, " | ");
+    var start: usize = span.start.offset;
+    if (start > len) { start = len; }
+    var first: usize = start;
+    for (first > 0 && src[first - 1] != '\n') { first = first - 1; }
+    var end: usize = start;
+    for (end < len && src[end] != '\n') { end = end + 1; }
+    text.bytes(t, ?src[first], end - first);
+    text.byte(t, '\n');
+    repeat(t, ' ', width + 1);
+    text.put(t, "| ");
+    repeat(t, ' ', start - first);
+    var marks: usize = span.len;
+    if (marks > end - start) { marks = end - start; }
+    if (marks == 0)          { marks = 1; }
+    repeat(t, '^', marks);
+    text.byte(t, '\n');
+}
+
+# the refusal worded `message` of `span` in `src[0..len]`, named `name`, that needed `u`, which words what it needed
+pub fun refusal(t: *text.Text, code: str, name: str, src: *u8, len: usize, message: str, span: diagnostic.Span, u: *core_unmet.Unmet) {
+    begin(t, code);
+    var worded:      vector.Vector[u8] = vector.init[u8](t.out.a);
+    val err_spelled: err[A.Error]      = core_unmet.spell_refusal(message, u, ?worded);
+    if (sel err_spelled.err) { t.failed = true; }
+    text.bytes(t, worded.data, worded.len);
+    vector.dnit[u8](?worded);
+    text.byte(t, '\n');
+    place(t, name, src, len, span);
+}
+
+# the refusal of a context that does not enter its architecture, naming the architecture and what its entry needs
+pub fun mode(t: *text.Text, code: str, m: *build_refusal.Mismatch) {
+    headline(t, code, build_refusal.MODE);
+    text.put(t, "  architecture '");
+    text.put(t, m.arch);
+    text.put(t, "' is entered only by a context that ");
+    var worded:      vector.Vector[u8] = vector.init[u8](t.out.a);
+    val err_spelled: err[A.Error]      = core_unmet.spell_unmet(?m.unmet, ?worded);
+    if (sel err_spelled.err) { t.failed = true; }
+    text.bytes(t, worded.data, worded.len);
+    vector.dnit[u8](?worded);
+    text.byte(t, '\n');
+}
+
+# the failure `f` of mink under the code `code`, in mink's own wording and form
+pub fun failure(t: *text.Text, code: str, f: fail.Fail) {
+    begin(t, code);
+    var s:          sink.Sink      = sink.init(t.out.a, reader.LITTLE);
+    val err_worded: err[fail.Fail] = diag.render(nil, f, ?s);
+    if (sel err_worded.err) { t.failed = true; }
+    text.bytes(t, sink.data(?s), sink.len(?s));
+    sink.dnit(?s);
+}
+
+# the failure `f` refusing the value given for one part, under the code `code`: `error[code] text 'given'`, as mach
+# names the word it refused
+pub fun refused(t: *text.Text, code: str, f: fail.Fail) {
+    begin(t, code);
+    said(t, f);
+    if (!diag.names_item(f)) {
+        text.put(t, " '");
+        if (sel f.refused.some) { text.view(t, f.refused.some.given); }
+        text.put(t, "'");
+    }
+    text.byte(t, '\n');
+}
+
+# the message of the failure `f` in mink's wording, its item set in
+pub fun said(t: *text.Text, f: fail.Fail) {
+    var s:          sink.Sink      = sink.init(t.out.a, reader.LITTLE);
+    val err_worded: err[fail.Fail] = diag.said(f, ?s);
+    if (sel err_worded.err) { t.failed = true; }
+    text.bytes(t, sink.data(?s), sink.len(?s));
+    sink.dnit(?s);
+}
+
+# `n` in hex, `0x` first and no leading zeros
+fun hex_of(t: *text.Text, n: u64) {
+    text.put(t, "0x");
+    var shift: u64 = 60;
+    for (shift > 0 && ((n >> shift) & 15) == 0) { shift = shift - 4; }
+    for {
+        text.byte(t, "0123456789abcdef"[((n >> shift) & 15)::usize]);
+        if (shift == 0) { brk; }
+        shift = shift - 4;
+    }
+}
+
+# the refusal `f` to disassemble the object `o` of the file `name`, and the section or the place in the module its format
+# builds it was found at
+pub fun unprinted(t: *text.Text, code: str, name: str, o: *object.Object, f: fail.Fail) {
+    begin(t, code);
+    said(t, f);
+    text.byte(t, '\n');
+    text.put(t, "  @ ");
+    text.put(t, name);
+    if (f.at.indexed) {
+        if (f.at.index < table.count[object.Section](?o.sections)::u64) {
+            val s:         *object.Section            = object.section_at(o, table.nth[object.Section](f.at.index::usize));
+            val opt_named: opt[table.Id[intern.Name]] = s.name;
+            if (sel opt_named.some) {
+                text.put(t, ", section '");
+                text.view(t, object.name_of(o, opt_named.some));
+            }
+            or {
+                text.put(t, ", nameless section of kind '");
+                text.put(t, s.kind.name);
+            }
+            text.put(t, "', offset ");
+            hex_of(t, f.at.offset);
+        }
+    }
+    or (f.at.placed) {
+        text.put(t, ", the module its format builds, offset ");
+        hex_of(t, f.at.offset);
+    }
+    text.byte(t, '\n');
+}
+
+# the traits of the object the file `name` holds that its text does not state, a note per row the caller gives the
+# assembler again: the abi row `abi` names, and each trait row in `rows` by its axis and value, with who gives it
+pub fun unwritten(t: *text.Text, name: str, abi: opt[*arch.Abi], rows: *vector.Vector[trait.Trait]) {
+    if (sel abi.some) {
+        text.put(t, "note[disasm.unwritten] the object's conventions are abi '");
+        text.put(t, abi.some.name);
+        text.put(t, "', which --abi gives the assembler again (");
+        text.put(t, name);
+        text.put(t, ")\n");
+    }
+    var i: usize = 0;
+    for (i < rows.len) {
+        val row: *trait.Trait = ?rows.data[i];
+        i = i + 1;
+        text.put(t, "note[disasm.unwritten] the text does not state trait ");
+        text.put(t, row.axis.name);
+        text.byte(t, ' ');
+        setting(t, row.setting);
+        if (sel row.axis.owner.selection)  { text.put(t, ", which the selection --isa names gives the assembler again ("); }
+        or (sel row.axis.owner.convention) { text.put(t, ", which no abi row gives the assembler again ("); }
+        or                                 { text.put(t, ", which only a source states ("); }
+        text.put(t, name);
+        text.put(t, ")\n");
+    }
+}
+
+# setting `s` as mink's trait tool spells it: a choice by name, a flag as set or clear, a number in decimal and bytes as
+# text, all borrowed
+fun setting(t: *text.Text, s: trait.Setting) {
+    if (sel s.choice) { text.put(t, s.choice.name); }
+    or (sel s.flag) {
+        if (s.flag) { text.put(t, "set"); }
+        or          { text.put(t, "clear"); }
+    }
+    or (sel s.number) { text.decimal(t, s.number::i64); }
+    or (sel s.text)   { held(t, s.text); }
+    or (sel s.set)    { held(t, s.set); }
+    or (sel s.pair) {
+        text.decimal(t, s.pair.number::i64);
+        text.byte(t, ' ');
+        held(t, s.pair.text);
+    }
+}
+
+# the bytes `h` borrows, as text
+fun held(t: *text.Text, h: store.Held) {
+    if (sel h.borrowed) { text.bytes(t, h.borrowed.data, h.borrowed.len); }
+}

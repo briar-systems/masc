@@ -1,0 +1,249 @@
+# the line directives, a layer of rows over the calls of `masc.emit.line`
+#
+# `.file` states a file of the table, in its DWARF 5 form with a directory and
+# a checksum, `.file 0 "dir" "name" md5 0x...`, or the older `.file N "name"`,
+# and `.loc` states a location with its flags. both only read their text and
+# make the calls mirl makes with none, so a location is attached to the
+# builder's position, the start of the next instruction, and its row is stated
+# on the object at its final offset. a `.loc` naming a file not in the table is
+# refused where it is read. a file is numbered as the table is, from 0, each
+# directly after the last.
+#
+# `.file "name"` with no number is no file of the table: it names the source
+# file the object is of, a local symbol of the source kind the builder states.
+# a location's `view` is refused, as the row's view is a fact of mink's line
+# model, which masc does not state yet.
+#
+# the layer holds the line facts and the two registers that hold from one
+# `.loc` to the next, is_stmt and the instruction set variant. its state is
+# the caller's, kept as long as the assembler is.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink_line: mink.model.line;
+
+use masc.asm.model;
+use build_label:   masc.build.label;
+use build_refusal: masc.build.refusal;
+use masc.core.diagnostic;
+use masc.core.operand;
+use core_syntax: masc.core.syntax;
+use lines:       masc.emit.line;
+use masc.syntax.expr;
+use masc.syntax.read;
+
+pub val OUT_OF_ORDER: str = "the file is not numbered directly after the last";
+pub val NOT_A_COUNT:  str = "a number from 0 to 4294967295 is expected here";
+pub val NOT_A_STMT:   str = "0 or 1 is expected here";
+pub val NOT_A_DIGEST: str = "32 hexadecimal digits are expected here";
+pub val NOT_A_FLAG:   str = "a location has no such flag";
+pub val FLAG_TWICE:   str = "the flag is stated twice";
+pub val NO_VIEW:      str = "a location's view is not supported yet";
+
+# the state of the layer
+# ---
+# lines: the line facts the directives state
+# stmt:  is_stmt, as the last `.loc` left it
+# isa:   the instruction set variant, as the last `.loc` left it
+pub rec Context {
+    lines: lines.Lines;
+    stmt:  bool;
+    isa:   u32;
+}
+
+# the state of a layer over an object, empty
+pub fun init(a: *A.Allocator) Context {
+    ret Context{lines: lines.make(a), stmt: true, isa: 0};
+}
+
+# give back what the state owns
+pub fun dnit(c: *Context) {
+    lines.dnit(?c.lines);
+}
+
+fun refused(rd: *core_syntax.Reader, message: str, at: usize) diagnostic.Diagnostic {
+    ret read.refuse(rd, message, at, rd.at - at);
+}
+
+# a count read at the reader, from 0 to the most a u32 holds
+fun count(rd: *core_syntax.Reader) res[u32, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at:        usize                                 = rd.at;
+    val res_parse: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+    if (sel res_parse.err)                                                { ret res[u32, diagnostic.Diagnostic].err{res_parse.err}; }
+    if (!sel res_parse.ok.constant)                                       { ret res[u32, diagnostic.Diagnostic].err{refused(rd, model.NOT_CONSTANT, at)}; }
+    if (res_parse.ok.constant < 0 || res_parse.ok.constant > 0xFFFF_FFFF) { ret res[u32, diagnostic.Diagnostic].err{refused(rd, NOT_A_COUNT, at)}; }
+    ret res[u32, diagnostic.Diagnostic].ok{res_parse.ok.constant::u32};
+}
+
+fun hexit(c: u8) u8 {
+    if (c >= '0' && c <= '9') { ret c - '0'; }
+    if (c >= 'a' && c <= 'f') { ret c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { ret c - 'A' + 10; }
+    ret 16;
+}
+
+# the 32 hexadecimal digits at the reader, after an optional `0x`, as a checksum
+fun digest(rd: *core_syntax.Reader) res[mink_line.Md5, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at: usize = rd.at;
+    if (read.peek(rd) == '0' && rd.at + 1 < rd.end && (rd.text[rd.at + 1] == 'x' || rd.text[rd.at + 1] == 'X')) { rd.at = rd.at + 2; }
+    var d: mink_line.Md5;
+    var i: usize = 0;
+    for (i < 16) {
+        val hi: u8 = hexit(read.peek(rd));
+        if (hi > 15) { ret res[mink_line.Md5, diagnostic.Diagnostic].err{refused(rd, NOT_A_DIGEST, at)}; }
+        rd.at = rd.at + 1;
+        val lo: u8 = hexit(read.peek(rd));
+        if (lo > 15) { ret res[mink_line.Md5, diagnostic.Diagnostic].err{refused(rd, NOT_A_DIGEST, at)}; }
+        rd.at      = rd.at + 1;
+        d.bytes[i] = hi * 16 + lo;
+        i          = i + 1;
+    }
+    if (read.word(read.peek(rd))) { ret res[mink_line.Md5, diagnostic.Diagnostic].err{refused(rd, NOT_A_DIGEST, at)}; }
+    ret res[mink_line.Md5, diagnostic.Diagnostic].ok{d};
+}
+
+# whether the word at the reader is `name`, passed when it is
+fun word(rd: *core_syntax.Reader, name: str) bool {
+    val n: usize = str_len(name);
+    if (!read.starts(rd, rd.at, name, n) || !read.bounded(rd, rd.at, n, name[n - 1])) { ret false; }
+    rd.at = rd.at + n;
+    ret true;
+}
+
+# a file of the table added, as `.file index ["dir"] "name" [md5 0x...]` states it, or the source file named, as
+# `.file "name"` states it
+fun do_file(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val c:  *Context            = args.layer.context::*Context;
+    val rd: *core_syntax.Reader = args.reader;
+    read.skip(rd);
+    val at: usize = rd.at;
+    if (read.peek(rd) == '"') {
+        val res_string: res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel res_string.err) { ret err[diagnostic.Diagnostic].err{res_string.err}; }
+        val err_named: err[build_refusal.Refusal] = build_label.source(model.builder(m), res_string.ok);
+        if (sel err_named.err) { ret err[diagnostic.Diagnostic].err{refused(rd, err_named.err.message, at)}; }
+        ret err[diagnostic.Diagnostic].ok{};
+    }
+    val res_index: res[u32, diagnostic.Diagnostic] = count(rd);
+    if (sel res_index.err) { ret err[diagnostic.Diagnostic].err{res_index.err}; }
+    val first: u32 = res_index.ok;
+    var names: [2]View;
+    var held:  u32 = 0;
+    read.skip(rd);
+    for (held < 2 && read.peek(rd) == '"') {
+        val res_string: res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel res_string.err) { ret err[diagnostic.Diagnostic].err{res_string.err}; }
+        names[held] = res_string.ok;
+        held        = held + 1;
+        read.skip(rd);
+    }
+    if (held == 0) { ret err[diagnostic.Diagnostic].err{refused(rd, model.NOT_A_STRING, rd.at)}; }
+    var source: lines.Source = lines.Source{directory: View{data: "", len: 0}, name: names[0], md5: opt[mink_line.Md5].none{}};
+    if (held == 2) {
+        source.directory = names[0];
+        source.name      = names[1];
+    }
+    if (word(rd, "md5")) {
+        val res_sum: res[mink_line.Md5, diagnostic.Diagnostic] = digest(rd);
+        if (sel res_sum.err) { ret err[diagnostic.Diagnostic].err{res_sum.err}; }
+        source.md5 = opt[mink_line.Md5].some{res_sum.ok};
+    }
+    val have: u32 = lines.file_count(?c.lines);
+    if (first != have) { ret err[diagnostic.Diagnostic].err{refused(rd, OUT_OF_ORDER, at)}; }
+    val res_added: res[u32, build_refusal.Refusal] = lines.file(?c.lines, source);
+    if (sel res_added.err) { ret err[diagnostic.Diagnostic].err{refused(rd, res_added.err.message, at)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# a location attached to the cursor, as `.loc file line [column] [flag ...]` states it, the flags `basic_block`,
+# `prologue_end`, `epilogue_begin`, `is_stmt n`, `isa n` and `discriminator n`
+fun do_loc(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val c:        *Context                        = args.layer.context::*Context;
+    val rd:       *core_syntax.Reader             = args.reader;
+    val at:       usize                           = rd.at;
+    val res_file: res[u32, diagnostic.Diagnostic] = count(rd);
+    if (sel res_file.err)                          { ret err[diagnostic.Diagnostic].err{res_file.err}; }
+    if (res_file.ok >= lines.file_count(?c.lines)) { ret err[diagnostic.Diagnostic].err{refused(rd, lines.UNKNOWN_FILE, at)}; }
+    val res_row: res[u32, diagnostic.Diagnostic] = count(rd);
+    if (sel res_row.err) { ret err[diagnostic.Diagnostic].err{res_row.err}; }
+    var loc: lines.Location = lines.Location{file: res_file.ok, line: res_row.ok, column: 0, end_column: opt[u32].none{}, flags: 0, isa: c.isa, discriminator: 0};
+    read.skip(rd);
+    val c0: u8 = read.peek(rd);
+    if (c0 >= '0' && c0 <= '9') {
+        val res_column: res[u32, diagnostic.Diagnostic] = count(rd);
+        if (sel res_column.err) { ret err[diagnostic.Diagnostic].err{res_column.err}; }
+        loc.column = res_column.ok;
+    }
+    var stmt: bool = c.stmt;
+    var seen: u32  = 0;
+    for {
+        read.skip(rd);
+        if (rd.at >= rd.end) { brk; }
+        val flag: usize = rd.at;
+        var bit:  u32   = 0;
+        if (word(rd, "basic_block")) {
+            loc.flags = loc.flags | mink_line.BLOCK;
+            bit       = 1;
+        }
+        or (word(rd, "prologue_end")) {
+            loc.flags = loc.flags | mink_line.PROLOGUE_END;
+            bit       = 2;
+        }
+        or (word(rd, "epilogue_begin")) {
+            loc.flags = loc.flags | mink_line.EPILOGUE_BEGIN;
+            bit       = 4;
+        }
+        or (word(rd, "is_stmt")) {
+            val res_count: res[u32, diagnostic.Diagnostic] = count(rd);
+            if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+            if (res_count.ok > 1)  { ret err[diagnostic.Diagnostic].err{refused(rd, NOT_A_STMT, flag)}; }
+            stmt = res_count.ok == 1;
+            bit  = 8;
+        }
+        or (word(rd, "isa")) {
+            val res_count: res[u32, diagnostic.Diagnostic] = count(rd);
+            if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+            loc.isa = res_count.ok;
+            bit     = 16;
+        }
+        or (word(rd, "discriminator")) {
+            val res_count: res[u32, diagnostic.Diagnostic] = count(rd);
+            if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+            loc.discriminator = res_count.ok;
+            bit               = 32;
+        }
+        or (word(rd, "view"))  { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_VIEW, flag, 4)}; }
+        or                     { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NOT_A_FLAG, flag, read.token(rd, flag))}; }
+        if ((seen & bit) != 0) { ret err[diagnostic.Diagnostic].err{refused(rd, FLAG_TWICE, flag)}; }
+        seen = seen | bit;
+    }
+    if (stmt) { loc.flags = loc.flags | mink_line.STATEMENT; }
+    c.stmt = stmt;
+    c.isa  = loc.isa;
+    val err_placed: err[build_refusal.Refusal] = lines.location(?c.lines, model.builder(m), loc);
+    if (sel err_placed.err) { ret err[diagnostic.Diagnostic].err{refused(rd, err_placed.err.message, at)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+val ROWS: [2]model.Directive = [2]model.Directive{
+    model.Directive{name: ".file", operands: model.TEXT, handler: do_file, param: 0},
+    model.Directive{name: ".loc", operands: model.TEXT, handler: do_loc, param: 0},
+};
+
+# the layer of the line rows over the state `c`, whose records the builder states when it finishes
+pub fun layer(c: *Context) model.Layer {
+    ret model.Layer{name: "line", directives: model.Directives{at: ?ROWS[0], len: 2}, context: c::ptr, finish: model.finished};
+}

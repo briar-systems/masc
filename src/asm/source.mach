@@ -1,0 +1,278 @@
+# the statement model of assembly source: tokens, statements and the feeds that hand them on
+#
+# source text is a run of statements. a statement is a label, as `f:` or a
+# numbered `1:`, a directive, whose head starts with a dot, or an
+# instruction, and a line holds any number of them: labels come before what
+# follows them on the line, and the set's separator ends a statement within
+# one. comments run from the set's comment marker or `/*` to their end and
+# are no statement. every token carries its line and column.
+#
+# statements reach the assembler through a feed, which hands on one at a
+# time. the lexer is the feed of a text, and a layer that rewrites the
+# stream, as macros and conditional assembly do, is a feed over another
+# feed, so the assembler reads expansions as it reads source. a statement's
+# text need not be the file's: an expansion's tokens are positioned in its
+# definition, and its site is where the file being assembled states it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use masc.core.diagnostic;
+use masc.core.requirement;
+use core_source: masc.core.source;
+use spell:       masc.syntax.name;
+
+pub val UNCLOSED_STRING:  str = "the string is not closed";
+pub val UNCLOSED_COMMENT: str = "the comment is not closed";
+pub val MALFORMED:        str = "the statement is malformed";
+
+# a token of source text
+# ---
+# at:       its offset in its statement's text
+# len:      its length
+# position: where it starts
+pub rec Token {
+    at:       usize;
+    len:      usize;
+    position: diagnostic.Position;
+}
+
+# what a statement is
+# ---
+# LABEL:       a label, its head the name before the colon, its quotes with it when it is quoted
+# DIRECTIVE:   a directive, its head the name with its dot
+# INSTRUCTION: an instruction, its head the mnemonic, or empty where the statement starts with what no head spells,
+#              which the set's syntax reads around its instruction, as spir-v's `%r =`
+pub def Kind: u8;
+
+pub val LABEL:       Kind = 0;
+pub val DIRECTIVE:   Kind = 1;
+pub val INSTRUCTION: Kind = 2;
+
+# one statement
+# ---
+# kind: what it is
+# text: the text its tokens are in
+# head: the label's name, the directive's name or the mnemonic, with the form markers in braces that lead it
+# body: the operands after the head, white space around them left out, empty for a label
+# site: where the file being assembled states it, its head for source text and the invocation for an expansion
+pub rec Statement {
+    kind: Kind;
+    text: *u8;
+    head: Token;
+    body: Token;
+    site: diagnostic.Position;
+}
+
+# the bytes of `t` in `s`
+pub fun bytes(s: *Statement, t: Token) View {
+    ret View{data: ?s.text[t.at], len: t.len};
+}
+
+# a source of statements
+# ---
+# context: the feed's state
+# next:    the next statement into its second argument, false at the end, or the refusal of malformed text
+pub rec Feed {
+    context: ptr;
+    next:    fun(ptr, *Statement) res[bool, diagnostic.Diagnostic];
+}
+
+# the feed of one text
+# ---
+# text:      the text
+# len:       its length
+# at:        the offset read to
+# position:  the position of `at`
+# comment:   the set's comment marker
+# separator: the set's statement separator
+pub rec Lexer {
+    text:      *u8;
+    len:       usize;
+    at:        usize;
+    position:  diagnostic.Position;
+    comment:   str;
+    separator: u8;
+}
+
+# a lexer over the `len` bytes of `text`, whose first byte is at `origin`, in the dialect `source`
+pub fun lexer(text: *u8, len: usize, origin: diagnostic.Position, source: *core_source.Source) Lexer {
+    ret Lexer{text: text, len: len, at: 0, position: origin, comment: source.comment, separator: source.separator};
+}
+
+# `l` as a feed, which reads it in place
+pub fun feed(l: *Lexer) Feed {
+    ret Feed{context: l::ptr, next: next};
+}
+
+fun peek(l: *Lexer, k: usize) u8 {
+    if (l.at + k >= l.len) { ret 0; }
+    ret l.text[l.at + k];
+}
+
+# the lexer moved past one byte
+fun step(l: *Lexer) {
+    if (l.text[l.at] == '\n') {
+        l.position.line   = l.position.line + 1;
+        l.position.column = 1;
+    }
+    or { l.position.column = l.position.column + 1; }
+    l.position.offset = l.position.offset + 1;
+    l.at              = l.at + 1;
+}
+
+# whether the comment marker starts at the lexer's offset
+fun commenting(l: *Lexer) bool {
+    val n: usize = str_len(l.comment);
+    if (n == 0 || l.len - l.at < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (l.text[l.at + i] != l.comment[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun refusal(message: str, at: diagnostic.Position, len: usize) diagnostic.Diagnostic {
+    ret diagnostic.Diagnostic{message: message, span: diagnostic.Span{start: at, len: len}, requires: requirement.NO_ALTERNATIVES};
+}
+
+# the lexer moved past a comment that starts at its offset, refused when a block comment is not closed
+fun skip_comment(l: *Lexer) res[bool, diagnostic.Diagnostic] {
+    if (peek(l, 0) == '/' && peek(l, 1) == '*') {
+        val at: diagnostic.Position = l.position;
+        step(l);
+        step(l);
+        for (!(peek(l, 0) == '*' && peek(l, 1) == '/')) {
+            if (l.at >= l.len) { ret res[bool, diagnostic.Diagnostic].err{refusal(UNCLOSED_COMMENT, at, 2)}; }
+            step(l);
+        }
+        step(l);
+        step(l);
+        ret res[bool, diagnostic.Diagnostic].ok{true};
+    }
+    if (commenting(l)) {
+        for (l.at < l.len && l.text[l.at] != '\n') {
+            step(l);
+        }
+        ret res[bool, diagnostic.Diagnostic].ok{true};
+    }
+    ret res[bool, diagnostic.Diagnostic].ok{false};
+}
+
+# whether `c` continues a head: a name, a mnemonic or a label
+fun heading(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+}
+
+fun is_blank(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r';
+}
+
+# the lexer moved past a string or a character constant that starts at its offset, refused when a string is not closed
+fun skip_quoted(l: *Lexer) res[bool, diagnostic.Diagnostic] {
+    val c: u8 = peek(l, 0);
+    if (c == '\'') {
+        # `'c` or `'c'`, an escape taking the byte after it
+        step(l);
+        if (peek(l, 0) == '\\' && l.at + 1 < l.len) { step(l); }
+        if (l.at < l.len && l.text[l.at] != '\n')   { step(l); }
+        if (peek(l, 0) == '\'')                     { step(l); }
+        ret res[bool, diagnostic.Diagnostic].ok{true};
+    }
+    if (c != '"') { ret res[bool, diagnostic.Diagnostic].ok{false}; }
+    val at: diagnostic.Position = l.position;
+    step(l);
+    for (peek(l, 0) != '"') {
+        if (l.at >= l.len || l.text[l.at] == '\n')    { ret res[bool, diagnostic.Diagnostic].err{refusal(UNCLOSED_STRING, at, 1)}; }
+        if (l.text[l.at] == '\\' && l.at + 1 < l.len) { step(l); }
+        step(l);
+    }
+    step(l);
+    ret res[bool, diagnostic.Diagnostic].ok{true};
+}
+
+# the length of the comment, string or character constant of `source`'s dialect that starts at `at` in the `len` bytes
+# of `text`, 0 where none starts, as the lexer passes it: a comment to its line's end or its `*/`, a string to its
+# closing quote or the line's end and a character constant as `'c` or `'c'`. a block comment never closed runs to `len`
+pub fun skipped(source: *core_source.Source, text: *u8, at: usize, len: usize) usize {
+    var l:           Lexer                            = lexer(?text[at], len - at, diagnostic.START, source);
+    val res_comment: res[bool, diagnostic.Diagnostic] = skip_comment(?l);
+    if (sel res_comment.err) { ret l.at; }
+    if (res_comment.ok)      { ret l.at; }
+    val res_quoted: res[bool, diagnostic.Diagnostic] = skip_quoted(?l);
+    ret l.at;
+}
+
+fun next(context: ptr, out: *Statement) res[bool, diagnostic.Diagnostic] {
+    val l: *Lexer = context::*Lexer;
+    # past blanks, line ends, separators and comments to a statement's head
+    for (l.at < l.len) {
+        val c: u8 = l.text[l.at];
+        if (is_blank(c) || c == '\n' || c == l.separator) {
+            step(l);
+            cnt;
+        }
+        val res_skipped: res[bool, diagnostic.Diagnostic] = skip_comment(l);
+        if (sel res_skipped.err) { ret res_skipped; }
+        if (!res_skipped.ok)     { brk; }
+    }
+    if (l.at >= l.len) { ret res[bool, diagnostic.Diagnostic].ok{false}; }
+    val head: Token = Token{at: l.at, len: 0, position: l.position};
+    # a form marker in braces, as x86's `{disp32}`, leads the instruction it marks and is read by the set's syntax
+    for (peek(l, 0) == '{') {
+        for (l.at < l.len && l.text[l.at] != '}' && l.text[l.at] != '\n') { step(l); }
+        if (peek(l, 0) == '}') { step(l); }
+        for (l.at < l.len && is_blank(l.text[l.at])) { step(l); }
+    }
+    # a label's name may be quoted (`masc.syntax.name`), as `"a b":`, and a quoted head that no colon follows is no head
+    val quoted: usize = spell.quoted(l.text, l.at, l.len);
+    if (quoted > 0 && l.at + quoted < l.len && l.text[l.at + quoted] == ':') {
+        var k: usize = 0;
+        for (k < quoted) {
+            step(l);
+            k = k + 1;
+        }
+    }
+    or {
+        for (l.at < l.len && heading(l.text[l.at])) {
+            step(l);
+        }
+    }
+    var h: Token = head;
+    h.len    = l.at - head.at;
+    out.text = l.text;
+    out.head = h;
+    out.site = h.position;
+    if (h.len > 0 && peek(l, 0) == ':') {
+        step(l);
+        out.kind = LABEL;
+        out.body = Token{at: l.at, len: 0, position: l.position};
+        ret res[bool, diagnostic.Diagnostic].ok{true};
+    }
+    out.kind = INSTRUCTION;
+    if (h.len > 0 && l.text[head.at] == '.') { out.kind = DIRECTIVE; }
+    for (l.at < l.len && is_blank(l.text[l.at])) {
+        step(l);
+    }
+    var body: Token = Token{at: l.at, len: 0, position: l.position};
+    var end:  usize = l.at;
+    # to the line's end, a separator or a comment, past strings that may hold any of them
+    for (l.at < l.len) {
+        val c: u8 = l.text[l.at];
+        if (c == '\n' || c == l.separator || commenting(l) || (c == '/' && peek(l, 1) == '*')) { brk; }
+        val res_quoted: res[bool, diagnostic.Diagnostic] = skip_quoted(l);
+        if (sel res_quoted.err) { ret res_quoted; }
+        if (!res_quoted.ok)     { step(l); }
+        if (!is_blank(c))       { end = l.at; }
+    }
+    body.len = end - body.at;
+    out.body = body;
+    ret res[bool, diagnostic.Diagnostic].ok{true};
+}

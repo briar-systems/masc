@@ -1,0 +1,278 @@
+# the risc-v pseudo instruction whose instructions the constant it names decides: li
+#
+# a respelling of one instruction is an alias of the syntax, and call, tail, lla and la are its sequence spellings,
+# expanded from the one table the printer and the parser read. `li` is a macro of the syntax (`riscv_syntax.MACROS`):
+# it expands to the instructions of `relax.Expansion`s over the rows of the catalog, found by mnemonic through the
+# syntax's index and admitted by the selection, and writes the shortest sequence of its alternatives that builds its
+# constant (`sequence`)
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use masc.core.operand;
+use masc.core.register;
+use masc.core.relax;
+use masc.core.row;
+use masc.core.state;
+use core_syntax: masc.core.syntax;
+
+use masc.isa.riscv.gen_extension;
+use masc.isa.riscv.gen_row;
+use masc.isa.riscv.gen_syntax;
+
+# the instructions a constant is built from, in the order they run
+# ---
+# LUI:   the upper twenty bits
+# ADDI:  an addition of a signed twelve bit immediate
+# ADDIW: the same, sign extending its 32 bit result
+# SLLI:  a left shift
+# SRLI:  a logical right shift
+pub def Op: u8;
+
+pub val LUI:   Op = 0;
+pub val ADDI:  Op = 1;
+pub val ADDIW: Op = 2;
+pub val SLLI:  Op = 3;
+pub val SRLI:  Op = 4;
+
+# one step of a constant's materialisation
+pub rec Step {
+    op:  Op;
+    imm: i64;
+}
+
+# a constant's materialisation, at most eight steps, which the alternatives tried on the way may exceed
+pub rec Sequence {
+    steps: [16]Step;
+    len:   u32;
+}
+
+fun push(seq: *Sequence, op: Op, imm: i64) {
+    # no sequence the alternatives build is longer than the room, the longest being eleven
+    if (seq.len >= 16) { ret; }
+    seq.steps[seq.len] = Step{op: op, imm: imm};
+    seq.len            = seq.len + 1;
+}
+
+fun int12(v: i64) bool {
+    ret v >= -2048 && v < 2048;
+}
+
+fun int32(v: i64) bool {
+    ret v >= -2147483648 && v < 2147483648;
+}
+
+# the low twelve bits of `v`, sign extended
+fun lo12(v: i64) i64 {
+    ret ((v & 0xFFF) ^ 0x800) - 0x800;
+}
+
+# the number of zero bits `v` ends in, 64 for zero
+fun trailing_zeros(v: i64) u32 {
+    if (v == 0) { ret 64; }
+    var n: u32 = 0;
+    var u: u64 = v:~u64;
+    for ((u & 1) == 0) {
+        u = u >> 1;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# the number of zero bits `v` starts with, 64 for zero
+fun leading_zeros(v: i64) u32 {
+    var n: u32 = 0;
+    var u: u64 = v:~u64;
+    for (n < 64 && (u & (1::u64 << 63)) == 0) {
+        u = u << 1;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# the base sequence for `v`, before the shifted alternatives
+fun materialize(v: i64, rv64: bool, seq: *Sequence) {
+    if (int32(v)) {
+        val hi: i64 = ((v + 0x800) >> 12) & 0xFFFFF;
+        val lo: i64 = lo12(v);
+        if (hi != 0) { push(seq, LUI, hi); }
+        if (lo != 0 || hi == 0) {
+            # lui sign extends bit 31, so the addition needs the word form when it carries out of 32 bits
+            val upper: i64 = (((hi << 12) ^ 0x80000000) - 0x80000000);
+            if (rv64 && upper + lo != v) { push(seq, ADDIW, lo); }
+            or                           { push(seq, ADDI, lo); }
+        }
+        ret;
+    }
+    split(v, lo12(v), rv64, seq);
+}
+
+# the constant `v` less its low part `low`, built as a constant of the width the shift leaves, shifted back, and `low` added
+fun split(v: i64, low: i64, rv64: bool, seq: *Sequence) {
+    var upper: u64 = (v:~u64 - low:~u64) >> 12;
+    var shift: u32 = 12 + trailing_zeros(upper:~i64);
+    upper = upper >> (shift - 12)::u64;
+    var rest: i64 = ((upper << shift::u64):~i64) >> shift::i64;
+    # fewer shifted bits when what remains fits a lui, which clears the low twelve
+    if (shift > 12 && !int12(rest) && int32((rest:~u64 << 12):~i64)) {
+        shift = shift - 12;
+        rest  = (rest:~u64 << 12):~i64;
+    }
+    materialize(rest, rv64, seq);
+    if (shift != 0) { push(seq, SLLI, shift::i64); }
+    if (low >= -2048 && low < 2048) {
+        if (low != 0) { push(seq, ADDI, low); }
+        ret;
+    }
+    var first: i64 = -2048;
+    if (low > 0) { first = 2047; }
+    push(seq, ADDI, first);
+    push(seq, ADDI, low - first);
+}
+
+# the sequence that builds the constant `v`, the shortest of its alternatives
+pub fun sequence(v: i64, rv64: bool, out: *Sequence) {
+    out.len = 0;
+    materialize(v, rv64, out);
+    # a low part that is positive can be two additions of a negative one, which leaves the rest with more zeros to shift out
+    if (!int32(v) && (v & 1) != 0 && lo12(v) > 0) {
+        var tmp: Sequence;
+        tmp.len = 0;
+        split(v, lo12(v) - 4096, rv64, ?tmp);
+        if (tmp.len < out.len) { @out = tmp; }
+    }
+    # trailing zeros: build the constant shifted down, and shift it back
+    if ((v & 0xFFF) != 0 && (v & 1) == 0 && out.len >= 2) {
+        val zeros:   u32 = trailing_zeros(v);
+        val shifted: i64 = v >> zeros::i64;
+        var tmp:     Sequence;
+        tmp.len = 0;
+        materialize(shifted, rv64, ?tmp);
+        if (tmp.len + 1 < out.len || (shifted >= -32 && shifted < 32)) {
+            push(?tmp, SLLI, zeros::i64);
+            @out = tmp;
+        }
+    }
+    # leading zeros: build the constant shifted up with ones below, and shift it back
+    if (v > 0 && out.len > 2) {
+        val zeros: u32 = leading_zeros(v);
+        var wide:  u64 = v:~u64 << zeros::u64;
+        wide = wide | ((1::u64 << zeros::u64) - 1);
+        var tmp: Sequence;
+        tmp.len = 0;
+        materialize(wide:~i64, rv64, ?tmp);
+        if (tmp.len + 1 < out.len) {
+            push(?tmp, SRLI, zeros::i64);
+            @out = tmp;
+        }
+        wide    = wide & ~((1::u64 << zeros::u64) - 1);
+        tmp.len = 0;
+        materialize(wide:~i64, rv64, ?tmp);
+        if (tmp.len + 1 < out.len) {
+            push(?tmp, SRLI, zeros::i64);
+            @out = tmp;
+        }
+    }
+}
+
+# the first row spelled `name` that the selection admits, none when no row is: a binary search of the syntax's index
+fun row_named(ctx: *state.Context, syntax: *core_syntax.Syntax, name: str) opt[*row.Row] {
+    val key: View = view(name, str_len(name));
+    var lo:  u32  = 0;
+    var hi:  u32  = gen_syntax.ENTRY_COUNT;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        val at:  str = gen_syntax.ENTRIES[mid].key;
+        val c:   i64 = core_syntax.compare(syntax, view(at, str_len(at)), key);
+        if (c == 0) {
+            var i: u32 = 0;
+            for (i < gen_syntax.ENTRIES[mid].len) {
+                val cand: core_syntax.Candidate = gen_syntax.CANDIDATES[gen_syntax.ENTRIES[mid].first + i];
+                val r:    *row.Row              = ?gen_row.CODEC.rows.at[cand.row];
+                if (cand.alias == 0 && state.admits(ctx, r.requires)) { ret opt[*row.Row].some{r}; }
+                i = i + 1;
+            }
+            ret opt[*row.Row].none{};
+        }
+        if (c < 0) { lo = mid + 1; }
+        or         { hi = mid; }
+    }
+    ret opt[*row.Row].none{};
+}
+
+fun reg(n: u16) operand.Value {
+    ret operand.Value.register{register.make(0, n)};
+}
+
+fun imm(v: i64) operand.Value {
+    ret operand.Value.immediate{v};
+}
+
+# the next instruction of `out`, of the row spelled `name`
+fun next(ctx: *state.Context, syntax: *core_syntax.Syntax, name: str, out: *relax.Expansion) *relax.Emitted {
+    val opt_row_named: opt[*row.Row] = row_named(ctx, syntax, name);
+    if (sel opt_row_named.none)       { ret nil; }
+    if (out.count >= relax.MAX_STEPS) { ret nil; }
+    val e: *relax.Emitted = ?out.steps[out.count];
+    e.row     = opt_row_named.some;
+    e.marker  = operand.NO_FIXUP;
+    out.count = out.count + 1;
+    ret e;
+}
+
+# whether the context is at xlen=64
+fun wide(ctx: *state.Context) bool {
+    ret state.holds(ctx, gen_extension.XLEN_64);
+}
+
+# `li rd, v`: the constant `v` built in `rd`, `v` being any 64 bit value at rv64 and any 32 bit value, signed or not, at rv32
+# ---
+# ret: whether the selection admits every row it needs and the constant fits the width
+pub fun li(ctx: *state.Context, syntax: *core_syntax.Syntax, rd: register.Id, v: i64, out: *relax.Expansion) bool {
+    out.count = 0;
+    val rv64:  bool = wide(ctx);
+    var value: i64  = v;
+    if (!rv64) {
+        if (v < -2147483648 || v > 4294967295) { ret false; }
+        value = ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000;
+    }
+    var seq: Sequence;
+    sequence(value, rv64, ?seq);
+    var i: u32 = 0;
+    for (i < seq.len) {
+        val s:    Step = seq.steps[i];
+        var name: str  = "addi";
+        if (s.op == LUI)   { name = "lui"; }
+        if (s.op == ADDIW) { name = "addiw"; }
+        if (s.op == SLLI)  { name = "slli"; }
+        if (s.op == SRLI)  { name = "srli"; }
+        val e: *relax.Emitted = next(ctx, syntax, name, out);
+        if (e == nil) { ret false; }
+        e.values[0] = operand.Value.register{rd};
+        if (s.op == LUI) { e.values[1] = imm(s.imm); }
+        or {
+            # the first addi adds to zero, every other step to what is built
+            if (i == 0) { e.values[1] = reg(0); }
+            or          { e.values[1] = operand.Value.register{rd}; }
+            e.values[2] = imm(s.imm);
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the expansion of the macro `li <0>, <1>` into `out`, false when its destination is no register, its value is not a
+# constant, or `li` refuses it
+pub fun expand_li(rd: *core_syntax.Reader, values: *operand.Value, out: *relax.Expansion) bool {
+    val into: *operand.Value = ?values[0];
+    val what: *operand.Value = ?values[1];
+    if (!sel into.register)  { ret false; }
+    if (!sel what.immediate) { ret false; }
+    ret li(rd.ctx, rd.syntax, into.register, what.immediate, out);
+}

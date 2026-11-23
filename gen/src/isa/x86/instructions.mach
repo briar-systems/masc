@@ -1,0 +1,477 @@
+# the xed generator: the x86 instruction tables generated from the XED copy
+#
+# it reads the XED copy into the model and works out what every ISA set XED names requires, in
+# its cpuid files or as the ISA_SET of an instruction: any one of its cpuid groups, each a
+# conjunction of the atoms its cpuid names stand for, kept as XED states them, nothing dropped for
+# another implying it, and nothing for a set whose every line is `n/a`. it then builds the rows
+# from the model and writes the x86 tables (`masc.isa.x86.gen_row` and those beside it), each row
+# requiring its ISA set's requirement.
+#
+# what XED does not state is masc's, in two cited topics of gen/data/x86:
+#   cpuid-names  the atom a cpuid name stands for where it is not the name of a row of the
+#                catalog, as ospku is pku and intel64 width=64
+#   isa-sets     the requirement of a set XED gives no cpuid group: `none`, or `requires=<atom>`,
+#                with the CPUID bit enumerating it as `leaf= subleaf= reg= bit=`, and `llvm=<bit_ name>`
+#                where clang's cpuid.h under vendor/llvm-cpuid names it, which holds the bit to it
+# a cpuid name that names no atom, a set XED gives no group and no fact answers, and a fact on a
+# name or set XED does not have, are refused, so a new XED revision cannot be read past them. a
+# fact the copy states otherwise is held to it by the overlay's own check
+#
+# atoms are named by the catalog's own records
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_starts_with;
+use std.types.string.str_to_upper;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+
+use gen.catalog;
+use gen.diag;
+use gen.isa.x86;
+use gen.isa.x86.forms;
+use gen.isa.x86.keys;
+use gen.isa.x86.llvm;
+use gen.isa.x86.rows;
+use gen.isa.x86.tables;
+use gen.isa.x86.xed;
+use xed_cpuid: gen.isa.x86.xed.cpuid;
+use gen.overlay;
+use gen.set;
+
+pub val NAMES_TOPIC: str = "cpuid-names";
+pub val SETS_TOPIC:  str = "isa-sets";
+
+pub val NO_INPUTS:  str = "xed generator reads the x86 catalog, the x86 overlay, clang's cpuid.h and the x86 register families beside XED";
+pub val NO_ATOM:    str = "cpuid name or fact names no row or state value of the x86 catalog";
+pub val UNANSWERED: str = "ISA set has no cpuid group and no fact";
+pub val NOT_NAMED:  str = "fact is on a cpuid name or ISA set XED does not have";
+pub val BAD_FACT:   str = "fact is not `none` or `requires=<atom>`, with `leaf= subleaf= reg= bit=` stating a CPUID bit whole and an optional `llvm=`";
+pub val NO_FEATURE: str = "fact names a constant clang's cpuid.h does not place under a heading";
+pub val MISPLACED:  str = "fact states a CPUID bit other than where clang's cpuid.h places the constant it names";
+
+# what the generator reads, and what the stated callbacks look in
+rec Reading {
+    alloc:    *A.Allocator;
+    xed:      *xed.Xed;
+    atoms:    map.Map[str, u32];
+    names:    map.Map[str, u32];
+    sets:     map.Map[str, u32];
+    features: vector.Vector[llvm.Feature];
+}
+
+# one set's requirement, each alternative the atoms it holds
+rec Need {
+    name:         str;
+    alternatives: vector.Vector[vector.Vector[str]];
+}
+
+fun memory(subject: str) diag.Refusal {
+    ret diag.refusal(nil, 0, diag.MEMORY, subject);
+}
+
+fun atom(r: *Reading, name: str) bool {
+    ret map.contains[str, u32](?r.atoms, ?name);
+}
+
+# what XED states a cpuid name stands for: the row of its own name, when the catalog has one
+fun name_stated(ctx: ptr, f: *overlay.Fact) opt[str] {
+    val r: *Reading = ctx::*Reading;
+    if (atom(r, f.key)) { ret opt[str].some{f.key}; }
+    ret opt[str].none{};
+}
+
+# a set's cpuid groups as XED states them, the names of a group joined by `&` and the groups by `;`, `none` for `n/a`
+fun spelled(a: *A.Allocator, s: *xed_cpuid.Set) opt[str] {
+    if (s.groups.len == 0) { ret opt[str].some{"none"}; }
+    var out: str   = "";
+    var g:   usize = 0;
+    for (g < s.groups.len) {
+        if (g > 0) {
+            val res_str_join: res[str, StrError] = str_join(a, out, ";");
+            if (sel res_str_join.err) { ret opt[str].none{}; }
+            out = res_str_join.ok;
+        }
+        var k: usize = 0;
+        for (k < s.groups.data[g].bits.len) {
+            if (k > 0) {
+                val res_str_join: res[str, StrError] = str_join(a, out, "&");
+                if (sel res_str_join.err) { ret opt[str].none{}; }
+                out = res_str_join.ok;
+            }
+            val res_str_join: res[str, StrError] = str_join(a, out, s.groups.data[g].bits.data[k]);
+            if (sel res_str_join.err) { ret opt[str].none{}; }
+            out = res_str_join.ok;
+            k   = k + 1;
+        }
+        g = g + 1;
+    }
+    ret opt[str].some{out};
+}
+
+# what XED states a set requires: its groups, or none for `n/a`, nothing for a set no cpuid file names
+fun set_stated(ctx: ptr, f: *overlay.Fact) opt[str] {
+    val r:        *Reading            = ctx::*Reading;
+    val opt_find: opt[*xed_cpuid.Set] = xed_cpuid.find(?r.xed.cpuid, f.key);
+    if (sel opt_find.none) { ret opt[str].none{}; }
+    ret spelled(r.alloc, opt_find.some);
+}
+
+fun upper(a: *A.Allocator, s: str) res[str, diag.Refusal] {
+    val res_str_to_upper: res[str, StrError] = str_to_upper(a, s);
+    if (sel res_str_to_upper.err) { ret res[str, diag.Refusal].err{memory(s)}; }
+    ret res[str, diag.Refusal].ok{res_str_to_upper.ok};
+}
+
+fun note(m: *map.Map[str, u32], name: str) err[diag.Refusal] {
+    if (map.contains[str, u32](m, ?name)) { ret err[diag.Refusal].ok{}; }
+    val res_put: res[bool, A.Error] = map.insert[str, u32](m, name, 0);
+    if (sel res_put.err) { ret err[diag.Refusal].err{memory(name)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# every ISA set the model names, in upper case, sorted and once each
+fun names(r: *Reading) res[vector.Vector[str], diag.Refusal] {
+    val x:   *xed.Xed           = r.xed;
+    var out: vector.Vector[str] = vector.init[str](r.alloc);
+    var i:   usize              = 0;
+    for (i < x.cpuid.sets.len + x.instructions.len) {
+        var name: str = nil;
+        if (i < x.cpuid.sets.len) { name = x.cpuid.sets.data[i].name; }
+        or {
+            val res_upper: res[str, diag.Refusal] = upper(r.alloc, x.instructions.data[i - x.cpuid.sets.len].isa_set);
+            if (sel res_upper.err) { ret res[vector.Vector[str], diag.Refusal].err{res_upper.err}; }
+            name = res_upper.ok;
+        }
+        if (!map.contains[str, u32](?r.sets, ?name)) {
+            val err_noted: err[diag.Refusal] = note(?r.sets, name);
+            if (sel err_noted.err) { ret res[vector.Vector[str], diag.Refusal].err{err_noted.err}; }
+            val res_pushed: res[usize, A.Error] = vector.push[str](?out, name);
+            if (sel res_pushed.err) { ret res[vector.Vector[str], diag.Refusal].err{memory(name)}; }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[str](out.data, out.len, str_order);
+    ret res[vector.Vector[str], diag.Refusal].ok{out};
+}
+
+fun str_order(x: *str, y: *str) i64 {
+    ret str_compare(@x, @y);
+}
+
+# the fact of `topic` on `key`, nil when it has none
+fun fact(t: *overlay.Topic, key: str) *overlay.Fact {
+    var i: usize = 0;
+    for (i < t.facts.len) {
+        if (str_equals(t.facts.data[i].key, key)) { ret ?t.facts.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# every fact of `t` is on a key `known` holds
+fun named(t: *overlay.Topic, known: *map.Map[str, u32]) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < t.facts.len) {
+        val f: *overlay.Fact = ?t.facts.data[i];
+        if (!map.contains[str, u32](known, ?f.key)) { ret err[diag.Refusal].err{overlay.refuse(f, NOT_NAMED, f.key)}; }
+        i = i + 1;
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# the atom cpuid name `name` stands for
+fun stands(r: *Reading, t: *overlay.Topic, name: str) opt[str] {
+    val f: *overlay.Fact = fact(t, name);
+    if (f != nil)      { ret opt[str].some{f.fact}; }
+    if (atom(r, name)) { ret opt[str].some{name}; }
+    ret opt[str].none{};
+}
+
+fun holds(x: *vector.Vector[str], s: str) bool {
+    var i: usize = 0;
+    for (i < x.len) {
+        if (str_equals(x.data[i], s)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun same(x: *vector.Vector[str], y: *vector.Vector[str]) bool {
+    if (x.len != y.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        if (!holds(y, x.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the CPUID bit fact `f` states, when it states one: a bit is stated whole, leaf, subleaf, register and bit, and
+# held to the constant `llvm=` names in clang's cpuid.h. a bit with no `llvm=` is held to its cite alone
+fun placement(r: *Reading, f: *overlay.Fact, ws: *vector.Vector[str]) err[diag.Refusal] {
+    val opt_named: opt[str] = overlay.value(ws, "llvm");
+    val fields:    [4]str   = [4]str{"leaf", "subleaf", "reg", "bit"};
+    var given:     u32      = 0;
+    var k:         u32      = 0;
+    for (k < 4) {
+        val opt_value: opt[str] = overlay.value(ws, fields[k]);
+        if (sel opt_value.some) { given = given + 1; }
+        k = k + 1;
+    }
+    if (given == 0) {
+        if (sel opt_named.some) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+        ret err[diag.Refusal].ok{};
+    }
+    if (given != 4) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    val opt_reg: opt[str] = overlay.value(ws, "reg");
+    if (sel opt_reg.none)                                                                                                                            { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    if (!(str_equals(opt_reg.some, "eax") || str_equals(opt_reg.some, "ebx") || str_equals(opt_reg.some, "ecx") || str_equals(opt_reg.some, "edx"))) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, opt_reg.some)}; }
+    var got:  [3]u64 = [3]u64{0, 0, 0};
+    val nums: [3]str = [3]str{"leaf", "subleaf", "bit"};
+    k = 0;
+    for (k < 3) {
+        val opt_value: opt[str] = overlay.value(ws, nums[k]);
+        if (sel opt_value.none) { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+        val res_number: res[i64, diag.Refusal] = overlay.number(f, opt_value.some);
+        if (sel res_number.err) { ret err[diag.Refusal].err{res_number.err}; }
+        if (res_number.ok < 0)  { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, opt_value.some)}; }
+        got[k] = res_number.ok::u64;
+        k      = k + 1;
+    }
+    if (sel opt_named.none) { ret err[diag.Refusal].ok{}; }
+    val opt_found: opt[*llvm.Feature] = llvm.find(?r.features, opt_named.some);
+    if (sel opt_found.none) { ret err[diag.Refusal].err{overlay.refuse(f, NO_FEATURE, opt_named.some)}; }
+    val at: *llvm.Feature = opt_found.some;
+    if (!str_equals(opt_reg.some, at.reg) || got[0] != at.leaf || got[1] != at.subleaf || got[2] != at.bit) { ret err[diag.Refusal].err{overlay.refuse(f, MISPLACED, opt_named.some)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the requirement fact `f` states: no alternative for `none`, one of its atom for `requires=`
+fun answer(r: *Reading, f: *overlay.Fact, n: *Need) err[diag.Refusal] {
+    val res_words: res[vector.Vector[str], diag.Refusal] = overlay.words(r.alloc, f, f.fact);
+    if (sel res_words.err) { ret err[diag.Refusal].err{res_words.err}; }
+    var ws: vector.Vector[str] = res_words.ok;
+    if (ws.len == 1 && str_equals(ws.data[0], "none")) { ret err[diag.Refusal].ok{}; }
+    val opt_req: opt[str] = overlay.value(?ws, "requires");
+    if (sel opt_req.none)       { ret err[diag.Refusal].err{overlay.refuse(f, BAD_FACT, f.key)}; }
+    if (!atom(r, opt_req.some)) { ret err[diag.Refusal].err{overlay.refuse(f, NO_ATOM, opt_req.some)}; }
+    val keys: [6]str = [6]str{"requires=", "llvm=", "leaf=", "subleaf=", "reg=", "bit="};
+    var i:    usize  = 0;
+    for (i < ws.len) {
+        var known: bool = false;
+        var k:     u32  = 0;
+        for (k < 6) {
+            if (str_starts_with(ws.data[i], keys[k])) { known = true; }
+            k = k + 1;
+        }
+        if (!known) { ret err[diag.Refusal].err{overlay.refuse(f, overlay.UNKNOWN_WORD, ws.data[i])}; }
+        i = i + 1;
+    }
+    val err_placed: err[diag.Refusal] = placement(r, f, ?ws);
+    if (sel err_placed.err) { ret err_placed; }
+    var ids:     vector.Vector[str]  = vector.init[str](r.alloc);
+    val res_one: res[usize, A.Error] = vector.push[str](?ids, opt_req.some);
+    if (sel res_one.err) { ret err[diag.Refusal].err{memory(f.key)}; }
+    val res_alt: res[usize, A.Error] = vector.push[vector.Vector[str]](?n.alternatives, ids);
+    if (sel res_alt.err) { ret err[diag.Refusal].err{memory(f.key)}; }
+    ret err[diag.Refusal].ok{};
+}
+
+# the requirement of `name`, from its fact, or else its cpuid groups as XED states them
+fun need(r: *Reading, names_topic: *overlay.Topic, sets_topic: *overlay.Topic, name: str) res[Need, diag.Refusal] {
+    var n: Need          = Need{name: name, alternatives: vector.init[vector.Vector[str]](r.alloc)};
+    val f: *overlay.Fact = fact(sets_topic, name);
+    if (f != nil) {
+        val err_answered: err[diag.Refusal] = answer(r, f, ?n);
+        if (sel err_answered.err) { ret res[Need, diag.Refusal].err{err_answered.err}; }
+        ret res[Need, diag.Refusal].ok{n};
+    }
+    val opt_found: opt[*xed_cpuid.Set] = xed_cpuid.find(?r.xed.cpuid, name);
+    if (sel opt_found.none) { ret res[Need, diag.Refusal].err{diag.refusal(nil, 0, UNANSWERED, name)}; }
+    val s: *xed_cpuid.Set = opt_found.some;
+    var g: usize          = 0;
+    for (g < s.groups.len) {
+        val group: *xed_cpuid.Group   = ?s.groups.data[g];
+        var ids:   vector.Vector[str] = vector.init[str](r.alloc);
+        var k:     usize              = 0;
+        for (k < group.bits.len) {
+            val bit:        str      = group.bits.data[k];
+            val opt_stands: opt[str] = stands(r, names_topic, bit);
+            if (sel opt_stands.none) { ret res[Need, diag.Refusal].err{diag.refusal(group.line.file, group.line.number, NO_ATOM, bit)}; }
+            # an enable bit stands for the row of its feature, so a group may name one atom twice
+            if (!holds(?ids, opt_stands.some)) {
+                val res_pushed: res[usize, A.Error] = vector.push[str](?ids, opt_stands.some);
+                if (sel res_pushed.err) { ret res[Need, diag.Refusal].err{memory(name)}; }
+            }
+            k = k + 1;
+        }
+        var twice: bool  = false;
+        var j:     usize = 0;
+        for (j < n.alternatives.len) {
+            if (same(?ids, ?n.alternatives.data[j])) { twice = true; }
+            j = j + 1;
+        }
+        if (!twice) {
+            val res_pushed: res[usize, A.Error] = vector.push[vector.Vector[str]](?n.alternatives, ids);
+            if (sel res_pushed.err) { ret res[Need, diag.Refusal].err{memory(name)}; }
+        }
+        g = g + 1;
+    }
+    ret res[Need, diag.Refusal].ok{n};
+}
+
+# the xed generator: the XED copy read into the model, the requirement of each ISA set worked out over the catalog's
+# atoms and the overlay's facts, the overlay's CPUID bits held to clang's cpuid.h, and the instruction tables written,
+# its inputs in that order
+pub fun generate(c: *set.Context) err[diag.Refusal] {
+    if (c.inputs.len != 4) { ret err[diag.Refusal].err{diag.refusal(nil, 0, NO_INPUTS, nil)}; }
+    val res_bits: res[vector.Vector[llvm.Feature], diag.Refusal] = llvm.read(c.alloc, c.inputs.data[2]);
+    if (sel res_bits.err) { ret err[diag.Refusal].err{res_bits.err}; }
+    val res_read: res[xed.Xed, diag.Refusal] = xed.read(c.alloc, c.tree);
+    if (sel res_read.err) { ret err[diag.Refusal].err{res_read.err}; }
+    var x:          xed.Xed            = res_read.ok;
+    var atoms:      vector.Vector[str] = vector.init[str](c.alloc);
+    val err_listed: err[diag.Refusal]  = catalog.atom_names(c.alloc, c.inputs.data[0], ?atoms);
+    if (sel err_listed.err) { ret err_listed; }
+    var r: Reading = Reading{alloc: c.alloc, xed: ?x, atoms: map.init[str, u32](c.alloc), names: map.init[str, u32](c.alloc), sets: map.init[str, u32](c.alloc), features: res_bits.ok};
+    var i: usize   = 0;
+    for (i < atoms.len) {
+        val err_noted: err[diag.Refusal] = note(?r.atoms, atoms.data[i]);
+        if (sel err_noted.err) { ret err_noted; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < x.cpuid.bits.len) {
+        val err_noted: err[diag.Refusal] = note(?r.names, x.cpuid.bits.data[i].name);
+        if (sel err_noted.err) { ret err_noted; }
+        i = i + 1;
+    }
+    val res_all: res[vector.Vector[str], diag.Refusal] = names(?r);
+    if (sel res_all.err) { ret err[diag.Refusal].err{res_all.err}; }
+    val res_read_alloc: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], NAMES_TOPIC);
+    if (sel res_read_alloc.err) { ret err[diag.Refusal].err{res_read_alloc.err}; }
+    var names_topic:   overlay.Topic                    = res_read_alloc.ok;
+    val res_read_data: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], SETS_TOPIC);
+    if (sel res_read_data.err) { ret err[diag.Refusal].err{res_read_data.err}; }
+    var sets_topic:     overlay.Topic     = res_read_data.ok;
+    val err_names_read: err[diag.Refusal] = named(?names_topic, ?r.names);
+    if (sel err_names_read.err) { ret err_names_read; }
+    val err_sets_read: err[diag.Refusal] = named(?sets_topic, ?r.sets);
+    if (sel err_sets_read.err) { ret err_sets_read; }
+    val err_names_checked: err[diag.Refusal] = overlay.check(?names_topic, ?r, name_stated);
+    if (sel err_names_checked.err) { ret err_names_checked; }
+    val err_sets_checked: err[diag.Refusal] = overlay.check(?sets_topic, ?r, set_stated);
+    if (sel err_sets_checked.err) { ret err_sets_checked; }
+    i = 0;
+    for (i < names_topic.facts.len) {
+        val f: *overlay.Fact = ?names_topic.facts.data[i];
+        if (!atom(?r, f.fact)) { ret err[diag.Refusal].err{overlay.refuse(f, NO_ATOM, f.fact)}; }
+        i = i + 1;
+    }
+    var needs: vector.Vector[Need] = vector.init[Need](c.alloc);
+    i = 0;
+    for (i < res_all.ok.len) {
+        val res_need: res[Need, diag.Refusal] = need(?r, ?names_topic, ?sets_topic, res_all.ok.data[i]);
+        if (sel res_need.err) { ret err[diag.Refusal].err{res_need.err}; }
+        val res_pushed: res[usize, A.Error] = vector.push[Need](?needs, res_need.ok);
+        if (sel res_pushed.err) { ret err[diag.Refusal].err{memory(res_all.ok.data[i])}; }
+        i = i + 1;
+    }
+    ret instructions(c, ?x, ?r, ?needs);
+}
+
+# the rows of the slice and their tables, over the register file the x86 register families state, each row requiring
+# its ISA set's requirement
+fun instructions(c: *set.Context, x: *xed.Xed, r: *Reading, needs: *vector.Vector[Need]) err[diag.Refusal] {
+    val res_named_rows: res[vector.Vector[x86.Named], diag.Refusal] = x86.named_rows(c.alloc, c.inputs.data[3], c.inputs.data[0]);
+    if (sel res_named_rows.err) { ret err[diag.Refusal].err{res_named_rows.err}; }
+    var named: vector.Vector[forms.Named] = vector.init[forms.Named](c.alloc);
+    var first: map.Map[str, u32]          = map.init[str, u32](c.alloc);
+    var i:     usize                      = 0;
+    for (i < res_named_rows.ok.len) {
+        val n:         *x86.Named = ?res_named_rows.ok.data[i];
+        var order:     u32        = i::u32;
+        val opt_known: opt[*u32]  = map.get[str, u32](?first, ?n.class);
+        if (sel opt_known.some) { order = @opt_known.some; }
+        or {
+            val res_put_in: res[bool, A.Error] = map.insert[str, u32](?first, n.class, i::u32);
+            if (sel res_put_in.err) { ret err[diag.Refusal].err{memory(n.name)}; }
+        }
+        val res_pushed: res[usize, A.Error] = vector.push[forms.Named](?named, forms.Named{name: n.name, class: n.class, order: order, number: n.number, row: i::u32, unspelled: n.unspelled, members: n.members, fixed: n.fixed});
+        if (sel res_pushed.err) { ret err[diag.Refusal].err{memory(n.name)}; }
+        i = i + 1;
+    }
+    var reader:   forms.Reader                     = forms.reader(c.alloc, x, ?named);
+    val res_read: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], forms.REGISTERS_TOPIC);
+    if (sel res_read.err) { ret err[diag.Refusal].err{res_read.err}; }
+    var registers_topic: overlay.Topic     = res_read.ok;
+    val err_aliased:     err[diag.Refusal] = forms.aliases(?reader, ?registers_topic);
+    if (sel err_aliased.err) { ret err_aliased; }
+    val res_read_alloc: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], forms.KNOBS_TOPIC);
+    if (sel res_read_alloc.err) { ret err[diag.Refusal].err{res_read_alloc.err}; }
+    var knobs_topic: overlay.Topic     = res_read_alloc.ok;
+    val err_knobbed: err[diag.Refusal] = forms.knobs(?reader, ?knobs_topic);
+    if (sel err_knobbed.err) { ret err_knobbed; }
+    val res_read_data: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.MNEMONICS_TOPIC);
+    if (sel res_read_data.err) { ret err[diag.Refusal].err{res_read_data.err}; }
+    var spelled_topic:           overlay.Topic                    = res_read_data.ok;
+    val res_read_operands_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.OPERANDS_TOPIC);
+    if (sel res_read_operands_topic.err) { ret err[diag.Refusal].err{res_read_operands_topic.err}; }
+    var operands_topic:            overlay.Topic                    = res_read_operands_topic.ok;
+    val res_read_immediates_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.IMMEDIATES_TOPIC);
+    if (sel res_read_immediates_topic.err) { ret err[diag.Refusal].err{res_read_immediates_topic.err}; }
+    var immediates_topic:       overlay.Topic                    = res_read_immediates_topic.ok;
+    val res_read_decoded_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.DECODED_TOPIC);
+    if (sel res_read_decoded_topic.err) { ret err[diag.Refusal].err{res_read_decoded_topic.err}; }
+    var decoded_topic:           overlay.Topic                    = res_read_decoded_topic.ok;
+    val res_read_distinct_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.DISTINCT_TOPIC);
+    if (sel res_read_distinct_topic.err) { ret err[diag.Refusal].err{res_read_distinct_topic.err}; }
+    var distinct_topic:         overlay.Topic                    = res_read_distinct_topic.ok;
+    val res_read_targets_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.TARGETS_TOPIC);
+    if (sel res_read_targets_topic.err) { ret err[diag.Refusal].err{res_read_targets_topic.err}; }
+    var targets_topic:         overlay.Topic                    = res_read_targets_topic.ok;
+    val res_read_yields_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.YIELDS_TOPIC);
+    if (sel res_read_yields_topic.err) { ret err[diag.Refusal].err{res_read_yields_topic.err}; }
+    var yields_topic:      overlay.Topic                    = res_read_yields_topic.ok;
+    val res_read_ct_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.CT_TOPIC);
+    if (sel res_read_ct_topic.err) { ret err[diag.Refusal].err{res_read_ct_topic.err}; }
+    var ct_topic:               overlay.Topic                    = res_read_ct_topic.ok;
+    val res_read_effects_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], rows.EFFECTS_TOPIC);
+    if (sel res_read_effects_topic.err) { ret err[diag.Refusal].err{res_read_effects_topic.err}; }
+    var effects_topic: overlay.Topic            = res_read_effects_topic.ok;
+    var built:         vector.Vector[*rows.Row] = vector.init[*rows.Row](c.alloc);
+    val respelled:     rows.Topics              = rows.Topics{mnemonics: ?spelled_topic, operands: ?operands_topic, immediates: ?immediates_topic, decoded: ?decoded_topic, distinct: ?distinct_topic, targets: ?targets_topic, yields: ?yields_topic, ct: ?ct_topic, effects: ?effects_topic};
+    val err_made:      err[diag.Refusal]        = rows.build(c.alloc, ?reader, respelled, ?built);
+    if (sel err_made.err) { ret err_made; }
+    val res_read_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], keys.TOPIC);
+    if (sel res_read_topic.err) { ret err[diag.Refusal].err{res_read_topic.err}; }
+    var keys_topic: overlay.Topic     = res_read_topic.ok;
+    var ks:         keys.Keys;
+    val err_keyed:  err[diag.Refusal] = keys.read(c.alloc, ?keys_topic, ?ks);
+    if (sel err_keyed.err) { ret err_keyed; }
+    val res_read_inverses_topic: res[overlay.Topic, diag.Refusal] = overlay.read(c.alloc, c.inputs.data[1], tables.INVERSES_TOPIC);
+    if (sel res_read_inverses_topic.err) { ret err[diag.Refusal].err{res_read_inverses_topic.err}; }
+    var inverses_topic: overlay.Topic = res_read_inverses_topic.ok;
+    var in:             tables.Input  = tables.Input{rows: ?built, needs: map.init[str, *vector.Vector[vector.Vector[str]]](c.alloc), named: ?named, reader: ?reader, atoms: r.atoms, counts: map.init[str, u32](c.alloc), keys: ?ks, inverses: ?inverses_topic};
+    i = 0;
+    for (i < needs.len) {
+        val res_put_in: res[bool, A.Error] = map.insert[str, *vector.Vector[vector.Vector[str]]](?in.needs, needs.data[i].name, ?needs.data[i].alternatives);
+        if (sel res_put_in.err) { ret err[diag.Refusal].err{memory(needs.data[i].name)}; }
+        i = i + 1;
+    }
+    ret tables.generate(c, ?in);
+}

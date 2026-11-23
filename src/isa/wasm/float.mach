@@ -1,0 +1,232 @@
+# wasm's float constants, read from text and written back
+#
+# the text spells a float as a decimal, a hexadecimal float `0x1.8p+3`, `inf`, `nan` for the canonical nan or
+# `nan:0x` and its payload, each signed, with `_` between digits (WebAssembly Specification release 3.0, tag wg-3.0,
+# 6.1-text.values.spectec, Tfloat). a decimal and a hexadecimal float are each read by std's parse and rounded once to
+# the nearest of the float's own format, ties to even, and one that rounds to infinity is refused. a float is written
+# as the hexadecimal float of its bits, so it reads back to them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.math.ieee;
+use std.text.parse;
+
+pub val MALFORMED: str = "malformed float constant";
+pub val RANGE:     str = "float constant out of range";
+pub val PAYLOAD:   str = "nan payload is 0 or wider than the float's fraction";
+pub val LONG:      str = "float constant longer than 1024 bytes";
+pub val WIDTH:     str = "float width is neither 32 nor 64 bits";
+
+# the longest float constant read, its `_` removed (limit): an f64's exact decimal is at most 767 significant digits
+pub val MAX_TEXT: usize = 1024;
+
+# the ieee 754 format of wasm's float of `bits`, none for a width wasm has no float of
+fun format_of(bits: u32) opt[ieee.Format] {
+    if (bits == 32) { ret opt[ieee.Format].some{ieee.F32}; }
+    if (bits == 64) { ret opt[ieee.Format].some{ieee.F64}; }
+    ret opt[ieee.Format].none{};
+}
+
+# the highest set bit of `m`, which is not 0
+fun top(m: u64) i64 {
+    var h: i64 = 63;
+    for (h > 0 && ((m >> h::u64) & 1) == 0) { h = h - 1; }
+    ret h;
+}
+
+fun hex(c: u8) i64 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i64 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i64 + 10; }
+    ret -1;
+}
+
+# whether `c` is a digit, hexadecimal for `hexed`
+fun digit(c: u8, hexed: bool) bool {
+    if (hexed) { ret hex(c) >= 0; }
+    ret c >= '0' && c <= '9';
+}
+
+# `text` less its `_` between digits into `out` and a nul, its length: each `_` between two hex digits after `0x` up
+# to a hex float's exponent, between two decimal digits elsewhere
+fun plain(text: *u8, len: usize, out: *u8) opt[usize] {
+    var i:     usize = 0;
+    var n:     usize = 0;
+    var hexed: bool  = false;
+    for (i < len) {
+        val c: u8 = text[i];
+        if (c == '_') {
+            if (i == 0 || i + 1 >= len || !digit(text[i - 1], hexed) || !digit(text[i + 1], hexed)) { ret opt[usize].none{}; }
+        }
+        or {
+            if (c == 'x' || c == 'X')            { hexed = true; }
+            or (hexed && (c == 'p' || c == 'P')) { hexed = false; }
+            out[n] = c;
+            n      = n + 1;
+        }
+        i = i + 1;
+    }
+    out[n] = 0;
+    ret opt[usize].some{n};
+}
+
+# the number at `s`, `len` bytes and unsigned, in `radix`, rounded once to `f`; refused where it rounds to infinity
+fun number(f: ieee.Format, radix: parse.Radix, s: *u8, len: usize) res[u64, str] {
+    # parse's work for the widest format read, its four bignums of f64's limbs
+    # the size copies std's private one until std publishes it, the std need #411 names under Limits
+    var work:            [4 * ieee.F64_LIMBS]u32;
+    val res_parse_float: res[u128, parse.ParseError] = parse.parse_float(f, radix, s, len, true, ?work[0]);
+    if (sel res_parse_float.err)                                     { ret res[u64, str].err{MALFORMED}; }
+    if ((res_parse_float.ok & ieee.inf_bits(f)) == ieee.inf_bits(f)) { ret res[u64, str].err{RANGE}; }
+    ret res[u64, str].ok{res_parse_float.ok::u64};
+}
+
+fun same(s: *u8, word: str) bool {
+    var i: usize = 0;
+    for (word[i] != 0) {
+        if (s[i] != word[i]) { ret false; }
+        i = i + 1;
+    }
+    ret s[i] == 0;
+}
+
+# the bits of the float of `bits` the `len` bytes of `text` spell
+pub fun read(text: *u8, len: usize, bits: u32) res[u64, str] {
+    if (len > MAX_TEXT) { ret res[u64, str].err{LONG}; }
+    val opt_format: opt[ieee.Format] = format_of(bits);
+    if (sel opt_format.none) { ret res[u64, str].err{WIDTH}; }
+    val f:        ieee.Format = opt_format.some;
+    var buf:      [1025]u8;
+    val opt_kept: opt[usize]  = plain(text, len, ?buf[0]);
+    if (sel opt_kept.none) { ret res[u64, str].err{MALFORMED}; }
+    var s:    *u8   = ?buf[0];
+    var n:    usize = opt_kept.some;
+    var sign: u64   = 0;
+    if (s[0] == '+' || s[0] == '-') {
+        if (s[0] == '-') { sign = 1::u64 << (bits - 1)::u64; }
+        s = ?s[1];
+        n = n - 1;
+    }
+    val inf:       u64           = ieee.inf_bits(f)::u64;
+    var res_value: res[u64, str] = res[u64, str].err{MALFORMED};
+    if (same(s, "inf")) { res_value = res[u64, str].ok{inf}; }
+    or (same(s, "nan")) { res_value = res[u64, str].ok{ieee.nan_bits(f)::u64}; }
+    or (n > 6 && s[0] == 'n' && s[1] == 'a' && s[2] == 'n' && s[3] == ':' && s[4] == '0' && s[5] == 'x') {
+        var payload: u64   = 0;
+        var i:       usize = 6;
+        for (i < n) {
+            val d: i64 = hex(s[i]);
+            if (d < 0 || payload >= (1::u64 << f.mant_bits::u64)) { ret res[u64, str].err{MALFORMED}; }
+            payload = payload * 16 + d::u64;
+            i       = i + 1;
+        }
+        if (payload == 0 || payload >= (1::u64 << f.mant_bits::u64)) { ret res[u64, str].err{PAYLOAD}; }
+        res_value = res[u64, str].ok{inf | payload};
+    }
+    or (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { res_value = number(f, parse.Radix.hex{}, s, n); }
+    or (n > 0 && s[0] >= '0' && s[0] <= '9')                  { res_value = number(f, parse.Radix.decimal{}, s, n); }
+    if (sel res_value.err)                                    { ret res_value; }
+    ret res[u64, str].ok{res_value.ok | sign};
+}
+
+fun put(out: *vector.Vector[u8], s: str) {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        vector.push[u8](out, s[i]);
+        i = i + 1;
+    }
+}
+
+fun put_hex(out: *vector.Vector[u8], v: u64) {
+    val digits: str = "0123456789abcdef";
+    var shift:  i64 = 60;
+    for (shift > 0 && ((v >> shift::u64) & 0xF) == 0) { shift = shift - 4; }
+    for (shift >= 0) {
+        vector.push[u8](out, digits[(v >> shift::u64) & 0xF]);
+        shift = shift - 4;
+    }
+}
+
+fun put_decimal(out: *vector.Vector[u8], v: i64) {
+    var n: u64 = v::u64;
+    if (v < 0) {
+        vector.push[u8](out, '-');
+        n = (0 - v)::u64;
+    }
+    or { vector.push[u8](out, '+'); }
+    var rev: [24]u8;
+    var len: usize = 0;
+    for {
+        rev[len] = '0' + (n % 10)::u8;
+        len      = len + 1;
+        n        = n / 10;
+        if (n == 0) { brk; }
+    }
+    for (len > 0) {
+        len = len - 1;
+        vector.push[u8](out, rev[len]);
+    }
+}
+
+# the float of `bits` whose bits are `v` written onto `out`, as a hexadecimal float, `inf` or a nan, nothing for a
+# width wasm has no float of
+pub fun write(out: *vector.Vector[u8], v: u64, bits: u32) {
+    val opt_format: opt[ieee.Format] = format_of(bits);
+    if (sel opt_format.none) { ret; }
+    val f:        ieee.Format = opt_format.some;
+    val sign:     bool        = ((v >> (bits - 1)::u64) & 1) == 1;
+    val exp:      u64         = (v >> f.mant_bits::u64) & ((1::u64 << f.exp_bits::u64) - 1);
+    var fraction: u64         = v & ((1::u64 << f.mant_bits::u64) - 1);
+    if (sign) { vector.push[u8](out, '-'); }
+    if (exp == (1::u64 << f.exp_bits::u64) - 1) {
+        if (fraction == 0) {
+            put(out, "inf");
+            ret;
+        }
+        put(out, "nan");
+        if (fraction != (1::u64 << (f.mant_bits - 1)::u64)) {
+            put(out, ":0x");
+            put_hex(out, fraction);
+        }
+        ret;
+    }
+    if (exp == 0 && fraction == 0) {
+        put(out, "0x0p+0");
+        ret;
+    }
+    var e: i64 = exp::i64 - f.bias;
+    if (exp == 0) {
+        # a subnormal written normalized
+        val h: i64 = top(fraction);
+        e        = 1 - f.bias - (f.mant_bits::i64 - h);
+        fraction = (fraction << (f.mant_bits::i64 - h)::u64) & ((1::u64 << f.mant_bits::u64) - 1);
+    }
+    put(out, "0x1");
+    if (fraction != 0) {
+        # the fraction left aligned to whole hex digits, its trailing zero digits dropped
+        val pad:   u32 = (4 - f.mant_bits % 4) % 4;
+        var bits_: u64 = fraction << pad::u64;
+        var width: u32 = (f.mant_bits + pad) / 4;
+        for (width > 0 && (bits_ & 0xF) == 0) {
+            bits_ = bits_ >> 4;
+            width = width - 1;
+        }
+        vector.push[u8](out, '.');
+        val digits: str = "0123456789abcdef";
+        var k:      i64 = width::i64 - 1;
+        for (k >= 0) {
+            vector.push[u8](out, digits[(bits_ >> (k * 4)::u64) & 0xF]);
+            k = k - 1;
+        }
+    }
+    vector.push[u8](out, 'p');
+    put_decimal(out, e);
+}

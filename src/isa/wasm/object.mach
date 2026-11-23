@@ -1,0 +1,652 @@
+# a wasm module made as mink's neutral object
+#
+# a producer of wasm code, masc's module reader or mirl's wasm back end, states what a module holds through a `Module`
+# and finishes it into a neutral object, which mink writes as the format's module or object. it never builds mink's
+# wasm model nor encodes a type, a limit or a segment head: those are mink's to state, through
+# `mink.format.wasm.fact`. what the producer encodes is masc's: the instructions of a body and of a constant
+# expression.
+#
+# the producer states each import and definition as it meets it, a function's body and a data segment's bytes as a
+# section of the object, and the element segments, exports, start function and data count of a module. `finish` adds
+# the entries in the order a module numbers them, every type the stream holds first, as an object's types are its first
+# entries, then the imports in the order they were stated, then the definitions of each space, functions, tables,
+# memories, globals and tags, then the data segments, and states each fact about them. an index a producer names, of a
+# function, table, memory or type, is the one its space gives the entry, so `finish` maps it to the entry once every
+# entry is added. a name is interned into the object as it is stated, once.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink_arch:    mink.catalog.arch;
+use catalog_kind: mink.catalog.kind;
+use mink.format.wasm.fact;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Entry;
+use mink.model.object.Import;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.section;
+use mink.model.space;
+use mink.model.space.Space;
+
+use wasm_kind:    masc.isa.wasm.kind;
+use wasm_stream:  masc.isa.wasm.stream;
+use wasm_valtype: masc.isa.wasm.valtype;
+
+# bytes the module holds until `finish` states them: `len` of them from `at` of its pool
+pub rec Span {
+    at:  usize;
+    len: usize;
+}
+
+# a table: the code of the reference type it holds, its limits, and the constant expression a defined one's elements
+# start as where it states one, its end opcode included
+pub rec TableType {
+    elem:   i64;
+    limits: fact.Limits;
+    init:   opt[Span];
+}
+
+# a global: the code of its value type, whether it is mutable, and the constant expression a defined one starts as,
+# its end opcode included
+pub rec Global {
+    value:   i64;
+    mutable: bool;
+    init:    opt[Span];
+}
+
+# what an import or a definition is
+# ---
+# function:  a function of the type of that index
+# table:     a table
+# memory:    a memory of those limits, in pages
+# global:    a global
+# exception: an exception tag of the function type of that index
+pub tag Desc: u8 {
+    function:  u32;
+    table:     TableType;
+    memory:    fact.Limits;
+    global:    Global;
+    exception: u32;
+}
+
+# an import or a definition: what it is, the module and field an import names, and the section of a defined
+# function's body, once stated
+rec Stated {
+    desc:   Desc;
+    import: opt[Import];
+    body:   opt[Id[object.Section]];
+}
+
+# where an active segment's bytes go: its memory or table by its index, none to leave the first one's index unwritten,
+# and its offset's constant expression, its end opcode included
+pub rec At {
+    index:  opt[u32];
+    offset: Span;
+}
+
+# a data segment's head
+pub tag Head: u8 {
+    passive;
+    active: At;
+}
+
+# an element segment's mode
+pub tag Mode: u8 {
+    passive;
+    active: At;
+    declarative;
+}
+
+# an element segment's items: functions by their index, or constant expressions, each with its end opcode
+pub tag Items: u8 {
+    functions:   vector.Vector[u32];
+    expressions: vector.Vector[Span];
+}
+
+# an element segment: its mode, the code of the reference type of its items, and its items
+pub rec Element {
+    mode:  Mode;
+    type:  i64;
+    items: Items;
+}
+
+rec Segment {
+    head:    Head;
+    section: Id[object.Section];
+}
+
+rec Export {
+    name:  Span;
+    space: *Space;
+    index: u32;
+}
+
+# a module being made
+# ---
+# o:       the object the module becomes
+# pool:    the bytes of names and expressions stated until `finish`
+# imports: the imports, in the order they were stated
+# functions, tables, memories, globals, tags: the definitions of each space, in the order they were stated
+# segments: the data segments, in the order they were stated
+# elements: the element segments, in the order they were stated
+# exports:  the exports, in the order they were stated
+# start:    the start function's index, none for none
+# counted:  whether the module states a data count
+pub rec Module {
+    o:         Object;
+    pool:      vector.Vector[u8];
+    imports:   vector.Vector[Stated];
+    functions: vector.Vector[Stated];
+    tables:    vector.Vector[Stated];
+    memories:  vector.Vector[Stated];
+    globals:   vector.Vector[Stated];
+    tags:      vector.Vector[Stated];
+    segments:  vector.Vector[Segment];
+    elements:  vector.Vector[Element];
+    exports:   vector.Vector[Export];
+    start:     opt[u32];
+    counted:   bool;
+}
+
+# a module of nothing, an object of `kind` for `arch` in `a`, which `dnit` gives back unless `finish` took it
+pub fun init(a: *A.Allocator, arch: *mink_arch.Arch, kind: *catalog_kind.Kind) Module {
+    ret Module{
+        o:         object.init(a, arch, kind),
+        pool:      vector.init[u8](a),
+        imports:   vector.init[Stated](a),
+        functions: vector.init[Stated](a),
+        tables:    vector.init[Stated](a),
+        memories:  vector.init[Stated](a),
+        globals:   vector.init[Stated](a),
+        tags:      vector.init[Stated](a),
+        segments:  vector.init[Segment](a),
+        elements:  vector.init[Element](a),
+        exports:   vector.init[Export](a),
+        start:     opt[u32].none{},
+        counted:   false,
+    };
+}
+
+fun items_dnit(it: *Items) {
+    if (sel it.functions) { vector.dnit[u32](?it.functions); }
+    or                    { vector.dnit[Span](?it.expressions); }
+}
+
+# what `m` holds besides the object
+fun tables_dnit(m: *Module) {
+    vector.dnit[u8](?m.pool);
+    vector.dnit[Stated](?m.imports);
+    vector.dnit[Stated](?m.functions);
+    vector.dnit[Stated](?m.tables);
+    vector.dnit[Stated](?m.memories);
+    vector.dnit[Stated](?m.globals);
+    vector.dnit[Stated](?m.tags);
+    vector.dnit[Segment](?m.segments);
+    var i: usize = 0;
+    for (i < m.elements.len) {
+        items_dnit(?m.elements.data[i].items);
+        i = i + 1;
+    }
+    vector.dnit[Element](?m.elements);
+    vector.dnit[Export](?m.exports);
+}
+
+# give back everything `m` holds, its object among it
+pub fun dnit(m: *Module) {
+    tables_dnit(m);
+    val err_gone: err[Fail] = object.dnit(?m.o);
+}
+
+fun memory() Fail {
+    ret fail.internal("out of memory");
+}
+
+fun pushed(got: res[usize, A.Error]) err[Fail] {
+    if (sel got.err) { ret err[Fail].err{memory()}; }
+    ret err[Fail].ok{};
+}
+
+# the `len` bytes at `data` held in the module's pool until `finish`
+pub fun hold(m: *Module, data: *u8, len: usize) res[Span, Fail] {
+    val at:       usize             = m.pool.len;
+    val res_room: res[u64, A.Error] = vector.reserve[u8](?m.pool, len);
+    if (sel res_room.err) { ret res[Span, Fail].err{memory()}; }
+    var i: usize = 0;
+    for (i < len) {
+        vector.push[u8](?m.pool, data[i]);
+        i = i + 1;
+    }
+    ret res[Span, Fail].ok{Span{at: at, len: len}};
+}
+
+# the bytes `s` names, valid until the module holds more
+pub fun view(m: *Module, s: Span) View {
+    ret View{data: ?m.pool.data[s.at], len: s.len};
+}
+
+# the definitions of the space `desc` names
+fun definitions(m: *Module, desc: *Desc) *vector.Vector[Stated] {
+    if (sel desc.function) { ret ?m.functions; }
+    if (sel desc.table)    { ret ?m.tables; }
+    if (sel desc.memory)   { ret ?m.memories; }
+    if (sel desc.global)   { ret ?m.globals; }
+    ret ?m.tags;
+}
+
+# state an import of `desc` from the module `module` and field `field`
+pub fun import(m: *Module, module: View, field: View, desc: Desc) err[Fail] {
+    val res_mod: res[Id[Name], Fail] = object.name(?m.o, module.data, module.len);
+    if (sel res_mod.err) { ret err[Fail].err{res_mod.err}; }
+    val res_fld: res[Id[Name], Fail] = object.name(?m.o, field.data, field.len);
+    if (sel res_fld.err) { ret err[Fail].err{res_fld.err}; }
+    val imp: Import = Import{module: res_mod.ok, field: res_fld.ok, library: opt[Id[object.Dependency]].none{}, ordinal: opt[u16].none{}, symbol: opt[Id[object.Symbol]].none{}, stays: false};
+    ret pushed(vector.push[Stated](?m.imports, Stated{desc: desc, import: opt[Import].some{imp}, body: opt[Id[object.Section]].none{}}));
+}
+
+# state a definition of `desc`, a defined function's body stated later with `body`
+pub fun define(m: *Module, desc: Desc) err[Fail] {
+    ret pushed(vector.push[Stated](definitions(m, ?desc), Stated{desc: desc, import: opt[Import].none{}, body: opt[Id[object.Section]].none{}}));
+}
+
+# state `init` as the initializer of the table defined at position `table` among the module's defined tables, its
+# elements' constant expression read once every field is
+pub fun initialize(m: *Module, table: u32, init: Span) err[Fail] {
+    if (table::usize >= m.tables.len) { ret err[Fail].err{fail.malformed("no table is defined at that position")}; }
+    val s:  *Stated = ?m.tables.data[table::usize];
+    var tt: TableType;
+    if (sel s.desc.table) { tt = s.desc.table; }
+    tt.init = opt[Span].some{init};
+    s.desc  = Desc.table{tt};
+    ret err[Fail].ok{};
+}
+
+# the number of tables the module defines, the position `initialize` names the next one by
+pub fun defined_tables(m: *Module) u32 {
+    ret m.tables.len::u32;
+}
+
+# where a data segment's bytes lie in the object: its section's name, none for an unnamed one as a module's are, its
+# kind, flags and alignment, as a relocatable object's segment info states them
+pub rec Placed {
+    name:  opt[View];
+    kind:  *section.Kind;
+    flags: section.Flags;
+    align: u64;
+}
+
+# an unnamed data section of no alignment, as a module's segment lies in
+pub val PLAIN: Placed = Placed{name: opt[View].none{}, kind: ?section.DATA, flags: section.ALLOC | section.WRITE, align: 1};
+
+# a section placed as `at` holding the `len` bytes at `data`, the zero fill where its kind holds no bits, kept whole
+fun section_of(m: *Module, at: *Placed, data: *u8, len: usize) res[Id[object.Section], Fail] {
+    var opt_name: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (sel at.name.some) {
+        val res_name: res[Id[Name], Fail] = object.name(?m.o, at.name.some.data, at.name.some.len);
+        if (sel res_name.err) { ret res[Id[object.Section], Fail].err{res_name.err}; }
+        opt_name = opt[Id[Name]].some{res_name.ok};
+    }
+    val res_held: res[Contents, Fail] = object.contents_of(?m.o, at.kind, data, len);
+    if (sel res_held.err) { ret res[Id[object.Section], Fail].err{res_held.err}; }
+    ret object.add_section(?m.o, object.Section{name: opt_name, kind: at.kind, flags: at.flags, align: at.align, contents: res_held.ok, disposition: ?section.WHOLE});
+}
+
+# an unnamed text section of no alignment, as a function's body lies in
+val BODY: Placed = Placed{name: opt[View].none{}, kind: ?section.TEXT, flags: section.ALLOC | section.EXEC, align: 1};
+
+# state the body of the defined function `k`, the `k`th the module defines, as the `len` bytes at `data`: its locals
+# vector and its code, its end opcode included, a text section of the object, whose id it answers
+pub fun body(m: *Module, k: usize, data: *u8, len: usize) res[Id[object.Section], Fail] {
+    if (k >= m.functions.len) { ret res[Id[object.Section], Fail].err{fail.internal("a body of a function the module does not define")}; }
+    val res_section_of: res[Id[object.Section], Fail] = section_of(m, ?BODY, data, len);
+    if (sel res_section_of.ok) { m.functions.data[k].body = opt[Id[object.Section]].some{res_section_of.ok}; }
+    ret res_section_of;
+}
+
+# state a data segment of head `head` holding the `len` bytes at `data`, a section of the object placed as `at`, whose
+# id it answers
+pub fun segment(m: *Module, head: Head, at: Placed, data: *u8, len: usize) res[Id[object.Section], Fail] {
+    val res_section_of: res[Id[object.Section], Fail] = section_of(m, ?at, data, len);
+    if (sel res_section_of.err) { ret res_section_of; }
+    val err_pushed: err[Fail] = pushed(vector.push[Segment](?m.segments, Segment{head: head, section: res_section_of.ok}));
+    if (sel err_pushed.err) { ret res[Id[object.Section], Fail].err{err_pushed.err}; }
+    ret res_section_of;
+}
+
+# state an element segment, which the module then holds, its items among it
+pub fun element(m: *Module, el: Element) err[Fail] {
+    var held:       Element   = el;
+    val err_pushed: err[Fail] = pushed(vector.push[Element](?m.elements, el));
+    if (sel err_pushed.err) { items_dnit(?held.items); }
+    ret err_pushed;
+}
+
+# state an export named `name` of the entry `index` of the space of import kind `kind`
+pub fun export(m: *Module, name: View, kind: u8, index: u32) err[Fail] {
+    val opt_space_of_kind: opt[*Space] = fact.space_of_kind(kind);
+    if (sel opt_space_of_kind.none) { ret err[Fail].err{fail.valued(fail.malformed("an export of a kind the specification does not define"), kind::i128)}; }
+    val res_hold: res[Span, Fail] = hold(m, name.data, name.len);
+    if (sel res_hold.err) { ret err[Fail].err{res_hold.err}; }
+    ret pushed(vector.push[Export](?m.exports, Export{name: res_hold.ok, space: opt_space_of_kind.some, index: index}));
+}
+
+# state the function `index` the module's start function
+pub fun start(m: *Module, index: u32) {
+    m.start = opt[u32].some{index};
+}
+
+# state that the module writes a data count
+pub fun count_data(m: *Module) {
+    m.counted = true;
+}
+
+# the space a definition of `desc` is in
+fun space_of(desc: *Desc) *Space {
+    if (sel desc.function) { ret ?space.FUNCTIONS; }
+    if (sel desc.table)    { ret ?space.TABLES; }
+    if (sel desc.memory)   { ret ?space.MEMORIES; }
+    if (sel desc.global)   { ret ?space.GLOBALS; }
+    ret ?space.TAGS;
+}
+
+fun type_entry(index: u32) Id[Entry] {
+    ret table.nth[Entry](index::usize);
+}
+
+fun added(m: *Module, e: Entry) err[Fail] {
+    val res_add_entry: res[Id[Entry], Fail] = object.add_entry(?m.o, e);
+    if (sel res_add_entry.err) { ret err[Fail].err{res_add_entry.err}; }
+    ret err[Fail].ok{};
+}
+
+# the entry of `s`, an import or a definition
+fun entry_of(s: *Stated) Entry {
+    var e: Entry = Entry{space: space_of(?s.desc), import: s.import};
+    if (sel s.desc.function) { e.signature = opt[Id[Entry]].some{type_entry(s.desc.function)}; }
+    if (sel s.body.some)     { e.body = opt[Place].some{Place{section: s.body.some, offset: 0}}; }
+    ret e;
+}
+
+fun entries_of(m: *Module, at: *vector.Vector[Stated]) err[Fail] {
+    var i: usize = 0;
+    for (i < at.len) {
+        val err_added: err[Fail] = added(m, entry_of(?at.data[i]));
+        if (sel err_added.err) { ret err_added; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# every entry, in the order a module numbers them: `types` types, the imports, each space's definitions and the data
+# segments
+fun entries(m: *Module, types: u32) err[Fail] {
+    var i: u32 = 0;
+    for (i < types) {
+        val err_added: err[Fail] = added(m, Entry{space: ?space.TYPES});
+        if (sel err_added.err) { ret err_added; }
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < 6) {
+        val err_entries_of: err[Fail] = entries_of(m, stated_of(m, k));
+        if (sel err_entries_of.err) { ret err_entries_of; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < m.segments.len) {
+        val err_added: err[Fail] = added(m, Entry{space: ?space.SEGMENTS, body: opt[Place].some{Place{section: m.segments.data[k].section, offset: 0}}});
+        if (sel err_added.err) { ret err_added; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the function type `index` of the stream, stated about its type entry
+fun signature(m: *Module, stream: ptr, index: u32) err[Fail] {
+    val opt_func_type: opt[*wasm_stream.FuncType] = wasm_stream.func_type(stream, index);
+    if (sel opt_func_type.none) { ret err[Fail].err{fail.internal("a type index the stream counts holds no function type")}; }
+    var params:  vector.Vector[fact.Value] = vector.init[fact.Value](m.o.a);
+    var results: vector.Vector[fact.Value] = vector.init[fact.Value](m.o.a);
+    fin {
+        vector.dnit[fact.Value](?params);
+        vector.dnit[fact.Value](?results);
+    }
+    var i: usize = 0;
+    for (i < opt_func_type.some.params.len) {
+        val err_pushed: err[Fail] = pushed(vector.push[fact.Value](?params, wasm_valtype.value(wasm_valtype.widened(opt_func_type.some.params.data[i]))));
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < opt_func_type.some.results.len) {
+        val err_pushed: err[Fail] = pushed(vector.push[fact.Value](?results, wasm_valtype.value(wasm_valtype.widened(opt_func_type.some.results.data[i]))));
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    ret fact.signature(?m.o, type_entry(index), params.data, params.len, results.data, results.len);
+}
+
+# the fact about the entry `e`, what `s` states it is
+fun typed(m: *Module, e: Id[Entry], s: *Stated) err[Fail] {
+    val d: *Desc = ?s.desc;
+    if (sel d.table) {
+        var opt_init: opt[View] = opt[View].none{};
+        if (sel d.table.init.some) { opt_init = opt[View].some{view(m, d.table.init.some)}; }
+        ret fact.table_type(?m.o, e, wasm_valtype.reference(d.table.elem), d.table.limits, opt_init);
+    }
+    if (sel d.memory)    { ret fact.memory_type(?m.o, e, d.memory); }
+    if (sel d.exception) { ret fact.tag_type(?m.o, e, type_entry(d.exception)); }
+    if (sel d.global) {
+        var opt_init: opt[View] = opt[View].none{};
+        if (sel d.global.init.some) { opt_init = opt[View].some{view(m, d.global.init.some)}; }
+        ret fact.global_type(?m.o, e, wasm_valtype.value(d.global.value), d.global.mutable, opt_init);
+    }
+    ret err[Fail].ok{};
+}
+
+# the facts about the entries of `at`, the first of which is entry `first`, answering the entry past the last
+fun typed_all(m: *Module, at: *vector.Vector[Stated], first: usize) res[usize, Fail] {
+    var i: usize = 0;
+    for (i < at.len) {
+        val err_typed: err[Fail] = typed(m, table.nth[Entry](first + i), ?at.data[i]);
+        if (sel err_typed.err) { ret res[usize, Fail].err{err_typed.err}; }
+        i = i + 1;
+    }
+    ret res[usize, Fail].ok{first + at.len};
+}
+
+# the entry the index `index` names in the space `sp`, whose entries `list` lists, refused past the space's end
+fun nth_of(list: *Table[Id[Entry]], sp: *Space, index: u32) res[Id[Entry], Fail] {
+    if (index::usize >= table.count[Id[Entry]](list)) { ret res[Id[Entry], Fail].err{fail.valued(fail.about(fail.malformed("an index lies past its space"), sp.name), index::i128)}; }
+    ret res[Id[Entry], Fail].ok{@table.at[Id[Entry]](list, table.nth[Id[Entry]](index::usize))};
+}
+
+fun listed(ix: *fact.Index, sp: *Space) *Table[Id[Entry]] {
+    if (sp == ?space.FUNCTIONS) { ret ?ix.functions; }
+    if (sp == ?space.TABLES)    { ret ?ix.tables; }
+    if (sp == ?space.MEMORIES)  { ret ?ix.memories; }
+    if (sp == ?space.GLOBALS)   { ret ?ix.globals; }
+    ret ?ix.tags;
+}
+
+# the entry `at` names in the space whose entries `list` lists, none where it leaves the first one's index unwritten
+fun target(list: *Table[Id[Entry]], sp: *Space, at: opt[u32]) res[opt[Id[Entry]], Fail] {
+    if (sel at.none) { ret res[opt[Id[Entry]], Fail].ok{opt[Id[Entry]].none{}}; }
+    val res_nth_of: res[Id[Entry], Fail] = nth_of(list, sp, at.some);
+    if (sel res_nth_of.err) { ret res[opt[Id[Entry]], Fail].err{res_nth_of.err}; }
+    ret res[opt[Id[Entry]], Fail].ok{opt[Id[Entry]].some{res_nth_of.ok}};
+}
+
+fun heads(m: *Module, ix: *fact.Index, first: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < m.segments.len) {
+        val h:    *Head            = ?m.segments.data[i].head;
+        var head: fact.SegmentHead = fact.SegmentHead.passive{};
+        if (sel h.active) {
+            val res_mem: res[opt[Id[Entry]], Fail] = target(?ix.memories, ?space.MEMORIES, h.active.index);
+            if (sel res_mem.err) { ret err[Fail].err{fail.in_indexed(res_mem.err, "data segment", i::u64)}; }
+            head = fact.SegmentHead.active{fact.InMemory{memory: res_mem.ok, offset: view(m, h.active.offset)}};
+        }
+        val err_segment_head: err[Fail] = fact.segment_head(?m.o, ix, table.nth[Entry](first + i), head);
+        if (sel err_segment_head.err) { ret err_segment_head; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the function entry `index` names added to `t`
+fun function_item(t: *Table[Id[Entry]], ix: *fact.Index, index: u32) err[Fail] {
+    val res_nth_of: res[Id[Entry], Fail] = nth_of(?ix.functions, ?space.FUNCTIONS, index);
+    if (sel res_nth_of.err) { ret err[Fail].err{res_nth_of.err}; }
+    val res_table_pushed: res[Id[Id[Entry]], Fail] = table.push[Id[Entry]](t, res_nth_of.ok);
+    if (sel res_table_pushed.err) { ret err[Fail].err{res_table_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the items of `el` as mink's facts state them, in tables the caller releases
+fun items_of(m: *Module, ix: *fact.Index, el: *Element) res[fact.Items, Fail] {
+    if (sel el.items.functions) {
+        var t: Table[Id[Entry]] = table.init[Id[Entry]](m.o.a);
+        var i: usize            = 0;
+        for (i < el.items.functions.len) {
+            val err_function_item: err[Fail] = function_item(?t, ix, el.items.functions.data[i]);
+            if (sel err_function_item.err) {
+                val err_gone: err[Fail] = table.dnit[Id[Entry]](?t);
+                ret res[fact.Items, Fail].err{err_function_item.err};
+            }
+            i = i + 1;
+        }
+        ret res[fact.Items, Fail].ok{fact.Items.functions{t}};
+    }
+    var x: Table[View] = table.init[View](m.o.a);
+    var i: usize       = 0;
+    for (i < el.items.expressions.len) {
+        val res_view_pushed: res[Id[View], Fail] = table.push[View](?x, view(m, el.items.expressions.data[i]));
+        if (sel res_view_pushed.err) {
+            val err_gone: err[Fail] = table.dnit[View](?x);
+            ret res[fact.Items, Fail].err{res_view_pushed.err};
+        }
+        i = i + 1;
+    }
+    ret res[fact.Items, Fail].ok{fact.Items.expressions{x}};
+}
+
+fun elements(m: *Module, ix: *fact.Index) err[Fail] {
+    var i: usize = 0;
+    for (i < m.elements.len) {
+        val el:   *Element         = ?m.elements.data[i];
+        var mode: fact.ElementMode = fact.ElementMode.passive{};
+        if (sel el.mode.declarative) { mode = fact.ElementMode.declarative{}; }
+        or (sel el.mode.active) {
+            val res_tab: res[opt[Id[Entry]], Fail] = target(?ix.tables, ?space.TABLES, el.mode.active.index);
+            if (sel res_tab.err) { ret err[Fail].err{fail.in_indexed(res_tab.err, "element segment", i::u64)}; }
+            mode = fact.ElementMode.active{fact.InTable{table: res_tab.ok, offset: view(m, el.mode.active.offset)}};
+        }
+        val res_items: res[fact.Items, Fail] = items_of(m, ix, el);
+        if (sel res_items.err) { ret err[Fail].err{fail.in_indexed(res_items.err, "element segment", i::u64)}; }
+        var stated:      fact.Element = fact.Element{mode: mode, type: wasm_valtype.reference(el.type), items: res_items.ok};
+        val err_element: err[Fail]    = fact.element(?m.o, ix, i::u64, ?stated);
+        val err_gone:    err[Fail]    = fact.element_dnit(?stated);
+        if (sel err_element.err) { ret err_element; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun exports(m: *Module, ix: *fact.Index) err[Fail] {
+    if (m.exports.len == 0) { ret err[Fail].ok{}; }
+    var out: vector.Vector[fact.Export] = vector.init[fact.Export](m.o.a);
+    fin { vector.dnit[fact.Export](?out); }
+    var i: usize = 0;
+    for (i < m.exports.len) {
+        val x:          *Export              = ?m.exports.data[i];
+        val res_nth_of: res[Id[Entry], Fail] = nth_of(listed(ix, x.space), x.space, x.index);
+        if (sel res_nth_of.err) { ret err[Fail].err{fail.in_indexed(res_nth_of.err, "export", i::u64)}; }
+        val err_pushed: err[Fail] = pushed(vector.push[fact.Export](?out, fact.Export{name: view(m, x.name), entry: res_nth_of.ok}));
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    ret fact.exports(?m.o, ix, out.data, out.len);
+}
+
+# every fact about the entries and the module, under the index of its entries
+fun facts(m: *Module, ix: *fact.Index, stream: ptr, types: u32) err[Fail] {
+    var i: u32 = 0;
+    for (i < types) {
+        val err_signature: err[Fail] = signature(m, stream, i);
+        if (sel err_signature.err) { ret err_signature; }
+        i = i + 1;
+    }
+    var at: usize = types::usize;
+    var k:  usize = 0;
+    for (k < 6) {
+        val res_typed_all: res[usize, Fail] = typed_all(m, stated_of(m, k), at);
+        if (sel res_typed_all.err) { ret err[Fail].err{res_typed_all.err}; }
+        at = res_typed_all.ok;
+        k  = k + 1;
+    }
+    val err_heads: err[Fail] = heads(m, ix, at);
+    if (sel err_heads.err) { ret err_heads; }
+    val err_exports: err[Fail] = exports(m, ix);
+    if (sel err_exports.err) { ret err_exports; }
+    if (sel m.start.some) {
+        val res_nth_of: res[Id[Entry], Fail] = nth_of(?ix.functions, ?space.FUNCTIONS, m.start.some);
+        if (sel res_nth_of.err) { ret err[Fail].err{res_nth_of.err}; }
+        val err_start: err[Fail] = fact.start(?m.o, ix, res_nth_of.ok);
+        if (sel err_start.err) { ret err_start; }
+    }
+    val err_elements: err[Fail] = elements(m, ix);
+    if (sel err_elements.err) { ret err_elements; }
+    if (m.counted)            { ret fact.data_count(?m.o, m.segments.len::u64); }
+    ret err[Fail].ok{};
+}
+
+# the imports, then each space's definitions, in the order `entries` adds them, by `k` from 0 to 5
+fun stated_of(m: *Module, k: usize) *vector.Vector[Stated] {
+    if (k == 0) { ret ?m.imports; }
+    if (k == 1) { ret ?m.functions; }
+    if (k == 2) { ret ?m.tables; }
+    if (k == 3) { ret ?m.memories; }
+    if (k == 4) { ret ?m.globals; }
+    ret ?m.tags;
+}
+
+# every entry and every fact about them
+fun stated(m: *Module, stream: ptr, types: u32) err[Fail] {
+    val err_entries: err[Fail] = entries(m, types);
+    if (sel err_entries.err) { ret err_entries; }
+    val res_indexed: res[fact.Index, Fail] = fact.indexed(?m.o);
+    if (sel res_indexed.err) { ret err[Fail].err{res_indexed.err}; }
+    var index:     fact.Index = res_indexed.ok;
+    val err_facts: err[Fail]  = facts(m, ?index, stream, types);
+    ret fail.kept(err_facts, fact.index_dnit(?index));
+}
+
+# the object `m` states, its types those `stream` holds, which the caller takes and releases. `m` holds nothing after
+# it, whether or not it is refused
+pub fun finish(m: *Module, stream: ptr) res[Object, Fail] {
+    val types:      u32       = wasm_stream.count(stream, wasm_kind.TYPES);
+    val err_stated: err[Fail] = stated(m, stream, types);
+    tables_dnit(m);
+    if (sel err_stated.err) {
+        val err_gone: err[Fail] = object.dnit(?m.o);
+        ret res[Object, Fail].err{err_stated.err};
+    }
+    ret res[Object, Fail].ok{m.o};
+}

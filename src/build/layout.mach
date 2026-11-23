@@ -1,0 +1,619 @@
+# the layout: placing every fragment, folding fixups and growing forms by relaxation until the sections settle
+#
+# `finish` lays the sections out to a fixed point, encodes every fragment and
+# hands back mink's neutral object. a fixup of any step of an instruction's
+# form, grown or not, folds into its bytes when its operand is relative or a
+# pc-relative address, its target is a label of the same section that cannot
+# be preempted, in the same atom where the format's files are cut at their
+# symbols, its relocation kind is plain pc-relative, and no instruction the
+# linker may resize lies between. every other fixup becomes a relocation
+# through the set's bindings, and one that would fold but for such an
+# instruction holds in its field the distance as laid out, so code read before
+# the link, as the constant-time walk reads it, follows it to where the label
+# is (`laid`). an instruction grows by the set's relaxation
+# rows when its target is out of range, measured by the layout whether or not
+# the fixup folds, or when only the linker knows the target, as a branch to
+# an undefined symbol is grown. growth is the only change a pass makes to
+# an instruction, and every length is the length of an encoding, never a sum
+# of field widths.
+#
+# the layout ends within a stated bound of passes. it starts every
+# instruction at its shortest form and only ever grows one, so a pass that
+# does not end grows at least one instruction by one relaxation, and an
+# instruction grows at most as many times as its row's chain of relaxations
+# is long (`relax.depth`), which the set's check bounds. with n instructions
+# of chains d1..dn, the layout takes at most 1 + d1 + ... + dn passes, and a
+# layout that has not settled by then, which only a set whose lengths depend
+# on their values could make, is refused rather than run on.
+use masc_codec: masc.codec;
+use masc.core.compress;
+use masc.core.dispatch;
+use masc.core.field;
+use masc.core.fill;
+use core_fixup: masc.core.fixup;
+use masc.core.index;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.relax;
+use masc.core.row;
+use core_state: masc.core.state;
+use mink.base.table;
+use mink_object: mink.model.object;
+use mink.model.reloc;
+use std.collections.sort;
+use std.collections.vector;
+use std.encoding.leb128;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use masc.build.refusal.CHAIN;
+use masc.build.refusal.CYCLE;
+use masc.build.refusal.EXPAND;
+use masc.build.refusal.NO_FILL;
+use masc.build.refusal.REALIGN_FORM;
+use masc.build.refusal.RELAXED_ALIGN;
+use masc.build.refusal.Refusal;
+use masc.build.refusal.encoding;
+use masc.build.refusal.held;
+use masc.build.refusal.memory;
+use masc.build.refusal.refuse;
+use masc.build.refusal.refused;
+use masc.build.state.Aimed;
+use masc.build.state.Align;
+use masc.build.state.Area;
+use masc.build.state.Atom;
+use masc.build.state.Based;
+use masc.build.state.Builder;
+use masc.build.state.Code;
+use masc.build.state.Folded;
+use masc.build.state.Fragment;
+use masc.build.state.Gap;
+use masc.build.state.Mark;
+use masc.build.state.Measured;
+use masc.build.state.Realigned;
+use masc.build.state.Spread;
+use masc.build.state.coded;
+use masc.build.state.gap;
+use masc.build.state.kind_of;
+use masc.build.state.offset_at;
+use masc.build.state.preemptible;
+use masc.build.state.settled;
+use masc.build.state.through;
+
+# the stored values of `c` copied into `out`, the values they hold within them and their literals pointed at the stores,
+# which do not move while they are read
+pub fun recall(b: *Builder, c: *Code, out: *operand.Value) {
+    var m: usize = c.members;
+    var l: usize = c.literals;
+    var k: u32   = 0;
+    for (k < c.count) {
+        out[k] = b.values.data[c.values + k::usize];
+        recall_of(b, ?out[k], ?m, ?l);
+        k = k + 1;
+    }
+}
+
+# `v`'s literal and the values it holds within it pointed at the stores from members `m` and literals `l`, in the order
+# `keep_value` stored them, both moved past what it holds
+fun recall_of(b: *Builder, v: *operand.Value, m: *usize, l: *usize) {
+    if (sel v.literal) {
+        v.literal.at = ?b.literals.data[@l];
+        @l           = @l + v.literal.len::usize;
+    }
+    val count: u32 = operand.inner(v).len;
+    if (count == 0) { ret; }
+    val first: usize = @m;
+    operand.move_inner(v, ?b.members.data[first]);
+    @m = first + count::usize;
+    var i: u32 = 0;
+    for (i < count) {
+        recall_of(b, ?b.members.data[first + i::usize], m, l);
+        i = i + 1;
+    }
+}
+
+# the length of `ins` encoded under view `v`, measured in scratch and left as found
+fun measure(b: *Builder, v: *core_state.Context, ins: *inst.Inst) res[usize, field.Refusal] {
+    val res_done: res[Measured, field.Refusal] = spanned(b, v, ?b.modes, ins, relax.MAX_STEPS);
+    if (sel res_done.err) { ret res[usize, field.Refusal].err{res_done.err}; }
+    ret res[usize, field.Refusal].ok{res_done.ok.len};
+}
+
+# `ins` encoded under view `v` in scratch and left as found, its length with the first of its fixups that covers more than the
+# `left` instructions from it to its sequence's end, and the marker its span states under the modes `modes`
+pub fun spanned(b: *Builder, v: *core_state.Context, modes: *mode.State, ins: *inst.Inst, left: u32) res[Measured, field.Refusal] {
+    val start:    usize                     = b.scratch.len;
+    val marks:    usize                     = b.fixups.len;
+    val res_done: res[usize, field.Refusal] = masc_codec.encode(b.set.codec, v, ins, ?b.scratch, ?b.fixups);
+    var got:      Measured                  = Measured{len: 0, split: operand.NO_SYMBOL, marker: operand.NO_FIXUP};
+    if (sel res_done.ok) {
+        got.len = res_done.ok;
+        spans(b, modes, marks, left, ?got);
+    }
+    vector.truncate[u8](?b.scratch, start);
+    vector.truncate[field.Fixup](?b.fixups, marks);
+    if (sel res_done.err) { ret res[Measured, field.Refusal].err{res_done.err}; }
+    ret res[Measured, field.Refusal].ok{got};
+}
+
+# the split and marker of `got` from the spans of the fixups from `marks` of one encoded instruction: the first fixup
+# that covers more than the `left` instructions from it to its sequence's end, and the marker its span states under the
+# modes `modes`
+pub fun spans(b: *Builder, modes: *mode.State, marks: usize, left: u32, got: *Measured) {
+    var i: usize = marks;
+    for (i < b.fixups.len && got.split == operand.NO_SYMBOL) {
+        val opt_span_of: opt[*core_fixup.Span] = core_fixup.span_of(b.set.spans, b.fixups.data[i].kind);
+        if (sel opt_span_of.some) {
+            if (opt_span_of.some.count > left)            { got.split = b.fixups.data[i].symbol; }
+            if (mode.holds(modes, opt_span_of.some.when)) { got.marker = opt_span_of.some.marker; }
+        }
+        i = i + 1;
+    }
+}
+
+# the shortest fill pattern view `v` admits, 0 for none
+fun shortest(b: *Builder, v: *core_state.Context) u64 {
+    if (b.set.fill == nil) { ret 0; }
+    var i: u32 = b.set.fill.count;
+    for (i > 0) {
+        i = i - 1;
+        val p: *fill.Pattern = ?b.set.fill.patterns[i];
+        if (core_state.admits(v, p.requires)) { ret p.len::u64; }
+    }
+    ret 0;
+}
+
+# the alignment `area` is finished with: what was asked, raised to the shortest fill pattern the object's selection
+# admits when it holds an instruction, which is the set's own statement of its smallest instruction
+pub fun aligned(b: *Builder, area: *Area) u64 {
+    var j: usize = 0;
+    for (j < area.fragments.len) {
+        if (sel area.fragments.data[j].body.code) {
+            val least: u64 = shortest(b, b.object);
+            if (least > area.align) { ret least; }
+            ret area.align;
+        }
+        j = j + 1;
+    }
+    ret area.align;
+}
+
+# whether alignment fragment `j` of `area` is realigned by the linker: code alignment after an instruction it may resize
+pub fun realigned(area: *Area, j: usize, al: *Align) bool {
+    ret area.code && area.marks.data[j] > 0 && al.boundary > 1;
+}
+
+# every fragment of `area` placed from the sizes of the last pass, and its marker counts taken. code
+# alignment after a marked instruction pads its worst case, the boundary less the shortest instruction its
+# view admits, and is itself marked, since the linker shrinks it and listed in the builder's realigned alignments
+pub fun place(b: *Builder, area: *Area, s: u32) err[Refusal] {
+    if (!held(vector.ensure[u32](?area.marks, area.fragments.len + 1))) { ret err[Refusal].err{memory()}; }
+    var at:     u64   = 0;
+    var marked: u32   = 0;
+    var j:      usize = 0;
+    for (j < area.fragments.len) {
+        val f: *Fragment = ?area.fragments.data[j];
+        area.marks.data[j] = marked;
+        f.offset           = at;
+        if (sel f.body.align) {
+            val al: *Align = ?f.body.align;
+            if (realigned(area, j, al)) {
+                if (b.set.realign == operand.NO_FIXUP) { ret refused(RELAXED_ALIGN); }
+                if (sel al.max.some)                   { ret refused(REALIGN_FORM); }
+                val least: u64 = shortest(b, f.view);
+                if (least == 0) { ret refused(NO_FILL); }
+                f.size = 0;
+                if (al.boundary > least) {
+                    f.size = al.boundary - least;
+                    marked = marked + 1;
+                }
+                if (!held(vector.push[Realigned](?b.realigns, Realigned{section: s, offset: at, length: f.size, fill: al.fill}))) {
+                    ret err[Refusal].err{memory()};
+                }
+            }
+            or { f.size = gap(al, at); }
+        }
+        if (sel f.body.code && f.body.code.marked) { marked = marked + 1; }
+        at = at + f.size;
+        j  = j + 1;
+    }
+    area.marks.data[area.fragments.len] = marked;
+    vector.truncate[u32](?area.marks, 0);
+    vector.commit[u32](?area.marks, area.fragments.len + 1);
+    area.size = at;
+    ret err[Refusal].ok{};
+}
+
+# the distance from fragment `j` of section `s` to the symbol operand `k` names as a distance from the program counter,
+# a relative target or a pc-relative address, none when it does not fold, and with `across` none only when the layout
+# cannot measure it
+fun fold(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value, across: bool) opt[i64] {
+    val desc:    *operand.Operand    = ?r.operands.at[k];
+    val opt_sym: opt[operand.Symbol] = operand.pc_symbol(desc, v);
+    if (sel opt_sym.none) { ret opt[i64].none{}; }
+    var fixup: operand.FixupKind = operand.value_fixup(desc, v);
+    if (opt_sym.some.fixup != operand.NO_FIXUP) { fixup = opt_sym.some.fixup; }
+    ret measured(b, s, j, opt_sym.some.id, opt_sym.some.addend, fixup, across);
+}
+
+# the distance from fragment `j` of section `s` to the symbol operand `k` of row `r` holding `v` names as a distance from
+# the program counter, as the layout lays it out, where it would fold but for an instruction the linker may resize lying
+# between, none where it folds or is the linker's for any other reason. the field of such an operand, whose relocation
+# the linker applies after resizing, holds it, so code read before the link, as the constant-time walk reads it, goes
+# where it will after
+pub fun laid(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value) opt[i64] {
+    val opt_near: opt[i64] = fold(b, s, j, r, k, v, false);
+    if (sel opt_near.some) { ret opt[i64].none{}; }
+    ret fold(b, s, j, r, k, v, true);
+}
+
+# the fold of immediate operand `k` of row `r` holding `v` in fragment `j` of section `s`, a symbol of a fixup kind the
+# set folds, none when it does not fold: a SELF fold where the distance to its symbol is known, and a PARTNER where its
+# symbol labels the start of an instruction in the section whose SELF fold does
+fun fold_immediate(b: *Builder, s: u32, j: u32, r: *row.Row, k: u32, v: *operand.Value) opt[Folded] {
+    val desc: *operand.Operand = ?r.operands.at[k];
+    if (!sel desc.shape.immediate) { ret opt[Folded].none{}; }
+    if (!sel v.symbol)             { ret opt[Folded].none{}; }
+    val sym:   operand.Symbol    = v.symbol;
+    var fixup: operand.FixupKind = operand.default_fixup(desc);
+    if (sym.fixup != operand.NO_FIXUP) { fixup = sym.fixup; }
+    val opt_fold_of: opt[*core_fixup.Fold] = core_fixup.fold_of(b.set.folds, fixup);
+    if (sel opt_fold_of.none) { ret opt[Folded].none{}; }
+    if (opt_fold_of.some.measure == core_fixup.SELF) {
+        val opt_measured: opt[i64] = measured(b, s, j, sym.id, sym.addend, fixup, false);
+        if (sel opt_measured.none) { ret opt[Folded].none{}; }
+        ret opt[Folded].some{Folded{fold: opt_fold_of.some, distance: opt_measured.some}};
+    }
+    val opt_aimed: opt[Aimed] = through(b, sym.id, sym.addend, false);
+    if (sel opt_aimed.none)         { ret opt[Folded].none{}; }
+    if (opt_aimed.some.addend != 0) { ret opt[Folded].none{}; }
+    val m: *Mark = ?b.labels.data[opt_aimed.some.id::usize - 1];
+    if (!same_item(b, s, j, m)) { ret opt[Folded].none{}; }
+    val area: *Area = ?b.areas.data[s::usize];
+    if (m.fragment::usize >= area.fragments.len) { ret opt[Folded].none{}; }
+    val f: *Fragment = ?area.fragments.data[m.fragment::usize];
+    if (!sel f.body.code) { ret opt[Folded].none{}; }
+    val c: *Code = ?f.body.code;
+    if (c.depth != 0) { ret opt[Folded].none{}; }
+    val pr:    *row.Row = coded(?c.of);
+    var given: [operand.MAX_OPERANDS]operand.Value;
+    recall(b, c, ?given[0]);
+    var p: u32 = 0;
+    for (p < c.count) {
+        val opt_own: opt[Folded] = fold_immediate(b, s, m.fragment, pr, p, ?given[p]);
+        if (sel opt_own.some) {
+            if (opt_own.some.fold.measure == core_fixup.SELF) { ret opt[Folded].some{Folded{fold: opt_fold_of.some, distance: opt_own.some.distance}}; }
+        }
+        p = p + 1;
+    }
+    ret opt[Folded].none{};
+}
+
+# every value of the steps of `out`, the form of fragment `j` of section `s` under view `v`, that names a symbol by its
+# distance from the program counter and folds, replaced by that distance from its own step's anchor, and every
+# immediate whose symbol the set's folds fold, replaced by the number its fold gives. each step is measured with those
+# values zero, as a length is the length of an encoding
+fun fold_form(b: *Builder, s: u32, j: u32, v: *core_state.Context, out: *relax.Expansion) err[Refusal] {
+    var any: bool = false;
+    var i:   u32  = 0;
+    for (i < out.count && !any) {
+        val r: *row.Row = out.steps[i].row;
+        var k: u32      = 0;
+        for (k < r.operands.len && !any) {
+            val opt_folded: opt[i64]    = fold(b, s, j, r, k, ?out.steps[i].values[k], false);
+            val opt_held:   opt[Folded] = fold_immediate(b, s, j, r, k, ?out.steps[i].values[k]);
+            any = sel opt_folded.some || sel opt_held.some;
+            k   = k + 1;
+        }
+        i = i + 1;
+    }
+    if (!any) { ret err[Refusal].ok{}; }
+    var at: i64 = 0;
+    i = 0;
+    for (i < out.count) {
+        val r:    *row.Row = out.steps[i].row;
+        var zero: [operand.MAX_OPERANDS]operand.Value;
+        var z:    u32      = 0;
+        for (z < r.operands.len) {
+            zero[z] = out.steps[i].values[z];
+            val opt_folded: opt[i64] = fold(b, s, j, r, z, ?out.steps[i].values[z], false);
+            if (sel opt_folded.some) { zero[z] = operand.resolved(?zero[z], 0); }
+            val opt_held: opt[Folded] = fold_immediate(b, s, j, r, z, ?out.steps[i].values[z]);
+            if (sel opt_held.some) { zero[z] = operand.Value.immediate{0}; }
+            z = z + 1;
+        }
+        var step:    inst.Inst                 = inst.Inst{row: r, values: ?zero[0], count: r.operands.len, form: out.steps[i].form};
+        val res_len: res[usize, field.Refusal] = measure(b, v, ?step);
+        if (sel res_len.err) { ret err[Refusal].err{encoding(res_len.err)}; }
+        var k: u32 = 0;
+        for (k < r.operands.len) {
+            val opt_folded: opt[i64] = fold(b, s, j, r, k, ?out.steps[i].values[k], false);
+            if (sel opt_folded.some) {
+                var d: i64 = opt_folded.some - at;
+                if (operand.anchor_of(?r.operands.at[k]) == operand.END) { d = d - res_len.ok::i64; }
+                out.steps[i].values[k] = operand.resolved(?out.steps[i].values[k], d);
+            }
+            val opt_held: opt[Folded] = fold_immediate(b, s, j, r, k, ?out.steps[i].values[k]);
+            if (sel opt_held.some) {
+                var d: i64 = opt_held.some.distance;
+                if (opt_held.some.fold.measure == core_fixup.SELF) {
+                    d = d - at;
+                    if (opt_held.some.fold.anchor == operand.END) { d = d - res_len.ok::i64; }
+                }
+                out.steps[i].values[k] = operand.Value.immediate{opt_held.some.fold.value(d)};
+            }
+            k = k + 1;
+        }
+        at = at + res_len.ok::i64;
+        i  = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the distance from fragment `j` of section `s` to label `id` plus `addend` under fixup kind `fixup`, none when the
+# assembler cannot know it: the label is elsewhere or undefined, other objects may preempt it, the kind is not plainly
+# pc-relative, or an instruction the linker may resize lies between
+pub fun distance(b: *Builder, s: u32, j: u32, id: u32, addend: i64, fixup: operand.FixupKind) opt[i64] {
+    ret measured(b, s, j, id, addend, fixup, false);
+}
+
+# the distance `distance` answers, and with `across` also one an instruction the linker may resize lies within, which
+# the layout measures to choose a form by but leaves to the linker, since the linker only ever shrinks code
+fun measured(b: *Builder, s: u32, j: u32, id: u32, addend: i64, fixup: operand.FixupKind, across: bool) opt[i64] {
+    val opt_aimed: opt[Aimed] = through(b, id, addend, false);
+    if (sel opt_aimed.none) { ret opt[i64].none{}; }
+    val m: *Mark = ?b.labels.data[opt_aimed.some.id::usize - 1];
+    if (!same_item(b, s, j, m)) { ret opt[i64].none{}; }
+    # a symbol other objects may refer to may be preempted, so its distance is the linker's
+    if (preemptible(m))         { ret opt[i64].none{}; }
+    if (!folds_fixup(b, fixup)) { ret opt[i64].none{}; }
+    val area: *Area = ?b.areas.data[s::usize];
+    var hi:   u32   = j + 1;
+    if (m.fragment > hi)                                                      { hi = m.fragment; }
+    if (!across && (!settled(area, j, hi) || !settled(area, m.fragment, hi))) { ret opt[i64].none{}; }
+    val to:   u64 = offset_at(area, m.fragment);
+    val from: u64 = area.fragments.data[j::usize].offset;
+    ret opt[i64].some{to:~i64 - from:~i64 + opt_aimed.some.addend};
+}
+
+# whether the builder folds fixup kind `fixup` when its target is a label it measures: a local kind, or one bound to a
+# relocation kind `folds_kind` folds
+fun folds_fixup(b: *Builder, fixup: operand.FixupKind) bool {
+    ret core_fixup.local(b.set.locals, fixup) || folds_kind(kind_of(b, fixup));
+}
+
+# whether the builder folds a fixup of relocation kind `kind`, nil for none, when its target is a label it measures: a
+# plainly pc-relative kind, no got, page, thread-local or partner kind, as a branch to a local label
+pub fun folds_kind(kind: *reloc.Kind) bool {
+    if (kind == nil || !reloc.has(kind, reloc.PC)) { ret false; }
+    ret (kind.caps & (reloc.GOT | reloc.PAGE | reloc.TLS | reloc.PARTNER)) == 0;
+}
+
+# whether the builder folds a fixup of relocation kind `kind` held by value `v` of operand `desc`, nil for a datum, to a
+# label of the fragment's own section that other objects cannot preempt, when no instruction the linker may resize lies
+# between them: an operand naming its target by its distance from the program counter, or a datum, of a kind
+# `folds_kind` folds. a reader of an object asks it of a relocation the object holds against such a label, which a
+# reassembly would not keep
+pub fun folds(desc: *operand.Operand, v: *operand.Value, kind: *reloc.Kind) bool {
+    if (desc != nil) {
+        val opt_sym: opt[operand.Symbol] = operand.pc_symbol(desc, v);
+        if (sel opt_sym.none) { ret false; }
+    }
+    ret folds_kind(kind);
+}
+
+# the instructions fragment `j` of section `s` is at depth `c.depth`, into `out`, answering whether the step taking the
+# target is out of range and its row has a longer form
+pub fun form(b: *Builder, s: u32, j: u32, c: *Code, out: *relax.Expansion) res[bool, Refusal] {
+    val codec: *dispatch.Codec     = b.set.codec;
+    val v:     *core_state.Context = b.areas.data[s::usize].fragments.data[j::usize].view;
+    val r:     *row.Row            = coded(?c.of);
+    var given: [operand.MAX_OPERANDS]operand.Value;
+    recall(b, c, ?given[0]);
+    # the distance to the relaxed operand's target as the layout measures it, folded or not, none when only the
+    # linker knows it
+    var opt_reach: opt[i64] = opt[i64].none{};
+    var opt_near:  opt[i64] = opt[i64].none{};
+    if (sel c.relax.some) {
+        val op: u32 = c.relax.some.operand::u32;
+        opt_reach = fold(b, s, j, r, op, ?given[op], true);
+        opt_near  = fold(b, s, j, r, op, ?given[op], false);
+    }
+    var target: u32 = 0;
+    if (c.depth == 0) {
+        out.count           = 1;
+        out.steps[0].row    = r;
+        out.steps[0].marker = c.marker;
+        out.steps[0].form   = c.form;
+        var k: u32 = 0;
+        for (k < c.count) {
+            out.steps[0].values[k] = given[k];
+            k                      = k + 1;
+        }
+    }
+    or {
+        # a grown form takes its target from the layout when it folds, and its other symbols fold below by the same rule
+        var from:       inst.Inst           = inst.Inst{row: r, values: ?given[0], count: c.count};
+        var shortening: compress.Shortening = compress.Shortening{codec: codec, all: b.set.compress, ctx: v};
+        val opt_why:    opt[str]            = relax.grown(codec, v, b.set.relax, ?from, c.depth, opt_near, compress.shorten(?shortening), out, ?target, ?b.scratch, ?b.fixups);
+        if (sel opt_why.some) {
+            if (str_equals(opt_why.some, relax.CHAIN)) { ret res[bool, Refusal].err{refuse(CHAIN)}; }
+            ret res[bool, Refusal].err{refuse(EXPAND)};
+        }
+        out.steps[0].marker = c.marker;
+    }
+    val err_folding: err[Refusal] = fold_form(b, s, j, v, out);
+    if (sel err_folding.err) { ret res[bool, Refusal].err{err_folding.err}; }
+    if (sel c.relax.some) {
+        val opt_reached: opt[bool] = relax.reaches(codec, v, b.set.relax, out, target, opt_reach, ?b.scratch, ?b.fixups);
+        if (sel opt_reached.none) { ret res[bool, Refusal].err{refuse(EXPAND)}; }
+        if (!opt_reached.some) {
+            if (out.count != 1) { ret res[bool, Refusal].err{refuse(CHAIN)}; }
+            ret res[bool, Refusal].ok{true};
+        }
+    }
+    ret res[bool, Refusal].ok{false};
+}
+
+# `size` bytes of padding for `al` appended to `area`: its fill byte, the set's code fill view `v` admits in code, or zeros
+pub fun pad(b: *Builder, area: *Area, al: *Align, v: *core_state.Context, size: u64) err[Refusal] {
+    if (!held(vector.reserve[u8](?area.bytes, size::usize))) { ret err[Refusal].err{memory()}; }
+    if (!area.code || sel al.fill.some) {
+        var byte: u8 = 0;
+        if (sel al.fill.some) { byte = al.fill.some; }
+        var i: u64 = 0;
+        for (i < size) {
+            area.bytes.data[area.bytes.len] = byte;
+            vector.commit[u8](?area.bytes, 1);
+            i = i + 1;
+        }
+        ret err[Refusal].ok{};
+    }
+    var left: u64 = size;
+    for (b.set.fill != nil && left > 0) {
+        val pattern: *fill.Pattern = fill.next(b.set.fill, v, left);
+        if (pattern == nil) { brk; }
+        var i: u32 = 0;
+        for (i < pattern.len) {
+            area.bytes.data[area.bytes.len] = pattern.bytes[i];
+            vector.commit[u8](?area.bytes, 1);
+            i = i + 1;
+        }
+        left = left - pattern.len::u64;
+    }
+    if (left > 0) { ret refused(NO_FILL); }
+    ret err[Refusal].ok{};
+}
+
+# difference `g` measured in the current pass, refused naming its label at a cycle of equates
+pub fun spread(b: *Builder, g: *Gap) res[Spread, Refusal] {
+    val opt_plus:  opt[Aimed] = through(b, g.of.plus, g.of.addend, false);
+    val opt_minus: opt[Aimed] = through(b, g.of.minus, 0, false);
+    if (sel opt_plus.none)  { ret res[Spread, Refusal].err{Refusal{message: CYCLE, label: g.of.plus}}; }
+    if (sel opt_minus.none) { ret res[Spread, Refusal].err{Refusal{message: CYCLE, label: g.of.minus}}; }
+    val p:   *Mark  = ?b.labels.data[opt_plus.some.id::usize - 1];
+    val q:   *Mark  = ?b.labels.data[opt_minus.some.id::usize - 1];
+    var out: Spread = Spread{plus: Aimed{id: opt_plus.some.id, addend: opt_plus.some.addend - opt_minus.some.addend}, minus: Aimed{id: opt_minus.some.id, addend: 0}, p: p, q: q, shared: p.defined && q.defined && p.section == q.section, value: 0};
+    if (out.shared) {
+        val home: *Area = ?b.areas.data[p.section::usize];
+        out.value = offset_at(home, p.fragment):~i64 - offset_at(home, q.fragment):~i64 + out.plus.addend;
+    }
+    ret res[Spread, Refusal].ok{out};
+}
+
+# the bytes a leb128 of `value` takes at its shortest, signed when `how` is SLEB
+pub fun leb_size(how: core_fixup.Encoding, value: i64) u64 {
+    if (how == core_fixup.SLEB) { ret leb128.signed_size(value)::u64; }
+    ret leb128.unsigned_size(value:~u64)::u64;
+}
+
+# leb128 fragment `f` of difference `g` grown to the length of the value the current pass measures, whether the
+# linker may resize code between its labels or not. it never shrinks,
+# so the layout settles, and a difference the layout cannot measure keeps its length until finish refuses it
+pub fun lengthen(b: *Builder, f: *Fragment, g: *Gap) bool {
+    if (g.encoding == core_fixup.FIXED) { ret false; }
+    val res_spread: res[Spread, Refusal] = spread(b, g);
+    if (sel res_spread.err)    { ret false; }
+    if (!res_spread.ok.shared) { ret false; }
+    val n: u64 = leb_size(g.encoding, res_spread.ok.value);
+    if (n <= f.size) { ret false; }
+    f.size = n;
+    ret true;
+}
+
+# the symbol a relocation names placed label `m` by where the format's files are cut at their symbols
+# (`contract.Cut.symbols`): the latest placed exposed label at or before it in its section, none where the format cuts
+# no section, for a relocation a debugging section holds (`debug`), which names the label's section, or with no such
+# label
+pub fun atom_of(b: *Builder, m: *Mark, debug: bool) opt[Based] {
+    if (!sel b.cut.symbols || debug) { ret opt[Based].none{}; }
+    val opt_atom_at: opt[u32] = atom_at(b, m.section, m.fragment, m.order);
+    if (sel opt_atom_at.none) { ret opt[Based].none{}; }
+    val base:    *Mark                             = ?b.labels.data[opt_atom_at.some::usize - 1];
+    val opt_sym: opt[table.Id[mink_object.Symbol]] = base.symbol;
+    if (sel opt_sym.none) { ret opt[Based].none{}; }
+    ret opt[Based].some{Based{symbol: opt_sym.some, fragment: base.fragment}};
+}
+
+# the exposed label of section `s` placed last at or before fragment `fragment`, and at or before `order` among those placed
+# before that fragment, by the layout's index: the atom the linker splits there, as an atom's symbol starts a fragment
+# and a label placed before it at its place ends the atom before. none before every one
+fun atom_at(b: *Builder, s: u32, fragment: u32, order: u32) opt[u32] {
+    val probe: Atom  = Atom{section: s, fragment: fragment, order: order, id: 0};
+    var lo:    usize = 0;
+    var hi:    usize = b.atoms.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (by_atom(?b.atoms.data[mid], ?probe) <= 0) { lo = mid + 1; }
+        or                                            { hi = mid; }
+    }
+    if (lo == 0 || b.atoms.data[lo - 1].section != s) { ret opt[u32].none{}; }
+    ret opt[u32].some{b.atoms.data[lo - 1].id};
+}
+
+# the order of the index of atoms: by section, then the fragment they precede, then the order placed
+fun by_atom(x: *Atom, y: *Atom) i64 {
+    if (x.section != y.section) {
+        if (x.section < y.section) { ret -1; }
+        ret 1;
+    }
+    if (x.fragment != y.fragment) {
+        if (x.fragment < y.fragment) { ret -1; }
+        ret 1;
+    }
+    if (x.order < y.order) { ret -1; }
+    if (x.order > y.order) { ret 1; }
+    ret 0;
+}
+
+# the index of atoms made of the labels as placed, where the format's files are cut at their symbols, false when it
+# could not grow
+pub fun index_atoms(b: *Builder) bool {
+    vector.truncate[Atom](?b.atoms, 0);
+    if (!sel b.cut.symbols) { ret true; }
+    var i: usize = 0;
+    for (i < b.labels.len) {
+        val k: *Mark = ?b.labels.data[i];
+        i = i + 1;
+        if (sel k.exposure.none || !k.defined)                                                                              { cnt; }
+        if (!held(vector.push[Atom](?b.atoms, Atom{section: k.section, fragment: k.fragment, order: k.order, id: i::u32}))) { ret false; }
+    }
+    sort.sort_by[Atom](b.atoms.data, b.atoms.len, by_atom);
+    ret true;
+}
+
+# an order after every label's, of a place after every label placed before its fragment
+val NO_ORDER: u32 = 0xFFFF_FFFF;
+
+# whether label `m` lies in the item fragment `j` of section `s` lies in, so the assembler may resolve a distance
+# between them: a linker keeps, drops and moves each item alone, and only a relocation says where a distance between two
+# leads. an item is a section, and where the format's files are cut at their symbols an atom of one. the places before
+# every symbol of a cut section are one atom, which no symbol names, so a distance from another atom to a label there is
+# relocated against the section
+fun same_item(b: *Builder, s: u32, j: u32, m: *Mark) bool {
+    if (!m.defined || m.section != s) { ret false; }
+    if (!sel b.cut.symbols)           { ret true; }
+    ret !differ(atom_at(b, s, j, NO_ORDER), atom_at(b, s, m.fragment, m.order));
+}
+
+# whether labels `p` and `q`, placed in one section, lie in two atoms where the format's files are cut at their symbols,
+# so their difference is the linker's
+pub fun apart(b: *Builder, p: *Mark, q: *Mark) bool {
+    if (!sel b.cut.symbols) { ret false; }
+    ret differ(atom_at(b, p.section, p.fragment, p.order), atom_at(b, q.section, q.fragment, q.order));
+}
+
+# whether two places lie in two atoms, given the exposed label of each atom, none for the places before every symbol
+fun differ(x: opt[u32], y: opt[u32]) bool {
+    if (sel x.none) { ret sel y.some; }
+    if (sel y.none) { ret true; }
+    ret x.some != y.some;
+}

@@ -1,0 +1,273 @@
+# the footprint of an instruction: every register, flag, access, order, stack change and transfer it makes, the one
+# query an allocator asks
+#
+# a consumer that places values in registers asks one question of an
+# instruction with its operand values: what it reads, what it writes and what
+# each write leaves, what it leaves unspecified, what memory it touches and
+# how it orders the accesses around it, what it does to the stack pointer and
+# where control goes, and of a typed stream's
+# instruction what it pops and pushes, the index space entries it reads and
+# writes and the blocks it opens or closes. `of` answers it whole,
+# from the row's operands and roles, its effect and its rules, and the
+# configuration state where an operand's groups turn on one. the walks'
+# queries it is made of stay their own: `query.implicit`, `may` and `must`,
+# `constraint.touched`, `covers` and `kills`, and `register.within`.
+#
+# it is shaped against its hardest members: an x86 sub-register write that
+# zeroes or keeps the rest of its register, aarch64 `w` writes zeroing their
+# `x` and scalable `z` registers holding `b` to `q`, risc-v vector groups
+# whose length vtype sets, and the pairs of a tuple class, as risc-v amocas.q's
+# or x86 cmpxchg16b's rdx:rax, which name both of their members. every query
+# answers decided or undecided with the reason, never a guess: an operand
+# with no value yet, an effect no value decides, configuration state the
+# query was not told, or a vector length the implementation chooses.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.config;
+use masc.core.constraint;
+use masc.core.effect;
+use masc.core.operand;
+use masc.core.query;
+use masc.core.register;
+use masc.core.row;
+use masc.core.state;
+
+# what an instruction holding operand values does, in storage the footprint owns and `of` refills
+# ---
+# file:      the register file its sets are over
+# reads:     the registers and flags it reads, a write that may keep any of a register's old value included, one bit
+#            per row of the file
+# written:   the registers and flags it writes, one bit per row
+# writes:    each register it writes and what the write leaves, as `extend`, `result` and `above` state it
+# clobbers:  the flags it leaves unspecified, which hold no value after it, one bit per row
+# flags:     the flags its effect states it reads, leaves defined, unspecified and as they were
+# memory:    the accesses its operands do not state whole
+# stack:     what it does to the stack pointer
+# control:   where control goes after it
+# transfers: every kind of transfer it makes, control's among them, so a block that leaves and on its way calls or
+#            traps states each, which control alone states one of
+# call:      the target of the calls it makes, INDIRECT when any is, UNTARGETED when it makes none
+# signature: what it takes from and leaves on a typed stream's operand stack, which the set's stream hooks resolve
+# entries:   the index space entries of a typed stream it reads and writes through its operands
+# structure: what it does to a typed stream's structured blocks
+# order:     how it orders the memory accesses around it, its orderings resolved by its operand values
+pub rec Footprint {
+    file:      *register.File;
+    reads:     vector.Vector[u64];
+    written:   vector.Vector[u64];
+    writes:    vector.Vector[effect.Written];
+    clobbers:  vector.Vector[u64];
+    flags:     effect.Flags;
+    memory:    effect.Accesses;
+    stack:     effect.Stack;
+    control:   effect.Control;
+    transfers: effect.Transfers;
+    call:      effect.Target;
+    signature: effect.Signature;
+    entries:   effect.Entries;
+    structure: effect.Structure;
+    order:     effect.Order;
+}
+
+# a footprint over `file` holding nothing, its sets sized to the file once, which `dnit` gives back
+pub fun init(a: *A.Allocator, file: *register.File) res[Footprint, A.Error] {
+    var fp: Footprint = Footprint{
+        file:      file,
+        reads:     vector.init[u64](a),
+        written:   vector.init[u64](a),
+        writes:    vector.init[effect.Written](a),
+        clobbers:  vector.init[u64](a),
+        flags:     effect.Flags{read: effect.NO_WORDS, written: effect.NO_WORDS, undefined: effect.NO_WORDS, kept: effect.NO_WORDS},
+        memory:    effect.NO_ACCESSES,
+        stack:     effect.Stack.none{},
+        transfers: effect.NO_TRANSFERS,
+        call:      effect.UNTARGETED,
+        signature: effect.NO_SIGNATURE,
+        entries:   effect.NO_ENTRIES,
+        structure: effect.FLAT,
+        order:     effect.UNORDERED,
+    };
+    val words:        usize               = effect.words(file)::usize;
+    val res_reads:    res[usize, A.Error] = vector.reserve[u64](?fp.reads, words);
+    val res_written:  res[usize, A.Error] = vector.reserve[u64](?fp.written, words);
+    val res_clobbers: res[usize, A.Error] = vector.reserve[u64](?fp.clobbers, words);
+    var opt_failed:   opt[A.Error]        = opt[A.Error].none{};
+    if (sel res_reads.err)    { opt_failed = opt[A.Error].some{res_reads.err}; }
+    if (sel res_written.err)  { opt_failed = opt[A.Error].some{res_written.err}; }
+    if (sel res_clobbers.err) { opt_failed = opt[A.Error].some{res_clobbers.err}; }
+    if (sel opt_failed.some) {
+        dnit(?fp);
+        ret res[Footprint, A.Error].err{opt_failed.some};
+    }
+    vector.truncate[u64](?fp.reads, 0);
+    vector.commit[u64](?fp.reads, words);
+    vector.truncate[u64](?fp.written, 0);
+    vector.commit[u64](?fp.written, words);
+    vector.truncate[u64](?fp.clobbers, 0);
+    vector.commit[u64](?fp.clobbers, words);
+    ret res[Footprint, A.Error].ok{fp};
+}
+
+# everything `fp` holds given back
+pub fun dnit(fp: *Footprint) {
+    vector.dnit[u64](?fp.reads);
+    vector.dnit[u64](?fp.written);
+    vector.dnit[effect.Written](?fp.writes);
+    vector.dnit[u64](?fp.clobbers);
+}
+
+# the words of `set` or-ed into the `n` words at `into`
+fun add(into: *u64, n: usize, set: effect.Set) {
+    var w: usize = 0;
+    for (w < n && w < set.len::usize) {
+        into[w] = into[w] | set.words[w];
+        w       = w + 1;
+    }
+}
+
+# the roles of the operands of row `r` holding `values` under `cfg` and the context `ctx`, each through `config.role`, so
+# the registers touched and the writes read one answer, less what holds only under a state the context does not admit. an operand
+# whose role is undecided keeps its own
+fun resolved(file: *register.File, r: *row.Row, values: operand.Values, ctx: *state.Context, cfg: config.Configured) constraint.Roles {
+    var roles: constraint.Roles = constraint.own_roles(r.operands.at, values.len, ctx);
+    if (r.effect.roles.len == 0) { ret roles; }
+    var op: u32 = 0;
+    for (op < values.len && op < operand.MAX_OPERANDS) {
+        val got: query.Answer[operand.Role] = config.role(file, cfg, r, op::u8, values);
+        if (sel got.decided) { roles.at[op] = got.decided & ~constraint.unheld(?r.operands.at[op], ctx); }
+        op = op + 1;
+    }
+    ret roles;
+}
+
+# the footprint of an instruction of row `r` of `file` holding `values` under the context `ctx`, its operands' groups as
+# the configuration `cfg` forms them, filled into `fp`, which is over the same file
+# ---
+# ret: `fp` when every part of it is decided, else why not, `fp` then holding nothing of it. refused only when the
+#      allocator cannot hold its writes
+pub fun of(fp: *Footprint, r: *row.Row, values: operand.Values, ctx: *state.Context, cfg: config.Configured) res[query.Answer[*Footprint], A.Error] {
+    val grouped: query.Answer[constraint.Grouping] = config.grouping(cfg, r, ctx);
+    if (sel grouped.undecided) { ret res[query.Answer[*Footprint], A.Error].ok{query.Answer[*Footprint].undecided{grouped.undecided}}; }
+    val g:       constraint.Grouping          = grouped.decided;
+    val e:       *effect.Effect               = r.effect;
+    val control: query.Answer[effect.Control] = query.control(fp.file, r.operands.at, e, values);
+    if (sel control.undecided) { ret res[query.Answer[*Footprint], A.Error].ok{query.Answer[*Footprint].undecided{control.undecided}}; }
+    val order: query.Answer[effect.Order] = query.order(e, values);
+    if (sel order.undecided) { ret res[query.Answer[*Footprint], A.Error].ok{query.Answer[*Footprint].undecided{order.undecided}}; }
+    val roles: constraint.Roles = resolved(fp.file, r, values, ctx, cfg);
+    vector.truncate[effect.Written](?fp.writes, 0);
+    val res_walked: res[query.Answer[bool], A.Error] = constraint.touched_writes(fp.file, r.operands.at, e, values, g, roles, fp.reads.data, fp.written.data, ?fp.writes);
+    if (sel res_walked.err)          { ret res[query.Answer[*Footprint], A.Error].err{res_walked.err}; }
+    if (sel res_walked.ok.undecided) { ret res[query.Answer[*Footprint], A.Error].ok{query.Answer[*Footprint].undecided{res_walked.ok.undecided}}; }
+    val words: usize = fp.reads.len;
+    add(fp.reads.data, words, e.flags.read);
+    add(fp.reads.data, words, e.flags.kept);
+    add(fp.written.data, words, e.flags.written);
+    var w: usize = 0;
+    for (w < words) {
+        fp.clobbers.data[w] = 0;
+        w                   = w + 1;
+    }
+    add(fp.clobbers.data, words, e.flags.undefined);
+    # a flag defined for some values only is unspecified for the others, so it is left out of the definite writes
+    w = 0;
+    for (w < words) {
+        fp.written.data[w] = fp.written.data[w] & ~fp.clobbers.data[w];
+        w                  = w + 1;
+    }
+    fp.flags     = e.flags;
+    fp.memory    = e.memory;
+    fp.stack     = e.stack;
+    fp.control   = control.decided;
+    fp.transfers = effect.transfer_bit(control.decided.transfer);
+    fp.call      = effect.UNTARGETED;
+    if (control.decided.transfer == effect.CALL) { fp.call = control.decided.target; }
+    fp.signature = e.signature;
+    fp.entries   = e.entries;
+    fp.structure = e.structure;
+    fp.order     = order.decided;
+    ret res[query.Answer[*Footprint], A.Error].ok{query.Answer[*Footprint].decided{fp}};
+}
+
+# whether row `at` is one of `set`
+fun in_set(set: effect.Set, at: u32) bool {
+    if (at / 64 >= set.len) { ret false; }
+    ret (set.words[at / 64] & (1::u64 << (at % 64)::u64)) != 0;
+}
+
+# whether the instruction `fp` is the footprint of leaves no bit of register `other` holding its old value, as `kills_of`
+# decides from its parts
+pub fun kills(fp: *Footprint, other: register.Id) bool {
+    ret kills_of(fp.file, fp.clobbers.data, fp.flags, fp.writes.data, fp.writes.len, other);
+}
+
+# whether an instruction leaves no bit of register `other` of `file` holding its old value, from the parts of its
+# footprint: the words of its clobbers, its flags and its `count` writes at `writes`. a write overwrites it, as
+# register.overwrites decides from the written register's row and what its write leaves, or it is a flag the
+# instruction leaves defined, which no operand value leaves as it was, or unspecified, each flag a row written whole. a
+# register the file has no row of is never killed
+pub fun kills_of(file: *register.File, clobbers: *u64, flags: effect.Flags, writes: *effect.Written, count: usize, other: register.Id) bool {
+    val opt_index_of: opt[u32] = register.index_of(file, other);
+    if (sel opt_index_of.none) { ret false; }
+    val row: *register.Register = ?file.registers[opt_index_of.some];
+    if ((clobbers[opt_index_of.some / 64] & (1::u64 << (opt_index_of.some % 64)::u64)) != 0) { ret true; }
+    if (in_set(flags.written, opt_index_of.some) && !in_set(flags.kept, opt_index_of.some))  { ret true; }
+    var i: usize = 0;
+    for (i < count) {
+        val w:          *effect.Written         = ?writes[i];
+        val opt_row_of: opt[*register.Register] = register.row_of(file, w.at);
+        if (sel opt_row_of.some && register.overwrites(file, opt_row_of.some, row, w.write.extend)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# how many registers one value of operand `op` of row `r` covers under configuration `cfg` and the context `ctx`
+# ---
+# ret: the count, or why it is not decided: the operand's groups turn on configuration state `cfg` does not hold
+pub fun covers(r: *row.Row, op: u8, ctx: *state.Context, cfg: config.Configured) query.Answer[u32] {
+    val grouped: query.Answer[constraint.Grouping] = config.grouping(cfg, r, ctx);
+    if (sel grouped.undecided) { ret query.Answer[u32].undecided{grouped.undecided}; }
+    ret query.Answer[u32].decided{constraint.covers(r.operands.at, op, grouped.decided)};
+}
+
+# the multiplier of slot `slot` under the context's view, 1 for a footprint that scales with none
+fun multiplier_of(ctx: *state.Context, slot: opt[u8]) query.Answer[u64] {
+    if (sel slot.none) { ret query.Answer[u64].decided{1}; }
+    val opt_multiplier: opt[u32] = register.multiplier(ctx.view, slot.some);
+    if (sel opt_multiplier.none) { ret query.Answer[u64].undecided{query.Undecided.scaled{slot.some}}; }
+    ret query.Answer[u64].decided{opt_multiplier.some::u64};
+}
+
+# where register `part` of `file` lies within register `container` under the context `ctx`, whose view states the
+# multiplier of every quantity the rows scale with, as aarch64's q0 lies in the low 128 bits of z0 whatever the vector
+# length, and a pair's second member past its first, the view of each half of the pair
+# ---
+# ret: the placement, none when part does not lie within container or the file has no row of either, or undecided
+#      naming the slot whose multiplier the context leaves to the implementation
+pub fun within(file: *register.File, part: register.Id, container: register.Id, ctx: *state.Context) query.Answer[opt[register.Placement]] {
+    val opt_row_of:      opt[*register.Register] = register.row_of(file, part);
+    val opt_row_of_file: opt[*register.Register] = register.row_of(file, container);
+    if (sel opt_row_of.none)      { ret query.Answer[opt[register.Placement]].decided{opt[register.Placement].none{}}; }
+    if (sel opt_row_of_file.none) { ret query.Answer[opt[register.Placement]].decided{opt[register.Placement].none{}}; }
+    val opt_scale_of:      opt[u8]           = register.scale_of(file, opt_row_of.some);
+    val opt_scale_of_file: opt[u8]           = register.scale_of(file, opt_row_of_file.some);
+    val mp:                query.Answer[u64] = multiplier_of(ctx, opt_scale_of);
+    if (sel mp.undecided) { ret query.Answer[opt[register.Placement]].undecided{mp.undecided}; }
+    val mc: query.Answer[u64] = multiplier_of(ctx, opt_scale_of_file);
+    if (sel mc.undecided) { ret query.Answer[opt[register.Placement]].undecided{mc.undecided}; }
+    var m: u64 = mc.decided;
+    if (sel opt_scale_of_file.none) { m = mp.decided; }
+    # two rows scaling with slots of different multipliers lie at no one multiplier
+    if (sel opt_scale_of.some && sel opt_scale_of_file.some && mp.decided != mc.decided) { ret query.Answer[opt[register.Placement]].decided{opt[register.Placement].none{}}; }
+    ret query.Answer[opt[register.Placement]].decided{register.within(file, opt_row_of.some, opt_row_of_file.some, m)};
+}

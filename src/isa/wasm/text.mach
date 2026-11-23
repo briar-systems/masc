@@ -1,0 +1,386 @@
+# the tokens of wasm's text format
+#
+# a module's text is parentheses, atoms and strings, between white space, line comments from `;;` and block comments
+# `(;` to `;)`, which nest (WebAssembly Specification release 3.0, tag wg-3.0, 6.0-text.lexical). an atom is a run of
+# the characters the format allows in a keyword, an identifier or a number: a keyword starts with a lower case
+# letter, an identifier with `$` and a number with a digit or a sign. an identifier may instead be `$` and a string,
+# which names the bytes the string spells. a string is `"` to `"`, `\` escaping one character or two hex digits.
+# comments are white space, so a reader of another grammar over the text, as the instruction syntax's, reads a copy
+# with them blanked.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+pub val UNCLOSED_COMMENT: str = "block comment not closed";
+pub val UNCLOSED_STRING:  str = "string not closed";
+pub val STRAY:            str = "character the text format allows in no token";
+
+pub def Kind: u8;
+
+pub val END:    Kind = 0;
+pub val OPEN:   Kind = 1;
+pub val CLOSE:  Kind = 2;
+pub val ATOM:   Kind = 3;
+pub val STRING: Kind = 4;
+pub val BROKEN: Kind = 5;
+
+# a token: its kind and its bytes, a string's quotes included, and for a broken one why
+pub rec Token {
+    kind: Kind;
+    at:   usize;
+    len:  usize;
+    why:  str;
+}
+
+# a cursor over the bytes `text[at..end]`
+pub rec Lexer {
+    text: *u8;
+    at:   usize;
+    end:  usize;
+}
+
+# a lexer over `text[at..end]`, at `at`
+# ---
+# text: the text, which the lexer borrows
+# at:   the offset the lexer starts at
+# end:  the offset it stops at
+# ret:  the lexer
+pub fun make(text: *u8, at: usize, end: usize) Lexer {
+    ret Lexer{text: text, at: at, end: end};
+}
+
+fun is_blank(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+# whether `c` may stand in an atom, the format's idchar
+pub fun idchar(c: u8) bool {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) { ret true; }
+    val marks: str   = "!#$%&'*+-./:<=>?@\\^_`|~";
+    var i:     usize = 0;
+    for (marks[i] != 0) {
+        if (c == marks[i]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun peek(l: *Lexer, k: usize) u8 {
+    if (l.at + k >= l.end) { ret 0; }
+    ret l.text[l.at + k];
+}
+
+# white space and comments passed, false for a block comment never closed
+fun space(l: *Lexer) bool {
+    for (l.at < l.end) {
+        val c: u8 = l.text[l.at];
+        if (is_blank(c)) { l.at = l.at + 1; }
+        or (c == ';' && peek(l, 1) == ';') {
+            for (l.at < l.end && l.text[l.at] != '\n') { l.at = l.at + 1; }
+        }
+        or (c == '(' && peek(l, 1) == ';') {
+            var depth: usize = 0;
+            for {
+                if (l.at >= l.end) { ret false; }
+                if (l.text[l.at] == '(' && peek(l, 1) == ';') {
+                    depth = depth + 1;
+                    l.at  = l.at + 2;
+                }
+                or (l.text[l.at] == ';' && peek(l, 1) == ')') {
+                    depth = depth - 1;
+                    l.at  = l.at + 2;
+                    if (depth == 0) { brk; }
+                }
+                or { l.at = l.at + 1; }
+            }
+        }
+        or { ret true; }
+    }
+    ret true;
+}
+
+# the lexer past the annotation at it, `(@id ...)` or `(@"id" ...)`, whose body is balanced parentheses over any tokens
+# but a string or a comment's, reserved characters among them (proposals/annotations, Overview.md). false when it is not
+# closed before the lexer's end
+fun past_annotation(l: *Lexer) bool {
+    var depth: usize = 0;
+    for {
+        if (!space(l) || l.at >= l.end) { ret false; }
+        val c: u8 = l.text[l.at];
+        if (c == '"') {
+            val n: usize = quoted(l.text, l.at, l.end);
+            if (n == 0) { ret false; }
+            l.at = l.at + n;
+            cnt;
+        }
+        l.at = l.at + 1;
+        if (c == '(') { depth = depth + 1; }
+        if (c == ')') {
+            depth = depth - 1;
+            if (depth == 0) { ret true; }
+        }
+    }
+}
+
+# whether an annotation starts at the lexer
+fun annotated(l: *Lexer) bool {
+    if (l.at + 2 >= l.end || l.text[l.at] != '(' || l.text[l.at + 1] != '@') { ret false; }
+    ret l.text[l.at + 2] == '"' || idchar(l.text[l.at + 2]);
+}
+
+# a copy of the `len` bytes of `text` with each comment and annotation blanked, its bytes spaces and its line breaks
+# kept, a nul after them, so a reader of the copy finds white space where the text has either, which mean nothing to a
+# module, and every position where the text has it. a comment or an annotation never closed is left for the lexer to
+# refuse
+pub fun blanked(a: *A.Allocator, text: *u8, len: usize) res[*u8, A.Error] {
+    val res_allocate: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel res_allocate.err) { ret res_allocate; }
+    val out: *u8   = res_allocate.ok;
+    var i:   usize = 0;
+    for (i < len) {
+        out[i] = text[i];
+        i      = i + 1;
+    }
+    out[len] = 0;
+    var l: Lexer = make(text, 0, len);
+    for (l.at < len) {
+        val from: usize = l.at;
+        if (!space(?l)) { brk; }
+        var k: usize = from;
+        for (k < l.at) {
+            if (!is_blank(out[k])) { out[k] = ' '; }
+            k = k + 1;
+        }
+        if (annotated(?l)) {
+            val start: usize = l.at;
+            if (!past_annotation(?l)) { brk; }
+            k = start;
+            for (k < l.at) {
+                if (!is_blank(out[k])) { out[k] = ' '; }
+                k = k + 1;
+            }
+            cnt;
+        }
+        val t: Token = next(?l);
+        if (t.kind == END || t.kind == BROKEN) { brk; }
+    }
+    ret res_allocate;
+}
+
+# the length of the comments or the string that start at `at` in the `len` bytes of `text`, 0 where neither starts, as
+# the lexer passes them: comments with the white space between them, a line comment to its line's end and a block
+# comment to its close, and a string to its closing quote. one never closed runs to `len`
+pub fun skipped(text: *u8, at: usize, len: usize) usize {
+    if (text[at] == '"') {
+        val n: usize = quoted(text, at, len);
+        if (n == 0) { ret len - at; }
+        ret n;
+    }
+    if (at + 1 >= len || (text[at] != ';' && text[at] != '(') || text[at + 1] != ';') { ret 0; }
+    var l: Lexer = make(text, at, len);
+    if (!space(?l)) { ret len - at; }
+    ret l.at - at;
+}
+
+# the length of the string whose `"` is at `at`, its quotes included, 0 when it is not closed before `end`
+fun quoted(text: *u8, at: usize, end: usize) usize {
+    var i: usize = at + 1;
+    for (i < end && text[i] != '"') {
+        if (text[i] == '\\') { i = i + 1; }
+        i = i + 1;
+    }
+    if (i >= end) { ret 0; }
+    ret i + 1 - at;
+}
+
+# the length of the identifier whose `$` is at `at`: its idchars, or a string after it, as `$"a b"`, which names what
+# the string's bytes spell (6.0-text.lexical.spectec, Tid). 0 for a string not closed before `end`
+pub fun identifier_len(text: *u8, at: usize, end: usize) usize {
+    if (at + 1 < end && text[at + 1] == '"') {
+        val n: usize = quoted(text, at + 1, end);
+        if (n == 0) { ret 0; }
+        ret n + 1;
+    }
+    var i: usize = at;
+    for (i < end && idchar(text[i])) { i = i + 1; }
+    ret i - at;
+}
+
+# what decoding a string's escapes came to
+# ---
+# ok:     its bytes decoded
+# bad:    the offset of an escape the format does not define
+# memory: the storage was refused
+pub tag Escape: u8 {
+    ok;
+    bad: usize;
+    memory;
+}
+
+fun hex(c: u8) i32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i32 + 10; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i32 + 10; }
+    ret -1;
+}
+
+fun put(out: *vector.Vector[u8], c: u8) bool {
+    val res_pushed: res[usize, A.Error] = vector.push[u8](out, c);
+    ret sel res_pushed.ok;
+}
+
+# the utf-8 bytes of code point `c` onto `out`
+fun utf8(out: *vector.Vector[u8], c: u32) bool {
+    if (c < 0x80)     { ret put(out, c::u8); }
+    if (c < 0x800)    { ret put(out, (0xC0 | (c >> 6))::u8) && put(out, (0x80 | (c & 0x3F))::u8); }
+    if (c < 0x1_0000) { ret put(out, (0xE0 | (c >> 12))::u8) && put(out, (0x80 | ((c >> 6) & 0x3F))::u8) && put(out, (0x80 | (c & 0x3F))::u8); }
+    ret put(out, (0xF0 | (c >> 18))::u8) && put(out, (0x80 | ((c >> 12) & 0x3F))::u8) && put(out, (0x80 | ((c >> 6) & 0x3F))::u8) && put(out, (0x80 | (c & 0x3F))::u8);
+}
+
+# the bytes the string body `text[at..end)`, between its quotes, spells onto `out`, its escapes decoded: `\n`, `\t`,
+# `\r`, `\"`, `\'`, `\\`, two hex digits and `\u{...}` a code point's utf-8 (6.0-text.lexical.spectec, Tstring)
+pub fun unescape(text: *u8, at: usize, end: usize, out: *vector.Vector[u8]) Escape {
+    var i: usize = at;
+    for (i < end) {
+        var c: u8 = text[i];
+        if (c != '\\') {
+            if (!put(out, c)) { ret Escape.memory{}; }
+            i = i + 1;
+            cnt;
+        }
+        if (i + 1 >= end) { ret Escape.bad{i}; }
+        val e:    u8    = text[i + 1];
+        val from: usize = i;
+        i = i + 2;
+        if (e == 'u') {
+            if (i >= end || text[i] != '{') { ret Escape.bad{from}; }
+            var v:    u32   = 0;
+            var k:    usize = i + 1;
+            var last: bool  = false;
+            for (k < end && text[k] != '}') {
+                if (text[k] == '_') {
+                    if (!last) { ret Escape.bad{from}; }
+                    last = false;
+                }
+                or {
+                    val d: i32 = hex(text[k]);
+                    if (d < 0 || v > 0x10_FFFF) { ret Escape.bad{from}; }
+                    v    = v * 16 + d::u32;
+                    last = true;
+                }
+                k = k + 1;
+            }
+            if (k >= end || !last || v > 0x10_FFFF || (v >= 0xD800 && v < 0xE000)) { ret Escape.bad{from}; }
+            if (!utf8(out, v))                                                     { ret Escape.memory{}; }
+            i = k + 1;
+            cnt;
+        }
+        if (e == 'n')                           { c = '\n'; }
+        or (e == 't')                           { c = '\t'; }
+        or (e == 'r')                           { c = '\r'; }
+        or (e == '"' || e == '\'' || e == '\\') { c = e; }
+        or (hex(e) >= 0 && i < end && hex(text[i]) >= 0) {
+            c = (hex(e) * 16 + hex(text[i]))::u8;
+            i = i + 1;
+        }
+        or                { ret Escape.bad{from}; }
+        if (!put(out, c)) { ret Escape.memory{}; }
+    }
+    ret Escape.ok{};
+}
+
+# the next token, the lexer past it
+pub fun next(l: *Lexer) Token {
+    val start: usize = l.at;
+    if (!space(l)) { ret Token{kind: BROKEN, at: start, len: l.at - start, why: UNCLOSED_COMMENT}; }
+    val at: usize = l.at;
+    if (at >= l.end) { ret Token{kind: END, at: at, len: 0, why: nil}; }
+    val c: u8 = l.text[at];
+    if (c == '(') {
+        l.at = at + 1;
+        ret Token{kind: OPEN, at: at, len: 1, why: nil};
+    }
+    if (c == ')') {
+        l.at = at + 1;
+        ret Token{kind: CLOSE, at: at, len: 1, why: nil};
+    }
+    if (c == '"') {
+        val n: usize = quoted(l.text, at, l.end);
+        if (n == 0) {
+            l.at = l.end;
+            ret Token{kind: BROKEN, at: at, len: l.end - at, why: UNCLOSED_STRING};
+        }
+        l.at = at + n;
+        ret Token{kind: STRING, at: at, len: n, why: nil};
+    }
+    if (c == '$' && peek(l, 1) == '"') {
+        val n: usize = identifier_len(l.text, at, l.end);
+        if (n == 0) {
+            l.at = l.end;
+            ret Token{kind: BROKEN, at: at, len: l.end - at, why: UNCLOSED_STRING};
+        }
+        l.at = at + n;
+        ret Token{kind: ATOM, at: at, len: n, why: nil};
+    }
+    if (!idchar(c)) {
+        l.at = at + 1;
+        ret Token{kind: BROKEN, at: at, len: 1, why: STRAY};
+    }
+    var i: usize = at;
+    for (i < l.end && idchar(l.text[i])) { i = i + 1; }
+    l.at = i;
+    ret Token{kind: ATOM, at: at, len: i - at, why: nil};
+}
+
+# the token after the one the lexer is at, the lexer left where it was
+pub fun ahead(l: *Lexer) Token {
+    var copy: Lexer = @l;
+    ret next(?copy);
+}
+
+# whether atom `t` is the keyword `word`
+pub fun is(l: *Lexer, t: Token, word: str) bool {
+    if (t.kind != ATOM || t.len != str_len(word)) { ret false; }
+    var i: usize = 0;
+    for (i < t.len) {
+        if (l.text[t.at + i] != word[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether atom `t` is an identifier
+pub fun identifier(l: *Lexer, t: Token) bool {
+    ret t.kind == ATOM && t.len > 1 && l.text[t.at] == '$';
+}
+
+# whether `(` and the keyword `word` come next, passed when they do
+pub fun opens(l: *Lexer, word: str) bool {
+    var copy: Lexer = @l;
+    if (next(?copy).kind != OPEN)  { ret false; }
+    if (!is(l, next(?copy), word)) { ret false; }
+    @l = copy;
+    ret true;
+}
+
+# the lexer past the rest of the parenthesized form it is inside, its `)` included, false when the text ends first
+pub fun skip(l: *Lexer) bool {
+    var depth: usize = 1;
+    for {
+        val t: Token = next(l);
+        if (t.kind == END || t.kind == BROKEN) { ret false; }
+        if (t.kind == OPEN)                    { depth = depth + 1; }
+        if (t.kind == CLOSE) {
+            depth = depth - 1;
+            if (depth == 0) { ret true; }
+        }
+    }
+}

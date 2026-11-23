@@ -1,0 +1,741 @@
+# a wasm module read as mink's neutral object, printed as its text
+#
+# the module is read through mink's facts (`mink.format.wasm.fact`): each type, import and definition by its entry,
+# a function's body and a data segment's bytes by the section its entry names, and the element segments, exports and
+# start function by the module's own facts. every field is written in the form the module reader
+# (`masc.isa.wasm.module`) reads back to the same object: each index by its number, each function's type by
+# `(type x)`, its locals and its instructions flat, one per line, each by the set's syntax under the stream the
+# module's index spaces fill, and each segment in its full form, so the reader makes the choices of its encoding the
+# module holds. a string is written by its printable bytes and `\hh` escapes. an instruction or a field the set
+# cannot print, or that mink's facts give no typed form of, is refused.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.format;
+use mink.format.wasm.fact;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.space;
+use mink.model.space.Space;
+
+use masc_codec: masc.codec;
+use masc.core.dispatch;
+use masc.core.field;
+use masc.core.inst;
+use masc.core.mode;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.state;
+use core_syntax:  masc.core.syntax;
+use syntax_print: masc.syntax.print;
+
+use wasm_codec:   masc.isa.wasm.codec;
+use wasm_field:   masc.isa.wasm.field;
+use wasm_kind:    masc.isa.wasm.kind;
+use wasm_leb:     masc.isa.wasm.leb;
+use wasm_stream:  masc.isa.wasm.stream;
+use wasm_syntax:  masc.isa.wasm.syntax;
+use wasm_valtype: masc.isa.wasm.valtype;
+
+use masc.isa.wasm.gen_row;
+use masc.isa.wasm.gen_row_index;
+
+pub val MEMORY:          str = "out of memory";
+pub val NO_SPACE:        str = "the stream refused a module's index space";
+pub val UNENDED:         str = "an expression or a body runs past its bytes with no end";
+pub val NO_FORM:         str = "a module entry the text format has no form of";
+pub val REFUSED:         str = "mink refused a fact of the module";
+pub val TOO_MANY_LOCALS: str = "a function declares more locals than a local index can name";
+
+# what a print writes with: the object, the index of its entries, its codec and context, the text so far, and the
+# stores each instruction is decoded into, grown to the operands and the alternatives the largest holds
+rec Job {
+    o:       *Object;
+    ix:      *fact.Index;
+    codec:   *dispatch.Codec;
+    ctx:     *state.Context;
+    out:     *vector.Vector[u8];
+    modes:   mode.State;
+    store:   vector.Vector[operand.Value];
+    alts:    vector.Vector[requirement.Alternative];
+    refusal: opt[Fail];
+}
+
+fun put(j: *Job, s: str) err[str] {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val res_pushed: res[usize, A.Error] = vector.push[u8](j.out, s[i]);
+        if (sel res_pushed.err) { ret err[str].err{MEMORY}; }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
+fun number(j: *Job, v: u64) err[str] {
+    var digits: [20]u8;
+    var n:      usize = 0;
+    var x:      u64   = v;
+    for {
+        digits[n] = ('0'::u64 + x % 10)::u8;
+        n         = n + 1;
+        x         = x / 10;
+        if (x == 0) { brk; }
+    }
+    for (n > 0) {
+        n = n - 1;
+        val res_pushed: res[usize, A.Error] = vector.push[u8](j.out, digits[n]);
+        if (sel res_pushed.err) { ret err[str].err{MEMORY}; }
+    }
+    ret err[str].ok{};
+}
+
+val HEX: str = "0123456789abcdef";
+
+# the `len` bytes at `data` as a string, its printable bytes as they are and every other as `\hh`, nil `data` standing
+# for zeros
+fun string(j: *Job, data: *u8, len: usize) err[str] {
+    var err_put: err[str] = put(j, "\"");
+    var i:       usize    = 0;
+    for (i < len && !bad(err_put)) {
+        var c: u8 = 0;
+        if (data != nil) { c = data[i]; }
+        if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') {
+            val res_pushed: res[usize, A.Error] = vector.push[u8](j.out, c);
+            if (sel res_pushed.err) { ret err[str].err{MEMORY}; }
+        }
+        or {
+            val esc: [4]u8 = [4]u8{'\\', HEX[c >> 4], HEX[c & 0xF], 0};
+            err_put = put(j, ?esc[0]);
+        }
+        i = i + 1;
+    }
+    if (bad(err_put)) { ret err_put; }
+    ret put(j, "\"");
+}
+
+# the value type of code `code`, by the syntax's spelling
+fun value_type(j: *Job, code: i64) err[str] {
+    var w:         core_syntax.Writer = core_syntax.Writer{out: j.out, codec: j.codec, ctx: j.ctx, syntax: ?wasm_syntax.SYNTAX, modes: ?j.modes, symbols: nil, context: nil, row: nil};
+    val err_wrote: err[field.Refusal] = wasm_syntax.valtype_write(?w, code);
+    if (sel err_wrote.err) { ret err[str].err{err_wrote.err.message}; }
+    ret err[str].ok{};
+}
+
+# mink's refusal `f`, which stops the print, kept for the module's caller to word as mink does
+fun refused(j: *Job, f: Fail) str {
+    j.refusal = opt[Fail].some{f};
+    ret REFUSED;
+}
+
+fun failed(j: *Job, f: Fail) err[str] {
+    ret err[str].err{refused(j, f)};
+}
+
+fun entry_at(j: *Job, e: Id[Entry]) *Entry {
+    ret table.at[Entry](?j.o.entries, e);
+}
+
+# the index the entry `e` takes in its space
+fun index_of(j: *Job, e: Id[Entry]) u64 {
+    ret @table.at[u64](?j.ix.within, table.nth[u64](e.index::usize));
+}
+
+fun bad(e: err[str]) bool {
+    ret sel e.err;
+}
+
+fun kept(first: err[str], next: err[str]) err[str] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+fun value_types(j: *Job, word: str, t: *Table[fact.Value]) err[str] {
+    val n: usize = table.count[fact.Value](t);
+    if (n == 0) { ret err[str].ok{}; }
+    var err_put: err[str] = put(j, " (");
+    err_put = kept(err_put, put(j, word));
+    var i: usize = 0;
+    for (i < n && !bad(err_put)) {
+        err_put = kept(err_put, put(j, " "));
+        err_put = kept(err_put, value_type(j, wasm_valtype.code_of(table.at[fact.Value](t, table.nth[fact.Value](i)))));
+        i       = i + 1;
+    }
+    ret kept(err_put, put(j, ")"));
+}
+
+fun limits(j: *Job, l: *fact.Limits) err[str] {
+    var err_put: err[str] = err[str].ok{};
+    if (l.wide) { err_put = put(j, " i64"); }
+    err_put = kept(err_put, put(j, " "));
+    err_put = kept(err_put, number(j, l.min));
+    if (sel l.max.some) {
+        err_put = kept(err_put, put(j, " "));
+        err_put = kept(err_put, number(j, l.max.some));
+    }
+    ret err_put;
+}
+
+fun memory_type(j: *Job, l: *fact.Limits) err[str] {
+    var err_limits: err[str] = limits(j, l);
+    if (l.shared) { err_limits = kept(err_limits, put(j, " shared")); }
+    ret err_limits;
+}
+
+fun table_type(j: *Job, t: *fact.TableType) err[str] {
+    var err_limits: err[str] = limits(j, ?t.limits);
+    err_limits = kept(err_limits, put(j, " "));
+    ret kept(err_limits, value_type(j, wasm_valtype.reference_code(?t.elem)));
+}
+
+fun global_type(j: *Job, g: *fact.GlobalType) err[str] {
+    if (!g.mutable) { ret value_type(j, wasm_valtype.code_of(?g.value)); }
+    var err_put: err[str] = put(j, "(mut ");
+    err_put = kept(err_put, value_type(j, wasm_valtype.code_of(?g.value)));
+    ret kept(err_put, put(j, ")"));
+}
+
+fun type_use(j: *Job, x: u64) err[str] {
+    var err_put: err[str] = put(j, " (type ");
+    err_put = kept(err_put, number(j, x));
+    ret kept(err_put, put(j, ")"));
+}
+
+# the instructions of the `len` bytes at `data` from `at`, one per line after `indent`, up to the `end` that closes
+# them, which is not written
+fun instructions(j: *Job, data: *u8, len: usize, at: usize, indent: str) err[str] {
+    var i: usize = at;
+    for (i < len) {
+        val res_decode_grown: res[masc_codec.Decoded, field.Refusal] = masc_codec.decode_grown(j.codec, j.ctx, data, len, i, ?j.store, ?j.alts);
+        if (sel res_decode_grown.err) { ret err[str].err{res_decode_grown.err.message}; }
+        var ins:      inst.Inst          = res_decode_grown.ok.inst;
+        val err_seen: err[field.Refusal] = wasm_stream.HOOKS.observe(j.ctx.stream, ?ins);
+        if (sel err_seen.err) { ret err[str].err{err_seen.err.message}; }
+        i = i + res_decode_grown.ok.len;
+        if (ins.row == ?gen_row.ROWS[gen_row_index.END] && wasm_stream.count(j.ctx.stream, wasm_kind.LABELS) == 0) { ret err[str].ok{}; }
+        var err_put: err[str] = put(j, "\n");
+        err_put = kept(err_put, put(j, indent));
+        if (bad(err_put)) { ret err_put; }
+        var w:         core_syntax.Writer = core_syntax.Writer{out: j.out, codec: j.codec, ctx: j.ctx, syntax: ?wasm_syntax.SYNTAX, modes: ?j.modes, symbols: nil, context: nil, row: ins.row};
+        val err_wrote: err[field.Refusal] = syntax_print.instruction(?w, ?ins);
+        if (sel err_wrote.err) { ret err[str].err{err_wrote.err.message}; }
+    }
+    ret err[str].err{UNENDED};
+}
+
+# a constant expression, its instructions in its own block
+fun expression(j: *Job, x: View) err[str] {
+    val err_entered: err[str] = wasm_stream.enter_expression(j.ctx.stream);
+    if (sel err_entered.err) { ret err_entered; }
+    ret instructions(j, x.data, x.len, 0, "    ");
+}
+
+# a run of locals' value type in a body: its code, and the bytes it takes
+rec Local {
+    code: i64;
+    len:  usize;
+}
+
+# the value type at `at` of the body `b`: its byte, and a typed reference's heap type as an s33 after it
+fun local_type(b: Bytes, at: usize) res[Local, field.Refusal] {
+    if (at >= b.len) { ret res[Local, field.Refusal].err{field.refusal(UNENDED, field.NO_OPERAND, at)}; }
+    val byte: u8 = b.data[at];
+    if (byte != wasm_field.REF && byte != wasm_field.REF_NULL) { ret res[Local, field.Refusal].ok{Local{code: byte::i64, len: 1}}; }
+    val res_heap: res[wasm_leb.Read, field.Refusal] = wasm_leb.signed(b.data, b.len, at + 1, 33, field.NO_OPERAND);
+    if (sel res_heap.err) { ret res[Local, field.Refusal].err{res_heap.err}; }
+    ret res[Local, field.Refusal].ok{Local{code: (res_heap.ok.value:~i64 << 8) | byte::i64, len: 1 + res_heap.ok.len}};
+}
+
+# the bytes of the section the entry `e` names as its body, refused for a zero fill
+fun body_bytes(j: *Job, e: *Entry) res[Bytes, str] {
+    if (sel e.body.none) { ret res[Bytes, str].err{NO_FORM}; }
+    val s: *object.Section = object.section_at(j.o, e.body.some.section);
+    if (sel s.contents.zero) { ret res[Bytes, str].err{NO_FORM}; }
+    ret res[Bytes, str].ok{object.bytes(j.o, ?s.contents)};
+}
+
+# the locals and instructions of the function the entry `e` defines, its body entered at its type `type`
+fun body(j: *Job, e: *Entry, type: u64) err[str] {
+    val res_body_bytes: res[Bytes, str] = body_bytes(j, e);
+    if (sel res_body_bytes.err) { ret err[str].err{res_body_bytes.err}; }
+    val b:           Bytes    = res_body_bytes.ok;
+    val err_entered: err[str] = wasm_stream.enter(j.ctx.stream, type::u32);
+    if (sel err_entered.err) { ret err_entered; }
+    val res_runs: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(b.data, b.len, 0, 32, field.NO_OPERAND);
+    if (sel res_runs.err) { ret err[str].err{res_runs.err.message}; }
+    val opt_func_type: opt[*wasm_stream.FuncType] = wasm_stream.func_type(j.ctx.stream, type::u32);
+    if (sel opt_func_type.none) { ret err[str].err{NO_FORM}; }
+    var locals:         u64      = opt_func_type.some.params.len::u64;
+    var at:             usize    = res_runs.ok.len;
+    var err_locals_put: err[str] = err[str].ok{};
+    var r:              u64      = 0;
+    for (r < res_runs.ok.value && !bad(err_locals_put)) {
+        val res_unsigned: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(b.data, b.len, at, 32, field.NO_OPERAND);
+        if (sel res_unsigned.err) { ret err[str].err{res_unsigned.err.message}; }
+        locals = locals + res_unsigned.ok.value;
+        if (locals > 0xFFFF_FFFF) { ret err[str].err{TOO_MANY_LOCALS}; }
+        at = at + res_unsigned.ok.len;
+        val res_code: res[Local, field.Refusal] = local_type(b, at);
+        if (sel res_code.err) { ret err[str].err{res_code.err.message}; }
+        at             = at + res_code.ok.len;
+        err_locals_put = put(j, " (local");
+        var i: u64 = 0;
+        for (i < res_unsigned.ok.value && !bad(err_locals_put)) {
+            err_locals_put = kept(err_locals_put, put(j, " "));
+            err_locals_put = kept(err_locals_put, value_type(j, res_code.ok.code));
+            val res_defined: res[u32, str] = wasm_stream.define(j.ctx.stream, wasm_kind.LOCALS, wasm_valtype.stream_code(res_code.ok.code), View{data: nil, len: 0});
+            if (sel res_defined.err) { ret err[str].err{res_defined.err}; }
+            i = i + 1;
+        }
+        err_locals_put = kept(err_locals_put, put(j, ")"));
+        r              = r + 1;
+    }
+    if (bad(err_locals_put)) { ret err_locals_put; }
+    ret instructions(j, b.data, b.len, at, "    ");
+}
+
+fun define(j: *Job, space: u16, code: u32) err[str] {
+    val res_define: res[u32, str] = wasm_stream.define(j.ctx.stream, space, code, View{data: nil, len: 0});
+    if (sel res_define.err) { ret err[str].err{NO_SPACE}; }
+    ret err[str].ok{};
+}
+
+# the address type code of limits `l`
+fun address(l: *fact.Limits) u32 {
+    if (l.wide) { ret wasm_stream.I64; }
+    ret wasm_stream.I32;
+}
+
+# the type index of the function the entry `e` is
+fun function_type(j: *Job, e: *Entry) res[u64, str] {
+    if (sel e.signature.none) { ret res[u64, str].err{NO_FORM}; }
+    ret res[u64, str].ok{index_of(j, e.signature.some)};
+}
+
+# the stream code of what the entry `id` holds in its space: a function's or a tag's type index, a table's or a
+# memory's address type, a global's value type
+fun code_of(j: *Job, id: Id[Entry]) res[u32, str] {
+    val e: *Entry = entry_at(j, id);
+    if (e.space == ?space.FUNCTIONS) {
+        val res_function_type: res[u64, str] = function_type(j, e);
+        if (sel res_function_type.err) { ret res[u32, str].err{res_function_type.err}; }
+        ret res[u32, str].ok{res_function_type.ok::u32};
+    }
+    if (e.space == ?space.TABLES) {
+        val res_table_type_of: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+        if (sel res_table_type_of.err) { ret res[u32, str].err{refused(j, res_table_type_of.err)}; }
+        ret res[u32, str].ok{address(?res_table_type_of.ok.limits)};
+    }
+    if (e.space == ?space.MEMORIES) {
+        val res_memory_type_of: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+        if (sel res_memory_type_of.err) { ret res[u32, str].err{refused(j, res_memory_type_of.err)}; }
+        ret res[u32, str].ok{address(?res_memory_type_of.ok)};
+    }
+    if (e.space == ?space.GLOBALS) {
+        val res_global_type_of: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+        if (sel res_global_type_of.err) { ret res[u32, str].err{refused(j, res_global_type_of.err)}; }
+        ret res[u32, str].ok{wasm_valtype.stream_code(wasm_valtype.code_of(?res_global_type_of.ok.value))};
+    }
+    val res_tag_type_of: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+    if (sel res_tag_type_of.err) { ret res[u32, str].err{refused(j, res_tag_type_of.err)}; }
+    ret res[u32, str].ok{index_of(j, res_tag_type_of.ok)::u32};
+}
+
+# the stream space of the index space `sp`
+fun stream_space(sp: *Space) u16 {
+    if (sp == ?space.FUNCTIONS) { ret wasm_kind.FUNCS; }
+    if (sp == ?space.TABLES)    { ret wasm_kind.TABLES; }
+    if (sp == ?space.MEMORIES)  { ret wasm_kind.MEMORIES; }
+    if (sp == ?space.GLOBALS)   { ret wasm_kind.GLOBALS; }
+    ret wasm_kind.TAGS;
+}
+
+# the entries of `list` defined in the stream's space of `sp`, imports first as a module numbers them
+fun defined_all(j: *Job, list: *Table[Id[Entry]], sp: *Space) err[str] {
+    var i: usize = 0;
+    for (i < table.count[Id[Entry]](list)) {
+        val res_code: res[u32, str] = code_of(j, @table.at[Id[Entry]](list, table.nth[Id[Entry]](i)));
+        if (sel res_code.err) { ret err[str].err{res_code.err}; }
+        val err_define: err[str] = define(j, stream_space(sp), res_code.ok);
+        if (sel err_define.err) { ret err_define; }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
+# how many facts of `key` the object states
+fun facts_of(j: *Job, key: u32) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Fact](?j.o.facts)) {
+        val f: *Fact = table.at[Fact](?j.o.facts, table.nth[Fact](i));
+        if (f.key == key && f.format == ?format.WASM) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# how many data segments the object holds
+fun segment_count(j: *Job) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Entry](?j.o.entries)) {
+        if (entry_at(j, table.nth[Entry](i)).space == ?space.SEGMENTS) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the module's index spaces and types defined in the stream, so its instructions decode as the module's
+fun spaces(j: *Job) err[str] {
+    wasm_stream.HOOKS.begin(j.ctx.stream);
+    var params:  vector.Vector[u32] = vector.init[u32](j.out.a);
+    var results: vector.Vector[u32] = vector.init[u32](j.out.a);
+    fin {
+        vector.dnit[u32](?params);
+        vector.dnit[u32](?results);
+    }
+    var i: usize = 0;
+    for (i < table.count[Id[Entry]](?j.ix.types)) {
+        val res_signature_of: res[fact.Signature, Fail] = fact.signature_of(j.o, j.ix, @table.at[Id[Entry]](?j.ix.types, table.nth[Id[Entry]](i)));
+        if (sel res_signature_of.err) { ret failed(j, res_signature_of.err); }
+        var sig: fact.Signature = res_signature_of.ok;
+        vector.truncate[u32](?params, 0);
+        vector.truncate[u32](?results, 0);
+        var k: usize = 0;
+        for (k < table.count[fact.Value](?sig.params)) {
+            vector.push[u32](?params, wasm_valtype.stream_code(wasm_valtype.code_of(table.at[fact.Value](?sig.params, table.nth[fact.Value](k)))));
+            k = k + 1;
+        }
+        k = 0;
+        for (k < table.count[fact.Value](?sig.results)) {
+            vector.push[u32](?results, wasm_valtype.stream_code(wasm_valtype.code_of(table.at[fact.Value](?sig.results, table.nth[fact.Value](k)))));
+            k = k + 1;
+        }
+        val err_gone:  err[Fail]     = fact.signature_dnit(?sig);
+        val res_added: res[u32, str] = wasm_stream.add_type(j.ctx.stream, params.data, params.len::u32, results.data, results.len::u32, View{data: nil, len: 0});
+        if (sel res_added.err) { ret err[str].err{res_added.err}; }
+        i = i + 1;
+    }
+    var err_defined_all: err[str] = defined_all(j, ?j.ix.functions, ?space.FUNCTIONS);
+    err_defined_all = kept(err_defined_all, defined_all(j, ?j.ix.tables, ?space.TABLES));
+    err_defined_all = kept(err_defined_all, defined_all(j, ?j.ix.memories, ?space.MEMORIES));
+    err_defined_all = kept(err_defined_all, defined_all(j, ?j.ix.globals, ?space.GLOBALS));
+    err_defined_all = kept(err_defined_all, defined_all(j, ?j.ix.tags, ?space.TAGS));
+    var n: usize = segment_count(j);
+    i = 0;
+    for (i < n && !bad(err_defined_all)) {
+        err_defined_all = define(j, wasm_kind.DATAS, 0);
+        i               = i + 1;
+    }
+    n = facts_of(j, fact.ELEMENT);
+    i = 0;
+    for (i < n && !bad(err_defined_all)) {
+        err_defined_all = define(j, wasm_kind.ELEMS, 0);
+        i               = i + 1;
+    }
+    ret err_defined_all;
+}
+
+val KIND_WORDS: [5]str = [5]str{"func", "table", "memory", "global", "tag"};
+
+# the word of the kind of the space `sp`
+fun kind_word(sp: *Space) res[str, str] {
+    val opt_kind_of_space: opt[u8] = fact.kind_of_space(sp);
+    if (sel opt_kind_of_space.none)         { ret res[str, str].err{NO_FORM}; }
+    if (opt_kind_of_space.some::usize >= 5) { ret res[str, str].err{NO_FORM}; }
+    ret res[str, str].ok{KIND_WORDS[opt_kind_of_space.some]};
+}
+
+fun import(j: *Job, id: Id[Entry]) err[str] {
+    val en: *Entry = entry_at(j, id);
+    if (sel en.import.none) { ret err[str].err{NO_FORM}; }
+    val imp:      *object.Import = ?en.import.some;
+    val res_word: res[str, str]  = kind_word(en.space);
+    if (sel res_word.err) { ret err[str].err{res_word.err}; }
+    val module:  View     = object.name_of(j.o, imp.module);
+    val field_:  View     = object.name_of(j.o, imp.field);
+    var err_put: err[str] = put(j, "\n  (import ");
+    err_put = kept(err_put, string(j, module.data, module.len));
+    err_put = kept(err_put, put(j, " "));
+    err_put = kept(err_put, string(j, field_.data, field_.len));
+    err_put = kept(err_put, put(j, " ("));
+    err_put = kept(err_put, put(j, res_word.ok));
+    if (bad(err_put)) { ret err_put; }
+    if (en.space == ?space.FUNCTIONS) {
+        val res_function_type: res[u64, str] = function_type(j, en);
+        if (sel res_function_type.err) { ret err[str].err{res_function_type.err}; }
+        err_put = type_use(j, res_function_type.ok);
+    }
+    or (en.space == ?space.TABLES) {
+        val res_table_type_of: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+        if (sel res_table_type_of.err) { ret failed(j, res_table_type_of.err); }
+        var tt: fact.TableType = res_table_type_of.ok;
+        err_put = table_type(j, ?tt);
+    }
+    or (en.space == ?space.MEMORIES) {
+        val res_memory_type_of: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+        if (sel res_memory_type_of.err) { ret failed(j, res_memory_type_of.err); }
+        var ll: fact.Limits = res_memory_type_of.ok;
+        err_put = memory_type(j, ?ll);
+    }
+    or (en.space == ?space.GLOBALS) {
+        val res_global_type_of: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+        if (sel res_global_type_of.err) { ret failed(j, res_global_type_of.err); }
+        var gg: fact.GlobalType = res_global_type_of.ok;
+        err_put = put(j, " ");
+        err_put = kept(err_put, global_type(j, ?gg));
+    }
+    or {
+        val res_tag_type_of: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+        if (sel res_tag_type_of.err) { ret failed(j, res_tag_type_of.err); }
+        err_put = type_use(j, index_of(j, res_tag_type_of.ok));
+    }
+    ret kept(err_put, put(j, "))"));
+}
+
+fun element(j: *Job, el: *fact.Element) err[str] {
+    var err_put: err[str] = put(j, "\n  (elem");
+    if (sel el.mode.declarative) { err_put = kept(err_put, put(j, " declare")); }
+    or (sel el.mode.active) {
+        var tab: u64 = 0;
+        if (sel el.mode.active.table.some) { tab = index_of(j, el.mode.active.table.some); }
+        err_put = kept(err_put, put(j, " (table "));
+        err_put = kept(err_put, number(j, tab));
+        err_put = kept(err_put, put(j, ") (offset"));
+        err_put = kept(err_put, expression(j, el.mode.active.offset));
+        err_put = kept(err_put, put(j, ")"));
+    }
+    if (sel el.items.functions) {
+        err_put = kept(err_put, put(j, " func"));
+        var i: usize = 0;
+        for (i < table.count[Id[Entry]](?el.items.functions)) {
+            err_put = kept(err_put, put(j, " "));
+            err_put = kept(err_put, number(j, index_of(j, @table.at[Id[Entry]](?el.items.functions, table.nth[Id[Entry]](i)))));
+            i       = i + 1;
+        }
+    }
+    or (sel el.items.expressions) {
+        err_put = kept(err_put, put(j, " "));
+        err_put = kept(err_put, value_type(j, wasm_valtype.reference_code(?el.type)));
+        var i: usize = 0;
+        for (i < table.count[View](?el.items.expressions)) {
+            err_put = kept(err_put, put(j, " (item"));
+            err_put = kept(err_put, expression(j, @table.at[View](?el.items.expressions, table.nth[View](i))));
+            err_put = kept(err_put, put(j, ")"));
+            i       = i + 1;
+        }
+    }
+    ret kept(err_put, put(j, ")"));
+}
+
+fun segment(j: *Job, id: Id[Entry]) err[str] {
+    val res_head: res[opt[fact.SegmentHead], Fail] = fact.segment_head_of(j.o, j.ix, id);
+    if (sel res_head.err)     { ret failed(j, res_head.err); }
+    if (sel res_head.ok.none) { ret err[str].err{NO_FORM}; }
+    val en: *Entry = entry_at(j, id);
+    if (sel en.body.none) { ret err[str].err{NO_FORM}; }
+    val s:       *object.Section  = object.section_at(j.o, en.body.some.section);
+    val h:       fact.SegmentHead = res_head.ok.some;
+    var err_put: err[str]         = put(j, "\n  (data");
+    if (sel h.active) {
+        var mem: u64 = 0;
+        if (sel h.active.memory.some) { mem = index_of(j, h.active.memory.some); }
+        err_put = kept(err_put, put(j, " (memory "));
+        err_put = kept(err_put, number(j, mem));
+        err_put = kept(err_put, put(j, ") (offset"));
+        err_put = kept(err_put, expression(j, h.active.offset));
+        err_put = kept(err_put, put(j, ")"));
+    }
+    err_put = kept(err_put, put(j, " "));
+    if (sel s.contents.zero) { err_put = kept(err_put, string(j, nil, s.contents.zero::usize)); }
+    or {
+        val b: Bytes = object.bytes(j.o, ?s.contents);
+        err_put = kept(err_put, string(j, b.data, b.len));
+    }
+    ret kept(err_put, put(j, ")"));
+}
+
+# the text of the module `o` states onto `out`, mink's neutral object of it, its instructions decoded under `ctx`, whose
+# stream it begins and fills
+pub fun module(o: *Object, ctx: *state.Context, out: *vector.Vector[u8]) err[Fail] {
+    val res_indexed: res[fact.Index, Fail] = fact.indexed(o);
+    if (sel res_indexed.err) { ret err[Fail].err{res_indexed.err}; }
+    var index:     fact.Index   = res_indexed.ok;
+    var j:         Job          = Job{o: o, ix: ?index, codec: ?wasm_codec.CODEC, ctx: ctx, out: out, modes: mode.initial(?mode.NO_MODES), store: vector.init[operand.Value](out.a), alts: vector.init[requirement.Alternative](out.a)};
+    val err_done:  err[str]     = written(?j);
+    val err_freed: err[A.Error] = vector.dnit[operand.Value](?j.store);
+    val err_gone:  err[A.Error] = vector.dnit[requirement.Alternative](?j.alts);
+    val err_left:  err[Fail]    = fact.index_dnit(?index);
+    if (sel err_done.ok)    { ret err[Fail].ok{}; }
+    if (sel j.refusal.some) { ret err[Fail].err{j.refusal.some}; }
+    ret err[Fail].err{fail.unsupported(err_done.err)};
+}
+
+# each entry of `list` the object defines, written by `each`
+fun definitions(j: *Job, list: *Table[Id[Entry]], each: fun(*Job, Id[Entry]) err[str]) err[str] {
+    var err_each: err[str] = err[str].ok{};
+    var i:        usize    = 0;
+    for (i < table.count[Id[Entry]](list) && !bad(err_each)) {
+        val id: Id[Entry] = @table.at[Id[Entry]](list, table.nth[Id[Entry]](i));
+        val en: *Entry    = entry_at(j, id);
+        if (sel en.import.none) { err_each = each(j, id); }
+        i = i + 1;
+    }
+    ret err_each;
+}
+
+fun function(j: *Job, id: Id[Entry]) err[str] {
+    val en:                *Entry        = entry_at(j, id);
+    val res_function_type: res[u64, str] = function_type(j, en);
+    if (sel res_function_type.err) { ret err[str].err{res_function_type.err}; }
+    var err_put: err[str] = put(j, "\n  (func");
+    err_put = kept(err_put, type_use(j, res_function_type.ok));
+    err_put = kept(err_put, body(j, en, res_function_type.ok));
+    ret kept(err_put, put(j, ")"));
+}
+
+fun table_def(j: *Job, id: Id[Entry]) err[str] {
+    val res_table_type_of: res[fact.TableType, Fail] = fact.table_type_of(j.o, j.ix, id);
+    if (sel res_table_type_of.err) { ret failed(j, res_table_type_of.err); }
+    var tt:      fact.TableType = res_table_type_of.ok;
+    var err_put: err[str]       = put(j, "\n  (table");
+    err_put = kept(err_put, table_type(j, ?tt));
+    if (sel tt.init.some) { err_put = kept(err_put, expression(j, tt.init.some)); }
+    ret kept(err_put, put(j, ")"));
+}
+
+fun memory_def(j: *Job, id: Id[Entry]) err[str] {
+    val res_memory_type_of: res[fact.Limits, Fail] = fact.memory_type_of(j.o, j.ix, id);
+    if (sel res_memory_type_of.err) { ret failed(j, res_memory_type_of.err); }
+    var ll:      fact.Limits = res_memory_type_of.ok;
+    var err_put: err[str]    = put(j, "\n  (memory");
+    err_put = kept(err_put, memory_type(j, ?ll));
+    ret kept(err_put, put(j, ")"));
+}
+
+fun tag_def(j: *Job, id: Id[Entry]) err[str] {
+    val res_tag_type_of: res[Id[Entry], Fail] = fact.tag_type_of(j.o, j.ix, id);
+    if (sel res_tag_type_of.err) { ret failed(j, res_tag_type_of.err); }
+    var err_put: err[str] = put(j, "\n  (tag");
+    err_put = kept(err_put, type_use(j, index_of(j, res_tag_type_of.ok)));
+    ret kept(err_put, put(j, ")"));
+}
+
+fun global_def(j: *Job, id: Id[Entry]) err[str] {
+    val res_global_type_of: res[fact.GlobalType, Fail] = fact.global_type_of(j.o, j.ix, id);
+    if (sel res_global_type_of.err) { ret failed(j, res_global_type_of.err); }
+    var gg: fact.GlobalType = res_global_type_of.ok;
+    if (sel gg.init.none) { ret err[str].err{NO_FORM}; }
+    var err_put: err[str] = put(j, "\n  (global ");
+    err_put = kept(err_put, global_type(j, ?gg));
+    err_put = kept(err_put, expression(j, gg.init.some));
+    ret kept(err_put, put(j, ")"));
+}
+
+fun exports(j: *Job) err[str] {
+    val res_exports_of: res[opt[Table[fact.Export]], Fail] = fact.exports_of(j.o, j.ix);
+    if (sel res_exports_of.err)     { ret failed(j, res_exports_of.err); }
+    if (sel res_exports_of.ok.none) { ret err[str].ok{}; }
+    var t:       Table[fact.Export] = res_exports_of.ok.some;
+    var err_put: err[str]           = err[str].ok{};
+    var i:       usize              = 0;
+    for (i < table.count[fact.Export](?t) && !bad(err_put)) {
+        val x:        *fact.Export  = table.at[fact.Export](?t, table.nth[fact.Export](i));
+        val res_word: res[str, str] = kind_word(entry_at(j, x.entry).space);
+        if (sel res_word.err) { err_put = err[str].err{res_word.err}; }
+        or {
+            err_put = put(j, "\n  (export ");
+            err_put = kept(err_put, string(j, x.name.data, x.name.len));
+            err_put = kept(err_put, put(j, " ("));
+            err_put = kept(err_put, put(j, res_word.ok));
+            err_put = kept(err_put, put(j, " "));
+            err_put = kept(err_put, number(j, index_of(j, x.entry)));
+            err_put = kept(err_put, put(j, "))"));
+        }
+        i = i + 1;
+    }
+    val err_gone: err[Fail] = table.dnit[fact.Export](?t);
+    ret err_put;
+}
+
+fun elements(j: *Job) err[str] {
+    var err_element: err[str] = err[str].ok{};
+    var i:           usize    = 0;
+    for (i < table.count[Fact](?j.o.facts) && !bad(err_element)) {
+        val f: *Fact = table.at[Fact](?j.o.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.WASM || f.key != fact.ELEMENT) { cnt; }
+        val res_element_of: res[fact.Element, Fail] = fact.element_of(j.o, j.ix, f);
+        if (sel res_element_of.err) { ret failed(j, res_element_of.err); }
+        var el: fact.Element = res_element_of.ok;
+        err_element = element(j, ?el);
+        val err_gone: err[Fail] = fact.element_dnit(?el);
+    }
+    ret err_element;
+}
+
+fun written(j: *Job) err[str] {
+    var err_spaces: err[str] = spaces(j);
+    if (bad(err_spaces)) { ret err_spaces; }
+    err_spaces = put(j, "(module");
+    var i: usize = 0;
+    for (i < table.count[Id[Entry]](?j.ix.types) && !bad(err_spaces)) {
+        val res_signature_of: res[fact.Signature, Fail] = fact.signature_of(j.o, j.ix, @table.at[Id[Entry]](?j.ix.types, table.nth[Id[Entry]](i)));
+        if (sel res_signature_of.err) { ret failed(j, res_signature_of.err); }
+        var sig: fact.Signature = res_signature_of.ok;
+        err_spaces = kept(err_spaces, put(j, "\n  (type (func"));
+        err_spaces = kept(err_spaces, value_types(j, "param", ?sig.params));
+        err_spaces = kept(err_spaces, value_types(j, "result", ?sig.results));
+        err_spaces = kept(err_spaces, put(j, "))"));
+        val err_gone: err[Fail] = fact.signature_dnit(?sig);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Entry](?j.o.entries) && !bad(err_spaces)) {
+        val id: Id[Entry] = table.nth[Entry](i);
+        val en: *Entry    = entry_at(j, id);
+        if (sel en.import.some) { err_spaces = import(j, id); }
+        i = i + 1;
+    }
+    if (!bad(err_spaces)) { err_spaces = definitions(j, ?j.ix.functions, function); }
+    if (!bad(err_spaces)) { err_spaces = definitions(j, ?j.ix.tables, table_def); }
+    if (!bad(err_spaces)) { err_spaces = definitions(j, ?j.ix.memories, memory_def); }
+    if (!bad(err_spaces)) { err_spaces = definitions(j, ?j.ix.tags, tag_def); }
+    if (!bad(err_spaces)) { err_spaces = definitions(j, ?j.ix.globals, global_def); }
+    if (!bad(err_spaces)) { err_spaces = exports(j); }
+    if (!bad(err_spaces)) {
+        val res_start: res[opt[Id[Entry]], Fail] = fact.start_of(j.o, j.ix);
+        if (sel res_start.err) { ret failed(j, res_start.err); }
+        if (sel res_start.ok.some) {
+            err_spaces = put(j, "\n  (start ");
+            err_spaces = kept(err_spaces, number(j, index_of(j, res_start.ok.some)));
+            err_spaces = kept(err_spaces, put(j, ")"));
+        }
+    }
+    if (!bad(err_spaces)) { err_spaces = elements(j); }
+    i = 0;
+    for (i < table.count[Entry](?j.o.entries) && !bad(err_spaces)) {
+        val id: Id[Entry] = table.nth[Entry](i);
+        if (entry_at(j, id).space == ?space.SEGMENTS) { err_spaces = segment(j, id); }
+        i = i + 1;
+    }
+    if (bad(err_spaces)) { ret err_spaces; }
+    ret put(j, ")\n");
+}

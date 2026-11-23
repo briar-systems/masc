@@ -1,0 +1,1539 @@
+# the core directives, as rows of the source model's directive table
+#
+# sections and the section stack, symbol bindings, visibilities, types and
+# sizes, data, strings, leb128 and floating point values, alignment, fills,
+# equates and common storage, each a row over the model's operand syntaxes.
+# what differs per target is the set's: the integer data directives and
+# their widths, how `.align` reads, and the type prefixes. a section with no
+# stated attributes takes the object format's convention for its name, as
+# mink's naming states it. a section opened with the dialect's unique number, as elf's
+# `unique, 1`, is a section apart from the others of its name, entered again
+# only by that name and number. a section of a comdat group, its flags holding
+# `G` and its type followed by the group's signature and `comdat`, is a
+# section apart from the others of its name too, entered again by its name and
+# signature. a link-order section, its flags holding `o` and its type
+# followed by the symbol or section it is linked to, is ordered after that
+# section and kept apart from the others of its name by it. a group that is no
+# comdat group is refused, as mink's object holds comdat groups only, and so is
+# an exclusion, since the builder states none.
+#
+# the grammar of `.section` and the directives that enter a section by its
+# own name are the dialect's (`masc.format.dialect.Sections`): elf's above,
+# mach-o's `segment,section, type, attributes`, whose type word mink's mach-o
+# naming classifies, and coff's `"flags", selection, symbol`, whose flag
+# letters and selection words are the dialect's rows and whose content word
+# mink's coff naming classifies. each writes back as it reads, through
+# `macho_header` and `coff_header`, so the listing and the disassembler spell
+# a header the assembler reads to the same section.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.encoding.leb128;
+use std.math.ieee;
+use number: std.text.parse;
+
+use mink.base.fail;
+use mink.base.store;
+use mink.catalog.arch;
+use mink.format.contract;
+use mink_group:   mink.model.group;
+use mink_reloc:   mink.model.reloc;
+use mink_section: mink.model.section;
+use mink.model.symbol;
+
+use masc.asm.model;
+use build_emit:    masc.build.emit;
+use build_label:   masc.build.label;
+use build_refusal: masc.build.refusal;
+use build_section: masc.build.section;
+use build_state:   masc.build.state;
+use masc.core.diagnostic;
+use masc.core.field;
+use masc.core.fixup;
+use masc.core.operand;
+use masc.core.source;
+use masc.core.syntax;
+use masc.emit.line;
+use masc.format.dialect;
+use masc.syntax.expr;
+use masc.syntax.read;
+
+pub val UNKNOWN_TYPE:      str = "no section type has this name";
+pub val UNKNOWN_FLAG:      str = "the section flag is not supported";
+pub val FLAGS_KIND:        str = "the section's type cannot carry these flags";
+pub val NO_KIND:           str = "the object format gives no kind to a section of this name, type and flags";
+pub val NO_ENTSIZE:        str = "the section of entries to merge states no entry size";
+pub val NEGATIVE:          str = "the count is negative";
+pub val OVERSIZED:         str = "the fill holds more bytes than a section can";
+pub val SECTION_NAME:      str = "a section name is expected here";
+pub val SIGNATURE:         str = "the signature of the section's group is expected here";
+pub val UNTYPED_GROUP:     str = "the section group is stated with no section type";
+pub val PLAIN_GROUP:       str = "the section group is no comdat group, and mink's object holds only comdat groups";
+pub val UNTYPED_ORDER:     str = "the link-order section is stated with no section type";
+pub val LINKED:            str = "the symbol or section a link-order section is linked to is expected here";
+pub val UNLINKED:          str = "the linked-to symbol is in no section, nor names one, so far";
+pub val NO_FLOAT_FORMAT:   str = "no ieee 754 format has the row's width";
+pub val SEGMENTED:         str = "a section named `segment,section` is expected here";
+pub val UNKNOWN_ATTRIBUTE: str = "the neutral section holds nothing of this section attribute apart from its kind";
+pub val STUBS:             str = "no section mink's object holds states a symbol stub size";
+pub val UNKNOWN_SELECTION: str = "no rule of mink's groups keeps this comdat selection";
+pub val COMDAT_SYMBOL:     str = "the comdat symbol is expected here";
+pub val UNLED:             str = "the associative leader is a symbol in no section, nor names one, so far";
+pub val DEFINING:          str = "a symbol definition is opened while another is open";
+pub val UNDEFINING:        str = "the symbol definition directive has no `.def` open";
+pub val UNENDED:           str = "the symbol definition is not closed by `.endef`";
+pub val UNKNOWN_CLASS:     str = "masc reads no such storage class, only 2 for external and 3 for static";
+pub val UNKNOWN_COFF_TYPE: str = "masc reads no such symbol type, only 32 for a function and 0 for none";
+pub val STATIC_EXTERNAL:   str = "the symbol is bound locally and given the external storage class";
+
+# why a section's header was not written
+# ---
+# kind:    no header of the dialect reads back to the section's kind, flags and element size
+# quoted:  its name has no spelling the header takes, as a mach-o name that is not two plain parts
+# grouped: its group keeps a copy by a rule no word of the dialect states, or the dialect states no group
+# memory:  the output did not grow
+pub tag Unwritten: u8 {
+    kind;
+    quoted;
+    grouped;
+    memory;
+}
+
+# the key the object format's convention gives a section named `name`, as elf's `.text` and `.text.hot` take text and
+# mach-o's `__TEXT,__cstring` takes merged strings of one byte, none for none
+fun convention(n: *contract.Naming, name: View) opt[mink_section.Key] {
+    ret n.kind_of(store.Bytes{data: name.data, len: name.len});
+}
+
+# a section type word a `.section` states after `@`, which the object format's naming reads
+# ---
+# name: the word
+# bits: whether a section of it holds bytes
+rec Type {
+    name: str;
+    bits: bool;
+}
+
+val TYPES: [6]Type = [6]Type{
+    Type{name: "progbits", bits: true},
+    Type{name: "nobits", bits: false},
+    Type{name: "note", bits: true},
+    Type{name: "init_array", bits: true},
+    Type{name: "fini_array", bits: true},
+    Type{name: "preinit_array", bits: true},
+};
+
+fun same(v: View, s: str) bool {
+    val n: usize = str_len(s);
+    if (v.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun type_named(v: View) *Type {
+    var i: usize = 0;
+    for (i < 6) {
+        if (same(v, TYPES[i].name)) { ret ?TYPES[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the attributes of a section named `name` with none stated, by the object format's naming `n`: its convention's kind,
+# that kind's flags and the key's element size, or bytes with no flags, the name left for the caller to state
+pub fun conventional(n: *contract.Naming, name: View) build_state.Spec {
+    val opt_convention: opt[mink_section.Key] = convention(n, name);
+    if (sel opt_convention.none) { ret build_state.Spec{name: opt[str].none{}, kind: ?mink_section.METADATA, flags: 0, disposition: ?mink_section.WHOLE, entsize: 0}; }
+    ret build_state.Spec{name: opt[str].none{}, kind: opt_convention.some.kind, flags: opt_convention.some.kind.flags, disposition: ?mink_section.WHOLE, entsize: opt_convention.some.entsize};
+}
+
+# a letter of a `.section` flag string and the flag it states
+rec Letter {
+    letter: u8;
+    flag:   mink_section.Flags;
+}
+
+# how many letters a flag string has
+pub val FLAG_LETTERS: usize = 7;
+
+val LETTERS: [FLAG_LETTERS]Letter = [FLAG_LETTERS]Letter{
+    Letter{letter: 'a', flag: mink_section.ALLOC},
+    Letter{letter: 'w', flag: mink_section.WRITE},
+    Letter{letter: 'x', flag: mink_section.EXEC},
+    Letter{letter: 'M', flag: mink_section.MERGE},
+    Letter{letter: 'S', flag: mink_section.STRINGS},
+    Letter{letter: 'T', flag: mink_section.TLS},
+    Letter{letter: 'R', flag: mink_section.RETAIN},
+};
+
+# the letter of a `.section` flag string that puts the section in a group, which is no flag of the section
+pub val GROUP_LETTER: u8 = 'G';
+
+# the letter of a `.section` flag string that orders the section after the one it links to, as elf's link order, which
+# is no flag of the section: the object's format derives it from the section's owner
+pub val ORDER_LETTER: u8 = 'o';
+
+# the flags spelled by a `.section` flag string, refused at the letter it does not support, `grouped` set when it holds
+# the group letter and `ordered` when it holds the order letter
+fun flags_of(args: *model.Args, rd: *syntax.Reader, spelled: View, at: usize, grouped: *bool, ordered: *bool) res[mink_section.Flags, diagnostic.Diagnostic] {
+    var f: mink_section.Flags = 0;
+    var i: usize              = 0;
+    for (i < spelled.len) {
+        if (spelled.data[i] == GROUP_LETTER) {
+            @grouped = true;
+            i        = i + 1;
+            cnt;
+        }
+        if (spelled.data[i] == ORDER_LETTER) {
+            @ordered = true;
+            i        = i + 1;
+            cnt;
+        }
+        var k: usize = 0;
+        for (k < FLAG_LETTERS && LETTERS[k].letter != spelled.data[i]) {
+            k = k + 1;
+        }
+        if (k == FLAG_LETTERS) { ret res[mink_section.Flags, diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FLAG, at + 1 + i, 1)}; }
+        f = f | LETTERS[k].flag;
+        i = i + 1;
+    }
+    ret res[mink_section.Flags, diagnostic.Diagnostic].ok{f};
+}
+
+# the flag string that states `flags`, written to `out`, which holds FLAG_LETTERS bytes, none when a flag has no letter
+pub fun flag_string(flags: mink_section.Flags, out: *u8) opt[usize] {
+    var left: mink_section.Flags = flags;
+    var n:    usize              = 0;
+    var k:    usize              = 0;
+    for (k < FLAG_LETTERS) {
+        if ((flags & LETTERS[k].flag) != 0) {
+            out[n] = LETTERS[k].letter;
+            n      = n + 1;
+            left   = left & ~LETTERS[k].flag;
+        }
+        k = k + 1;
+    }
+    if (left != 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{n};
+}
+
+# the key `.section name, "flags", @type, entsize` states, as the object format's naming `n` classifies a section of the
+# name, type word, flags and element size, none where it gives such a section no key
+fun stated_kind(n: *contract.Naming, name: View, t: *Type, flags: mink_section.Flags, entsize: u64) opt[mink_section.Key] {
+    val res_kind_for: res[mink_section.Key, fail.Fail] = n.kind_for(store.Bytes{data: name.data, len: name.len}, t.name, flags, entsize);
+    if (sel res_kind_for.err) { ret opt[mink_section.Key].none{}; }
+    ret opt[mink_section.Key].some{res_kind_for.ok};
+}
+
+# the type a `.section` states for the section `name` of `kind` with `flags` and entries of `entsize` so it reads back
+# to that kind under the object format's naming `n`, none when no type does
+pub fun section_type(n: *contract.Naming, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, entsize: u64) opt[str] {
+    if ((kind.flags & flags) != kind.flags) { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < 6) {
+        val t:               *Type                 = ?TYPES[i];
+        val opt_stated_kind: opt[mink_section.Key] = stated_kind(n, name, t, flags, entsize);
+        if (sel opt_stated_kind.some && opt_stated_kind.some.kind == kind) { ret opt[str].some{t.name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# a section's name, in quotes or as the text up to a comma or white space
+fun section_name(m: *model.Assembler, rd: *syntax.Reader) res[View, diagnostic.Diagnostic] {
+    if (read.peek(rd) == '"') { ret model.string(m, rd); }
+    val at: usize = rd.at;
+    for (rd.at < rd.end && rd.text[rd.at] != ',' && !read.is_blank(rd.text[rd.at])) {
+        rd.at = rd.at + 1;
+    }
+    if (rd.at == at) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, SECTION_NAME, at, 0)}; }
+    ret res[View, diagnostic.Diagnostic].ok{read.span(rd, at, rd.at - at)};
+}
+
+# `, word, number` read when the dialect keeps sections of one name apart by a unique number and its word is next, the
+# number it opens the section apart with; none, with nothing read, otherwise. a dialect that keeps them apart by their
+# leader states a selection, which the section's grammar reads
+fun apart(m: *model.Assembler, rd: *syntax.Reader) res[opt[u64], diagnostic.Diagnostic] {
+    val back:       usize         = rd.at;
+    val way:        dialect.Apart = m.dialect.apart;
+    var opt_unique: opt[str]      = opt[str].none{};
+    if (sel way.unique)      { opt_unique = opt[str].some{way.unique}; }
+    if (sel opt_unique.none) { ret res[opt[u64], diagnostic.Diagnostic].ok{opt[u64].none{}}; }
+    read.skip(rd);
+    if (!read.take(rd, ",")) {
+        rd.at = back;
+        ret res[opt[u64], diagnostic.Diagnostic].ok{opt[u64].none{}};
+    }
+    read.skip(rd);
+    val n: usize = str_len(opt_unique.some);
+    if (read.token(rd, rd.at) != n || !read.starts(rd, rd.at, opt_unique.some, n)) {
+        rd.at = back;
+        ret res[opt[u64], diagnostic.Diagnostic].ok{opt[u64].none{}};
+    }
+    rd.at = rd.at + n;
+    read.skip(rd);
+    if (!read.take(rd, ",")) { ret res[opt[u64], diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_A_NUMBER, rd.at, 0)}; }
+    read.skip(rd);
+    val at:         usize                                 = rd.at;
+    val res_number: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+    if (sel res_number.err)          { ret res[opt[u64], diagnostic.Diagnostic].err{res_number.err}; }
+    if (!sel res_number.ok.constant) { ret res[opt[u64], diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_CONSTANT, at, rd.at - at)}; }
+    if (res_number.ok.constant < 0)  { ret res[opt[u64], diagnostic.Diagnostic].err{read.refuse(rd, NEGATIVE, at, rd.at - at)}; }
+    ret res[opt[u64], diagnostic.Diagnostic].ok{opt[u64].some{res_number.ok.constant:~u64}};
+}
+
+# `, comdat` read when it is next, answering whether it was, with nothing read when it is not
+fun comdat(rd: *syntax.Reader) bool {
+    val back: usize = rd.at;
+    read.skip(rd);
+    if (!read.take(rd, ",")) {
+        rd.at = back;
+        ret false;
+    }
+    read.skip(rd);
+    if (read.token(rd, rd.at) != str_len(COMDAT) || !read.starts(rd, rd.at, COMDAT, str_len(COMDAT))) {
+        rd.at = back;
+        ret false;
+    }
+    rd.at = rd.at + str_len(COMDAT);
+    ret true;
+}
+
+# the linkage word of a comdat group
+pub val COMDAT: str = "comdat";
+
+# `.section name[, "flags"[, @type[, entsize][, linked][, signature, comdat][, unique, number]]]` read and entered, after
+# a push when `push`. the unique number, under the dialect's word for it, opens the section apart from every other of
+# its name, a signature, which the flags' group letter calls for, puts it in the comdat group of that signature, and a
+# symbol or section name it is linked to, which the flags' order letter calls for, orders it after the section that
+# names (`model.linked`). each keeps it apart from every section of its name that differs in it
+fun section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd:       *syntax.Reader                   = args.reader;
+    val at:       usize                            = rd.at;
+    val res_name: res[View, diagnostic.Diagnostic] = section_name(m, rd);
+    if (sel res_name.err) { ret err[diagnostic.Diagnostic].err{res_name.err}; }
+    var spec:       build_state.Spec = conventional(model.naming(m), res_name.ok);
+    var stated:     bool             = false;
+    var opt_unique: opt[u64]         = opt[u64].none{};
+    var keys:       model.Keys       = model.NO_KEYS;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        stated = true;
+        # stated attributes replace the convention's, its element size with them
+        spec.entsize = 0;
+        val flags_at:    usize                            = rd.at;
+        val res_spelled: res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel res_spelled.err) { ret err[diagnostic.Diagnostic].err{res_spelled.err}; }
+        var grouped:   bool                                           = false;
+        var ordered:   bool                                           = false;
+        val res_flags: res[mink_section.Flags, diagnostic.Diagnostic] = flags_of(args, rd, res_spelled.ok, flags_at, ?grouped, ?ordered);
+        if (sel res_flags.err) { ret err[diagnostic.Diagnostic].err{res_flags.err}; }
+        val merging: bool = (res_flags.ok & mink_section.MERGE) != 0;
+        # the type the name's convention takes, bytes or none, until one is stated
+        var t: *Type = ?TYPES[0];
+        if (!mink_section.has(spec.kind, mink_section.BITS)) { t = ?TYPES[1]; }
+        read.skip(rd);
+        val typed: bool = read.take(rd, ",");
+        if (grouped && !typed) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNTYPED_GROUP, flags_at, rd.at - flags_at)}; }
+        if (ordered && !typed) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNTYPED_ORDER, flags_at, rd.at - flags_at)}; }
+        if (typed) {
+            read.skip(rd);
+            val type_at:  usize                                      = rd.at;
+            val res_word: res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.WORD);
+            if (sel res_word.err)      { ret err[diagnostic.Diagnostic].err{res_word.err}; }
+            if (!sel res_word.ok.word) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+            t = type_named(res_word.ok.word);
+            if (t == nil) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+            val res_bare: res[opt[u64], diagnostic.Diagnostic] = apart(m, rd);
+            if (sel res_bare.err) { ret err[diagnostic.Diagnostic].err{res_bare.err}; }
+            opt_unique = res_bare.ok;
+            read.skip(rd);
+            # the section linked to and a group's signature follow the type, or the element size of a section of
+            # entries to merge
+            if (sel opt_unique.none && (merging || (!grouped && !ordered)) && read.take(rd, ",")) {
+                read.skip(rd);
+                val size_at:  usize                                 = rd.at;
+                val res_size: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+                if (sel res_size.err)          { ret err[diagnostic.Diagnostic].err{res_size.err}; }
+                if (!sel res_size.ok.constant) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_CONSTANT, size_at, rd.at - size_at)}; }
+                if (res_size.ok.constant < 0)  { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NEGATIVE, size_at, rd.at - size_at)}; }
+                spec.entsize = res_size.ok.constant:~u64;
+                val res_sized: res[opt[u64], diagnostic.Diagnostic] = apart(m, rd);
+                if (sel res_sized.err) { ret err[diagnostic.Diagnostic].err{res_sized.err}; }
+                opt_unique = res_sized.ok;
+            }
+            if (ordered) {
+                read.skip(rd);
+                if (sel opt_unique.some || !read.take(rd, ",")) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, LINKED, rd.at, 0)}; }
+                read.skip(rd);
+                val link_at:  usize                            = rd.at;
+                val res_link: res[View, diagnostic.Diagnostic] = model.symbol_name(m, rd);
+                if (sel res_link.err) { ret err[diagnostic.Diagnostic].err{res_link.err}; }
+                val opt_owner: opt[build_state.Section] = model.linked(m, res_link.ok);
+                if (sel opt_owner.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNLINKED, link_at, rd.at - link_at)}; }
+                keys.owner = opt_owner;
+                if (!grouped) {
+                    val res_after: res[opt[u64], diagnostic.Diagnostic] = apart(m, rd);
+                    if (sel res_after.err) { ret err[diagnostic.Diagnostic].err{res_after.err}; }
+                    opt_unique = res_after.ok;
+                }
+            }
+            if (grouped) {
+                read.skip(rd);
+                if (sel opt_unique.some || !read.take(rd, ",")) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, SIGNATURE, rd.at, 0)}; }
+                read.skip(rd);
+                val sig_at:        usize                            = rd.at;
+                val res_signature: res[View, diagnostic.Diagnostic] = section_name(m, rd);
+                if (sel res_signature.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, SIGNATURE, sig_at, 0)}; }
+                if (!comdat(rd))           { ret err[diagnostic.Diagnostic].err{read.refuse(rd, PLAIN_GROUP, sig_at, rd.at - sig_at)}; }
+                keys.group = opt[View].some{res_signature.ok};
+                val res_after: res[opt[u64], diagnostic.Diagnostic] = apart(m, rd);
+                if (sel res_after.err) { ret err[diagnostic.Diagnostic].err{res_after.err}; }
+                opt_unique = res_after.ok;
+            }
+        }
+        if (merging && spec.entsize == 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_ENTSIZE, flags_at, rd.at - flags_at)}; }
+        val opt_kind: opt[mink_section.Key] = stated_kind(model.naming(m), res_name.ok, t, res_flags.ok, spec.entsize);
+        if (sel opt_kind.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_KIND, flags_at, rd.at - flags_at)}; }
+        spec.kind = opt_kind.some.kind;
+        if ((spec.kind.flags & res_flags.ok) != spec.kind.flags) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, FLAGS_KIND, flags_at, rd.at - flags_at)}; }
+        spec.flags = res_flags.ok;
+    }
+    val err_rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel err_rest.err) { ret err_rest; }
+    if (push) {
+        val err_pushed: err[str] = model.push_section(m);
+        if (sel err_pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_pushed.err, at, 0)}; }
+    }
+    keys.unique = opt_unique;
+    val err_entered: err[str] = model.enter_kept(m, res_name.ok, spec, stated, keys);
+    if (sel err_entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_entered.err, at, res_name.ok.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the word of `words` that `v` spells, none when none does
+fun word_of(words: dialect.Words, v: View) opt[str] {
+    var i: u32 = 0;
+    for (i < words.len) {
+        if (same(v, words.at[i])) { ret opt[str].some{words.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the attribute of the dialect's sections `d` spelled `v`, none for none
+fun attribute_of(d: *dialect.Sections, v: View) opt[*dialect.Attribute] {
+    var i: u32 = 0;
+    for (i < d.attributes.len) {
+        if (same(v, d.attributes.at[i].word)) { ret opt[*dialect.Attribute].some{?d.attributes.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*dialect.Attribute].none{};
+}
+
+# a word at the reader, refused as `why` when there is none
+fun word_at(m: *model.Assembler, rd: *syntax.Reader, why: str) res[View, diagnostic.Diagnostic] {
+    read.skip(rd);
+    val at:       usize                                      = rd.at;
+    val res_word: res[model.Argument, diagnostic.Diagnostic] = model.read_item(m, rd, model.WORD);
+    if (sel res_word.err)      { ret res[View, diagnostic.Diagnostic].err{res_word.err}; }
+    if (!sel res_word.ok.word) { ret res[View, diagnostic.Diagnostic].err{read.refuse(rd, why, at, rd.at - at)}; }
+    ret res[View, diagnostic.Diagnostic].ok{res_word.ok.word};
+}
+
+# the width of a pointer of the object's architecture, which mach-o's literal pointers type states its entries in
+fun pointer_width(m: *model.Assembler) u64 {
+    val opt_pointer: opt[arch.Pointer] = model.builder(m).arch.pointer;
+    if (sel opt_pointer.none) { ret 0; }
+    ret opt_pointer.some.bytes::u64;
+}
+
+# the key mach-o's naming gives a section named `name` of type word `word` and flags `flags`, its literal pointers
+# `pointer` bytes wide
+fun macho_key(n: *contract.Naming, name: View, word: str, flags: mink_section.Flags, pointer: u64) opt[mink_section.Key] {
+    val res_kind_for: res[mink_section.Key, fail.Fail] = n.kind_for(store.Bytes{data: name.data, len: name.len}, word, flags, pointer);
+    if (sel res_kind_for.err) { ret opt[mink_section.Key].none{}; }
+    ret opt[mink_section.Key].some{res_kind_for.ok};
+}
+
+# `.section segment,section[, type[, attribute+attribute]]` read and entered, after a push when `push`. with no type the name's convention opens it, and a type opens it as the
+# format's naming classifies the name under that word and the flags of a section the image loads, with those its
+# attributes state, as pure instructions state code. an attribute is read only where its meaning is the kind's, and a
+# stub size is refused
+fun macho_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd: *syntax.Reader    = args.reader;
+    val d:  *dialect.Sections = m.dialect.sections;
+    read.skip(rd);
+    val at:     usize = rd.at;
+    var commas: u32   = 0;
+    for (rd.at < rd.end && !read.is_blank(rd.text[rd.at])) {
+        if (rd.text[rd.at] == ',') {
+            if (commas == 1) { brk; }
+            commas = commas + 1;
+        }
+        rd.at = rd.at + 1;
+    }
+    if (commas != 1 || rd.text[rd.at - 1] == ',' || rd.text[at] == ',') { ret err[diagnostic.Diagnostic].err{read.refuse(rd, SEGMENTED, at, rd.at - at)}; }
+    val name:   View             = read.span(rd, at, rd.at - at);
+    var spec:   build_state.Spec = conventional(model.naming(m), name);
+    var stated: bool             = false;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        val type_at:  usize                            = rd.at;
+        val res_word: res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_TYPE);
+        if (sel res_word.err) { ret err[diagnostic.Diagnostic].err{res_word.err}; }
+        val opt_spelled: opt[str] = word_of(d.types, res_word.ok);
+        if (sel opt_spelled.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_TYPE, type_at, rd.at - type_at)}; }
+        var flags: mink_section.Flags = mink_section.ALLOC;
+        read.skip(rd);
+        if (read.take(rd, ",")) {
+            for {
+                val attr_at:  usize                            = rd.at;
+                val res_attr: res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_ATTRIBUTE);
+                if (sel res_attr.err) { ret err[diagnostic.Diagnostic].err{res_attr.err}; }
+                val opt_known: opt[*dialect.Attribute] = attribute_of(d, res_attr.ok);
+                if (sel opt_known.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_ATTRIBUTE, attr_at, rd.at - attr_at)}; }
+                flags = (flags | opt_known.some.sets) & ~opt_known.some.clears;
+                read.skip(rd);
+                if (!read.take(rd, "+")) { brk; }
+            }
+            read.skip(rd);
+            if (read.peek(rd) == ',') { ret err[diagnostic.Diagnostic].err{read.refuse(rd, STUBS, rd.at, rd.end - rd.at)}; }
+        }
+        val opt_key: opt[mink_section.Key] = macho_key(model.naming(m), name, opt_spelled.some, flags, pointer_width(m));
+        if (sel opt_key.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_KIND, type_at, rd.at - type_at)}; }
+        spec.kind    = opt_key.some.kind;
+        spec.flags   = opt_key.some.kind.flags;
+        spec.entsize = opt_key.some.entsize;
+        stated       = true;
+    }
+    val err_rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel err_rest.err) { ret err_rest; }
+    if (push) {
+        val err_pushed: err[str] = model.push_section(m);
+        if (sel err_pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_pushed.err, at, 0)}; }
+    }
+    val err_entered: err[str] = model.enter_kept(m, name, spec, stated, model.NO_KEYS);
+    if (sel err_entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_entered.err, at, name.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# what a coff flag string states: the content word of its last content letter, nil for none, and the neutral flags of
+# a section that starts allocated
+# ---
+# type:  the content word
+# flags: the flags
+# bad:   the index of a letter no row of the dialect reads, none when every one is
+pub rec Lettered {
+    type:  str;
+    flags: mink_section.Flags;
+    bad:   opt[usize];
+}
+
+# the flag string `spelled` read by the letters of the dialect's sections `d`
+pub fun coff_letters(d: *dialect.Sections, spelled: View) Lettered {
+    var out: Lettered = Lettered{type: nil, flags: mink_section.ALLOC, bad: opt[usize].none{}};
+    var i:   usize    = 0;
+    for (i < spelled.len) {
+        var k: u32 = 0;
+        for (k < d.letters.len && d.letters.at[k].letter != spelled.data[i]) {
+            k = k + 1;
+        }
+        if (k == d.letters.len) {
+            out.bad = opt[usize].some{i};
+            ret out;
+        }
+        val l: *dialect.Letter = ?d.letters.at[k];
+        if (l.type != nil) { out.type = l.type; }
+        out.flags = (out.flags | l.sets) & ~l.clears;
+        i         = i + 1;
+    }
+    ret out;
+}
+
+# the content word a flag string of none states, initialized data, so `.section name, "w"` is writable data
+val INITIALIZED: str = "cnt_initialized_data";
+
+# the key coff's naming gives a section named `name` of the flag string read as `l`, none when it gives none
+fun coff_key(n: *contract.Naming, name: View, l: Lettered) opt[mink_section.Key] {
+    var t: str = l.type;
+    if (t == nil) { t = INITIALIZED; }
+    val res_kind_for: res[mink_section.Key, fail.Fail] = n.kind_for(store.Bytes{data: name.data, len: name.len}, t, l.flags, 0);
+    if (sel res_kind_for.err) { ret opt[mink_section.Key].none{}; }
+    ret opt[mink_section.Key].some{res_kind_for.ok};
+}
+
+# the selection of the dialect's sections `d` spelled `v`, none for none
+fun selection_of(d: *dialect.Sections, v: View) opt[*dialect.Selection] {
+    var i: u32 = 0;
+    for (i < d.selections.len) {
+        if (same(v, d.selections.at[i].word)) { ret opt[*dialect.Selection].some{?d.selections.at[i]}; }
+        i = i + 1;
+    }
+    ret opt[*dialect.Selection].none{};
+}
+
+# `.section name[, "flags"[, selection, symbol]]` read and entered, after a push when `push`. the flags' letters state the section's content word and its neutral flags, and a selection
+# puts it in the comdat group the symbol signs, kept by the selection's rule, apart from every section of its name in
+# another group. an associative selection's symbol locates the leader section it is kept with instead, as a link-order
+# section's names the section it is ordered after (`model.linked`), apart from every section of its name with another
+# leader
+fun coff_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val rd:       *syntax.Reader                   = args.reader;
+    val d:        *dialect.Sections                = m.dialect.sections;
+    val at:       usize                            = rd.at;
+    val res_name: res[View, diagnostic.Diagnostic] = section_name(m, rd);
+    if (sel res_name.err) { ret err[diagnostic.Diagnostic].err{res_name.err}; }
+    val bridges: *dialect.Bridges = m.dialect.bridges;
+    if (bridges != nil && same(res_name.ok, bridges.section)) { ret bridge_section(m, rd, push, at, res_name.ok.len); }
+    var spec:   build_state.Spec = conventional(model.naming(m), res_name.ok);
+    var stated: bool             = false;
+    var keys:   model.Keys       = model.NO_KEYS;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        val flags_at:    usize                            = rd.at;
+        val res_spelled: res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel res_spelled.err) { ret err[diagnostic.Diagnostic].err{res_spelled.err}; }
+        val l: Lettered = coff_letters(d, res_spelled.ok);
+        if (sel l.bad.some) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_FLAG, flags_at + 1 + l.bad.some, 1)}; }
+        val opt_key: opt[mink_section.Key] = coff_key(model.naming(m), res_name.ok, l);
+        if (sel opt_key.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, NO_KIND, flags_at, rd.at - flags_at)}; }
+        # a kind coff states by its name, as thread-local data, holds its kind's flags whatever the letters state
+        spec.kind    = opt_key.some.kind;
+        spec.flags   = l.flags | opt_key.some.kind.flags;
+        spec.entsize = 0;
+        stated       = true;
+        read.skip(rd);
+        if (read.take(rd, ",")) {
+            val word_at_: usize                            = rd.at;
+            val res_word: res[View, diagnostic.Diagnostic] = word_at(m, rd, UNKNOWN_SELECTION);
+            if (sel res_word.err) { ret err[diagnostic.Diagnostic].err{res_word.err}; }
+            val opt_chosen: opt[*dialect.Selection] = selection_of(d, res_word.ok);
+            if (sel opt_chosen.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_SELECTION, word_at_, rd.at - word_at_)}; }
+            read.skip(rd);
+            if (!read.take(rd, ",")) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, COMDAT_SYMBOL, rd.at, 0)}; }
+            read.skip(rd);
+            val sig_at:        usize                            = rd.at;
+            val res_signature: res[View, diagnostic.Diagnostic] = model.symbol_name(m, rd);
+            if (sel res_signature.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, COMDAT_SYMBOL, sig_at, 0)}; }
+            keys.rule = opt_chosen.some.rule;
+            if (mink_group.has(opt_chosen.some.rule, mink_group.ASSOCIATIVE)) {
+                val opt_leader: opt[build_state.Section] = model.linked(m, res_signature.ok);
+                if (sel opt_leader.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNLED, sig_at, rd.at - sig_at)}; }
+                keys.owner = opt_leader;
+            }
+            or { keys.group = opt[View].some{res_signature.ok}; }
+        }
+    }
+    val err_rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel err_rest.err) { ret err_rest; }
+    if (push) {
+        val err_pushed: err[str] = model.push_section(m);
+        if (sel err_pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_pushed.err, at, 0)}; }
+    }
+    val err_entered: err[str] = model.enter_kept(m, res_name.ok, spec, stated, keys);
+    if (sel err_entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_entered.err, at, res_name.ok.len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the rest of a `.section` of the section the dialect states bridges in read, after a push when `push`, and the
+# section entered. its flag string, as llvm's `"yi"`, states nothing, as the format lays the section out of the bridges
+# with characteristics of its own
+fun bridge_section(m: *model.Assembler, rd: *syntax.Reader, push: bool, at: usize, len: usize) err[diagnostic.Diagnostic] {
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        val res_spelled: res[View, diagnostic.Diagnostic] = model.string(m, rd);
+        if (sel res_spelled.err) { ret err[diagnostic.Diagnostic].err{res_spelled.err}; }
+    }
+    val err_rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel err_rest.err) { ret err_rest; }
+    if (push) {
+        val err_pushed: err[str] = model.push_section(m);
+        if (sel err_pushed.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_pushed.err, at, 0)}; }
+    }
+    val err_entered: err[str] = model.enter_bridges(m);
+    if (sel err_entered.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_entered.err, at, len)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun put_text(out: *vector.Vector[u8], p: *u8, n: usize) bool {
+    if (!held(vector.reserve[u8](out, n))) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        out.data[out.len] = p[i];
+        vector.commit[u8](out, 1);
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun put_str(out: *vector.Vector[u8], s: str) bool {
+    ret put_text(out, s, str_len(s));
+}
+
+fun held(r: res[usize, A.Error]) bool {
+    ret sel r.ok;
+}
+
+# whether `c` is a byte a section name or signature is written with unquoted
+fun plain_byte(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$';
+}
+
+# `v` bare when every byte is plain, else as a string (`masc.emit.line.put_string`), false when the output did not grow
+fun put_named(out: *vector.Vector[u8], v: View) bool {
+    var bare: bool  = v.len > 0;
+    var i:    usize = 0;
+    for (i < v.len) {
+        if (!plain_byte(v.data[i])) { bare = false; }
+        i = i + 1;
+    }
+    if (bare) { ret put_text(out, v.data, v.len); }
+    ret line.put_string(out, v);
+}
+
+# the mach-o section type word of a section of coalesced definitions (mach-o/loader.h, S_COALESCED)
+val COALESCED: str = "coalesced";
+
+# the `.section` line that reads back, under mach-o's naming `n` and the dialect's sections `d`, to a section named
+# `name` of `kind`, `flags` and entries of `entsize`, a literal pointer `pointer` bytes wide, appended to `out`: the name
+# alone when its convention opens it so, else the name and the first type word that classifies it so, alone or with
+# the first attribute that does. a section in a group is refused, as mach-o holds none
+pub fun macho_header(out: *vector.Vector[u8], n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, entsize: u64, pointer: u64, grouped: bool, coalesced: bool) err[Unwritten] {
+    if (grouped) { ret err[Unwritten].err{Unwritten.grouped{}}; }
+    var commas: u32   = 0;
+    var i:      usize = 0;
+    for (i < name.len) {
+        val c: u8 = name.data[i];
+        if (c == ',')       { commas = commas + 1; }
+        or (!plain_byte(c)) { ret err[Unwritten].err{Unwritten.quoted{}}; }
+        i = i + 1;
+    }
+    if (commas != 1) { ret err[Unwritten].err{Unwritten.quoted{}}; }
+    var word: str                = nil;
+    val c:    build_state.Spec   = conventional(n, name);
+    var attr: *dialect.Attribute = nil;
+    if (coalesced || c.kind != kind || c.flags != flags || c.entsize != entsize) {
+        # each type word alone, then with each attribute, only the coalesced one for a section of coalesced definitions
+        var a: u32 = 0;
+        for (a <= d.attributes.len && word == nil) {
+            var with: mink_section.Flags = mink_section.ALLOC;
+            if (a > 0) { with = (with | d.attributes.at[a - 1].sets) & ~d.attributes.at[a - 1].clears; }
+            var k: u32 = 0;
+            for (k < d.types.len && word == nil) {
+                if (coalesced && !str_equals(d.types.at[k], COALESCED)) {
+                    k = k + 1;
+                    cnt;
+                }
+                val opt_key: opt[mink_section.Key] = macho_key(n, name, d.types.at[k], with, pointer);
+                if (sel opt_key.some) {
+                    if (opt_key.some.kind == kind && opt_key.some.kind.flags == flags && opt_key.some.entsize == entsize) {
+                        word = d.types.at[k];
+                        if (a > 0) { attr = ?d.attributes.at[a - 1]; }
+                    }
+                }
+                k = k + 1;
+            }
+            a = a + 1;
+        }
+        if (word == nil) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    }
+    var ok: bool = put_str(out, "\t.section ") && put_text(out, name.data, name.len);
+    if (ok && word != nil) {
+        ok = put_str(out, ",") && put_str(out, word);
+        if (ok && attr != nil) { ok = put_str(out, ",") && put_str(out, attr.word); }
+    }
+    if (!ok || !put_str(out, "\n")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    ret err[Unwritten].ok{};
+}
+
+# the coff flag string that reads back to `kind` and `flags` for a section named `name`, its content letter first, then
+# `w` or `r` and `D` for a section the link drops, as `"xr"` and `"dw"`, into `out`, which holds four
+# bytes. none when no content letter's string reads back to them
+fun coff_string(n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, out: *u8) opt[usize] {
+    var k: u32 = 0;
+    for (k < d.letters.len) {
+        val l: *dialect.Letter = ?d.letters.at[k];
+        k = k + 1;
+        if (l.type == nil) { cnt; }
+        var len: usize = 0;
+        out[len] = l.letter;
+        len      = len + 1;
+        if ((flags & mink_section.WRITE) != 0) { out[len] = 'w'; }
+        or                                     { out[len] = 'r'; }
+        len = len + 1;
+        if ((flags & mink_section.ALLOC) == 0 && (l.clears & mink_section.ALLOC) == 0) {
+            out[len] = 'D';
+            len      = len + 1;
+        }
+        val read_: Lettered = coff_letters(d, View{data: out, len: len});
+        if (sel read_.bad.some) { cnt; }
+        val opt_key: opt[mink_section.Key] = coff_key(n, name, read_);
+        if (sel opt_key.some) {
+            if (opt_key.some.kind == kind && opt_key.some.entsize == 0 && (read_.flags | kind.flags) == flags) { ret opt[usize].some{len}; }
+        }
+    }
+    ret opt[usize].none{};
+}
+
+# the `.section` line that reads back, under coff's naming `n` and the dialect's sections `d`, to a section named
+# `name` of `kind`, `flags` and entries of `entsize`, in the comdat group `group` signs, kept by `rule`, appended to
+# `out`, `group` naming the leader for an associative rule. an element size, which no coff header states, is refused,
+# and so is a rule no selection word states
+pub fun coff_header(out: *vector.Vector[u8], n: *contract.Naming, d: *dialect.Sections, name: View, kind: *mink_section.Kind, flags: mink_section.Flags, entsize: u64, group: opt[View], rule: *mink_group.Rule) err[Unwritten] {
+    if (entsize != 0) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    var letters:     [4]u8;
+    val opt_spelled: opt[usize] = coff_string(n, d, name, kind, flags, ?letters[0]);
+    if (sel opt_spelled.none) { ret err[Unwritten].err{Unwritten.kind{}}; }
+    var word: str = nil;
+    if (sel group.some) {
+        var k: u32 = 0;
+        for (k < d.selections.len) {
+            if (d.selections.at[k].rule == rule) { word = d.selections.at[k].word; }
+            k = k + 1;
+        }
+        if (word == nil) { ret err[Unwritten].err{Unwritten.grouped{}}; }
+    }
+    if (!put_str(out, "\t.section ")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    if (!put_named(out, name))        { ret err[Unwritten].err{Unwritten.memory{}}; }
+    var ok: bool = put_str(out, ", \"") && put_text(out, ?letters[0], opt_spelled.some) && put_str(out, "\"");
+    if (sel group.some) {
+        ok = ok && put_str(out, ", ") && put_str(out, word) && put_str(out, ", ");
+        ok = ok && put_named(out, group.some);
+    }
+    if (!ok || !put_str(out, "\n")) { ret err[Unwritten].err{Unwritten.memory{}}; }
+    ret err[Unwritten].ok{};
+}
+
+fun failed(args: *model.Args, k: u32, e: err[str]) err[diagnostic.Diagnostic] {
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, e.err)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+fun built(args: *model.Args, k: u32, e: err[build_refusal.Refusal]) err[diagnostic.Diagnostic] {
+    if (sel e.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, e.err.message)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the section the dialect's directive at the row's parameter enters by its own name, as `.text`, opened as that name's
+# convention states
+pub fun named_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val n:    *dialect.Named = ?m.dialect.sections.named.at[args.directive.param::u32];
+    val name: View           = View{data: n.name, len: str_len(n.name)};
+    ret failed(args, 0, model.enter(m, name, conventional(model.naming(m), name), false, opt[u64].none{}));
+}
+
+# `.section` read in the dialect's grammar, after a push when `push`
+fun any_section(m: *model.Assembler, args: *model.Args, push: bool) err[diagnostic.Diagnostic] {
+    val form: dialect.Form = m.dialect.sections.form;
+    if (sel form.macho) { ret macho_section(m, args, push); }
+    if (sel form.coff)  { ret coff_section(m, args, push); }
+    ret section(m, args, push);
+}
+
+fun do_section(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret any_section(m, args, false);
+}
+
+fun do_pushsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret any_section(m, args, true);
+}
+
+fun do_popsection(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret failed(args, 0, model.pop_section(m));
+}
+
+# every section cut at its symbols, as mach-o states for the whole file
+fun do_subsections(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret built(args, 0, build_section.split_by_symbols(model.builder(m)));
+}
+
+fun do_previous(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret failed(args, 0, model.swap_previous(m));
+}
+
+# each named symbol given the binding the row's parameter indexes
+val BINDINGS: [4]*symbol.Binding = [4]*symbol.Binding{?symbol.GLOBAL, ?symbol.LOCAL, ?symbol.WEAKLY, ?symbol.UNIQUELY};
+
+fun do_binding(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+        val err_done: err[diagnostic.Diagnostic] = failed(args, k, model.declare_binding(m, res_symbol.ok, BINDINGS[args.directive.param]));
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the directive that gives a symbol binding `b`, the first row that does, none when none does
+pub fun binding_directive(b: *symbol.Binding) opt[str] {
+    var i: usize = 0;
+    for (i < ROW_COUNT) {
+        if (ROWS[i].handler == do_binding && BINDINGS[ROWS[i].param::usize] == b) { ret opt[str].some{ROWS[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# each named symbol made a weak external whose fallback `.set` names, searched for as the row's parameter indexes. a
+# search is a row here and in mink's symbol model (`mink.model.symbol.Search`), so a coff search characteristic
+# (IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY, LIBRARY, ALIAS) is one more row. anti-dependency is characteristic 4, which
+# Microsoft's PE format page does not list, from llvm-project llvm/include/llvm/BinaryFormat/COFF.h
+# (IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY = 4), spelled as llvm-mc spells it (MCSA_WeakAntiDep)
+val SEARCHES: [1]*symbol.Search = [1]*symbol.Search{?symbol.ANTI_DEPENDENCY};
+
+fun do_search(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+        val err_done: err[diagnostic.Diagnostic] = failed(args, k, model.declare_search(m, res_symbol.ok, SEARCHES[args.directive.param]));
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the directive that makes a symbol a weak external searched for as `s`, the first row that does, none when none does
+pub fun search_directive(s: *symbol.Search) opt[str] {
+    var i: usize = 0;
+    for (i < ROW_COUNT) {
+        if (ROWS[i].handler == do_search && SEARCHES[ROWS[i].param::usize] == s) { ret opt[str].some{ROWS[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the directive that names the symbol, and then the thunk, of the bridge being stated in the section the dialect
+# states bridges in, a symbol table index only the object writer knows, as llvm-mc spells it
+# (MCStreamer::emitCOFFSymbolIndex)
+pub val SYMBOL_INDEX: str = ".symidx";
+
+fun do_symbol_index(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+        val err_done: err[diagnostic.Diagnostic] = failed(args, k, model.bridge_index(m, res_symbol.ok, model.position(args, k)));
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each named symbol given the visibility the row's parameter indexes
+val VISIBILITIES: [3]*symbol.Visibility = [3]*symbol.Visibility{?symbol.HIDDEN, ?symbol.PROTECTED, ?symbol.INTERNAL};
+
+fun do_visibility(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, k);
+        if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+        val err_done: err[diagnostic.Diagnostic] = failed(args, k, model.declare_visibility(m, res_symbol.ok, VISIBILITIES[args.directive.param]));
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the directive that gives a symbol visibility `v`, the first row that does, none when none does
+pub fun visibility_directive(v: *symbol.Visibility) opt[str] {
+    var i: usize = 0;
+    for (i < ROW_COUNT) {
+        if (ROWS[i].handler == do_visibility && VISIBILITIES[ROWS[i].param::usize] == v) { ret opt[str].some{ROWS[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# a `.type` spelling and the kind of symbol it names
+rec Kind {
+    name: str;
+    kind: *symbol.Kind;
+}
+
+val KINDS: [5]Kind = [5]Kind{
+    Kind{name: "function", kind: ?symbol.FUNCTION},
+    Kind{name: "object", kind: ?symbol.DATA},
+    Kind{name: "notype", kind: ?symbol.NOTYPE},
+    Kind{name: "tls_object", kind: ?symbol.TLS},
+    Kind{name: "common", kind: ?symbol.COMMONS},
+};
+
+# the `.type` spelling of symbol kind `kind`, the first that names it, none when none does
+pub fun type_spelling(kind: *symbol.Kind) opt[str] {
+    var i: usize = 0;
+    for (i < 5) {
+        if (KINDS[i].kind == kind) { ret opt[str].some{KINDS[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+fun do_type(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+    val w: model.Argument = args.items[1].value;
+    if (!sel w.word) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, UNKNOWN_TYPE)}; }
+    var i: usize = 0;
+    for (i < 5) {
+        if (same(w.word, KINDS[i].name)) { ret failed(args, 1, model.declare_kind(m, res_symbol.ok, KINDS[i].kind)); }
+        i = i + 1;
+    }
+    ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, UNKNOWN_TYPE)};
+}
+
+fun do_size(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+    val v: model.Argument = args.items[1].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    var e: expr.Expr = v.expression;
+    if (sel e.constant) {
+        if (e.constant < 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, NEGATIVE)}; }
+        ret failed(args, 1, model.declare_size(m, res_symbol.ok, build_state.Size.fixed{e.constant:~u64}));
+    }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    val err_bound: err[str] = model.bind(m, ?e, model.position(args, 1));
+    if (sel err_bound.err) { ret failed(args, 1, err_bound); }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    val d: build_state.Difference = build_state.Difference{plus: e.difference.plus, minus: e.difference.minus, addend: e.difference.addend};
+    ret failed(args, 1, model.declare_size(m, res_symbol.ok, build_state.Size.measured{d}));
+}
+
+# each value of an integer data directive at the row's width, which the set states
+pub fun integers(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val err_done: err[diagnostic.Diagnostic] = model.datum(m, args, k, args.directive.param);
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each string's bytes, a nul after each when the row's parameter is 1
+fun do_strings(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var k: u32 = 0;
+    for (k < args.count) {
+        val v: model.Argument = args.items[k].value;
+        if (!sel v.string) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_A_STRING)}; }
+        val err_bytes: err[diagnostic.Diagnostic] = built(args, k, build_emit.data(model.builder(m), v.string.data, v.string.len));
+        if (sel err_bytes.err) { ret err_bytes; }
+        if (args.directive.param == 1) {
+            val err_nul: err[diagnostic.Diagnostic] = built(args, k, build_emit.integer(model.builder(m), 0, 1));
+            if (sel err_nul.err) { ret err_nul; }
+        }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# each value as a leb128, signed when the row's parameter is 1: a constant as its shortest, and a difference of labels
+# as a value the builder's layout settles, whatever of it is placed so far
+fun do_leb128(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    var how: fixup.Encoding = fixup.ULEB;
+    if (args.directive.param == 1) { how = fixup.SLEB; }
+    var k: u32 = 0;
+    for (k < args.count) {
+        val err_done: err[diagnostic.Diagnostic] = leb(m, args, k, how);
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# operand `k` of `args` written as a leb128 of encoding `how`
+fun leb(m: *model.Assembler, args: *model.Args, k: u32, how: fixup.Encoding) err[diagnostic.Diagnostic] {
+    val v: model.Argument = args.items[k].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_CONSTANT)}; }
+    var e: expr.Expr = v.expression;
+    if (sel e.constant) {
+        var bytes: [10]u8;
+        var len:   usize = 0;
+        if (how == fixup.SLEB) { len = leb128.put_signed(?bytes[0], e.constant); }
+        or                     { len = leb128.put_unsigned(?bytes[0], e.constant:~u64); }
+        ret built(args, k, build_emit.data(model.builder(m), ?bytes[0], len));
+    }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_CONSTANT)}; }
+    val err_bound: err[str] = model.bind(m, ?e, model.position(args, k));
+    if (sel err_bound.err) { ret failed(args, k, err_bound); }
+    if (!sel e.difference) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_CONSTANT)}; }
+    val d: build_state.Difference = build_state.Difference{plus: e.difference.plus, minus: e.difference.minus, addend: e.difference.addend};
+    ret built(args, k, build_emit.deferred(model.builder(m), d, how, 0));
+}
+
+# the ieee 754 interchange format `bytes` wide, none for a width that names none
+fun float_format(bytes: u64) opt[ieee.Format] {
+    if (bytes == 2) { ret opt[ieee.Format].some{ieee.F16}; }
+    if (bytes == 4) { ret opt[ieee.Format].some{ieee.F32}; }
+    if (bytes == 8) { ret opt[ieee.Format].some{ieee.F64}; }
+    ret opt[ieee.Format].none{};
+}
+
+# each literal rounded once to the ieee 754 format the row's parameter names the width of
+fun do_floats(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val opt_float_format: opt[ieee.Format] = float_format(args.directive.param);
+    if (sel opt_float_format.none) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, NO_FLOAT_FORMAT)}; }
+    var k: u32 = 0;
+    for (k < args.count) {
+        val v: model.Argument = args.items[k].value;
+        if (!sel v.float) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_A_NUMBER)}; }
+        val res_bits: res[u128, number.ParseError] = model.float_bits(v.float, opt_float_format.some);
+        if (sel res_bits.err) { ret err[diagnostic.Diagnostic].err{model.refuse(args, k, model.NOT_A_NUMBER)}; }
+        val err_done: err[diagnostic.Diagnostic] = built(args, k, build_emit.integer(model.builder(m), res_bits.ok::u64, args.directive.param::u8));
+        if (sel err_done.err) { ret err_done; }
+        k = k + 1;
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# an alignment: its boundary in bytes, or as a power of two when `power`, then an optional fill byte and limit
+fun aligned(m: *model.Assembler, args: *model.Args, power: bool) err[diagnostic.Diagnostic] {
+    val res_constant: res[i64, diagnostic.Diagnostic] = model.constant(args, 0);
+    if (sel res_constant.err) { ret err[diagnostic.Diagnostic].err{res_constant.err}; }
+    var boundary: u64 = res_constant.ok:~u64;
+    if (power) {
+        if (res_constant.ok < 0 || res_constant.ok >= 64) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, model.RANGE)}; }
+        boundary = 1::u64 << res_constant.ok::u64;
+    }
+    or (res_constant.ok <= 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, build_refusal.BOUNDARY)}; }
+    var al: build_state.Align = build_state.Align{boundary: boundary, fill: opt[u8].none{}, max: opt[u64].none{}};
+    if (model.given(args, 1)) {
+        val res_fill: res[i64, diagnostic.Diagnostic] = model.constant(args, 1);
+        if (sel res_fill.err)                        { ret err[diagnostic.Diagnostic].err{res_fill.err}; }
+        if (res_fill.ok < -128 || res_fill.ok > 255) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+        al.fill = opt[u8].some{(res_fill.ok & 0xFF)::u8};
+    }
+    if (model.given(args, 2)) {
+        val res_max: res[i64, diagnostic.Diagnostic] = model.constant(args, 2);
+        if (sel res_max.err) { ret err[diagnostic.Diagnostic].err{res_max.err}; }
+        if (res_max.ok < 0)  { ret err[diagnostic.Diagnostic].err{model.refuse(args, 2, NEGATIVE)}; }
+        al.max = opt[u64].some{res_max.ok:~u64};
+    }
+    ret built(args, 0, build_emit.align(model.builder(m), al));
+}
+
+# `.align`, which reads its boundary as the set states
+fun do_align(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, model.builder(m).set.source.align == source.ALIGN_POWER);
+}
+
+fun do_p2align(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, true);
+}
+
+fun do_balign(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    ret aligned(m, args, false);
+}
+
+# `count` copies of the `size` low bytes of `value` in the set's byte order, zeros as a zero fill
+fun repeated(m: *model.Assembler, args: *model.Args, count: u64, size: u64, value: u64) err[diagnostic.Diagnostic] {
+    if (count == 0 || size == 0)              { ret err[diagnostic.Diagnostic].ok{}; }
+    if (count > 0xFFFF_FFFF_FFFF_FFFF / size) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, OVERSIZED)}; }
+    val total: u64 = count * size;
+    if (value == 0) { ret built(args, 0, build_emit.zero(model.builder(m), total)); }
+    var pattern: [8]u8;
+    build_state.ordered(model.builder(m), value, size::usize, ?pattern[0]);
+    var bytes:    vector.Vector[u8]   = vector.init[u8](m.a);
+    val res_room: res[usize, A.Error] = vector.reserve[u8](?bytes, total::usize);
+    if (sel res_room.err) {
+        vector.dnit[u8](?bytes);
+        ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, field.MEMORY)};
+    }
+    var i: u64 = 0;
+    for (i < total) {
+        bytes.data[i::usize] = pattern[(i % size)::usize];
+        i                    = i + 1;
+    }
+    val err_done: err[diagnostic.Diagnostic] = built(args, 0, build_emit.data(model.builder(m), bytes.data, total::usize));
+    vector.dnit[u8](?bytes);
+    ret err_done;
+}
+
+# a count operand, refused when negative
+fun count(args: *model.Args, k: u32, otherwise: i64) res[u64, diagnostic.Diagnostic] {
+    val res_constant_or: res[i64, diagnostic.Diagnostic] = model.constant_or(args, k, otherwise);
+    if (sel res_constant_or.err) { ret res[u64, diagnostic.Diagnostic].err{res_constant_or.err}; }
+    if (res_constant_or.ok < 0)  { ret res[u64, diagnostic.Diagnostic].err{model.refuse(args, k, NEGATIVE)}; }
+    ret res[u64, diagnostic.Diagnostic].ok{res_constant_or.ok:~u64};
+}
+
+# `.skip size[, fill]`: size bytes of the fill byte
+fun do_skip(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_count: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+    val res_fill: res[i64, diagnostic.Diagnostic] = model.constant_or(args, 1, 0);
+    if (sel res_fill.err)                        { ret err[diagnostic.Diagnostic].err{res_fill.err}; }
+    if (res_fill.ok < -128 || res_fill.ok > 255) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+    ret repeated(m, args, res_count.ok, 1, (res_fill.ok & 0xFF):~u64);
+}
+
+# `.zero size`: size zero bytes
+fun do_zero(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_count: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+    ret repeated(m, args, res_count.ok, 1, 0);
+}
+
+# `.fill repeat[, size[, value]]`: repeat copies of size bytes, of an eight byte number whose high four bytes are zero
+# and whose low four are the value's
+fun do_fill(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_count: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel res_count.err) { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+    val res_size: res[u64, diagnostic.Diagnostic] = count(args, 1, 1);
+    if (sel res_size.err) { ret err[diagnostic.Diagnostic].err{res_size.err}; }
+    if (res_size.ok > 8)  { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.RANGE)}; }
+    val res_value: res[i64, diagnostic.Diagnostic] = model.constant_or(args, 2, 0);
+    if (sel res_value.err) { ret err[diagnostic.Diagnostic].err{res_value.err}; }
+    ret repeated(m, args, res_count.ok, res_size.ok, res_value.ok:~u64 & 0xFFFF_FFFF);
+}
+
+# `.set name, value` when the row's parameter is 0, which may redefine it, and `.equ` when 1, which may not
+fun do_equate(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+    val v: model.Argument = args.items[1].value;
+    if (!sel v.expression) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 1, model.NOT_CONSTANT)}; }
+    ret failed(args, 0, model.equate(m, res_symbol.ok, v.expression, args.directive.param == 1, model.position(args, 1)));
+}
+
+pub val UNKNOWN_RELOCATION: str = "the object's format names no kind of this relocation for the architecture";
+pub val RELOCATION_PLACE:   str = "the relocation place is neither an offset nor a label plus one";
+pub val RELOCATION_TARGET:  str = "the relocation target is neither a label plus an addend nor a constant addend";
+
+# `.reloc offset, name[, target]` read: a relocation of the kind `name` names at `offset` of the
+# current section, a number from its start or a label plus one, naming `target`, a label plus an addend, or nothing
+# with a constant addend or none
+fun do_reloc(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val rd:        *syntax.Reader                        = args.reader;
+    val place_at:  usize                                 = rd.at;
+    var res_place: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+    if (sel res_place.err) { ret err[diagnostic.Diagnostic].err{res_place.err}; }
+    val err_bound: err[str] = model.bind(m, ?res_place.ok, read.refuse(rd, "", place_at, 0).span.start);
+    if (sel err_bound.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_bound.err, place_at, rd.at - place_at)}; }
+    var opt_label: opt[build_state.Label] = opt[build_state.Label].none{};
+    var offset:    i64                    = 0;
+    if (sel res_place.ok.constant) { offset = res_place.ok.constant; }
+    or (sel res_place.ok.symbol) {
+        if (res_place.ok.symbol.fixup != operand.NO_FIXUP) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, RELOCATION_PLACE, place_at, rd.at - place_at)}; }
+        opt_label = opt[build_state.Label].some{res_place.ok.symbol.id};
+        offset    = res_place.ok.symbol.addend;
+    }
+    or              { ret err[diagnostic.Diagnostic].err{read.refuse(rd, RELOCATION_PLACE, place_at, rd.at - place_at)}; }
+    if (offset < 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, RELOCATION_PLACE, place_at, rd.at - place_at)}; }
+    read.skip(rd);
+    if (!read.take(rd, ",")) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, model.EXPECTED_COMMA, rd.at, read.token(rd, rd.at))}; }
+    read.skip(rd);
+    val name_at: usize = rd.at;
+    val len:     usize = read.name(rd);
+    if (len == 0) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, model.NOT_A_NAME, name_at, read.token(rd, name_at))}; }
+    rd.at = name_at + len;
+    val opt_kind: opt[*mink_reloc.Kind] = build_label.relocation_named(?m.b, read.span(rd, name_at, len));
+    if (sel opt_kind.none) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, UNKNOWN_RELOCATION, name_at, len)}; }
+    var opt_target: opt[build_state.Label] = opt[build_state.Label].none{};
+    var addend:     i64                    = 0;
+    read.skip(rd);
+    if (read.take(rd, ",")) {
+        read.skip(rd);
+        val aim_at:    usize                                 = rd.at;
+        var res_aimed: res[expr.Expr, diagnostic.Diagnostic] = expr.parse(rd, operand.NO_FIXUP);
+        if (sel res_aimed.err) { ret err[diagnostic.Diagnostic].err{res_aimed.err}; }
+        val err_named: err[str] = model.bind(m, ?res_aimed.ok, read.refuse(rd, "", aim_at, 0).span.start);
+        if (sel err_named.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_named.err, aim_at, rd.at - aim_at)}; }
+        # a constant is the addend of a relocation that names nothing
+        if (sel res_aimed.ok.constant) { addend = res_aimed.ok.constant; }
+        or (sel res_aimed.ok.symbol) {
+            if (res_aimed.ok.symbol.fixup != operand.NO_FIXUP) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, RELOCATION_TARGET, aim_at, rd.at - aim_at)}; }
+            opt_target = opt[build_state.Label].some{res_aimed.ok.symbol.id};
+            addend     = res_aimed.ok.symbol.addend;
+        }
+        or { ret err[diagnostic.Diagnostic].err{read.refuse(rd, RELOCATION_TARGET, aim_at, rd.at - aim_at)}; }
+    }
+    val err_rest: err[diagnostic.Diagnostic] = model.ended(rd);
+    if (sel err_rest.err) { ret err_rest; }
+    val err_stated: err[build_refusal.Refusal] = build_label.relocate(?m.b, build_state.Direct{at: opt_label, offset: offset:~u64, kind: opt_kind.some, target: opt_target, addend: addend});
+    if (sel err_stated.err) { ret err[diagnostic.Diagnostic].err{read.refuse(rd, err_stated.err.message, place_at, rd.at - place_at)}; }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the alignment storage of `size` bytes takes when none is stated: the largest power of two not above it, at most 16
+fun natural(size: u64) u64 {
+    var a: u64 = 1;
+    for (a * 2 <= size && a < 16) {
+        a = a * 2;
+    }
+    ret a;
+}
+
+# `size` bytes at a boundary of `align` reserved for label `l` in `.bss`, the sections as they were after
+fun local_storage(m: *model.Assembler, args: *model.Args, l: build_state.Label, size: u64, align: u64) err[diagnostic.Diagnostic] {
+    val b:            *build_state.Builder       = model.builder(m);
+    val opt_was:      opt[build_state.Section]   = build_section.current(b);
+    val bridging:     bool                       = model.bridging(m);
+    val opt_previous: opt[build_state.Section]   = model.previous_of(m);
+    val name:         View                       = View{data: ".bss", len: 4};
+    val err_entered:  err[diagnostic.Diagnostic] = failed(args, 0, model.enter(m, name, conventional(model.naming(m), name), false, opt[u64].none{}));
+    if (sel err_entered.err) { ret err_entered; }
+    val err_built: err[diagnostic.Diagnostic] = built(args, 2, build_emit.align(b, build_state.Align{boundary: align, fill: opt[u8].none{}, max: opt[u64].none{}}));
+    if (sel err_built.err) { ret err_built; }
+    val err_placed: err[diagnostic.Diagnostic] = built(args, 0, build_label.define(b, l));
+    if (sel err_placed.err) { ret err_placed; }
+    val err_zeros: err[diagnostic.Diagnostic] = built(args, 1, build_emit.zero(b, size));
+    if (sel err_zeros.err) { ret err_zeros; }
+    if (bridging) {
+        val err_again: err[diagnostic.Diagnostic] = failed(args, 0, model.enter_bridges(m));
+        if (sel err_again.err) { ret err_again; }
+    }
+    or (sel opt_was.some) {
+        val err_back: err[diagnostic.Diagnostic] = built(args, 0, build_section.switch(b, opt_was.some));
+        if (sel err_back.err) { ret err_back; }
+    }
+    model.restore_previous(m, opt_previous);
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `.comm name, size[, align]`, common storage, or local storage in `.bss` for a name declared local, as `.lcomm`
+# always is when the row's parameter is 1
+fun do_common(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+    val res_size: res[u64, diagnostic.Diagnostic] = count(args, 1, 0);
+    if (sel res_size.err) { ret err[diagnostic.Diagnostic].err{res_size.err}; }
+    val res_align: res[u64, diagnostic.Diagnostic] = count(args, 2, natural(res_size.ok)::i64);
+    if (sel res_align.err)                                             { ret err[diagnostic.Diagnostic].err{res_align.err}; }
+    if (res_align.ok == 0 || (res_align.ok & (res_align.ok - 1)) != 0) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 2, build_refusal.BOUNDARY)}; }
+    val opt_binding: opt[*symbol.Binding] = model.binding_of(m, res_symbol.ok);
+    var local:       bool                 = args.directive.param == 1;
+    if (sel opt_binding.some) { local = local || opt_binding.some == ?symbol.LOCAL; }
+    if (local)                { ret local_storage(m, args, res_symbol.ok, res_size.ok, res_align.ok); }
+    if (sel opt_binding.none) {
+        val err_declared: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_binding(m, res_symbol.ok, ?symbol.GLOBAL));
+        if (sel err_declared.err) { ret err_declared; }
+    }
+    val opt_kind: opt[*symbol.Kind] = model.kind_declared(m, res_symbol.ok);
+    if (sel opt_kind.none) {
+        val err_typed: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_kind(m, res_symbol.ok, ?symbol.DATA));
+        if (sel err_typed.err) { ret err_typed; }
+    }
+    ret built(args, 0, build_label.common(model.builder(m), res_symbol.ok, res_size.ok, res_align.ok));
+}
+
+val TYPE_ITEMS:   [2]model.Item = [2]model.Item{model.NAME, model.WORD};
+val NAMED_VALUE:  [2]model.Item = [2]model.Item{model.NAME, model.EXPRESSION};
+val THREE_VALUES: [3]model.Item = [3]model.Item{model.EXPRESSION, model.EXPRESSION, model.EXPRESSION};
+val STORAGE:      [3]model.Item = [3]model.Item{model.NAME, model.EXPRESSION, model.EXPRESSION};
+
+val TYPED:  model.Shape = model.Shape{items: ?TYPE_ITEMS[0], len: 2, least: 2, repeat: false, text: false};
+val VALUED: model.Shape = model.Shape{items: ?NAMED_VALUE[0], len: 2, least: 2, repeat: false, text: false};
+val ALIGN:  model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 3, least: 1, repeat: false, text: false};
+val SKIP:   model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 2, least: 1, repeat: false, text: false};
+val ZERO:   model.Shape = model.Shape{items: ?THREE_VALUES[0], len: 1, least: 1, repeat: false, text: false};
+val COMMON: model.Shape = model.Shape{items: ?STORAGE[0], len: 3, least: 2, repeat: false, text: false};
+
+# the core rows
+val ROW_COUNT: usize = 33;
+
+val ROWS: [ROW_COUNT]model.Directive = [ROW_COUNT]model.Directive{
+    model.Directive{name: ".section", operands: model.TEXT, handler: do_section, param: 0},
+    model.Directive{name: ".pushsection", operands: model.TEXT, handler: do_pushsection, param: 0},
+    model.Directive{name: ".popsection", operands: model.NO_ITEMS, handler: do_popsection, param: 0},
+    model.Directive{name: ".previous", operands: model.NO_ITEMS, handler: do_previous, param: 0},
+    model.Directive{name: ".subsections_via_symbols", operands: model.NO_ITEMS, handler: do_subsections, param: 0},
+    model.Directive{name: ".globl", operands: model.NAMES, handler: do_binding, param: 0},
+    model.Directive{name: ".global", operands: model.NAMES, handler: do_binding, param: 0},
+    model.Directive{name: ".local", operands: model.NAMES, handler: do_binding, param: 1},
+    model.Directive{name: ".weak", operands: model.NAMES, handler: do_binding, param: 2},
+    model.Directive{name: ".unique", operands: model.NAMES, handler: do_binding, param: 3},
+    model.Directive{name: ".weak_anti_dep", operands: model.NAMES, handler: do_search, param: 0},
+    model.Directive{name: ".hidden", operands: model.NAMES, handler: do_visibility, param: 0},
+    model.Directive{name: ".protected", operands: model.NAMES, handler: do_visibility, param: 1},
+    model.Directive{name: ".internal", operands: model.NAMES, handler: do_visibility, param: 2},
+    model.Directive{name: ".ascii", operands: model.STRINGS, handler: do_strings, param: 0},
+    model.Directive{name: ".asciz", operands: model.STRINGS, handler: do_strings, param: 1},
+    model.Directive{name: ".string", operands: model.STRINGS, handler: do_strings, param: 1},
+    model.Directive{name: ".uleb128", operands: model.EXPRESSIONS, handler: do_leb128, param: 0},
+    model.Directive{name: ".sleb128", operands: model.EXPRESSIONS, handler: do_leb128, param: 1},
+    model.Directive{name: ".float", operands: model.FLOATS, handler: do_floats, param: 4},
+    model.Directive{name: ".double", operands: model.FLOATS, handler: do_floats, param: 8},
+    model.Directive{name: ".align", operands: ALIGN, handler: do_align, param: 0},
+    model.Directive{name: ".p2align", operands: ALIGN, handler: do_p2align, param: 0},
+    model.Directive{name: ".balign", operands: ALIGN, handler: do_balign, param: 0},
+    model.Directive{name: ".skip", operands: SKIP, handler: do_skip, param: 0},
+    model.Directive{name: ".zero", operands: ZERO, handler: do_zero, param: 0},
+    model.Directive{name: ".fill", operands: ALIGN, handler: do_fill, param: 0},
+    model.Directive{name: ".set", operands: VALUED, handler: do_equate, param: 0},
+    model.Directive{name: ".equ", operands: VALUED, handler: do_equate, param: 1},
+    model.Directive{name: ".comm", operands: COMMON, handler: do_common, param: 0},
+    model.Directive{name: ".lcomm", operands: COMMON, handler: do_common, param: 1},
+    model.Directive{name: ".reloc", operands: model.TEXT, handler: do_reloc, param: 0},
+    model.Directive{name: SYMBOL_INDEX, operands: model.NAMES, handler: do_symbol_index, param: 0},
+};
+
+# the layer of the core rows
+pub val LAYER: model.Layer = model.Layer{name: "core", directives: model.Directives{at: ?ROWS[0], len: ROW_COUNT::u32}, context: nil, finish: model.finished};
+
+val ONE_VALUE_ITEMS: [1]model.Item = [1]model.Item{model.EXPRESSION};
+val ONE_VALUE:       model.Shape   = model.Shape{items: ?ONE_VALUE_ITEMS[0], len: 1, least: 1, repeat: false, text: false};
+
+# the rows of a dialect that states a symbol's kind and size as elf's does
+val TYPED_ROWS: [2]model.Directive = [2]model.Directive{
+    model.Directive{name: ".type", operands: TYPED, handler: do_type, param: 0},
+    model.Directive{name: ".size", operands: VALUED, handler: do_size, param: 0},
+};
+
+pub val TYPED_LAYER: model.Layer = model.Layer{name: "typed", directives: model.Directives{at: ?TYPED_ROWS[0], len: 2}, context: nil, finish: model.finished};
+
+# the rows of a dialect that states a symbol's class and type in a definition, as coff's does
+val DEFINED_ROWS: [4]model.Directive = [4]model.Directive{
+    model.Directive{name: ".def", operands: model.ONE, handler: do_def, param: 0},
+    model.Directive{name: ".scl", operands: ONE_VALUE, handler: do_scl, param: 0},
+    model.Directive{name: ".type", operands: ONE_VALUE, handler: do_coff_type, param: 0},
+    model.Directive{name: ".endef", operands: model.NO_ITEMS, handler: do_endef, param: 0},
+};
+
+pub val DEFINED_LAYER: model.Layer = model.Layer{name: "defined", directives: model.Directives{at: ?DEFINED_ROWS[0], len: 4}, context: nil, finish: defined};
+
+# the layer of the rows dialect `d` states a symbol's kind and size by, nil for one that states neither
+pub fun symbols(d: *dialect.Dialect) *model.Layer {
+    if (sel d.symbols.typed)   { ret ?TYPED_LAYER; }
+    if (sel d.symbols.defined) { ret ?DEFINED_LAYER; }
+    ret nil;
+}
+
+# coff's symbol type of a function, its complex type function above no base type (pe format, "Type Representation")
+pub val COFF_FUNCTION: u64 = 0x20;
+
+# coff's symbol type of a symbol of no type
+pub val COFF_NOTYPE: u64 = 0;
+
+# coff's storage class of a symbol another object may name (pe format, "Storage Class")
+pub val COFF_EXTERNAL: u64 = 2;
+
+# coff's storage class of a symbol only its own object names
+pub val COFF_STATIC: u64 = 3;
+
+# the coff storage class of a symbol of binding `b`
+pub fun coff_class(b: *symbol.Binding) u64 {
+    if (b == ?symbol.LOCAL) { ret COFF_STATIC; }
+    ret COFF_EXTERNAL;
+}
+
+# `.def name`: open the definition of a symbol
+fun do_def(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    if (m.defining.open) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, DEFINING)}; }
+    val res_symbol: res[build_state.Label, diagnostic.Diagnostic] = model.symbol(m, args, 0);
+    if (sel res_symbol.err) { ret err[diagnostic.Diagnostic].err{res_symbol.err}; }
+    m.defining       = model.NOT_DEFINING;
+    m.defining.open  = true;
+    m.defining.label = res_symbol.ok;
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `.scl class`: the storage class of the symbol the open definition defines
+fun do_scl(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    if (!m.defining.open) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNDEFINING)}; }
+    val res_count: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel res_count.err)                                            { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+    if (res_count.ok != COFF_EXTERNAL && res_count.ok != COFF_STATIC) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNKNOWN_CLASS)}; }
+    m.defining.class = opt[u64].some{res_count.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `.type type`: the type of the symbol the open definition defines
+fun do_coff_type(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    if (!m.defining.open) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNDEFINING)}; }
+    val res_count: res[u64, diagnostic.Diagnostic] = count(args, 0, 0);
+    if (sel res_count.err)                                            { ret err[diagnostic.Diagnostic].err{res_count.err}; }
+    if (res_count.ok != COFF_FUNCTION && res_count.ok != COFF_NOTYPE) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNKNOWN_COFF_TYPE)}; }
+    m.defining.type = opt[u64].some{res_count.ok};
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# `.endef`: the open definition closed, its class the symbol's binding, static bound locally and external bound
+# globally unless a directive bound it otherwise, and its type the symbol's kind
+fun do_endef(m: *model.Assembler, args: *model.Args) err[diagnostic.Diagnostic] {
+    if (!m.defining.open) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, UNDEFINING)}; }
+    val d: model.Defining = m.defining;
+    m.defining = model.NOT_DEFINING;
+    if (sel d.class.some) {
+        val opt_bound: opt[*symbol.Binding] = model.binding_of(m, d.label);
+        if (d.class.some == COFF_STATIC) {
+            val err_local: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_binding(m, d.label, ?symbol.LOCAL));
+            if (sel err_local.err) { ret err_local; }
+        }
+        or (sel opt_bound.none) {
+            val err_global: err[diagnostic.Diagnostic] = failed(args, 0, model.declare_binding(m, d.label, ?symbol.GLOBAL));
+            if (sel err_global.err) { ret err_global; }
+        }
+        or (sel opt_bound.some) {
+            if (opt_bound.some == ?symbol.LOCAL) { ret err[diagnostic.Diagnostic].err{model.refuse(args, 0, STATIC_EXTERNAL)}; }
+        }
+    }
+    if (sel d.type.some) {
+        if (d.type.some == COFF_FUNCTION) { ret failed(args, 0, model.declare_kind(m, d.label, ?symbol.FUNCTION)); }
+    }
+    ret err[diagnostic.Diagnostic].ok{};
+}
+
+# the end of a source under coff's rows, refused with a definition still open
+fun defined(context: ptr, m: *model.Assembler) err[model.Refusal] {
+    if (m.defining.open) { ret err[model.Refusal].err{model.nowhere(UNENDED)}; }
+    ret err[model.Refusal].ok{};
+}
+
+# the assembly started in the section the dialect starts in, as `.text` on elf and `__TEXT,__text` on mach-o, opened as its convention states when something is first written to it, a label is placed
+# in it or a directive names it, so a source whose first statement is a `.section` holds no empty starting section
+pub fun begin(m: *model.Assembler) err[str] {
+    val start: str              = m.dialect.sections.start;
+    val name:  View             = View{data: start, len: str_len(start)};
+    var spec:  build_state.Spec = conventional(model.naming(m), name);
+    spec.name = opt[str].some{start};
+    val err_begun: err[build_refusal.Refusal] = build_section.begin(model.builder(m), spec);
+    if (sel err_begun.err) { ret err[str].err{err_begun.err.message}; }
+    ret err[str].ok{};
+}
+
+# the directive of the dialect's sections `d` that enters a nameless section of `kind`, `flags`, `disposition` and
+# entries of `entsize` by its key alone under the object format's naming `n`: the first that enters a section by a
+# name whose convention opens it so, none when none does. the section read back is named as the directive's row names
+# it
+pub fun kind_directive(n: *contract.Naming, d: *dialect.Sections, kind: *mink_section.Kind, flags: mink_section.Flags, disposition: *mink_section.Disposition, entsize: u64) opt[*dialect.Named] {
+    var i: u32 = 0;
+    for (i < d.named.len) {
+        val row: *dialect.Named = ?d.named.at[i];
+        i = i + 1;
+        val c: build_state.Spec = conventional(n, View{data: row.name, len: str_len(row.name)});
+        if (c.kind == kind && c.flags == flags && c.disposition == disposition && c.entsize == entsize) { ret opt[*dialect.Named].some{row}; }
+    }
+    ret opt[*dialect.Named].none{};
+}
+
+# the name the object format gives a nameless section of `kind` and entries of `entsize` when it writes the object, none
+# for a key the format has no name for
+pub fun format_name(n: *contract.Naming, kind: *mink_section.Kind, entsize: u64) opt[View] {
+    val res_name: res[str, fail.Fail] = n.name_of(mink_section.Key{kind: kind, entsize: entsize});
+    if (sel res_name.err) { ret opt[View].none{}; }
+    ret opt[View].some{View{data: res_name.ok, len: str_len(res_name.ok)}};
+}

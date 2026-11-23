@@ -1,0 +1,244 @@
+# the aarch64 extension catalog and its +ext/-ext selection syntax
+#
+# a row is an architecture version or a FEAT_* feature of the Arm Architecture Reference Manual for
+# A-profile, each named as the manual's feature model names it. the versions are rows so that a
+# constraint the manual conditions on a version, as "an Armv8.1 implementation with FEAT_AdvSIMD has
+# FEAT_RDM", is a combination like any other. a level armv8-a to armv9.N-a selects its version, which
+# closes to every feature the version makes mandatory: its plain implications are the features it makes
+# mandatory outright, and its combinations the ones it makes mandatory with others held.
+#
+# the rows, their ids, implications, revisions, combinations and conflicts, the levels, the name index and
+# the extension names for the rows are generated, by gen aarch64 into gen_extension, from Arm's feature model
+# (Features.json of the AARCHMRS release vendored under gen/vendor/aarchmrs) and the feature names
+# (AArch64Features.td of the llvm-project revision vendored under gen/vendor/llvm-aarch64). how each
+# constraint of the model is read is gen/src/aarch64/feature.mach's, and gen_extension is never edited by
+# hand. the ids are gen_extension's: SVE, SME, FP and SIMD first, as the register
+# file names them, then the versions in order, then every other feature by name.
+#
+# the levels close to what the manual makes mandatory: no version makes FEAT_FP or FEAT_AdvSIMD mandatory,
+# nor FEAT_SVE or FEAT_SVE2 at armv9-a, so `armv8-a` admits no floating-point instruction and
+# `armv8-a+fp+simd` admits them. a feature's revision is the version it is permitted from, which selection
+# does not enforce, so +sve is admitted at armv8-a.
+#
+# the syntax reads a level and `+` and `-` modifiers, as `.arch` reads them.
+#
+# the state code runs under is three axes, no rows: streaming, whether the processor is in streaming sve
+# mode, which `smstart` and `smstop` switch and under which the z and p registers are svl wide,
+# dit, PSTATE.DIT, whose timing guarantee `msr dit, #1` switches on, and nep, FPCR.NEP, which `msr fpcr`
+# switches.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.view;
+
+use alloc: std.allocator;
+use std.collections.bitset;
+use std.collections.vector;
+
+use masc.core.extension;
+use masc.core.requirement;
+use masc.core.set;
+use masc.core.state;
+use aarch64_frame: masc.isa.aarch64.frame;
+use masc.isa.aarch64.gen_extension;
+
+use arch_aarch64: mink.catalog.arch.aarch64;
+
+# where the token from `at` ends: the next `+` or `,`, or the spelling's end
+fun token_end(s: str, len: usize, at: usize) usize {
+    var end: usize = at;
+    for (end < len && s[end] != '+' && s[end] != ',') { end = end + 1; }
+    ret end;
+}
+
+# extension `id` added to the request, or removed with what needs it
+fun apply(r: *extension.Request, id: requirement.Id, adding: bool) {
+    if (adding) { extension.request_add(r, id); }
+    or          { extension.request_remove(r, id); }
+}
+
+# the name index's entry for r.spelling[at..at + len]: an extension name, all lower case, ignoring case, else a row's or a
+# level's own name as the manual spells it
+fun named(r: *extension.Request, at: usize, len: usize) opt[*extension.NameEntry] {
+    val opt_folded: opt[*extension.NameEntry] = extension.entry(r.catalog, view(?r.spelling[at], len), true);
+    if (sel opt_folded.some) { ret opt_folded; }
+    ret extension.entry(r.catalog, view(?r.spelling[at], len), false);
+}
+
+# the extensions r.spelling[at..at + len] names added to the request, or removed, a level standing for its members
+# ---
+# ret: whether the token names any
+fun change(r: *extension.Request, at: usize, len: usize, adding: bool) bool {
+    val opt_found: opt[*extension.NameEntry] = named(r, at, len);
+    if (sel opt_found.none) { ret false; }
+    val rows: requirement.Ids = opt_found.some.rows;
+    var i:    u32             = 0;
+    for (i < rows.len) {
+        if (rows.at[i] >= r.catalog.count) {
+            val level: *extension.Level = ?r.catalog.levels[rows.at[i] - r.catalog.count];
+            var k:     u32              = 0;
+            for (k < level.members.len) {
+                apply(r, level.members.at[k], adding);
+                k = k + 1;
+            }
+        }
+        or { apply(r, rows.at[i], adding); }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a level, then modifiers in order, each `+name` or `-name` and `+noname` to remove, after an optional comma:
+# `armv9.2-a+sve2+nolse` as -march and .arch spell it, `+v9.2a,-lse` as -mattr does
+fun parse(r: *extension.Request) err[extension.Error] {
+    val s:   str   = r.spelling;
+    val len: usize = str_len(s);
+    if (len == 0) { ret err[extension.Error].err{extension.refusal(r, "empty architecture", 0, 0)}; }
+    var at: usize = 0;
+    if (s[0] != '+' && s[0] != '-') {
+        val end:       usize                     = token_end(s, len, 0);
+        val opt_found: opt[*extension.NameEntry] = extension.entry(r.catalog, view(?s[0], end), false);
+        var opt_level: opt[*extension.Level]     = opt[*extension.Level].none{};
+        if (sel opt_found.some) { opt_level = extension.only_level(r.catalog, opt_found.some); }
+        if (sel opt_level.none) { ret err[extension.Error].err{extension.refusal(r, "unknown architecture", 0, end)}; }
+        if (sel opt_found.some) { extension.request_entry(r, opt_found.some); }
+        at = end;
+    }
+    for (at < len) {
+        if (s[at] == ',') { at = at + 1; }
+        if (at >= len)    { ret err[extension.Error].err{extension.refusal(r, "empty extension name", at, 0)}; }
+        val sign: u8 = s[at];
+        if (sign != '+' && sign != '-') { ret err[extension.Error].err{extension.refusal(r, "expected + or - before an extension", at, 1)}; }
+        val start: usize = at + 1;
+        val end:   usize = token_end(s, len, start);
+        if (end == start) { ret err[extension.Error].err{extension.refusal(r, "empty extension name", start, 0)}; }
+        if (!change(r, start, end - start, sign == '+')) {
+            val negated: bool = sign == '+' && end - start > 2 && s[start] == 'n' && s[start + 1] == 'o';
+            if (!negated || !change(r, start + 2, end - start - 2, false)) { ret err[extension.Error].err{extension.refusal(r, "unknown extension", start, end - start)}; }
+        }
+        at = end;
+    }
+    ret err[extension.Error].ok{};
+}
+
+# the name extension `id` spells with: its first -march name, which names it alone, else its own
+fun printed(catalog: *extension.Catalog, id: requirement.Id) str {
+    var i: u32 = 0;
+    for (i < gen_extension.MARCH_COUNT) {
+        if (gen_extension.MARCH_NAMES[i].row == id) { ret gen_extension.MARCH_NAMES[i].key; }
+        i = i + 1;
+    }
+    ret catalog.extensions[id].name;
+}
+
+# the level of the latest version held, then `+name` for every member that level's closure does not hold,
+# which reads back to the same selection
+fun spell(s: *extension.Selection, out: *vector.Vector[u8]) err[alloc.Error] {
+    val res_made: res[bitset.Bitset, alloc.Error] = bitset.init(s.members.alloc, s.catalog.count::usize);
+    if (sel res_made.err) { ret err[alloc.Error].err{res_made.err}; }
+    var base: bitset.Bitset = res_made.ok;
+    var v:    u32           = 0;
+    var top:  u32           = s.catalog.level_count;
+    for (v < s.catalog.level_count) {
+        if (s.catalog.levels[v].kind == extension.ARCH && extension.has(s, s.catalog.levels[v].members.at[0])) { top = v; }
+        v = v + 1;
+    }
+    var err_wrote: err[alloc.Error] = err[alloc.Error].ok{};
+    if (top < s.catalog.level_count) {
+        bitset.set(?base, s.catalog.levels[top].members.at[0]::usize);
+        extension.grow(s.catalog, ?base, ?s.stated);
+        err_wrote = extension.append(out, s.catalog.levels[top].name);
+    }
+    var i: u32 = 0;
+    for (!(sel err_wrote.err) && i < s.catalog.count) {
+        if (extension.has(s, i) && !bitset.get(?base, i::usize)) {
+            err_wrote = extension.append(out, "+");
+            if (!(sel err_wrote.err)) { err_wrote = extension.append(out, printed(s.catalog, i)); }
+        }
+        i = i + 1;
+    }
+    bitset.dnit(?base);
+    ret err_wrote;
+}
+
+# the execution state axes, in atom order: an axis's values number on from the extensions, axis by axis
+# ---
+# streaming: PSTATE.SM, streaming sve mode (DDI 0487, "Streaming SVE mode"), set by `smstart sm` and cleared by
+#            `smstop sm`
+# dit:       PSTATE.DIT, data independent timing (DDI 0487, FEAT_DIT), set and cleared by `msr dit, #imm`
+# nep:       FPCR.NEP, which under FEAT_AFP makes a scalar float instruction keep the upper bits of its destination
+#            register, or of a source, as the A64 pages state through `IsMerging(FPCR())`, set and cleared by
+#            `msr fpcr, xN`. a warm reset leaves it UNKNOWN (Arm's FPCR register page), so code starts at on, the
+#            state that reads every merging destination, unless the system it runs on establishes it clear, which
+#            the target states (mink's `Host.entered`), or a function switches to it around its own code. a write of
+#            fpcr takes effect for the next instruction with no context synchronization: "writes to the FPCR
+#            register are self-synchronizing" (Arm, Cortex-A57 Software Optimization Guide, UAN 0015B, 4.16), so
+#            the switch needs no barrier
+val OFF_ON: [2]state.Value = [2]state.Value{
+    state.Value{name: "off", flag: nil, doc: "off"},
+    state.Value{name: "on", flag: nil, doc: "on"},
+};
+
+val AXIS_ROWS: [3]state.Axis = [3]state.Axis{
+    state.Axis{name: "streaming", values: state.Values{at: ?OFF_ON[0], len: 2}, initial: 0, switchable: true},
+    state.Axis{name: "dit", values: state.Values{at: ?OFF_ON[0], len: 2}, initial: 0, switchable: true, held: "dit"},
+    state.Axis{name: "nep", values: state.Values{at: ?OFF_ON[0], len: 2}, initial: 1, switchable: true, held: "fpcr", roles: true},
+};
+
+pub val AXES: state.Axes = state.Axes{at: ?AXIS_ROWS[0], len: 3};
+
+# the state atoms, numbered on from the extensions in axis order
+pub val STREAMING_OFF: requirement.Id = gen_extension.COUNT;
+pub val STREAMING_ON:  requirement.Id = STREAMING_OFF + 1;
+pub val DIT_OFF:       requirement.Id = STREAMING_ON + 1;
+pub val DIT_ON:        requirement.Id = DIT_OFF + 1;
+pub val NEP_OFF:       requirement.Id = DIT_ON + 1;
+pub val NEP_ON:        requirement.Id = NEP_OFF + 1;
+
+# arm64e enters with FEAT_PAuth, which its pointer authentication needs ("arm64e ... pointer authentication",
+# Apple, "Preparing your app to work with pointer authentication"), so a selection without it is refused for arm64e
+# as one without memory64 is for wasm64. every armv8.3-a and later level selects it, as does `+pauth`
+val ARM64E_IDS: [1]requirement.Id = [1]requirement.Id{gen_extension.PAUTH};
+
+val ARM64E_ENTERS: [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?ARM64E_IDS[0], len: 1}, none: requirement.NO_IDS}};
+
+# the architectures of the set and the state code of each enters, outside streaming mode with dit clear, as a process
+# starts, and nep on, as nothing of the architecture establishes it clear. arm64e is the arm64 instruction set with
+# pointer authentication, and arm64ec is the arm64 instruction set under the ARM64EC ABI ("ARM64EC ... utilizes a subset
+# of the ARM64 register set", Microsoft, "Overview of ARM64EC ABI conventions"), so each shares every table, state and frame of aarch64. the registers that ABI blocks and x18's
+# TEB are its convention's reserved registers, never the register file's: they exist and decode under arm64ec, and
+# only an x64 transition does not preserve them
+pub val ARCH_COUNT: u32                  = 3;
+pub val ARCHES:     [ARCH_COUNT]set.Arch = [ARCH_COUNT]set.Arch{
+    set.Arch{arch: ?arch_aarch64.AARCH64, enters: requirement.NO_ALTERNATIVES, initial: state.Settings{at: [state.MAX_AXES]u8{0, 0, 1, 0, 0, 0, 0, 0}}, frame: ?aarch64_frame.FRAME},
+    set.Arch{arch: ?arch_aarch64.ARM64E, enters: requirement.Requirement{at: ?ARM64E_ENTERS[0], len: 1}, initial: state.Settings{at: [state.MAX_AXES]u8{0, 0, 1, 0, 0, 0, 0, 0}}, frame: ?aarch64_frame.FRAME},
+    set.Arch{arch: ?arch_aarch64.ARM64EC, enters: requirement.NO_ALTERNATIVES, initial: state.Settings{at: [state.MAX_AXES]u8{0, 0, 1, 0, 0, 0, 0, 0}}, frame: ?aarch64_frame.FRAME},
+};
+
+# how aarch64 selections are spelled, which state no revision, so the versioned spelling is the plain one
+pub val SYNTAX: extension.Syntax = extension.Syntax{parse: parse, spell: spell, versioned: spell};
+
+# the aarch64 catalog: its features, versions, levels, conflicts and +ext/-ext syntax
+# the base selection, nothing added, no version nor feature, is named `none`, as no -march or -mattr spelling names an
+# empty set
+pub val CATALOG: extension.Catalog = extension.Catalog{
+    extensions:        ?gen_extension.ROWS[0],
+    count:             gen_extension.COUNT,
+    levels:            ?gen_extension.LEVELS[0],
+    level_count:       gen_extension.LEVEL_COUNT,
+    names:             extension.Names{at: ?gen_extension.NAMES[0], len: gen_extension.NAME_COUNT},
+    name_keys:         ?gen_extension.NAME_KEYS[0],
+    conflicts:         ?gen_extension.CONFLICTS[0],
+    conflict_count:    gen_extension.CONFLICT_COUNT,
+    combinations:      ?gen_extension.COMBINATIONS[0],
+    combination_count: gen_extension.COMBINATION_COUNT,
+    syntax:            ?SYNTAX,
+    base:              "none",
+};

@@ -1,0 +1,869 @@
+# the wasm field kinds: the opcode, LEB128 integers, the memarg, the block type and the vectors
+#
+# a wasm instruction is its opcode, a byte or a prefix byte and its index's u32, and then its immediates in order,
+# each read whole with no length before it, so an instruction's length is how far its fields read (`leb`). an index
+# is an unsigned LEB128, an integer constant and a heap type a signed one, a float its bytes little-endian and a vector
+# its count and its members. an optional index the text leaves out is 0 in the binary, and decode places none for a 0,
+# so its printing leaves it out again: a pair of indices, as memory.copy's, is none only when both are 0.
+#
+# a memarg is its flags, the alignment's log2 with bit 6 set when a memory index other than 0 follows, and its offset,
+# an unsigned LEB128 of the address type of the memory it names, which the stream knows (`masc.isa.wasm.stream`): a
+# 64-bit offset under memory64. the alignment is stated in bytes, as the text spells it, and decode places none for
+# the natural one and a 0 offset. a memory index other than 0 needs multimemory, a table index other than 0
+# reference types, and a block type by type index multivalue, which their kinds admit. a value type is a byte of the types the set names, or 0x63 or 0x64 and a heap
+# type's s33, held in one immediate as the byte in its low eight bits and the heap type above them. a value type and
+# a heap type are admitted by the features their type requires (`gen_row.TYPE_NAMES_REQUIRES` and
+# `HEAP_NAMES_REQUIRES`), and a reference to a type index or a non-null reference by function-references, on encode
+# and on decode alike.
+#
+# a symbol in place of an index, a constant or a memarg's offset is written as the zero of its fixup kind's site,
+# padded to the bytes the site's width takes, and its fixup recorded at the site's first byte in the kind's form at the
+# field's width (`masc.isa.wasm.fixup`): an index's and a block type's type index as a 32-bit unsigned site, a constant
+# as a signed one of its width and an offset as an unsigned one of its memory's address width. a symbolic table index
+# needs reference types, as a padded one is no reserved byte. decode reads a padded number as its value.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use masc.core.extension;
+use masc.core.field;
+use masc.core.operand;
+use masc.core.requirement;
+use masc.core.state;
+
+use wasm_fixup:  masc.isa.wasm.fixup;
+use wasm_kind:   masc.isa.wasm.kind;
+use wasm_leb:    masc.isa.wasm.leb;
+use wasm_stream: masc.isa.wasm.stream;
+
+use masc.isa.wasm.gen_extension;
+use masc.isa.wasm.gen_row;
+
+pub val ALIGNMENT:  str = "alignment is no power of two up to the access's natural one";
+pub val FLAGS:      str = "memarg flags hold bits past the alignment and the memory index";
+pub val UNSTREAMED: str = "memarg's memory read with no stream";
+pub val NO_MEMORY:  str = "memarg names a memory the stream does not hold";
+pub val NO_TYPE:    str = "byte is no value type";
+pub val NO_HEAP:    str = "s33 is no heap type, neither an abstract one nor a type index";
+pub val BLOCKTYPE:  str = "block type holds other than one value type or one type index";
+pub val NO_TARGET:  str = "br_table names no default label";
+pub val CATCH:      str = "catch clause's tag present where its kind names none, or absent where it names one";
+pub val NO_OPCODE:  str = "opcode field names an operand";
+pub val UNSITED:    str = "symbol's fixup kind relocates no field of this encoding and width";
+
+# the reference type bytes, a heap type after them
+pub val REF_NULL: u8 = 0x63;
+pub val REF:      u8 = 0x64;
+
+# the empty block type's byte
+pub val EMPTY: u8 = 0x40;
+
+val MULTIMEMORY_IDS: [1]requirement.Id          = [1]requirement.Id{gen_extension.MULTIMEMORY};
+val MULTIMEMORY_ALT: [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?MULTIMEMORY_IDS[0], len: 1}, none: requirement.NO_IDS}};
+val MULTIVALUE_IDS:  [1]requirement.Id          = [1]requirement.Id{gen_extension.MULTIVALUE};
+val MULTIVALUE_ALT:  [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?MULTIVALUE_IDS[0], len: 1}, none: requirement.NO_IDS}};
+
+val TABLES_IDS: [1]requirement.Id          = [1]requirement.Id{gen_extension.REFERENCE_TYPES};
+val TABLES_ALT: [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?TABLES_IDS[0], len: 1}, none: requirement.NO_IDS}};
+
+val TYPED_IDS: [1]requirement.Id          = [1]requirement.Id{gen_extension.FUNCTION_REFERENCES};
+val TYPED_ALT: [1]requirement.Alternative = [1]requirement.Alternative{requirement.Alternative{all: requirement.Ids{at: ?TYPED_IDS[0], len: 1}, none: requirement.NO_IDS}};
+
+# what a memory index other than 0 needs
+pub val MULTIMEMORY: requirement.Requirement = requirement.Requirement{at: ?MULTIMEMORY_ALT[0], len: 1};
+
+# what a table index other than 0 needs, where wasm 1.0 holds one table and its index a reserved 0 byte (changes,
+# release 2.0, reference types: multiple tables)
+pub val TABLES: requirement.Requirement = requirement.Requirement{at: ?TABLES_ALT[0], len: 1};
+
+# index `index` of space `space` admitted under `ctx`: a memory's other than 0 by multimemory and a table's by
+# reference types, every other index by nothing
+pub fun index_admit(ctx: *state.Context, space: u16, index: u64, at: usize) err[field.Refusal] {
+    if (index == 0)                  { ret err[field.Refusal].ok{}; }
+    if (space == wasm_kind.MEMORIES) { ret admitted(ctx, MULTIMEMORY, at); }
+    if (space == wasm_kind.TABLES)   { ret admitted(ctx, TABLES, at); }
+    ret err[field.Refusal].ok{};
+}
+
+# what a reference to a type index, or a non-null reference, needs (changes, release 3.0, typeful references)
+pub val TYPED: requirement.Requirement = requirement.Requirement{at: ?TYPED_ALT[0], len: 1};
+
+# what a block type by type index needs
+pub val MULTIVALUE: requirement.Requirement = requirement.Requirement{at: ?MULTIVALUE_ALT[0], len: 1};
+
+fun refuse(message: str, op: u8, at: usize) err[field.Refusal] {
+    ret err[field.Refusal].err{field.refusal(message, op, at)};
+}
+
+# the byte `b` appended, or only admitted when the encoder has no output
+fun byte(enc: *field.Encoder, b: u8) err[field.Refusal] {
+    if (enc.out == nil) { ret err[field.Refusal].ok{}; }
+    ret field.put(enc, b::u64, 1);
+}
+
+fun uleb(enc: *field.Encoder, v: u64) {
+    if (enc.out != nil) { wasm_leb.put_unsigned(enc.out, v); }
+}
+
+fun sleb(enc: *field.Encoder, v: i64) {
+    if (enc.out != nil) { wasm_leb.put_signed(enc.out, v); }
+}
+
+# the site of symbolic operand `op`'s fixup kind in a field of `encoding` and `bits`, refused where it relocates none
+fun site(enc: *field.Encoder, op: u8, encoding: wasm_fixup.Encoding, bits: u8) res[*wasm_fixup.Site, field.Refusal] {
+    val opt_site_at: opt[*wasm_fixup.Site] = wasm_fixup.site_at(enc.parts[op].fixup, encoding, bits);
+    if (sel opt_site_at.none) { ret res[*wasm_fixup.Site, field.Refusal].err{field.refusal(UNSITED, op, 0)}; }
+    ret res[*wasm_fixup.Site, field.Refusal].ok{opt_site_at.some};
+}
+
+# symbolic operand `op` written as its site's padded zero in a field of `encoding` and `bits`, its fixup recorded at
+# the site in the kind of the field's width, or only admitted when the encoder has no output
+fun relocated(enc: *field.Encoder, op: u8, encoding: wasm_fixup.Encoding, bits: u8) err[field.Refusal] {
+    val res_site: res[*wasm_fixup.Site, field.Refusal] = site(enc, op, encoding, bits);
+    if (sel res_site.err) { ret err[field.Refusal].err{res_site.err}; }
+    if (enc.out == nil)   { ret err[field.Refusal].ok{}; }
+    enc.parts[op].fixup = res_site.ok.fixup;
+    val err_noted: err[field.Refusal] = field.fixup(enc, op, enc.out.len - enc.start);
+    if (sel err_noted.err) { ret err_noted; }
+    wasm_leb.put_site(enc.out, wasm_fixup.bytes_of(res_site.ok));
+    ret err[field.Refusal].ok{};
+}
+
+# the fixup kind a symbol in member `k` of group operand `op` of `ops` takes when it states none
+fun member_fixup(ops: *operand.Operand, op: u8, k: u32) operand.FixupKind {
+    val shape: *operand.Shape = ?ops[op].shape;
+    if (!sel shape.group)     { ret operand.NO_FIXUP; }
+    if (k >= shape.group.len) { ret operand.NO_FIXUP; }
+    ret operand.shape_fixup(?shape.group.at[k].shape);
+}
+
+# the site of the symbol member `member` of operand `op` names in a field of `encoding` and `bits`, of its own kind or
+# else `fallback`, refused where the kind relocates none
+fun inner_site(member: *operand.Value, fallback: operand.FixupKind, op: u8, encoding: wasm_fixup.Encoding, bits: u8) res[*wasm_fixup.Site, field.Refusal] {
+    val opt_sym: opt[operand.Symbol] = operand.symbol_of(member);
+    if (sel opt_sym.none) { ret res[*wasm_fixup.Site, field.Refusal].err{field.refusal(field.WRONG_KIND, op, 0)}; }
+    var kind: operand.FixupKind = fallback;
+    if (opt_sym.some.fixup != operand.NO_FIXUP) { kind = opt_sym.some.fixup; }
+    if (kind == operand.NO_FIXUP)               { ret res[*wasm_fixup.Site, field.Refusal].err{field.refusal(field.NO_SYMBOL, op, 0)}; }
+    val opt_site_at: opt[*wasm_fixup.Site] = wasm_fixup.site_at(kind, encoding, bits);
+    if (sel opt_site_at.none) { ret res[*wasm_fixup.Site, field.Refusal].err{field.refusal(UNSITED, op, 0)}; }
+    ret res[*wasm_fixup.Site, field.Refusal].ok{opt_site_at.some};
+}
+
+# the symbol member `member` of operand `op` names written as its site's padded zero in a field of `encoding` and
+# `bits`, its fixup recorded at the site in the kind `inner_site` gives, at the field's width
+fun inner_relocated(enc: *field.Encoder, op: u8, fallback: operand.FixupKind, member: *operand.Value, encoding: wasm_fixup.Encoding, bits: u8) err[field.Refusal] {
+    val res_inner_site: res[*wasm_fixup.Site, field.Refusal] = inner_site(member, fallback, op, encoding, bits);
+    if (sel res_inner_site.err) { ret err[field.Refusal].err{res_inner_site.err}; }
+    if (enc.out == nil)         { ret err[field.Refusal].ok{}; }
+    val opt_sym: opt[operand.Symbol] = operand.symbol_of(member);
+    if (sel opt_sym.none) { ret refuse(field.WRONG_KIND, op, 0); }
+    val noted:      field.Fixup         = field.Fixup{kind: res_inner_site.ok.fixup, operand: op, field: enc.field, offset: enc.out.len - enc.start, symbol: opt_sym.some.id, addend: opt_sym.some.addend};
+    val res_pushed: res[usize, A.Error] = vector.push[field.Fixup](enc.fixups, noted);
+    if (sel res_pushed.err) { ret err[field.Refusal].err{field.unallocated(res_pushed.err, op, enc.out.len)}; }
+    wasm_leb.put_site(enc.out, wasm_fixup.bytes_of(res_inner_site.ok));
+    ret err[field.Refusal].ok{};
+}
+
+# the next unsigned LEB128 of `bits`, consumed
+fun get_uleb(dec: *field.Decoder, bits: u32, op: u8) res[u64, field.Refusal] {
+    val res_unsigned: res[wasm_leb.Read, field.Refusal] = wasm_leb.unsigned(dec.in.data, dec.end, dec.at, bits, op);
+    if (sel res_unsigned.err) { ret res[u64, field.Refusal].err{res_unsigned.err}; }
+    dec.at = dec.at + res_unsigned.ok.len;
+    ret res[u64, field.Refusal].ok{res_unsigned.ok.value};
+}
+
+fun get_sleb(dec: *field.Decoder, bits: u32, op: u8) res[i64, field.Refusal] {
+    val res_signed: res[wasm_leb.Read, field.Refusal] = wasm_leb.signed(dec.in.data, dec.end, dec.at, bits, op);
+    if (sel res_signed.err) { ret res[i64, field.Refusal].err{res_signed.err}; }
+    dec.at = dec.at + res_signed.ok.len;
+    ret res[i64, field.Refusal].ok{res_signed.ok.value::i64};
+}
+
+fun get_byte(dec: *field.Decoder, op: u8) res[u8, field.Refusal] {
+    if (dec.at >= dec.end) { ret res[u8, field.Refusal].err{field.refusal(field.TRUNCATED, op, dec.at)}; }
+    val b: u8 = dec.in.data[dec.at];
+    dec.at = dec.at + 1;
+    ret res[u8, field.Refusal].ok{b};
+}
+
+# the index in the set's value types of the one byte `code` spells, none for a byte the set names no type by
+fun type_index(code: u32) opt[u32] {
+    var i: u32 = 0;
+    for (i < gen_row.TYPE_NAMES_COUNT) {
+        if (gen_row.TYPE_NAMES[i].code == code) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun admitted(ctx: *state.Context, required: requirement.Requirement, at: usize) err[field.Refusal] {
+    if (state.admits(ctx, required)) { ret err[field.Refusal].ok{}; }
+    ret err[field.Refusal].err{field.unadmitted(required, at)};
+}
+
+# heap type `heap` admitted under `ctx`: an abstract one by the features its type requires, a type index by
+# function-references, refused for an s33 that is neither
+pub fun heap_admit(ctx: *state.Context, heap: i64, op: u8, at: usize) err[field.Refusal] {
+    if (heap < -0x1_0000_0000 || heap > 0xFFFF_FFFF) { ret refuse(field.OUT_OF_RANGE, op, at); }
+    if (heap >= 0)                                   { ret admitted(ctx, TYPED, at); }
+    val code: i64 = heap + 0x80;
+    var i:    u32 = 0;
+    for (i < gen_row.HEAP_NAMES_COUNT) {
+        if (gen_row.HEAP_NAMES[i].code::i64 == code) { ret admitted(ctx, gen_row.HEAP_NAMES_REQUIRES[i], at); }
+        i = i + 1;
+    }
+    ret refuse(NO_HEAP, op, at);
+}
+
+# value type `v` admitted under `ctx`: its byte by the features its type requires, a reference by its heap type's and
+# a non-null one by function-references too, refused for a byte the set names no type by
+pub fun valtype_admit(ctx: *state.Context, v: i64, op: u8, at: usize) err[field.Refusal] {
+    val code: u8 = (v & 0xFF)::u8;
+    if (code == REF_NULL || code == REF) {
+        if (code == REF) {
+            val err_typed: err[field.Refusal] = admitted(ctx, TYPED, at);
+            if (sel err_typed.err) { ret err_typed; }
+        }
+        ret heap_admit(ctx, v >> 8, op, at);
+    }
+    val opt_type_index: opt[u32] = type_index(code::u32);
+    if (sel opt_type_index.none) { ret refuse(NO_TYPE, op, at); }
+    if ((v >> 8) != 0)           { ret refuse(NO_TYPE, op, at); }
+    ret admitted(ctx, gen_row.TYPE_NAMES_REQUIRES[opt_type_index.some], at);
+}
+
+# value type `v` written, its byte and a reference type's heap type
+fun valtype_put(enc: *field.Encoder, v: i64, op: u8) err[field.Refusal] {
+    val err_held: err[field.Refusal] = valtype_admit(enc.ctx, v, op, 0);
+    if (sel err_held.err) { ret err_held; }
+    val code: u8 = (v & 0xFF)::u8;
+    if (code == REF_NULL || code == REF) {
+        val err_byte: err[field.Refusal] = byte(enc, code);
+        if (sel err_byte.err) { ret err_byte; }
+        sleb(enc, v >> 8);
+        ret err[field.Refusal].ok{};
+    }
+    ret byte(enc, code);
+}
+
+# the value type at the decoder, consumed, refused where the context does not admit it
+fun valtype_get(dec: *field.Decoder, op: u8) res[i64, field.Refusal] {
+    val at:       usize                  = dec.at;
+    val res_byte: res[u8, field.Refusal] = get_byte(dec, op);
+    if (sel res_byte.err) { ret res[i64, field.Refusal].err{res_byte.err}; }
+    var v: i64 = res_byte.ok::i64;
+    if (res_byte.ok == REF_NULL || res_byte.ok == REF) {
+        val res_heap: res[i64, field.Refusal] = get_sleb(dec, 33, op);
+        if (sel res_heap.err) { ret res_heap; }
+        v = (res_heap.ok << 8) | res_byte.ok::i64;
+    }
+    val err_held: err[field.Refusal] = valtype_admit(dec.ctx, v, op, at);
+    if (sel err_held.err) { ret res[i64, field.Refusal].err{err_held.err}; }
+    ret res[i64, field.Refusal].ok{v};
+}
+
+fun no_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    ret opt[str].none{};
+}
+
+fun operand_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count) { ret opt[str].some{field.OPERAND_COUNT}; }
+    ret opt[str].none{};
+}
+
+fun opcode_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    if (f.param == 0) { ret byte(enc, (f.fixed & 0xFF)::u8); }
+    val err_byte: err[field.Refusal] = byte(enc, f.param::u8);
+    if (sel err_byte.err) { ret err_byte; }
+    uleb(enc, f.fixed);
+    ret err[field.Refusal].ok{};
+}
+
+fun opcode_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:       usize                  = dec.at;
+    val res_byte: res[u8, field.Refusal] = get_byte(dec, field.NO_OPERAND);
+    if (sel res_byte.err) { ret err[field.Refusal].err{res_byte.err}; }
+    if (f.param == 0) {
+        if (res_byte.ok::u64 != (f.fixed & 0xFF)) { ret refuse(field.MISMATCH, field.NO_OPERAND, at); }
+        ret err[field.Refusal].ok{};
+    }
+    if (res_byte.ok::u64 != f.param) { ret refuse(field.MISMATCH, field.NO_OPERAND, at); }
+    val res_code: res[u64, field.Refusal] = get_uleb(dec, 32, field.NO_OPERAND);
+    if (sel res_code.err)       { ret err[field.Refusal].err{res_code.err}; }
+    if (res_code.ok != f.fixed) { ret refuse(field.MISMATCH, field.NO_OPERAND, at); }
+    ret err[field.Refusal].ok{};
+}
+
+fun opcode_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand != field.NO_OPERAND || f.param > 0xFF) { ret opt[str].some{NO_OPCODE}; }
+    ret opt[str].none{};
+}
+
+# the id value `v` holds, 0 for none
+fun index_of(v: *operand.Value) u64 {
+    if (sel v.id) { ret v.id::u64; }
+    ret 0;
+}
+
+# the space of the index operand `op` of `ops` names
+fun space_of(ops: *operand.Operand, op: u8) u16 {
+    val shape: *operand.Shape = ?ops[op].shape;
+    if (sel shape.id) { ret shape.id.space; }
+    ret wasm_kind.SPACES;
+}
+
+# an index, or a symbol at an unsigned site of the index's bits, a table's needing reference types as any index but
+# 0 does
+fun uleb_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.none) { ret err[field.Refusal].ok{}; }
+    if (sel v.symbol) {
+        val res_site: res[*wasm_fixup.Site, field.Refusal] = site(enc, f.operand, wasm_fixup.ULEB, (f.param & 0xFF)::u8);
+        if (sel res_site.err)                                      { ret err[field.Refusal].err{res_site.err}; }
+        if (space_of(enc.operands, f.operand) == wasm_kind.TABLES) { ret admitted(enc.ctx, TABLES, 0); }
+        ret err[field.Refusal].ok{};
+    }
+    if (!sel v.id) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    ret index_admit(enc.ctx, space_of(enc.operands, f.operand), v.id::u64, 0);
+}
+
+fun uleb_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = uleb_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.none) {
+        uleb(enc, 0);
+        ret err[field.Refusal].ok{};
+    }
+    if (sel v.symbol) { ret relocated(enc, f.operand, wasm_fixup.ULEB, (f.param & 0xFF)::u8); }
+    if (!sel v.id)    { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    uleb(enc, v.id::u64);
+    ret err[field.Refusal].ok{};
+}
+
+# an index read, none for an optional one's 0 that is no pair's
+fun uleb_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:       usize                   = dec.at;
+    val res_uleb: res[u64, field.Refusal] = get_uleb(dec, (f.param & 0xFF)::u32, f.operand);
+    if (sel res_uleb.err) { ret err[field.Refusal].err{res_uleb.err}; }
+    val err_held: err[field.Refusal] = index_admit(dec.ctx, space_of(dec.operands, f.operand), res_uleb.ok, at);
+    if (sel err_held.err) { ret err_held; }
+    val desc: *operand.Operand = ?dec.operands[f.operand];
+    if (desc.quantity == operand.OPTIONAL && res_uleb.ok == 0 && (f.param >> 8) == 0) {
+        field.place(dec, f.operand, operand.Value.none{});
+        ret err[field.Refusal].ok{};
+    }
+    field.place(dec, f.operand, operand.Value.id{res_uleb.ok::u32});
+    ret err[field.Refusal].ok{};
+}
+
+# a pair whose indices are both 0 left out, as the text leaves it
+fun uleb_complete(dec: *field.Decoder, f: *field.Field, offset: usize) err[field.Refusal] {
+    val partner: u64 = f.param >> 8;
+    if (partner == 0) { ret err[field.Refusal].ok{}; }
+    val other:  u8             = (partner - 1)::u8;
+    val mine:   *operand.Value = ?dec.values[f.operand];
+    val theirs: *operand.Value = ?dec.values[other];
+    if ((sel mine.id && mine.id == 0) && ((sel theirs.id && theirs.id == 0) || sel theirs.none)) {
+        field.place(dec, f.operand, operand.Value.none{});
+        field.place(dec, other, operand.Value.none{});
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun uleb_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count) { ret opt[str].some{field.OPERAND_COUNT}; }
+    val o: *operand.Operand = ?ops[f.operand];
+    if (!sel o.shape.id) { ret opt[str].some{field.WRONG_KIND}; }
+    val partner: u64 = f.param >> 8;
+    if (partner > count::u64) { ret opt[str].some{field.OPERAND_COUNT}; }
+    ret opt[str].none{};
+}
+
+# a constant, or a symbol at a signed site of the constant's bits
+fun sleb_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.symbol) {
+        val res_site: res[*wasm_fixup.Site, field.Refusal] = site(enc, f.operand, wasm_fixup.SLEB, f.param::u8);
+        if (sel res_site.err) { ret err[field.Refusal].err{res_site.err}; }
+        ret err[field.Refusal].ok{};
+    }
+    if (!sel v.immediate) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    ret err[field.Refusal].ok{};
+}
+
+fun sleb_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.symbol)     { ret relocated(enc, f.operand, wasm_fixup.SLEB, f.param::u8); }
+    if (!sel v.immediate) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    sleb(enc, v.immediate);
+    ret err[field.Refusal].ok{};
+}
+
+fun sleb_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val res_sleb: res[i64, field.Refusal] = get_sleb(dec, f.param::u32, f.operand);
+    if (sel res_sleb.err) { ret err[field.Refusal].err{res_sleb.err}; }
+    field.place(dec, f.operand, operand.Value.immediate{res_sleb.ok});
+    ret err[field.Refusal].ok{};
+}
+
+# the address bits of the memory `memidx` names under the encoder's or decoder's context
+fun address_bits(ctx_stream: ptr, memidx: u64, op: u8, at: usize) res[u32, field.Refusal] {
+    if (ctx_stream == nil) { ret res[u32, field.Refusal].err{field.refusal(UNSTREAMED, op, at)}; }
+    val opt_bits: opt[u32] = wasm_stream.address(ctx_stream, memidx::u32);
+    if (sel opt_bits.none) { ret res[u32, field.Refusal].err{field.refusal(NO_MEMORY, op, at)}; }
+    ret res[u32, field.Refusal].ok{opt_bits.some};
+}
+
+# the log2 of alignment `bytes`, none for no power of two
+fun log2(bytes: i64) opt[u64] {
+    var n: u64 = 0;
+    for (n < 16) {
+        if ((1::i64 << n) == bytes) { ret opt[u64].some{n}; }
+        n = n + 1;
+    }
+    ret opt[u64].none{};
+}
+
+# the memarg's flags and its memory index, offset and alignment admitted: an alignment the access's natural one or
+# below, a memory the stream holds and an offset within its address type, multimemory for a memory other than 0
+fun memarg_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val op:       u8                 = f.operand;
+    val memory:   *operand.Value     = ?enc.values[op];
+    val offset:   *operand.Value     = ?enc.values[op + 1];
+    val align:    *operand.Value     = ?enc.values[op + 2];
+    val index:    u64                = index_of(memory);
+    val err_held: err[field.Refusal] = index_admit(enc.ctx, wasm_kind.MEMORIES, index, 0);
+    if (sel err_held.err) { ret err_held; }
+    if (sel align.immediate) {
+        val opt_log: opt[u64] = log2(align.immediate);
+        if (sel opt_log.none)       { ret refuse(ALIGNMENT, op + 2, 0); }
+        if (opt_log.some > f.param) { ret refuse(ALIGNMENT, op + 2, 0); }
+    }
+    var stream: ptr = nil;
+    if (enc.ctx != nil) { stream = enc.ctx.stream; }
+    val res_bits: res[u32, field.Refusal] = address_bits(stream, index, op, 0);
+    if (sel res_bits.err) { ret err[field.Refusal].err{res_bits.err}; }
+    if (sel offset.immediate) {
+        if (res_bits.ok == 32 && offset.immediate:~u64 > 0xFFFF_FFFF) { ret refuse(field.OUT_OF_RANGE, op + 1, 0); }
+    }
+    if (sel offset.symbol) {
+        val res_site: res[*wasm_fixup.Site, field.Refusal] = site(enc, op + 1, wasm_fixup.ULEB, res_bits.ok::u8);
+        if (sel res_site.err) { ret err[field.Refusal].err{res_site.err}; }
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun memarg_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = memarg_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val op:     u8             = f.operand;
+    val index:  u64            = index_of(?enc.values[op]);
+    val offset: *operand.Value = ?enc.values[op + 1];
+    val align:  *operand.Value = ?enc.values[op + 2];
+    var flags:  u64            = f.param;
+    if (sel align.immediate) {
+        val opt_log: opt[u64] = log2(align.immediate);
+        if (sel opt_log.some) { flags = opt_log.some; }
+    }
+    if (index != 0) { flags = flags | 0x40; }
+    uleb(enc, flags);
+    if (index != 0) { uleb(enc, index); }
+    if (sel offset.symbol) {
+        val res_bits: res[u32, field.Refusal] = address_bits(enc.ctx.stream, index, op, 0);
+        if (sel res_bits.err) { ret err[field.Refusal].err{res_bits.err}; }
+        ret relocated(enc, op + 1, wasm_fixup.ULEB, res_bits.ok::u8);
+    }
+    var off: u64 = 0;
+    if (sel offset.immediate) { off = offset.immediate:~u64; }
+    uleb(enc, off);
+    ret err[field.Refusal].ok{};
+}
+
+fun memarg_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val op:        u8                      = f.operand;
+    val at:        usize                   = dec.at;
+    val res_flags: res[u64, field.Refusal] = get_uleb(dec, 32, op);
+    if (sel res_flags.err)   { ret err[field.Refusal].err{res_flags.err}; }
+    if (res_flags.ok > 0x7F) { ret refuse(FLAGS, op, at); }
+    val log: u64 = res_flags.ok & 0x3F;
+    if (log > f.param) { ret refuse(ALIGNMENT, op + 2, at); }
+    var index: u64 = 0;
+    if ((res_flags.ok & 0x40) != 0) {
+        val res_uleb: res[u64, field.Refusal] = get_uleb(dec, 32, op);
+        if (sel res_uleb.err) { ret err[field.Refusal].err{res_uleb.err}; }
+        index = res_uleb.ok;
+        if (!extension.has(dec.ctx.selection, gen_extension.MULTIMEMORY)) { ret err[field.Refusal].err{field.unadmitted(MULTIMEMORY, at)}; }
+    }
+    var stream: ptr = nil;
+    if (dec.ctx != nil) { stream = dec.ctx.stream; }
+    val res_bits: res[u32, field.Refusal] = address_bits(stream, index, op, at);
+    if (sel res_bits.err) { ret err[field.Refusal].err{res_bits.err}; }
+    val res_off: res[u64, field.Refusal] = get_uleb(dec, res_bits.ok, op + 1);
+    if (sel res_off.err) { ret err[field.Refusal].err{res_off.err}; }
+    if (index == 0)      { field.place(dec, op, operand.Value.none{}); }
+    or                   { field.place(dec, op, operand.Value.id{index::u32}); }
+    if (res_off.ok == 0) { field.place(dec, op + 1, operand.Value.none{}); }
+    or                   { field.place(dec, op + 1, operand.Value.immediate{res_off.ok:~i64}); }
+    if (log == f.param)  { field.place(dec, op + 2, operand.Value.none{}); }
+    or                   { field.place(dec, op + 2, operand.Value.immediate{(1::i64 << log)}); }
+    ret err[field.Refusal].ok{};
+}
+
+fun memarg_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 + 3 > count || f.param > 4) { ret opt[str].some{field.OPERAND_COUNT}; }
+    val memory: *operand.Operand = ?ops[f.operand];
+    val offset: *operand.Operand = ?ops[f.operand + 1];
+    val align:  *operand.Operand = ?ops[f.operand + 2];
+    if (!sel memory.shape.id || !sel offset.shape.immediate || !sel align.shape.immediate) { ret opt[str].some{field.WRONG_KIND}; }
+    ret opt[str].none{};
+}
+
+# the block type's members, exactly one present, admitted: a type index needs multivalue
+fun blocktype_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.none)   { ret err[field.Refusal].ok{}; }
+    if (!sel v.group) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val m: operand.Values = v.group;
+    if (m.len != 2) { ret refuse(BLOCKTYPE, f.operand, 0); }
+    val typed:   bool = sel m.at[0].immediate;
+    val indexed: bool = sel m.at[1].id || sel m.at[1].symbol;
+    if (typed == indexed || (!typed && !sel m.at[0].none) || (!indexed && !sel m.at[1].none)) { ret refuse(BLOCKTYPE, f.operand, 0); }
+    if (indexed && !extension.has(enc.ctx.selection, gen_extension.MULTIVALUE))               { ret err[field.Refusal].err{field.unadmitted(MULTIVALUE, 0)}; }
+    if (sel m.at[1].symbol) {
+        val res_inner_site: res[*wasm_fixup.Site, field.Refusal] = inner_site(?m.at[1], member_fixup(enc.operands, f.operand, 1), f.operand, wasm_fixup.ULEB, 32);
+        if (sel res_inner_site.err) { ret err[field.Refusal].err{res_inner_site.err}; }
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun blocktype_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = blocktype_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (sel v.none)   { ret byte(enc, EMPTY); }
+    if (!sel v.group) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val m: operand.Values = v.group;
+    if (sel m.at[0].immediate) { ret valtype_put(enc, m.at[0].immediate, f.operand); }
+    if (sel m.at[1].symbol)    { ret inner_relocated(enc, f.operand, member_fixup(enc.operands, f.operand, 1), ?m.at[1], wasm_fixup.ULEB, 32); }
+    if (sel m.at[1].id)        { sleb(enc, m.at[1].id::i64); }
+    ret err[field.Refusal].ok{};
+}
+
+# `count` values pushed into the decoder's pool as one run
+fun run(dec: *field.Decoder, values: *operand.Value, count: u32) res[operand.Values, field.Refusal] {
+    if (count == 0) { ret res[operand.Values, field.Refusal].ok{operand.NO_VALUES}; }
+    var first: *operand.Value = nil;
+    var i:     u32            = 0;
+    for (i < count) {
+        val res_slot: res[*operand.Value, field.Refusal] = field.push(dec, values[i]);
+        if (sel res_slot.err) { ret res[operand.Values, field.Refusal].err{res_slot.err}; }
+        if (i == 0)           { first = res_slot.ok; }
+        i = i + 1;
+    }
+    ret res[operand.Values, field.Refusal].ok{operand.Values{at: first, len: count}};
+}
+
+fun blocktype_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at: usize = dec.at;
+    if (dec.at >= dec.end) { ret refuse(field.TRUNCATED, f.operand, at); }
+    val b: u8 = dec.in.data[dec.at];
+    if (b == EMPTY) {
+        dec.at = dec.at + 1;
+        field.place(dec, f.operand, operand.Value.none{});
+        ret err[field.Refusal].ok{};
+    }
+    var members: [2]operand.Value = [2]operand.Value{operand.Value.none{}, operand.Value.none{}};
+    # a value type's byte is a negative s33 of one byte, and a type index is never negative
+    if ((b & 0xC0) == 0x40) {
+        val res_valtype_get: res[i64, field.Refusal] = valtype_get(dec, f.operand);
+        if (sel res_valtype_get.err) { ret err[field.Refusal].err{res_valtype_get.err}; }
+        members[0] = operand.Value.immediate{res_valtype_get.ok};
+    }
+    or {
+        val res_sleb: res[i64, field.Refusal] = get_sleb(dec, 33, f.operand);
+        if (sel res_sleb.err)                                            { ret err[field.Refusal].err{res_sleb.err}; }
+        if (res_sleb.ok < 0 || res_sleb.ok > 0xFFFF_FFFF)                { ret refuse(BLOCKTYPE, f.operand, at); }
+        if (!extension.has(dec.ctx.selection, gen_extension.MULTIVALUE)) { ret err[field.Refusal].err{field.unadmitted(MULTIVALUE, at)}; }
+        members[1] = operand.Value.id{res_sleb.ok::u32};
+    }
+    val res_held: res[operand.Values, field.Refusal] = run(dec, ?members[0], 2);
+    if (sel res_held.err) { ret err[field.Refusal].err{res_held.err}; }
+    field.place(dec, f.operand, operand.Value.group{res_held.ok});
+    ret err[field.Refusal].ok{};
+}
+
+fun group_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count) { ret opt[str].some{field.OPERAND_COUNT}; }
+    val o: *operand.Operand = ?ops[f.operand];
+    if (!sel o.shape.group) { ret opt[str].some{field.WRONG_KIND}; }
+    ret opt[str].none{};
+}
+
+fun targets_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.list)     { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    if (v.list.len == 0) { ret refuse(NO_TARGET, f.operand, 0); }
+    ret err[field.Refusal].ok{};
+}
+
+# the labels' count less the default, each label, and the default last
+fun targets_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = targets_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.list) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val list: operand.Values = v.list;
+    uleb(enc, (list.len - 1)::u64);
+    var i: u32 = 0;
+    for (i < list.len) {
+        if (!sel list.at[i].id) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        uleb(enc, list.at[i].id::u64);
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+# a vector's `n` members reserved as one run. each member takes at least a byte, so a count past the bytes left is a
+# truncated vector rather than a store to grow
+fun reserve(dec: *field.Decoder, n: u64, op: u8, at: usize) res[*operand.Value, field.Refusal] {
+    if (n > (dec.end - dec.at)::u64) { ret res[*operand.Value, field.Refusal].err{field.refusal(field.TRUNCATED, op, dec.end)}; }
+    ret field.reserve(dec, n, op, at);
+}
+
+fun targets_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:        usize                   = dec.at;
+    val res_count: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+    if (sel res_count.err) { ret err[field.Refusal].err{res_count.err}; }
+    val n:         u64                                = res_count.ok + 1;
+    val res_first: res[*operand.Value, field.Refusal] = reserve(dec, n, f.operand, at);
+    if (sel res_first.err) { ret err[field.Refusal].err{res_first.err}; }
+    var i: u64 = 0;
+    for (i < n) {
+        val res_uleb: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+        if (sel res_uleb.err) { ret err[field.Refusal].err{res_uleb.err}; }
+        res_first.ok[i] = operand.Value.id{res_uleb.ok::u32};
+        i               = i + 1;
+    }
+    field.place(dec, f.operand, operand.Value.list{operand.Values{at: res_first.ok, len: n::u32}});
+    ret err[field.Refusal].ok{};
+}
+
+fun list_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count || ops[f.operand].quantity != operand.VARIADIC) { ret opt[str].some{field.OPERAND_COUNT}; }
+    ret opt[str].none{};
+}
+
+# each clause's kind, its tag where the kind names one and none where it does not
+fun catches_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.list) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val list: operand.Values = v.list;
+    var i:    u32            = 0;
+    for (i < list.len) {
+        val c: *operand.Value = ?list.at[i];
+        if (!sel c.group)     { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        if (c.group.len != 3) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        val m:      operand.Values = c.group;
+        val kind:   *operand.Value = ?m.at[0];
+        val label:  *operand.Value = ?m.at[2];
+        val tagged: bool           = sel m.at[1].id || sel m.at[1].symbol;
+        if (!sel kind.enumerant)                              { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        if (!sel label.id)                                    { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        if (wasm_kind.tagged(kind.enumerant.value) != tagged) { ret refuse(CATCH, f.operand, 0); }
+        if (sel m.at[1].symbol) {
+            val res_inner_site: res[*wasm_fixup.Site, field.Refusal] = inner_site(?m.at[1], member_fixup(enc.operands, f.operand, 1), f.operand, wasm_fixup.ULEB, 32);
+            if (sel res_inner_site.err) { ret err[field.Refusal].err{res_inner_site.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun catches_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = catches_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.list) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val list: operand.Values = v.list;
+    uleb(enc, list.len::u64);
+    var i: u32 = 0;
+    for (i < list.len) {
+        val c: *operand.Value = ?list.at[i];
+        if (!sel c.group) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        val m:     operand.Values = c.group;
+        val kind:  *operand.Value = ?m.at[0];
+        val tag:   *operand.Value = ?m.at[1];
+        val label: *operand.Value = ?m.at[2];
+        if (!sel kind.enumerant) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        if (!sel label.id)       { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        val err_byte: err[field.Refusal] = byte(enc, kind.enumerant.value::u8);
+        if (sel err_byte.err) { ret err_byte; }
+        if (sel tag.id)       { uleb(enc, tag.id::u64); }
+        if (sel tag.symbol) {
+            val err_put: err[field.Refusal] = inner_relocated(enc, f.operand, member_fixup(enc.operands, f.operand, 1), tag, wasm_fixup.ULEB, 32);
+            if (sel err_put.err) { ret err_put; }
+        }
+        uleb(enc, label.id::u64);
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun catches_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:        usize                   = dec.at;
+    val res_count: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+    if (sel res_count.err) { ret err[field.Refusal].err{res_count.err}; }
+    val res_first: res[*operand.Value, field.Refusal] = reserve(dec, res_count.ok, f.operand, at);
+    if (sel res_first.err) { ret err[field.Refusal].err{res_first.err}; }
+    var i: u64 = 0;
+    for (i < res_count.ok) {
+        val res_byte: res[u8, field.Refusal] = get_byte(dec, f.operand);
+        if (sel res_byte.err) { ret err[field.Refusal].err{res_byte.err}; }
+        if (res_byte.ok > 3)  { ret refuse(field.NOT_A_MEMBER, f.operand, at); }
+        var members: [3]operand.Value = [3]operand.Value{operand.enumerant(res_byte.ok::u32), operand.Value.none{}, operand.Value.none{}};
+        if (wasm_kind.tagged(res_byte.ok::u32)) {
+            val res_tag: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+            if (sel res_tag.err) { ret err[field.Refusal].err{res_tag.err}; }
+            members[1] = operand.Value.id{res_tag.ok::u32};
+        }
+        val res_label: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+        if (sel res_label.err) { ret err[field.Refusal].err{res_label.err}; }
+        members[2] = operand.Value.id{res_label.ok::u32};
+        val res_held: res[operand.Values, field.Refusal] = run(dec, ?members[0], 3);
+        if (sel res_held.err) { ret err[field.Refusal].err{res_held.err}; }
+        res_first.ok[i] = operand.Value.group{res_held.ok};
+        i               = i + 1;
+    }
+    var all: operand.Values = operand.Values{at: res_first.ok, len: res_count.ok::u32};
+    if (res_count.ok == 0) { all = operand.NO_VALUES; }
+    field.place(dec, f.operand, operand.Value.list{all});
+    ret err[field.Refusal].ok{};
+}
+
+fun valtypes_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.list) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val list: operand.Values = v.list;
+    uleb(enc, list.len::u64);
+    var i: u32 = 0;
+    for (i < list.len) {
+        if (!sel list.at[i].immediate) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+        val err_valtype_put: err[field.Refusal] = valtype_put(enc, list.at[i].immediate, f.operand);
+        if (sel err_valtype_put.err) { ret err_valtype_put; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun valtypes_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    ret valtypes_encode(enc, f);
+}
+
+fun valtypes_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:        usize                   = dec.at;
+    val res_count: res[u64, field.Refusal] = get_uleb(dec, 32, f.operand);
+    if (sel res_count.err) { ret err[field.Refusal].err{res_count.err}; }
+    val res_first: res[*operand.Value, field.Refusal] = reserve(dec, res_count.ok, f.operand, at);
+    if (sel res_first.err) { ret err[field.Refusal].err{res_first.err}; }
+    var i: u64 = 0;
+    for (i < res_count.ok) {
+        val res_valtype_get: res[i64, field.Refusal] = valtype_get(dec, f.operand);
+        if (sel res_valtype_get.err) { ret err[field.Refusal].err{res_valtype_get.err}; }
+        res_first.ok[i] = operand.Value.immediate{res_valtype_get.ok};
+        i               = i + 1;
+    }
+    var all: operand.Values = operand.Values{at: res_first.ok, len: res_count.ok::u32};
+    if (res_count.ok == 0) { all = operand.NO_VALUES; }
+    field.place(dec, f.operand, operand.Value.list{all});
+    ret err[field.Refusal].ok{};
+}
+
+fun bytes_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.literal)                { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    if (v.literal.len::u64 != f.param) { ret refuse(field.LITERAL_LENGTH, f.operand, 0); }
+    ret err[field.Refusal].ok{};
+}
+
+fun bytes_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = bytes_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.literal) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    val b: operand.Bytes = v.literal;
+    var i: u32           = 0;
+    for (i < b.len) {
+        val err_one: err[field.Refusal] = byte(enc, b.at[i]);
+        if (sel err_one.err) { ret err_one; }
+        i = i + 1;
+    }
+    ret err[field.Refusal].ok{};
+}
+
+fun bytes_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val res_borrow: res[operand.Bytes, field.Refusal] = field.borrow(dec, f.param::usize);
+    if (sel res_borrow.err) {
+        var refused: field.Refusal = res_borrow.err;
+        refused.operand = f.operand;
+        ret err[field.Refusal].err{refused};
+    }
+    field.place(dec, f.operand, operand.Value.literal{res_borrow.ok});
+    ret err[field.Refusal].ok{};
+}
+
+fun bytes_check(f: *field.Field, ops: *operand.Operand, count: u32) opt[str] {
+    if (f.operand::u32 >= count || f.param == 0) { ret opt[str].some{field.OPERAND_COUNT}; }
+    val o: *operand.Operand = ?ops[f.operand];
+    if (!sel o.shape.literal) { ret opt[str].some{field.WRONG_KIND}; }
+    ret opt[str].none{};
+}
+
+fun heaptype_admit(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.immediate) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    ret heap_admit(enc.ctx, v.immediate, f.operand, 0);
+}
+
+fun heaptype_encode(enc: *field.Encoder, f: *field.Field) err[field.Refusal] {
+    val err_held: err[field.Refusal] = heaptype_admit(enc, f);
+    if (sel err_held.err) { ret err_held; }
+    val v: *operand.Value = ?enc.values[f.operand];
+    if (!sel v.immediate) { ret refuse(field.WRONG_KIND, f.operand, 0); }
+    sleb(enc, v.immediate);
+    ret err[field.Refusal].ok{};
+}
+
+fun heaptype_decode(dec: *field.Decoder, f: *field.Field) err[field.Refusal] {
+    val at:       usize                   = dec.at;
+    val res_sleb: res[i64, field.Refusal] = get_sleb(dec, 33, f.operand);
+    if (sel res_sleb.err) { ret err[field.Refusal].err{res_sleb.err}; }
+    val err_held: err[field.Refusal] = heap_admit(dec.ctx, res_sleb.ok, f.operand, at);
+    if (sel err_held.err) { ret err_held; }
+    field.place(dec, f.operand, operand.Value.immediate{res_sleb.ok});
+    ret err[field.Refusal].ok{};
+}
+
+pub val OPCODE_KIND:    field.Kind = field.Kind{name: "opcode", admit: nil, encode: opcode_encode, decode: opcode_decode, finish: nil, complete: nil, check: opcode_check};
+pub val ULEB_KIND:      field.Kind = field.Kind{name: "uleb", admit: uleb_admit, encode: uleb_encode, decode: uleb_decode, finish: nil, complete: uleb_complete, check: uleb_check};
+pub val SLEB_KIND:      field.Kind = field.Kind{name: "sleb", admit: sleb_admit, encode: sleb_encode, decode: sleb_decode, finish: nil, complete: nil, check: operand_check};
+pub val MEMARG_KIND:    field.Kind = field.Kind{name: "memarg", admit: memarg_admit, encode: memarg_encode, decode: memarg_decode, finish: nil, complete: nil, check: memarg_check};
+pub val BLOCKTYPE_KIND: field.Kind = field.Kind{name: "blocktype", admit: blocktype_admit, encode: blocktype_encode, decode: blocktype_decode, finish: nil, complete: nil, check: group_check};
+pub val TARGETS_KIND:   field.Kind = field.Kind{name: "targets", admit: targets_admit, encode: targets_encode, decode: targets_decode, finish: nil, complete: nil, check: list_check};
+pub val CATCHES_KIND:   field.Kind = field.Kind{name: "catches", admit: catches_admit, encode: catches_encode, decode: catches_decode, finish: nil, complete: nil, check: list_check};
+pub val VALTYPES_KIND:  field.Kind = field.Kind{name: "valtypes", admit: valtypes_admit, encode: valtypes_encode, decode: valtypes_decode, finish: nil, complete: nil, check: list_check};
+pub val BYTES_KIND:     field.Kind = field.Kind{name: "bytes", admit: bytes_admit, encode: bytes_encode, decode: bytes_decode, finish: nil, complete: nil, check: bytes_check};
+pub val HEAPTYPE_KIND:  field.Kind = field.Kind{name: "heaptype", admit: heaptype_admit, encode: heaptype_encode, decode: heaptype_decode, finish: nil, complete: nil, check: operand_check};
+
+val KINDS: [11]*field.Kind = [11]*field.Kind{?OPCODE_KIND, ?ULEB_KIND, ?SLEB_KIND, ?MEMARG_KIND, ?BLOCKTYPE_KIND, ?TARGETS_KIND, ?CATCHES_KIND, ?VALTYPES_KIND, ?BYTES_KIND, ?field.UNIT, ?HEAPTYPE_KIND};
+
+# the wasm field table, each kind at its index in `masc.isa.wasm.kind`, its units little-endian
+pub val TABLE: field.Table = field.Table{kinds: ?KINDS[0], count: 11, order: field.LITTLE};
