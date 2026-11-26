@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
 ### Added
 
 - `masc.isa.wasm.object.import_named` states a wasm import from a module and field the object's names already hold, so a caller that lends its names to the object, as mirl does, no longer passes a view into names that interning the module can move (#715).
+
+### Changed
+
+- Requires mach `^7`, the 7.0.0 release and later, where 0.1.0 also admitted `7.0.0-rc.1`.
 
 ## [0.1.0] - 2026-11-23
 
