@@ -14,6 +14,7 @@ use std.collections.slice.Slice;
 use std.collections.vector;
 
 use mink.base.fail;
+use mink.base.table;
 use mink_arch: mink.catalog.arch;
 use mink.catalog.trait;
 use mink_registry: mink.format.registry;
@@ -21,6 +22,7 @@ use mink_object:   mink.model.object;
 
 use masc.cli.context;
 use masc.cli.context.Run;
+use masc.cli.layout;
 use masc.disasm;
 use masc.format.dialect;
 use masc.tool.object;
@@ -64,48 +66,35 @@ fun spelling(aliased: bool) disasm.Spelling {
 fun disassemble_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
     val path:       str              = context.operand(r, 0);
     val output:     str              = args.value(r.line, ?context.OUTPUT);
-    val aliased:    bool             = aliases(r);
-    val verbose:    bool             = context.verbosity(r) > 0;
     var t:          target.Target;
     val opt_opened: opt[render.Exit] = context.target_init(r, ?t);
     if (sel opt_opened.some) { ret opt_opened.some; }
 
+    context.begin(r, path);
+    var reading:           context.Stage               = context.stage(r);
     val res_disasm_opened: res[disasm.File, fail.Fail] = disasm.file_init(formats, r.a, path);
     if (sel res_disasm_opened.err) {
+        val exit: render.Exit = context.failed(r, "object.read", res_disasm_opened.err);
+        context.closed(r, ?reading, "read", nil);
         target.dnit(?t);
-        ret context.failed(r, "object.read", res_disasm_opened.err);
+        ret exit;
     }
 
     var f:          disasm.File                      = res_disasm_opened.ok;
     val res_spoken: res[*dialect.Dialect, fail.Fail] = object.dialect_of(f.format, t.arch);
     if (sel res_spoken.err) {
+        val exit: render.Exit = context.refused_part(r, res_spoken.err);
+        context.closed(r, ?reading, "read", nil);
         val err_shut: err[fail.Fail] = disasm.file_dnit(?f);
         target.dnit(?t);
-        ret context.refused_part(r, res_spoken.err);
+        ret exit;
     }
+    var rt: layout.Text;
+    context.closed(r, ?reading, "read", layout.counted(?rt, table.count[mink_object.Section](?f.object.sections)::u64, "section", "sections"));
 
-    # the listing goes to stdout, or is gathered here when it goes to a file
-    var printed: vector.Vector[u8]  = vector.init[u8](r.a);
-    var into:    *vector.Vector[u8] = ?r.out.out;
-    if (output != nil) { into = ?printed; }
-
-    val options:  disasm.Options = disasm.Options{syntax: t.syntax, spelling: spelling(aliased), dialect: res_spoken.ok, formats: formats};
-    val err_done: err[fail.Fail] = disasm.disassemble(r.a, t.set, ?t.context, options, ?f.object, into);
-    var exit:     render.Exit    = render.SUCCESS;
-    if (sel err_done.err) {
-        render.unprinted(?r.err, "disasm.refused", path, ?f.object, err_done.err);
-        exit = render.USER;
-    }
-    or (!unwritten(r, ?t, path, ?f.object)) {
-        render.headline(?r.err, "cli.memory", "out of memory");
-        exit = render.ENVIRONMENT;
-    }
-    or (output != nil) {
-        exit = context.save_text(r, output, printed.data, printed.len);
-        if (exit == render.SUCCESS && verbose) {
-            context.wrote_text(r, path, printed.len, "source", output);
-        }
-    }
+    var printed: vector.Vector[u8] = vector.init[u8](r.a);
+    var exit:    render.Exit       = printed_as(r, ?t, ?f, formats, res_spoken.ok, path, output, ?printed);
+    if (exit == render.SUCCESS && output != nil) { exit = saved(r, ?printed, output); }
 
     vector.dnit[u8](?printed);
     val err_closed: err[fail.Fail] = disasm.file_dnit(?f);
@@ -117,14 +106,75 @@ fun disassemble_with(r: *Run, formats: *mink_registry.Registry) render.Exit {
     ret exit;
 }
 
-# the traits of object `o` of file `path` that its disassembly does not state, noted on stderr, false when memory ran out
+# the object of `f` disassembled as the disassemble stage, in the dialect `d`, on stdout or into `printed` when it goes
+# to `output`, its traits the text does not state noted
+fun printed_as(r: *Run, t: *target.Target, f: *disasm.File, formats: *mink_registry.Registry, d: *dialect.Dialect, path: str, output: str, printed: *vector.Vector[u8]) render.Exit {
+    var into: *vector.Vector[u8] = printed;
+    if (output == nil) { into = ?context.stdout(r).out; }
+
+    var s:        context.Stage  = context.stage(r);
+    val before:   usize          = into.len;
+    val options:  disasm.Options = disasm.Options{syntax: t.syntax, spelling: spelling(aliases(r)), dialect: d, formats: formats};
+    val err_done: err[fail.Fail] = disasm.disassemble(r.a, t.set, ?t.context, options, ?f.object, into);
+    var exit:     render.Exit    = render.SUCCESS;
+    if (sel err_done.err) {
+        render.unprinted(context.error(r), "disasm.refused", path, ?f.object, err_done.err);
+        exit = render.USER;
+    }
+    or (!unwritten(r, t, path, ?f.object)) { exit = context.memory(r); }
+
+    var zt:   layout.Text;
+    var done: str = nil;
+    if (exit == render.SUCCESS) { done = layout.size(?zt, (into.len - before)::u64); }
+    context.closed(r, ?s, "disasm", done);
+    ret exit;
+}
+
+# the source `printed` written as the file `output` as the write stage, with the `disassembled` result: the target, the
+# source's size, the warnings, the time and the output
+fun saved(r: *Run, printed: *vector.Vector[u8], output: str) render.Exit {
+    var s:    context.Stage = context.stage(r);
+    val exit: render.Exit   = context.save_text(r, output, printed.data, printed.len);
+    var zt:   layout.Text;
+    if (exit != render.SUCCESS) {
+        context.closed(r, ?s, "write", nil);
+        ret exit;
+    }
+    context.closed(r, ?s, "write", layout.size(?zt, printed.len::u64));
+
+    var wt:     layout.Text;
+    var dt:     layout.Text;
+    var fields: [5]layout.Field = [5]layout.Field{
+        layout.Field{key: "target", value: context.named(r)},
+        layout.Field{key: "size", value: layout.size(?zt, printed.len::u64)},
+        layout.Field{key: "warnings", value: context.warned(r, ?wt)},
+        layout.Field{key: "time", value: context.took(r, ?dt)},
+        layout.Field{key: "output", value: layout.shown_path(output)},
+    };
+    context.result(r, layout.DISASSEMBLED, ?fields[0], 5);
+    ret render.SUCCESS;
+}
+
+# the traits of object `o` of file `path` that its disassembly does not state, a note each on stderr but under -q, false
+# when memory ran out
 fun unwritten(r: *Run, t: *target.Target, path: str, o: *mink_object.Object) bool {
     var rows:     vector.Vector[trait.Trait]          = vector.init[trait.Trait](r.a);
     val res_left: res[opt[*mink_arch.Abi], fail.Fail] = disasm.unwritten(t.set, o, t.abi, ?rows);
     if (sel res_left.ok) {
-        if (!context.quiet(r)) { render.unwritten(?r.err, path, res_left.ok, ?rows); }
+        if (!context.quiet(r)) { notes(r, path, res_left.ok, ?rows); }
     }
 
     vector.dnit[trait.Trait](?rows);
     ret sel res_left.ok;
+}
+
+# a note on stderr for the abi row `abi` names and each trait row in `rows` that the disassembly of the file `path`
+# does not state
+fun notes(r: *Run, path: str, abi: opt[*mink_arch.Abi], rows: *vector.Vector[trait.Trait]) {
+    if (sel abi.some) { render.unwritten_abi(context.note(r), path, abi.some); }
+    var i: usize = 0;
+    for (i < rows.len) {
+        render.unwritten_trait(context.note(r), path, ?rows.data[i]);
+        i = i + 1;
+    }
 }
