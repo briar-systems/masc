@@ -292,8 +292,14 @@ counter:
 ```
 
 ```
-$ masc assemble b.s -t linux-x86_64 -o b.o -v
-b.s: 4 sections, 8 symbols, 6 relocations, written to b.o as elf
+$ masc assemble b.s -t linux-x86_64 -o b.o
+assembled b.s
+  target       linux-x86_64
+  sections     4
+  symbols      8
+  relocations  6
+  time         1.7ms
+  output       b.o
 ```
 
 The text section holds `R_X86_64_PLT32` against `helper`, `R_X86_64_PC32`

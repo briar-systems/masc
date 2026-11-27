@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The command line writes mach's output: each command ends in a result block on stdout naming its verb and subject (`assembled`, `disassembled`, `listed`, `verified`, or `failed` once its work began and was refused), with its fields beneath and zero fields left out (#714).
+- `-v` logs each stage with its time and detail, and `-vv` lists the resolved target's facts beneath the target line. Each diagnostic block is followed by a blank line (#714).
+- `-q` leaves out results and notes and keeps errors and warnings, and `-q` with `-v` is refused as `cli.flag_conflict`. `walk` takes `-v` and `-q` (#714).
+- `isas` prints its sets as a table (#714).
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

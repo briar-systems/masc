@@ -1,6 +1,13 @@
 # what every command of the masc command line shares: its run context, the
-# flag rows several commands take, the target its flags name, and the
-# refusals it renders
+# flag rows several commands take, the target its flags name, the refusals it
+# renders, its stage log and its results
+#
+# a command writes in one output language with mach, mirl and mink: a result on
+# stdout for what it did, the same at every level, a log line on stderr for each
+# stage as it closes under -v, the target's facts under -vv, and each diagnostic
+# as a block with a blank line after it, written before whatever follows on
+# either stream. a command whose work began and did not do what was asked closes
+# with a `failed` result in place of its own.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -16,20 +23,20 @@ use std.types.view.View;
 
 use A: std.allocator;
 use std.args;
+use chrono_duration: std.chrono.duration;
 use std.collections.vector;
-use fs: std.filesystem;
+use fs:           std.filesystem;
+use std_io_error: std.io.error;
 
 use mink.base.fail;
-use mink.base.table;
 use mink_arch:   mink.catalog.arch;
 use mink_format: mink.catalog.format;
 use mink_target: mink.catalog.target;
 use mink.format.file;
-use mink_registry: mink.format.registry;
-use mink_object:   mink.model.object;
 
 use masc.asm.model;
-use masc.cli.report;
+use masc.cli.layout;
+use masc.cli.log;
 use masc.core.diagnostic;
 use masc.core.extension;
 use masc.core.register;
@@ -45,8 +52,8 @@ use masc.tool.text;
 # the flags several commands take, each with its one meaning in mach, mirl, masc and mink
 pub val HELP:       args.Flag = args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"};
 pub val OUTPUT:     args.Flag = args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "write the output here"};
-pub val VERBOSE:    args.Flag = args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "report what was written, and the target with -vv"};
-pub val QUIET:      args.Flag = args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "print refusals only"};
+pub val VERBOSE:    args.Flag = args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "show each stage as it closes, -vv the target's facts too"};
+pub val QUIET:      args.Flag = args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "suppress non-error output"};
 pub val TARGET:     args.Flag = args.Flag{long: "target", short: 't', value: "sys-arch", repeat: false, negatable: false, help: "the target, as linux-x86_64"};
 pub val ENV:        args.Flag = args.Flag{long: "env", short: 0, value: "name", repeat: false, negatable: false, help: "the environment (default: the target's)"};
 pub val ABI:        args.Flag = args.Flag{long: "abi", short: 0, value: "name", repeat: false, negatable: false, help: "the calling convention (default: the target's)"};
@@ -75,27 +82,191 @@ pub rec Modes {
 
 # a command line being run
 # ---
-# a:      the allocator everything lives in
-# line:   the command line, read against masc's commands
-# modes:  the registered sets' mode flags, for a command that takes them, nil for one that does not
-# chosen: the mode switches given, the first `chose` of them
-# chose:  how many
-# target: the target mink's catalog resolved from the flags, once a command has opened it
-# exts:   the extensions --ext adds, the first `added` of them
-# added:  how many
-# out:    what goes to stdout
-# err:    what goes to stderr
+# a:       the allocator everything lives in
+# line:    the command line, read against masc's commands
+# modes:   the registered sets' mode flags, for a command that takes them, nil for one that does not
+# chosen:  the mode switches given, the first `chose` of them
+# chose:   how many
+# target:  the target mink's catalog resolved from the flags, once a command has opened it
+# named:   the target as a result names it, `sys-arch`, empty until mink's catalog resolves it
+# exts:    the extensions --ext adds, the first `added` of them
+# added:   how many
+# out:     what goes to stdout
+# err:     what goes to stderr
+# origin:  when the command began, which a log line's stamp and a result's time count from
+# owed:    whether a blank line is owed after the last diagnostic, before whatever is written next
+# errors:  the errors the command reported, its warnings in `warnings`
+# subject: what the command's work acts on, nil until it begins, as a result names it
 pub rec Run {
-    a:      *A.Allocator;
-    line:   *args.Parsed;
-    modes:  *Modes;
-    chosen: [MAX_MODE_FLAGS]target.Switched;
-    chose:  u32;
-    target: mink_target.Target;
-    exts:   [MAX_EXTS]str;
-    added:  u32;
-    out:    text.Text;
-    err:    text.Text;
+    a:        *A.Allocator;
+    line:     *args.Parsed;
+    modes:    *Modes;
+    chosen:   [MAX_MODE_FLAGS]target.Switched;
+    chose:    u32;
+    target:   mink_target.Target;
+    named:    layout.Value;
+    exts:     [MAX_EXTS]str;
+    added:    u32;
+    out:      text.Text;
+    err:      text.Text;
+    origin:   log.Instant;
+    owed:     bool;
+    errors:   u32;
+    warnings: u32;
+    subject:  str;
+}
+
+# a run of the command line in `a` begun now, writing nothing yet
+pub fun init(r: *Run, a: *A.Allocator) {
+    r.a        = a;
+    r.line     = nil;
+    r.modes    = nil;
+    r.chose    = 0;
+    r.added    = 0;
+    r.out      = text.init(a);
+    r.err      = text.init(a);
+    r.origin   = log.sample();
+    r.owed     = false;
+    r.errors   = 0;
+    r.warnings = 0;
+    r.subject  = nil;
+    layout.value_init(?r.named);
+}
+
+# give back what the run holds
+pub fun dnit(r: *Run) {
+    text.dnit(?r.out);
+    text.dnit(?r.err);
+}
+
+# the blank line owed after the last diagnostic, written before what is written next
+fun paid(r: *Run) {
+    if (!r.owed) { ret; }
+    r.owed = false;
+    text.byte(?r.err, '\n');
+}
+
+# the run ended: stdout is written after all of stderr, so a blank line still owed after the last diagnostic is written
+# when stdout holds anything
+pub fun ended(r: *Run) {
+    if (r.out.out.len > 0) { paid(r); }
+}
+
+# where the command's product and its result go, stdout, a blank line owed after a diagnostic written first
+pub fun stdout(r: *Run) *text.Text {
+    paid(r);
+    ret ?r.out;
+}
+
+# where an error is written, one diagnostic block, counted, with a blank line owed after it
+pub fun error(r: *Run) *text.Text {
+    paid(r);
+    r.owed   = true;
+    r.errors = r.errors + 1;
+    ret ?r.err;
+}
+
+# where a warning is written, one diagnostic block, counted, with a blank line owed after it
+pub fun warning(r: *Run) *text.Text {
+    paid(r);
+    r.owed     = true;
+    r.warnings = r.warnings + 1;
+    ret ?r.err;
+}
+
+# where a note that stands alone is written, one diagnostic block, with a blank line owed after it
+pub fun note(r: *Run) *text.Text {
+    paid(r);
+    r.owed = true;
+    ret ?r.err;
+}
+
+# a stage of the command's work begun: when, and the diagnostics reported before it
+pub rec Stage {
+    from:     log.Instant;
+    errors:   u32;
+    warnings: u32;
+}
+
+# a stage begun now
+pub fun stage(r: *Run) Stage {
+    ret Stage{from: log.sample(), errors: r.errors, warnings: r.warnings};
+}
+
+# under -v, the log line of the stage `s`, named `label`, closed now, `did` what it did and then the errors and warnings
+# reported since it began
+pub fun closed(r: *Run, s: *Stage, label: str, did: str) {
+    if (verbosity(r) == 0) { ret; }
+    spent(r, s, label, log.elapsed(s.from), 0, did);
+}
+
+# under -v, the log line of the stage `s`, named `label`, which took `d` and closed `ago` before now, as `closed` writes
+# it, for stages one call ran together and measured apart
+pub fun spent(r: *Run, s: *Stage, label: str, d: chrono_duration.Duration, ago: chrono_duration.Duration, did: str) {
+    if (verbosity(r) == 0) { ret; }
+    paid(r);
+    var at: chrono_duration.Duration = log.elapsed(r.origin) - ago;
+    if (at < 0) { at = 0; }
+    val t: *text.Text = ?r.err;
+    log.head(t, at, label, d);
+    log.detail(t, did);
+    var et: layout.Text;
+    var wt: layout.Text;
+    if (r.errors > s.errors)     { log.detail(t, layout.counted(?et, (r.errors - s.errors)::u64, "error", "errors")); }
+    if (r.warnings > s.warnings) { log.detail(t, layout.counted(?wt, (r.warnings - s.warnings)::u64, "warning", "warnings")); }
+    log.end(t);
+}
+
+# under -vv, one of the target's facts beneath its log line
+fun fact(r: *Run, key: str, value: str) {
+    log.fact(?r.err, key, value);
+}
+
+# the command's work begun on `subject`, which its result names: from here a command that does not do what was asked
+# closes with a failed result
+pub fun begin(r: *Run, subject: str) {
+    r.subject = layout.shown_path(subject);
+}
+
+# the target as a result names it, nil before mink's catalog resolved it
+pub fun named(r: *Run) str {
+    ret layout.value_of(?r.named);
+}
+
+# the time since the command began, written into `t`
+pub fun took(r: *Run, t: *layout.Text) str {
+    ret layout.duration(t, log.elapsed(r.origin));
+}
+
+# the warnings the command reported, as a result's value, nil for none
+pub fun warned(r: *Run, t: *layout.Text) str {
+    ret layout.nonzero(t, r.warnings::u64);
+}
+
+# the result of the command's work on its subject on stdout, left out under -q
+# ---
+# r:      the run, its work begun
+# v:      what was done
+# fields: the result's fields in the order they show, n of them
+pub fun result(r: *Run, v: layout.Verb, fields: *layout.Field, n: usize) {
+    if (quiet(r)) { ret; }
+    layout.result(stdout(r), v, r.subject, fields, n);
+}
+
+# the failed result of a command whose work began and did not do what was asked, in place of its own: its target, the
+# errors and warnings it reported and its time, left out under -q
+pub fun failure(r: *Run) {
+    if (r.subject == nil) { ret; }
+    var et:     layout.Text;
+    var wt:     layout.Text;
+    var dt:     layout.Text;
+    var fields: [4]layout.Field = [4]layout.Field{
+        layout.Field{key: "target", value: named(r)},
+        layout.Field{key: "errors", value: layout.nonzero(?et, r.errors::u64)},
+        layout.Field{key: "warnings", value: warned(r, ?wt)},
+        layout.Field{key: "time", value: took(r, ?dt)},
+    };
+    result(r, layout.FAILED, ?fields[0], 4);
 }
 
 # the operand at `i` of the command line, which the command's bounds guarantee
@@ -105,19 +276,19 @@ pub fun operand(r: *Run, i: usize) str {
     ret opt_operand.some;
 }
 
-# how often -v was given: 0 for none, 1 to report what was written, 2 for the target too
+# how often -v was given: 0 for none, 1 for the stage lines, 2 for the target's facts too
 pub fun verbosity(r: *Run) usize {
     ret args.occurrences(r.line, ?VERBOSE);
 }
 
-# whether -q asks for no notes
+# whether -q asks for no results and no notes
 pub fun quiet(r: *Run) bool {
     ret args.given(r.line, ?QUIET);
 }
 
 # the end of a command whose storage was refused
 pub fun memory(r: *Run) render.Exit {
-    render.headline(?r.err, "cli.memory", "out of memory");
+    render.headline(error(r), "cli.memory", "out of memory");
     ret render.ENVIRONMENT;
 }
 
@@ -129,7 +300,7 @@ pub fun memory(r: *Run) render.Exit {
 # subject: what it is about, quoted after the message
 # ret:     render.USER
 pub fun refuse(r: *Run, code: str, message: str, subject: str) render.Exit {
-    render.quoted(?r.err, code, message, subject);
+    render.quoted(error(r), code, message, subject);
     ret render.USER;
 }
 
@@ -140,7 +311,7 @@ pub fun refuse(r: *Run, code: str, message: str, subject: str) render.Exit {
 # f:    the failure
 # ret:  the exit the failure calls for (`render.exit_of`)
 pub fun failed(r: *Run, code: str, f: fail.Fail) render.Exit {
-    render.failure(?r.err, code, f);
+    render.failure(error(r), code, f);
     ret render.exit_of(f);
 }
 
@@ -169,6 +340,10 @@ fun resolved(r: *Run, out: *isa.Checked) opt[render.Exit] {
     if (sel res_row.err) { ret opt[render.Exit].some{refused_target(r, res_row.err)}; }
 
     r.target = res_row.ok;
+    layout.value_init(?r.named);
+    layout.add(?r.named, r.target.sys.name);
+    layout.add(?r.named, "-");
+    layout.add(?r.named, r.target.arch.name);
     val res_checked: res[opt[isa.Checked], fail.Fail] = isa.check(r.a, ?r.target);
     if (sel res_checked.err)     { ret opt[render.Exit].some{refused_target(r, res_checked.err)}; }
     if (sel res_checked.ok.none) { ret opt[render.Exit].some{unserved(r)}; }
@@ -183,9 +358,9 @@ fun unserved(r: *Run) render.Exit {
     ret refuse(r, "target.unserved", "no instruction set serves the architecture", r.target.arch.name);
 }
 
-# the refusal `why` of the target the flags name, as mink's catalog states it, into `r.err`
+# the refusal `why` of the target the flags name, as mink's catalog states it
 fun refused_target(r: *Run, why: fail.Fail) render.Exit {
-    render.failure(?r.err, "target", why);
+    render.failure(error(r), "target", why);
     ret render.exit_of(why);
 }
 
@@ -224,7 +399,7 @@ fun spelling(r: *Run) str {
 }
 
 # the target the flags name opened into `t`, a refusal rendered when it is not, with `t` then not held
-pub fun target_init(r: *Run, t: *target.Target) opt[render.Exit] {
+fun opened(r: *Run, t: *target.Target) opt[render.Exit] {
     var checked:   isa.Checked;
     val opt_named: opt[render.Exit] = resolved(r, ?checked);
     if (sel opt_named.some) { ret opt_named; }
@@ -235,35 +410,55 @@ pub fun target_init(r: *Run, t: *target.Target) opt[render.Exit] {
         ret opt[render.Exit].some{res_made.err};
     }
 
-    val q:          target.Request = res_made.ok;
-    val err_opened: err[fail.Fail] = target.init(r.a, ?checked, q, t);
+    val err_opened: err[fail.Fail] = target.init(r.a, ?checked, res_made.ok, t);
     if (sel err_opened.err) {
         isa.dnit(?checked);
         ret opt[render.Exit].some{refused_part(r, err_opened.err)};
     }
-
-    if (verbosity(r) > 1) { noted(r, ?q, t); }
     ret opt[render.Exit].none{};
 }
 
-# the target the flags name, as it was resolved and opened into `t`, noted on stderr
-fun noted(r: *Run, q: *target.Request, t: *target.Target) {
-    text.put(?r.err, "note[target] ");
-    text.put(?r.err, r.target.sys.name);
-    text.byte(?r.err, '-');
-    text.put(?r.err, r.target.arch.name);
-    text.put(?r.err, ", abi ");
-    if (q.abi != nil) { text.put(?r.err, q.abi.name); }
-    or                { text.put(?r.err, "none"); }
-    text.put(?r.err, ", isa ");
-    var spelled:     vector.Vector[u8] = vector.init[u8](r.a);
-    val err_spelled: err[A.Error]      = extension.spell(?t.selection, ?spelled);
+# the `target` stage closed: its log line naming the target, or the value -t gave where the catalog refused it, and
+# under -vv the facts of the target `t` beneath it once it opened
+fun targeted(r: *Run, s: *Stage, t: *target.Target) {
+    var shown: str = named(r);
+    if (shown == nil) { shown = args.value(r.line, ?TARGET); }
+    closed(r, s, "target", shown);
+    if (t == nil || verbosity(r) < 2) { ret; }
+
+    var env: str = "none";
+    if (sel r.target.env.some) { env = r.target.env.some.name; }
+    var abi: str = "-";
+    if (t.abi != nil) { abi = t.abi.name; }
+    var code_model: str = "-";
+    if (sel r.target.code_model.some) { code_model = r.target.code_model.some.name; }
+    var linkage: str = "-";
+    if (sel r.target.linkage.some) { linkage = r.target.linkage.some.name; }
+
+    log.fact_key(?r.err, "isa");
+    val err_spelled: err[A.Error] = extension.spell(?t.selection, ?r.err.out);
     if (sel err_spelled.err) { r.err.failed = true; }
-    text.bytes(?r.err, spelled.data, spelled.len);
-    vector.dnit[u8](?spelled);
-    text.put(?r.err, ", format ");
-    text.put(?r.err, r.target.format.name);
-    text.byte(?r.err, '\n');
+    log.end(?r.err);
+    fact(r, "sys", r.target.sys.name);
+    fact(r, "env", env);
+    fact(r, "abi", abi);
+    fact(r, "code_model", code_model);
+    fact(r, "linkage", linkage);
+    fact(r, "object", r.target.format.name);
+    fact(r, "syntax", t.set.syntaxes.at[t.syntax].name);
+}
+
+# the target the flags name opened into `t` as the `target` stage, a refusal rendered when it is not, with `t` then not
+# held
+pub fun target_init(r: *Run, t: *target.Target) opt[render.Exit] {
+    var s:          Stage            = stage(r);
+    val opt_opened: opt[render.Exit] = opened(r, t);
+    if (sel opt_opened.some) {
+        targeted(r, ?s, nil);
+        ret opt_opened;
+    }
+    targeted(r, ?s, t);
+    ret opt[render.Exit].none{};
 }
 
 # a target with the object format it is written in and that format's assembly dialect
@@ -277,20 +472,27 @@ pub rec Output {
     dialect: *dialect.Dialect;
 }
 
-# the target the flags name opened into `o`, its object format and that format's dialect, a refusal rendered when they
-# are not, with nothing then held
+# the target the flags name opened into `o` as the `target` stage, its object format and that format's dialect, a
+# refusal rendered when they are not, with nothing then held
 pub fun output_init(r: *Run, o: *Output) opt[render.Exit] {
-    val opt_opened: opt[render.Exit] = target_init(r, ?o.t);
-    if (sel opt_opened.some) { ret opt_opened; }
+    var s:          Stage            = stage(r);
+    val opt_opened: opt[render.Exit] = opened(r, ?o.t);
+    if (sel opt_opened.some) {
+        targeted(r, ?s, nil);
+        ret opt_opened;
+    }
 
     val res_spoken: res[*dialect.Dialect, fail.Fail] = object.dialect_of(r.target.format, o.t.arch);
     if (sel res_spoken.err) {
         target.dnit(?o.t);
-        ret opt[render.Exit].some{refused_part(r, res_spoken.err)};
+        val exit: render.Exit = refused_part(r, res_spoken.err);
+        targeted(r, ?s, nil);
+        ret opt[render.Exit].some{exit};
     }
 
     o.format  = r.target.format;
     o.dialect = res_spoken.ok;
+    targeted(r, ?s, ?o.t);
     ret opt[render.Exit].none{};
 }
 
@@ -310,33 +512,35 @@ fun code_of(part: str) str {
 # the refusal `why` of a part of what the flags name, a syntax, mode flag, selection or format, or else of its storage
 pub fun refused_part(r: *Run, why: fail.Fail) render.Exit {
     if (sel why.refused.some) {
-        render.refused(?r.err, code_of(why.refused.some.part), why);
+        render.refused(error(r), code_of(why.refused.some.part), why);
         ret render.exit_of(why);
     }
     ret memory(r);
 }
 
-# the refusal `why` to assemble `src[0..len]`, the file `path`
+# the refusal `why` to assemble `src[0..len]`, the file `path`, one diagnostic with its cause beneath it
 pub fun refused_source(r: *Run, path: str, src: *u8, len: usize, why: *model.Refusal) {
+    val t: *text.Text = error(r);
     if (sel why.lacked.mode) {
-        render.mode(?r.err, "asm.mode", ?why.lacked.mode);
+        render.mode(t, "asm.mode", ?why.lacked.mode);
         ret;
     }
     var unmet: core_unmet.Unmet = core_unmet.nothing_unmet();
     if (sel why.lacked.unmet) { unmet = why.lacked.unmet; }
-    render.refusal(?r.err, "asm.refused", path, src, len, why.message, why.span, ?unmet);
-    if (sel why.cause.some) { render.failure(?r.err, "asm.cause", why.cause.some); }
+    render.refusal(t, "asm.refused", path, src, len, why.message, why.span, ?unmet);
+    if (sel why.cause.some) { render.failure(t, "asm.cause", why.cause.some); }
 }
 
 # the diagnostic `d` about `src[0..len]`, the file `path`, worded under `ctx`
 pub fun diagnosed(r: *Run, code: str, path: str, src: *u8, len: usize, ctx: *state.Context, d: *diagnostic.Diagnostic) {
-    render.begin(?r.err, code);
-    if (!r.err.failed) {
-        val err_spelled: err[A.Error] = core_unmet.spell_diagnostic(ctx, d, ?r.err.out);
-        if (sel err_spelled.err) { r.err.failed = true; }
+    val t: *text.Text = error(r);
+    render.begin(t, code);
+    if (!t.failed) {
+        val err_spelled: err[A.Error] = core_unmet.spell_diagnostic(ctx, d, ?t.out);
+        if (sel err_spelled.err) { t.failed = true; }
     }
-    text.byte(?r.err, '\n');
-    render.place(?r.err, path, src, len, d.span);
+    text.byte(t, '\n');
+    render.place(t, path, src, len, d.span);
 }
 
 # the file at `path` read whole into `out`, its refusal rendered and its exit returned
@@ -356,53 +560,23 @@ pub fun save_text(r: *Run, path: str, data: *u8, len: usize) render.Exit {
     ret render.SUCCESS;
 }
 
+# the size of the file at `path` as a log line's detail written into `t`, nil where it cannot be told
+pub fun sized(t: *layout.Text, path: str) str {
+    val res_meta: res[fs.Metadata, std_io_error.Error] = fs.metadata(path);
+    if (sel res_meta.err) { ret nil; }
+    ret layout.size(t, res_meta.ok.size::u64);
+}
+
 # the register of the target's set named `name` in its register file, without regard to case where the target's syntax
 # reads registers so, a refusal rendered as none
 pub fun register_named(r: *Run, t: *target.Target, name: str) opt[register.Id] {
     val file: *register.File = t.set.codec.registers;
     if (file == nil) {
-        render.quoted(?r.err, "cli.register", "the instruction set has no register file to name", name);
+        render.quoted(error(r), "cli.register", "the instruction set has no register file to name", name);
         ret opt[register.Id].none{};
     }
 
     val opt_named: opt[register.Id] = register.named(file, View{data: name, len: str_len(name)}, t.set.syntaxes.at[t.syntax].fold);
-    if (sel opt_named.none) { render.quoted(?r.err, "cli.register", "the instruction set has no register", name); }
+    if (sel opt_named.none) { render.quoted(error(r), "cli.register", "the instruction set has no register", name); }
     ret opt_named;
-}
-
-# the object `o` assembled from the file `path` written as a file of format `f` at `out`, which it releases, its counts
-# noted when `verbose`
-pub fun saved_object(r: *Run, formats: *mink_registry.Registry, o: *mink_object.Object, f: *mink_format.Format, path: str, out: str, verbose: bool) render.Exit {
-    val err_saved: err[fail.Fail] = object.save(formats, r.a, o, f, out);
-    var exit:      render.Exit    = render.SUCCESS;
-    if (sel err_saved.err) { exit = failed(r, "object.write", err_saved.err); }
-    or (verbose) {
-        text.put(?r.err, path);
-        text.put(?r.err, ": ");
-        report.count(?r.err, table.count[mink_object.Section](?o.sections), "section", "sections");
-        text.put(?r.err, ", ");
-        report.count(?r.err, table.count[mink_object.Symbol](?o.symbols), "symbol", "symbols");
-        text.put(?r.err, ", ");
-        report.count(?r.err, table.count[mink_object.Reloc](?o.relocs), "relocation", "relocations");
-        text.put(?r.err, ", written to ");
-        text.put(?r.err, out);
-        text.put(?r.err, " as ");
-        text.put(?r.err, f.name);
-        text.byte(?r.err, '\n');
-    }
-
-    mink_object.dnit(o);
-    ret exit;
-}
-
-# the verbose line of a command that wrote `len` bytes of text, `what` it is, made from the file `path` to the file `out`
-pub fun wrote_text(r: *Run, path: str, len: usize, what: str, out: str) {
-    text.put(?r.err, path);
-    text.put(?r.err, ": ");
-    report.size(?r.err, len);
-    text.put(?r.err, " of ");
-    text.put(?r.err, what);
-    text.put(?r.err, ", written to ");
-    text.put(?r.err, out);
-    text.byte(?r.err, '\n');
 }

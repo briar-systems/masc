@@ -38,8 +38,13 @@ anywhere.
 ```
 
 ```
-$ masc assemble ext.s -t linux-aarch64 -o ext.o -v
-ext.s: 1 section, 1 symbol, 0 relocations, written to ext.o as elf
+$ masc assemble ext.s -t linux-aarch64 -o ext.o
+assembled ext.s
+  target    linux-aarch64
+  sections  1
+  symbols   1
+  time      2.3ms
+  output    ext.o
 $ masc disassemble ext.o -t linux-aarch64 --isa armv8.1-a+crc
 	.section .text, "ax", @progbits
 	.balign 4
@@ -150,8 +155,14 @@ table:
 ```
 
 ```
-$ masc assemble a.s -t linux-aarch64 -o a.o -v
-a.s: 2 sections, 5 symbols, 4 relocations, written to a.o as elf
+$ masc assemble a.s -t linux-aarch64 -o a.o
+assembled a.s
+  target       linux-aarch64
+  sections     2
+  symbols      5
+  relocations  4
+  time         2.1ms
+  output       a.o
 ```
 
 The text holds `R_AARCH64_ADR_PREL_PG_HI21` and `R_AARCH64_ADD_ABS_LO12_NC`

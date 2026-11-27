@@ -43,8 +43,25 @@ pop:
 
 ```
 $ masc assemble b.s -t linux-riscv32 --abi ilp32 --isa rv32imac -o b2.o -vv
-note[target] linux-riscv32, abi ilp32, isa rv32imac, format elf
-b.s: 1 section, 2 symbols, 0 relocations, written to b2.o as elf
+[  0.00] target       91us  linux-riscv32
+                            isa         rv32imac_zmmul_zaamo_zalrsc_zca
+                            sys         linux
+                            env         none
+                            abi         ilp32
+                            code_model  medany
+                            linkage     static
+                            object      elf
+                            syntax      riscv
+[  0.00] parse       306us  7 lines
+[  0.00] layout      2.1us  1 section
+[  0.00] encode       64us  10 B
+[  0.00] write       1.5ms  552 B
+assembled b.s
+  target    linux-riscv32
+  sections  1
+  symbols   2
+  time      2.1ms
+  output    b2.o
 $ masc disassemble b2.o -t linux-riscv32 --abi ilp32 --isa rv32imac -q
 	.globl pop
 	.section .text, "ax", @progbits
@@ -124,8 +141,14 @@ factor:
 ```
 
 ```
-$ masc assemble a.s -t linux-riscv64 -o a.o -v
-a.s: 2 sections, 8 symbols, 10 relocations, written to a.o as elf
+$ masc assemble a.s -t linux-riscv64 -o a.o
+assembled a.s
+  target       linux-riscv64
+  sections     2
+  symbols      8
+  relocations  10
+  time         1.8ms
+  output       a.o
 ```
 
 The ten relocations are `R_RISCV_HI20`, `R_RISCV_LO12_I`,
@@ -137,6 +160,8 @@ holds a `.riscv.attributes` section.
 
 ```
 $ masc disassemble a.o -t linux-riscv64
+note[disasm.unwritten] the text does not state trait riscv-arch rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zca1p0_zcd1p0, which the selection --isa names gives the assembler again (a.o)
+
 	.globl scale
 	.type scale, @function
 	.size scale, 36
@@ -163,7 +188,6 @@ full:
 	.balign 4
 factor:
 	.byte 0x03, 0x00, 0x00, 0x00
-note[disasm.unwritten] the text does not state trait riscv-arch rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zca1p0_zcd1p0, which the selection --isa names gives the assembler again (a.o)
 ```
 
 ## Targets

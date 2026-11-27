@@ -1,0 +1,264 @@
+# the work assemble, inline and listing share as stages of the run's log: a source read and parsed,
+# its builder's layout and encoding, and the object written with the `assembled` result
+#
+# the parse stage runs from reading the file to the assembler's finish, less the time the builder
+# measured laying out and encoding, which close as the layout and encode stages after it. a
+# refusal of the finish is counted on encode where encoding began, and on layout before.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use chrono_duration: std.chrono.duration;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.store;
+use mink.base.table;
+use mink_registry: mink.format.registry;
+use mink_object:   mink.model.object;
+
+use masc.asm;
+use masc.asm.cfi;
+use masc.asm.line;
+use masc.asm.model;
+use masc.asm.seh;
+use masc.build;
+use build_refusal: masc.build.refusal;
+use masc.build.stats;
+use masc.cli.context;
+use masc.cli.context.Run;
+use masc.cli.layout;
+use masc.cli.log;
+use masc.core.diagnostic;
+use masc.tool.object;
+use masc.tool.render;
+use masc.tool.target;
+
+# an assembly under way, which stays where it is from `init` to `dnit`, its layers pointing into it
+# ---
+# lines:  the line directives' state, `over` its layer
+# frames: the call frame directives' state, `framed` its layer
+# codes:  the windows unwind directives' state, `coded` its layer
+# layers: the three layers over the assembly, in the order they are read
+# stats:  what the builder measured of laying out and encoding
+# parse:  the parse stage, begun as the source is read
+# source: the source's bytes, once `loaded`
+pub rec Assembly {
+    lines:  line.Context;
+    over:   model.Layer;
+    frames: cfi.Text;
+    framed: model.Layer;
+    codes:  seh.Text;
+    coded:  model.Layer;
+    layers: [3]*model.Layer;
+    stats:  stats.Stats;
+    parse:  context.Stage;
+    source: vector.Vector[u8];
+    loaded: bool;
+}
+
+# an assembly made in `a` with the line, call frame and windows unwind directives layered over it, nothing read yet
+pub fun init(r: *Run, a: *Assembly) {
+    a.lines     = line.init(r.a);
+    a.over      = line.layer(?a.lines);
+    a.frames    = cfi.make();
+    a.framed    = cfi.layer(?a.frames);
+    a.codes     = seh.make();
+    a.coded     = seh.layer(?a.codes);
+    a.layers[0] = ?a.over;
+    a.layers[1] = ?a.framed;
+    a.layers[2] = ?a.coded;
+    a.stats     = stats.Stats{layout: 0, encode: 0};
+    a.parse     = context.stage(r);
+    a.loaded    = false;
+}
+
+# everything the assembly holds given back, after the assembler its layers serve
+pub fun dnit(a: *Assembly) {
+    line.dnit(?a.lines);
+    if (a.loaded) { vector.dnit[u8](?a.source); }
+}
+
+# the layers over the assembly, as an assembler takes them
+pub fun layers(a: *Assembly) model.Layers {
+    ret model.Layers{at: ?a.layers[0], len: 3};
+}
+
+# the file at `path` read whole into the assembly as its parse stage begins, the stage closed on a refusal
+pub fun load(r: *Run, a: *Assembly, path: str) render.Exit {
+    a.parse = context.stage(r);
+    val exit: render.Exit = context.load(r, path, ?a.source);
+    if (exit != render.SUCCESS) {
+        unparsed(r, a);
+        ret exit;
+    }
+
+    a.loaded = true;
+    ret render.SUCCESS;
+}
+
+# the parse stage closed on the refusals rendered within it
+pub fun unparsed(r: *Run, a: *Assembly) {
+    context.closed(r, ?a.parse, "parse", nil);
+}
+
+# the source's lines as a log line's detail, a last line without its newline counted, written into `t`
+fun lines(t: *layout.Text, a: *Assembly) str {
+    var n: u64   = 0;
+    var i: usize = 0;
+    for (i < a.source.len) {
+        if (a.source.data[i] == '\n') { n = n + 1; }
+        i = i + 1;
+    }
+    if (a.source.len > 0 && a.source.data[a.source.len - 1] != '\n') { n = n + 1; }
+    ret layout.counted(t, n, "line", "lines");
+}
+
+# the source assembled by the target's set into the module the dialect's text states whole, in one step as the parse
+# stage, which closes then, into `out`
+pub fun printed(r: *Run, a: *Assembly, o: *context.Output, formats: *mink_registry.Registry, path: str, out: *mink_object.Object) render.Exit {
+    val res_built: res[mink_object.Object, model.Refusal] = asm.assembled(r.a, o.t.set, ?o.t.context, target.assembler(?o.t, formats, o.dialect, layers(a), path), a.source.data, a.source.len, diagnostic.START);
+    if (sel res_built.err) {
+        context.refused_source(r, path, a.source.data, a.source.len, ?res_built.err);
+        unparsed(r, a);
+        ret render.USER;
+    }
+
+    var lt: layout.Text;
+    context.closed(r, ?a.parse, "parse", lines(?lt, a));
+    @out = res_built.ok;
+    ret render.SUCCESS;
+}
+
+# an assembler over the target's set and the layers `l` made into `m`, its builder measured, as the parse stage goes on,
+# the stage closed on a refusal
+pub fun begun(r: *Run, a: *Assembly, o: *context.Output, formats: *mink_registry.Registry, path: str, l: model.Layers, m: *model.Assembler) render.Exit {
+    val res_made: res[model.Assembler, model.Refusal] = asm.init(r.a, o.t.set, ?o.t.context, target.assembler(?o.t, formats, o.dialect, l, path));
+    if (sel res_made.err) {
+        context.refused_source(r, path, a.source.data, a.source.len, ?res_made.err);
+        unparsed(r, a);
+        ret render.USER;
+    }
+
+    @m = res_made.ok;
+    build.measure(model.builder(m), ?a.stats);
+    ret render.SUCCESS;
+}
+
+# the source read by `m` over the target's set into its builder as the parse stage goes on, the stage closed on a
+# refusal
+pub fun read(r: *Run, a: *Assembly, o: *context.Output, m: *model.Assembler, path: str) render.Exit {
+    val err_ran: err[model.Refusal] = asm.read(m, o.t.set, a.source.data, a.source.len, diagnostic.START);
+    if (sel err_ran.err) {
+        context.refused_source(r, path, a.source.data, a.source.len, ?err_ran.err);
+        unparsed(r, a);
+        ret render.USER;
+    }
+    ret render.SUCCESS;
+}
+
+# a stage's time from what the builder measured, in nanoseconds
+fun measured(n: u64) chrono_duration.Duration {
+    ret n::chrono_duration.Duration;
+}
+
+# the assembler `m`, its source read, finished into its builder's object, which `m` keeps: the parse stage closed, then
+# the layout and encode stages as the builder measured them, a refusal counted on the stage it came in
+pub fun finish(r: *Run, a: *Assembly, m: *model.Assembler, path: str) res[*mink_object.Object, render.Exit] {
+    val res_finished: res[*mink_object.Object, model.Refusal] = model.finish(m);
+    val laid:         chrono_duration.Duration                = measured(a.stats.layout);
+    val made:         chrono_duration.Duration                = measured(a.stats.encode);
+    var parsed:       chrono_duration.Duration                = log.elapsed(a.parse.from) - laid - made;
+    if (parsed < 0) { parsed = 0; }
+
+    var lt: layout.Text;
+    context.spent(r, ?a.parse, "parse", parsed, laid + made, lines(?lt, a));
+
+    var laying: context.Stage = context.stage(r);
+    if (sel res_finished.err) {
+        if (made == 0) {
+            context.refused_source(r, path, a.source.data, a.source.len, ?res_finished.err);
+            context.spent(r, ?laying, "layout", laid, 0, nil);
+            ret res[*mink_object.Object, render.Exit].err{render.USER};
+        }
+        context.spent(r, ?laying, "layout", laid, made, nil);
+        var encoding: context.Stage = context.stage(r);
+        context.refused_source(r, path, a.source.data, a.source.len, ?res_finished.err);
+        context.spent(r, ?encoding, "encode", made, 0, nil);
+        ret res[*mink_object.Object, render.Exit].err{render.USER};
+    }
+
+    val o:  *mink_object.Object = res_finished.ok;
+    var st: layout.Text;
+    context.spent(r, ?laying, "layout", laid, made, layout.counted(?st, table.count[mink_object.Section](?o.sections)::u64, "section", "sections"));
+    var encoding: context.Stage = context.stage(r);
+    var bt:       layout.Text;
+    context.spent(r, ?encoding, "encode", made, 0, layout.size(?bt, encoded(o)));
+    ret res[*mink_object.Object, render.Exit].ok{o};
+}
+
+# the bytes of every section of `o`
+fun encoded(o: *mink_object.Object) u64 {
+    val n:     usize = table.count[mink_object.Section](?o.sections);
+    var total: u64   = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        val s:     *mink_object.Section = table.at[mink_object.Section](?o.sections, table.nth[mink_object.Section](i));
+        val bytes: store.Bytes          = mink_object.bytes(o, ?s.contents);
+        total = total + bytes.len::u64;
+        i     = i + 1;
+    }
+    ret total;
+}
+
+# the object `m`'s builder finished, handed over into `out`, a refusal rendered
+pub fun taken(r: *Run, a: *Assembly, m: *model.Assembler, path: str, out: *mink_object.Object) render.Exit {
+    val res_taken: res[mink_object.Object, build_refusal.Refusal] = build.take(model.builder(m));
+    if (sel res_taken.err) {
+        var why: model.Refusal = model.refused_build(res_taken.err);
+        context.refused_source(r, path, a.source.data, a.source.len, ?why);
+        ret render.USER;
+    }
+
+    @out = res_taken.ok;
+    ret render.SUCCESS;
+}
+
+# the object `file` written as a file of the target's format at `out` as the write stage, which it releases, and the
+# `assembled` result: the target, the object's sections, symbols and relocations, the warnings, the time and the output
+pub fun written(r: *Run, formats: *mink_registry.Registry, o: *context.Output, file: *mink_object.Object, out: str) render.Exit {
+    var s:         context.Stage  = context.stage(r);
+    val err_saved: err[fail.Fail] = object.save(formats, r.a, file, o.format, out);
+    if (sel err_saved.err) {
+        val exit: render.Exit = context.failed(r, "object.write", err_saved.err);
+        context.closed(r, ?s, "write", nil);
+        mink_object.dnit(file);
+        ret exit;
+    }
+
+    var zt: layout.Text;
+    context.closed(r, ?s, "write", context.sized(?zt, out));
+
+    var ct:     layout.Text;
+    var yt:     layout.Text;
+    var lt:     layout.Text;
+    var wt:     layout.Text;
+    var dt:     layout.Text;
+    var fields: [7]layout.Field = [7]layout.Field{
+        layout.Field{key: "target", value: context.named(r)},
+        layout.Field{key: "sections", value: layout.nonzero(?ct, table.count[mink_object.Section](?file.sections)::u64)},
+        layout.Field{key: "symbols", value: layout.nonzero(?yt, table.count[mink_object.Symbol](?file.symbols)::u64)},
+        layout.Field{key: "relocations", value: layout.nonzero(?lt, table.count[mink_object.Reloc](?file.relocs)::u64)},
+        layout.Field{key: "warnings", value: context.warned(r, ?wt)},
+        layout.Field{key: "time", value: context.took(r, ?dt)},
+        layout.Field{key: "output", value: layout.shown_path(out)},
+    };
+    context.result(r, layout.ASSEMBLED, ?fields[0], 7);
+    mink_object.dnit(file);
+    ret render.SUCCESS;
+}
