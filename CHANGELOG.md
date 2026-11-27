@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-27
+
 ### Changed
 
 - The command line writes mach's output: each command ends in a result block on stdout naming its verb and subject (`assembled`, `disassembled`, `listed`, `verified`, or `failed` once its work began and was refused), with its fields beneath and zero fields left out (#714).
