@@ -59,8 +59,12 @@ in that register, read and written, its constraint the register's class.
 ```
 
 ```
-$ masc inline blk.s -t linux-x86_64 --operand acc=rax --operand step=rcx -o blk.o -v
-blk.s: 1 section, 0 symbols, 0 relocations, written to blk.o as elf
+$ masc inline blk.s -t linux-x86_64 --operand acc=rax --operand step=rcx -o blk.o
+assembled blk.s
+  target    linux-x86_64
+  sections  1
+  time      2.6ms
+  output    blk.o
 $ masc disassemble blk.o -t linux-x86_64
 	.section .text, "ax", @progbits
 	add rax, rcx
@@ -81,11 +85,21 @@ error[inline.refused] the instruction does not admit every value of this operand
   @ blk.s:1:16
 1 |     add {acc}, {step}
   |                ^^^^^^
+
+failed blk.s
+  target  linux-x86_64
+  errors  1
+  time    611us
 $ masc inline blk.s -t linux-x86_64 --operand acc=rax -o blk3.o
 error[inline.refused] the block declares no operand of this name
   @ blk.s:1:16
 1 |     add {acc}, {step}
   |                ^^^^^^
+
+failed blk.s
+  target  linux-x86_64
+  errors  1
+  time    504us
 $ masc inline blk.s -t linux-x86_64 --operand acc -o blk3.o
 error[inline.operand] an operand is declared as name=register, not 'acc'
 $ masc inline blk.s -t linux-x86_64 --operand acc=r99 -o blk3.o
@@ -99,6 +113,10 @@ Raw bytes with the registers they write:
 ```
 
 ```
-$ masc inline raw.s -t linux-x86_64 -o raw.o -v
-raw.s: 1 section, 0 symbols, 0 relocations, written to raw.o as elf
+$ masc inline raw.s -t linux-x86_64 -o raw.o
+assembled raw.s
+  target    linux-x86_64
+  sections  1
+  time      1.4ms
+  output    raw.o
 ```

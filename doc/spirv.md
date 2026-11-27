@@ -54,9 +54,15 @@ OpFunctionEnd
 ```
 
 ```
-$ masc assemble b.spvasm -t vulkan-spirv -o b.spv -v
-b.spvasm: 1 section, 0 symbols, 0 relocations, written to b.spv as spirv
+$ masc assemble b.spvasm -t vulkan-spirv -o b.spv
+assembled b.spvasm
+  target    vulkan-spirv
+  sections  1
+  time      2.4ms
+  output    b.spv
 $ masc disassemble b.spv -t vulkan-spirv
+note[disasm.unwritten] the text does not state trait spirv-version 1.6, which only a source states (b.spv)
+
 	OpCapability Shader
 	OpCapability Float64
 	OpMemoryModel Logical GLSL450
@@ -73,7 +79,6 @@ $ masc disassemble b.spv -t vulkan-spirv
 	%8 = OpLabel
 	OpReturn
 	OpFunctionEnd
-note[disasm.unwritten] the text does not state trait spirv-version 1.6, which only a source states (b.spv)
 ```
 
 The printer writes every id by its number, so its text reads back to the
