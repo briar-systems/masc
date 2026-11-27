@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-27
+
+### Changed
+
+- Requires mink `^0.2.0` and builds against mink 0.2.0, where 0.2.1 required `^0.1.0`.
+
+### Fixed
+
+- masc builds for a host whose `usize` is 32 bits: `masc.walk`'s `NO_OFFSET` is `usize`'s own all-ones and `masc.isa.wasm.object` holds a reserved pool index as the `usize` it is (#719).
+
 ## [0.2.1] - 2026-11-27
 
 ### Changed
