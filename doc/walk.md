@@ -59,10 +59,14 @@ a secret unless an `--access` seed says it reads public data.
 
 | outcome            | output                                                  | exit |
 |--------------------|---------------------------------------------------------|------|
-| clear              | `<file>: <symbol>: constant time` on stdout              | 0    |
-| unguaranteed       | `<file>: <symbol>: constant time but for the timing of its instructions` and a `warning[walk.unguaranteed]` | 0 |
-| refused            | `error[walk.refused] <why>` and `@ <file>, <symbol> + <offset>` | 1 |
-| unread             | `error[walk.unread] <why>` at the offset no row decodes  | 1    |
+| clear              | a `verified <symbol>` result on stdout                  | 0    |
+| unguaranteed       | a `warning[walk.unguaranteed]` and a `verified <symbol>` result | 0 |
+| refused            | `error[walk.refused] <why>` and `@ <file>, <symbol> + <offset>`, then a `failed <symbol>` result | 1 |
+| unread             | `error[walk.unread] <why>` at the offset no row decodes, then a `failed <symbol>` result | 1 |
+
+A result names the function, then the target, the object, the warnings and the
+time, as every command's does (see [command line](command-line.md#output)).
+`-v` logs the `target`, `read` and `walk` stages.
 
 ## RISC-V example
 
@@ -93,6 +97,11 @@ Without `zkt` no RISC-V row's timing is independent of its data:
 $ masc walk ctrv.o -t linux-riscv64 --symbol select --secret a0
 error[walk.refused] secret value in an input the instruction's timing depends on (needs zkt)
   @ ctrv.o, select + 0
+
+failed select
+  target  linux-riscv64
+  errors  1
+  time    1.0ms
 ```
 
 With `zkt` in the selection, the branch-free select is clear and the branch
@@ -101,17 +110,28 @@ is refused:
 ```
 $ masc assemble ctrv.s -t linux-riscv64 --ext zkt -o ctrvz.o
 $ masc walk ctrvz.o -t linux-riscv64 --ext zkt --symbol select --secret a0
-ctrvz.o: select: constant time
+verified select
+  target  linux-riscv64
+  object  ctrvz.o
+  time    722us
 $ masc walk ctrvz.o -t linux-riscv64 --ext zkt --symbol leaky --secret a0
 error[walk.refused] control transfer decided by a secret value
   @ ctrvz.o, leaky + 0
+
+failed leaky
+  target  linux-riscv64
+  errors  1
+  time    698us
 ```
 
 With no seed, `leaky` is clear:
 
 ```
 $ masc walk ctrvz.o -t linux-riscv64 --ext zkt --symbol leaky
-ctrvz.o: leaky: constant time
+verified leaky
+  target  linux-riscv64
+  object  ctrvz.o
+  time    707us
 ```
 
 ## Access seeds
@@ -135,8 +155,16 @@ that load reads public data clears the function:
 $ masc walk acc.o -t linux-riscv64 --ext zkt --symbol check
 error[walk.refused] control transfer decided by a secret value
   @ acc.o, check + 2
+
+failed check
+  target  linux-riscv64
+  errors  1
+  time    954us
 $ masc walk acc.o -t linux-riscv64 --ext zkt --symbol check --access 0:1=public
-acc.o: check: constant time
+verified check
+  target  linux-riscv64
+  object  acc.o
+  time    703us
 ```
 
 ## Memory addresses
@@ -156,6 +184,11 @@ lookup:
 $ masc walk ct.o -t linux-x86_64 --symbol lookup --secret rdi
 error[walk.refused] memory access whose address or length is formed from a secret value
   @ ct.o, lookup + 0
+
+failed lookup
+  target  linux-x86_64
+  errors  1
+  time    524us
 ```
 
 ## Timing state
@@ -170,6 +203,11 @@ states `--state doitm=on`:
 $ masc walk ct.o -t linux-x86_64 --symbol select --secret rdi
 error[walk.refused] secret value in an input the instruction's timing depends on (needs doitm=on)
   @ ct.o, select + 0
+
+failed select
+  target  linux-x86_64
+  errors  1
+  time    490us
 ```
 
 The walk does not follow a switch the code makes. On AArch64 a function that
@@ -189,6 +227,11 @@ select:
 $ masc walk ct64.o -t linux-aarch64 --isa armv8.4-a --symbol select --secret x0
 error[walk.refused] secret value in an input the instruction's timing depends on (needs dit=on)
   @ ct64.o, select + 4
+
+failed select
+  target  linux-aarch64
+  errors  1
+  time    903us
 ```
 
 With `--state dit=on` that row is classified under `dit=on`. A value that names no axis of the target, or

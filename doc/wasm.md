@@ -48,8 +48,12 @@ and a memory's page size.
 ```
 
 ```
-$ masc assemble a.wat -t wasi-wasm32 -o a.wasm -v
-a.wat: 3 sections, 0 symbols, 0 relocations, written to a.wasm as wasm
+$ masc assemble a.wat -t wasi-wasm32 -o a.wasm
+assembled a.wat
+  target    wasi-wasm32
+  sections  3
+  time      1.6ms
+  output    a.wasm
 $ masc disassemble a.wasm -t wasi-wasm32
 (module
   (type (func (param i32 i32) (result i32)))
@@ -115,6 +119,11 @@ error[asm.refused] the selection does not admit the instruction (needs sign-ext)
   @ s.wat:1:40
 1 | (module (func (result i64) i64.const 1 i64.extend32_s))
   |                                        ^^^^^^^^^^^^^^
+
+failed s.wat
+  target  wasi-wasm32
+  errors  1
+  time    167us
 ```
 
 `--isa wasm2` or `--ext sign-ext` admits it.

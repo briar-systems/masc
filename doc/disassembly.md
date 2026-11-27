@@ -42,9 +42,9 @@ the ones the object holds. A statement that does not read back is printed as
 data, never as a guessed instruction.
 
 ```
-$ masc assemble b.s -t linux-x86_64 -o b.o
-$ masc disassemble b.o -t linux-x86_64 -o b2.s
-$ masc assemble b2.s -t linux-x86_64 -o b2.o
+$ masc assemble b.s -t linux-x86_64 -o b.o -q
+$ masc disassemble b.o -t linux-x86_64 -o b2.s -q
+$ masc assemble b2.s -t linux-x86_64 -o b2.o -q
 ```
 
 `b.o` and `b2.o` hold the same section bytes and the same relocations. The

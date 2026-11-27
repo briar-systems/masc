@@ -47,14 +47,42 @@ adds one extension to it:
 
 ```
 $ masc assemble avx.s -t linux-x86_64 -o avx.o
-error[asm.refused] the selection does not make this register available (needs avx)
-  @ avx.s:3:12
+error[asm.refused] the selection does not admit the instruction (needs avx)
+  @ avx.s:3:5
 3 |     vaddps ymm0, ymm0, ymm1
-  |            ^^^^
+  |     ^^^^^^
+
+failed avx.s
+  target  linux-x86_64
+  errors  1
+  time    760us
 $ masc assemble avx.s -t linux-x86_64 --ext avx -o avx.o
+assembled avx.s
+  target    linux-x86_64
+  sections  1
+  symbols   1
+  time      3.3ms
+  output    avx.o
 $ masc assemble avx.s -t linux-x86_64 --isa x86-64-v3 -o avx.o -vv
-note[target] linux-x86_64, abi sysv64, isa cx8,cmov,x87,fxsr,osfxsr,mmx,sce,sse,sse2,sse3,ssse3,sse41,sse42,cx16,lahf,popcnt,movbe,xsave,osxsave,bmi1,bmi2,lzcnt,avx,f16c,fma,avx2, format elf
-avx.s: 1 section, 1 symbol, 0 relocations, written to avx.o as elf
+[  0.00] target       89us  linux-x86_64
+                            isa         cx8,cmov,x87,fxsr,osfxsr,mmx,sce,sse,sse2,sse3,ssse3,sse41,sse42,cx16,lahf,popcnt,movbe,xsave,osxsave,bmi1,bmi2,lzcnt,avx,f16c,fma,avx2
+                            sys         linux
+                            env         none
+                            abi         sysv64
+                            code_model  small
+                            linkage     static
+                            object      elf
+                            syntax      intel
+[  0.00] parse       688us  3 lines
+[  0.00] layout      3.5us  1 section
+[  0.00] encode       23us  4 B
+[  0.00] write       2.5ms  480 B
+assembled avx.s
+  target    linux-x86_64
+  sections  1
+  symbols   1
+  time      3.4ms
+  output    avx.o
 ```
 
 The refusal names what is missing in parentheses, as `(needs avx)`,
