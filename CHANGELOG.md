@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-28
+
+### Fixed
+
+- The x86 table stated the destination of register-to-register `movss` and `movsd` as written whole, where the instruction keeps the bits above its result. A code generator reading the table took the destination's old value as dead, so mirl could place a reload feeding a lane insert in a live vector's register: a scalar float held in a stack slot and then written to lane 0 of a float vector came out with the vector's other lanes zeroed. Every earlier masc release has it. The generator now classifies every register operand it writes by what it leaves in the rest of its register: kept, which makes the operand read-write, zeroed, which the write states, or neither, which it refuses to generate. `extrq` and `insertq`, whose destination is also their source, are read-write as well, and so are the destinations of EVEX instructions that may merge under a mask (2683 rows) and of the 48 gathers. No aarch64, riscv, wasm or SPIR-V row changes, and every encoding is unchanged. A committed snapshot of every read-write row, checked by `mach test . -a masc` in CI, guards the table against a later regeneration (#723).
+
 ## [0.2.2] - 2026-11-27
 
 ### Changed
