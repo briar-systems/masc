@@ -79,6 +79,8 @@ pub val NO_ROW:      str = "registers line names no row of masc's x86 register f
 pub val BAD_ALIAS:   str = "registers line is not `<XED register> | <row>`";
 pub val BAD_KNOB:    str = "knobs line is not `<XED field> | <value>`";
 pub val NO_KNOB:     str = "knobs line names no field XED states";
+pub val NARROW:      str = "register write narrower than its register, of a class or space no rule states the rest of";
+pub val UNMASKED:    str = "opmask governs a register write it neither merges into nor zeroes";
 
 # the overlay topic naming the XED registers of no row of their own name
 pub val REGISTERS_TOPIC: str = "xed-registers";
@@ -276,6 +278,8 @@ pub val IS4:   Place = 6;
 # ---
 # name:      the row's name
 # class:     its class's name
+# kind:      its class's kind, as masc.core.register names it
+# bits:      its class's width, 0 for a class as wide as the code, as cr0
 # order:     its class's place among the classes, the row index of the class's first row
 # number:    its number in its class
 # row:       its index in the file's rows
@@ -285,6 +289,8 @@ pub val IS4:   Place = 6;
 pub rec Named {
     name:      str;
     class:     str;
+    kind:      str;
+    bits:      u32;
     order:     u32;
     number:    u32;
     row:       u32;
@@ -341,6 +347,7 @@ pub val DFV:      What = 10;
 #            is u8 and `IMM0:r:b:i8` i8
 # address:   whether a RELATIVE operand names an address the instruction may reach rather than its branch's target, as
 #            xbegin's abort handler, which the targets topic states
+# zeroes:    whether a REGISTER operand's write fills only its low `width` bits of the register and zeroes the rest
 pub rec Operand {
     what:      What;
     role:      operand.Role;
@@ -357,6 +364,7 @@ pub rec Operand {
     overrides: bool;
     unsigned:  bool;
     address:   bool;
+    zeroes:    bool;
 }
 
 # what an implied names
@@ -1284,12 +1292,90 @@ fun operand_make() Operand {
     o.overrides = false;
     o.unsigned  = false;
     o.address   = false;
+    o.zeroes    = false;
     ret o;
 }
 
 fun push_operand(f: *Form, o: Operand, name: str) err[diag.Refusal] {
     if (!pushed(vector.push[Operand](?f.operands, o))) { ret err[diag.Refusal].err{memory(name)}; }
     ret err[diag.Refusal].ok{};
+}
+
+# what an evex opmask leaves in the elements it masks off
+# ---
+# UNMASKED_FORM: no opmask governs the form
+# MERGES:        it may keep them: its `{z}` is optional, so merging is the default, or it is never k0 and admits no
+#                `{z}`, as a gather's, which leaves the elements it does not load as they were (Intel SDM 325462-093US
+#                Vol 2C VGATHERDPS, "elements whose mask bit is clear are left unchanged")
+# ZEROES:        it zeroes them: it admits no `{z}` and may be k0, as a compare into an opmask, whose result bits it
+#                masks off are 0 (Intel SDM 325462-093US Vol 2A CMPPS, "zeroing-masking only")
+pub def Masking: u8;
+
+pub val UNMASKED_FORM: Masking = 0;
+pub val MERGES:        Masking = 1;
+pub val ZEROES:        Masking = 2;
+
+# what the opmask operand `op` leaves in the elements it masks off
+fun masking_of(op: *xed_operand.Operand) Masking {
+    if (has_conversion(op, "ZEROSTR") || str_equals(op.value, "MASKNOT0")) { ret MERGES; }
+    ret ZEROES;
+}
+
+# what a register write leaves in the rest of its register, past the bits it writes
+# ---
+# WHOLE:  there is no rest: the write covers the register
+# KEPT:   the rest may keep its old value, so the write reads it as well (masc.core.operand.Role)
+# ZEROED: the rest is zeroed, which the operand's write states (masc.core.operand.Write)
+pub def Rest: u8;
+
+pub val WHOLE:  Rest = 0;
+pub val KEPT:   Rest = 1;
+pub val ZEROED: Rest = 2;
+
+# the register writes of `f` stated as what they leave in the rest of their register. XED's `w` states only that an
+# operand is written, so a write narrower than its register or one an opmask governs is a read as well where it may
+# keep some of the register, and states the rest zeroed where the space zeroes it, each refused where no rule states
+# which
+fun kept_writes(ins: *xed_instruction.Instruction, f: *Form, masking: Masking) err[diag.Refusal] {
+    var i: usize = 0;
+    for (i < f.operands.len) {
+        val o: *Operand = ?f.operands.data[i];
+        i = i + 1;
+        if (o.what != REGISTER || o.role != operand.WRITE || o.place == MASK) { cnt; }
+        val res_rest: res[Rest, diag.Refusal] = rest_of(ins, f, o, masking);
+        if (sel res_rest.err)      { ret err[diag.Refusal].err{res_rest.err}; }
+        if (res_rest.ok == KEPT)   { o.role = operand.READ_WRITE; }
+        if (res_rest.ok == ZEROED) { o.zeroes = true; }
+    }
+    ret err[diag.Refusal].ok{};
+}
+
+# what the write of register operand `o` of `f` leaves in the rest of its register. an opmask that merges keeps the
+# elements it masks off. a write narrower than its register keeps the rest in the legacy space's vector registers, as
+# movss's of xmm (Intel SDM 325462-093US Vol 2B MOVSS, "bits (MAXVL-1:32) of the destination are unmodified"), and
+# zeroes it in the vex, evex and xop spaces, as vcvtps2ph's (Vol 2C VCVTPS2PH, "bits (MAXVL-1:64) of the destination
+# are zeroed"). a legacy write narrower than its register that reads it, as sse4a's extrq and insertq whose destination
+# is also their source (AMD APM 24594 3.38 EXTRQ and INSERTQ), is read either way. a general register written narrower
+# is a register of a narrower class, whose extension the register file states, so its operand is as wide as its class.
+# a tile written at no fixed width is written in the shape the tile configuration states and zeroed past it (Intel ISE
+# 319433-062 TILELOADD, "zero_upper_rows" and "zero_tileupper"), so the whole register
+fun rest_of(ins: *xed_instruction.Instruction, f: *Form, o: *Operand, masking: Masking) res[Rest, diag.Refusal] {
+    if (masking == MERGES) { ret res[Rest, diag.Refusal].ok{KEPT}; }
+    if (o.count == 0)      { ret res[Rest, diag.Refusal].err{lines.refuse(?ins.line, NARROW, ins.iclass)}; }
+    var k: u8 = 0;
+    for (k < o.count) {
+        val reg:  *Named = o.classes[k];
+        var bits: u32    = reg.bits;
+        k = k + 1;
+        if (bits == 0)                                             { bits = width_of(f.config.mode)::u32; }
+        if (o.width::u32 >= bits)                                  { cnt; }
+        if (o.width == 0 && str_equals(reg.kind, "register.TILE")) { cnt; }
+        if (masking == ZEROES)                                     { ret res[Rest, diag.Refusal].err{lines.refuse(?ins.line, UNMASKED, ins.iclass)}; }
+        if (!str_equals(reg.kind, "register.VECTOR"))              { ret res[Rest, diag.Refusal].err{lines.refuse(?ins.line, NARROW, ins.iclass)}; }
+        if (f.config.space == LEGACY)                              { ret res[Rest, diag.Refusal].ok{KEPT}; }
+        ret res[Rest, diag.Refusal].ok{ZEROED};
+    }
+    ret res[Rest, diag.Refusal].ok{WHOLE};
 }
 
 # the operands of `ins` under `s` into `f`, the bits its nonterminals took in `fx`
@@ -1305,9 +1391,10 @@ fun operands_of(r: *Reader, ins: *xed_instruction.Instruction, s: *State, fx: *E
         val err_push_operand: err[diag.Refusal] = push_operand(f, d, ins.iclass);
         if (sel err_push_operand.err) { ret err_push_operand; }
     }
-    var at:    vector.Vector[u8]    = vector.init[u8](r.alloc);
-    var later: vector.Vector[usize] = vector.init[usize](r.alloc);
-    var i:     usize                = 0;
+    var at:      vector.Vector[u8]    = vector.init[u8](r.alloc);
+    var later:   vector.Vector[usize] = vector.init[usize](r.alloc);
+    var masking: Masking              = UNMASKED_FORM;
+    var i:       usize                = 0;
     for (i < ins.operands.len) {
         if (!pushed(vector.push[u8](?at, field.NO_OPERAND))) { ret err[diag.Refusal].err{memory(ins.iclass)}; }
         i = i + 1;
@@ -1395,6 +1482,7 @@ fun operands_of(r: *Reader, ins: *xed_instruction.Instruction, s: *State, fx: *E
             val err_register_nt: err[diag.Refusal] = register_nt(r, op.value, s, ?o, ?ins.line);
             if (sel err_register_nt.err) { ret err_register_nt; }
             if (op.group > 1)            { o.numbers = o.numbers & grouped(op.group); }
+            if (o.place == MASK)         { masking = masking_of(op); }
             val opt_code:          opt[str]               = xed_operand.width(r.alloc, ?r.xed.tables, op);
             var res_yielded_width: res[u16, diag.Refusal] = yielded_width(r, op.value, s, ?ins.line);
             if (sel opt_code.some)         { res_yielded_width = width_bits(r, ins, op, f); }
@@ -1436,6 +1524,8 @@ fun operands_of(r: *Reader, ins: *xed_instruction.Instruction, s: *State, fx: *E
         }
         i = i + 1;
     }
+    val err_kept: err[diag.Refusal] = kept_writes(ins, f, masking);
+    if (sel err_kept.err) { ret err_kept; }
     if (rounds) {
         val err_push_operand: err[diag.Refusal] = push_operand(f, rc, ins.iclass);
         if (sel err_push_operand.err) { ret err_push_operand; }

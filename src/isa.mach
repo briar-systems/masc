@@ -10,6 +10,7 @@
 # tool runs `check` once, right after mink's `resolve`, reads its refusal as it
 # reads one of `resolve`, and keeps the closed selection it gives.
 
+use std.print;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -19,6 +20,7 @@ use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
+use std.allocator.page;
 
 use mink.base.fail;
 use mink_arch:   mink.catalog.arch;
@@ -26,6 +28,11 @@ use mink_target: mink.catalog.target;
 
 use masc.core.diagnostic;
 use masc.core.extension;
+use masc.core.index;
+use masc.core.operand;
+use masc.core.quantity;
+use masc.core.register;
+use masc.core.row;
 use masc.core.set;
 
 use aarch64_set: masc.isa.aarch64.set;
@@ -33,6 +40,8 @@ use riscv_set:   masc.isa.riscv.set;
 use spirv_set:   masc.isa.spirv.set;
 use wasm_set:    masc.isa.wasm.set;
 use x86_set:     masc.isa.x86.set;
+
+use masc.isa.x86.gen_encoding;
 
 # every registered instruction set
 val SETS: [5]*set.Set = [5]*set.Set{?riscv_set.SET, ?x86_set.SET, ?wasm_set.SET, ?spirv_set.SET, ?aarch64_set.SET};
@@ -181,4 +190,213 @@ pub fun check(a: *A.Allocator, t: *mink_target.Target) res[opt[Checked], fail.Fa
         ret res[opt[Checked], fail.Fail].err{refusal(mink_target.Part.isa{}, spelling, "the instruction set holds extensions that conflict", opt_none)};
     }
     ret res[opt[Checked], fail.Fail].err{refusal(mink_target.Part.isa{}, spelling, "the instruction set cannot hold the selection", opt_none)};
+}
+
+# every register write a row states as a write alone, narrower than its register, states what lies above its result,
+# so a write that keeps the rest of its register, which reads it, is never stated as one that does not, as x86 movss's
+# of xmm once was. a class as wide as a state's multiplier, as x86's cr0 or risc-v's x registers, has no width to be
+# narrower than, and a row that states no operand width, as aarch64's, states nothing this can compare
+test registry__narrow_writes_state_the_rest {
+    var failed: u32 = 0;
+    var s:      u32 = 0;
+    for (s < REGISTRY.count) {
+        val st: *set.Set = REGISTRY.sets[s];
+        s = s + 1;
+        if (st.codec == nil || st.codec.registers == nil) { cnt; }
+        val file: *register.File = st.codec.registers;
+        var i:    u32            = 0;
+        for (i < st.codec.rows.len) {
+            val r: *row.Row = ?st.codec.rows.at[i];
+            i = i + 1;
+            var k: u32 = 0;
+            for (k < r.operands.len) {
+                val o: *operand.Operand = ?r.operands.at[k];
+                k = k + 1;
+                if (!(sel o.shape.register))                                                       { cnt; }
+                if ((o.role & operand.READ) != 0 || (o.role & operand.WRITE) == 0 || o.width == 0) { cnt; }
+                var c: u32 = 0;
+                for (c < o.shape.register.classes.len) {
+                    val w: quantity.Scaled = file.classes[o.shape.register.classes.at[c]].width;
+                    c = c + 1;
+                    if (w.per != 0 || o.width::u32 >= w.fixed) { cnt; }
+                    val opt_narrowed: opt[operand.Narrowed] = operand.narrowed(?o.write, w.fixed::u64);
+                    if (sel opt_narrowed.some) {
+                        if (opt_narrowed.some.above == register.ZEROES || opt_narrowed.some.above == register.ONES) { cnt; }
+                    }
+                    print.eprintlnf("{} writes operand {} narrower than its register and states nothing above it", r.key, k - 1);
+                    failed = failed + 1;
+                }
+            }
+        }
+    }
+    if (failed != 0) { ret 1; }
+}
+
+#[testing]
+#[embed("isa/read_write.txt")]
+val READ_WRITE: [_]u8;
+
+# the bytes of `v` as the text `s`
+#[testing]
+fun spelled(v: View, s: str) u1 {
+    if (str_len(s) != v.len) { ret 0; }
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != s[i]) { ret 0; }
+        i = i + 1;
+    }
+    ret 1;
+}
+
+# the bytes of `v` as text in `buf`, cut to fit
+#[testing]
+fun text_of(v: View, buf: *[256]u8) str {
+    var n: usize = v.len;
+    if (n > 255) { n = 255; }
+    var i: usize = 0;
+    for (i < n) {
+        buf[0][i] = v.data[i];
+        i         = i + 1;
+    }
+    buf[0][n] = 0;
+    ret ?buf[0][0];
+}
+
+# the register operands of `r` both read and written, as bits
+#[testing]
+fun read_written(r: *row.Row) u32 {
+    var bits: u32 = 0;
+    var k:    u32 = 0;
+    for (k < r.operands.len) {
+        val o: *operand.Operand = ?r.operands.at[k];
+        if (sel o.shape.register && (o.role & operand.READ_WRITE) == operand.READ_WRITE) { bits = bits | (1::u32 << k); }
+        k = k + 1;
+    }
+    ret bits;
+}
+
+# the x86 rows whose twin reaches `reach` registers
+#[testing]
+fun twinned(reach: u8) u64 {
+    var n: u64 = 0;
+    var j: u64 = 0;
+    for (j < $length_of(gen_encoding.OPCODES)) {
+        if (gen_encoding.OPCODES[j].twin == reach) { n = n + 1; }
+        j = j + 1;
+    }
+    ret n;
+}
+
+# the next space-separated word of `t` from `at`, which moves past it and the spaces after it
+#[testing]
+fun word(t: *u8, len: usize, at: *usize) View {
+    val from: usize = @at;
+    for (@at < len && t[@at] != ' ' && t[@at] != '\n') { @at = @at + 1; }
+    val w: View = View{data: ?t[from], len: @at - from};
+    for (@at < len && t[@at] == ' ') { @at = @at + 1; }
+    ret w;
+}
+
+# a word of hex or decimal digits as a number
+#[testing]
+fun number_of(v: View, radix: u64) u64 {
+    var n: u64   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        val c: u8  = v.data[i];
+        var d: u64 = 0;
+        if (c >= '0' && c <= '9') { d = (c - '0')::u64; }
+        or (c >= 'a' && c <= 'f') { d = (c - 'a' + 10)::u64; }
+        n = n * radix + d;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# every row whose register operand is both read and written is the row `isa/read_write.txt` names with those operands,
+# and the x86 twin counts are the file's, so a regeneration that flips a role or loses a twin fails naming it. a
+# deliberate change edits the lines the failure names
+test registry__read_write_rows_hold {
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 2; }
+    var seen: [8]*u8;
+    var s:    u32 = 0;
+    for (s < REGISTRY.count) {
+        val st: *set.Set = REGISTRY.sets[s];
+        seen[s] = nil;
+        if (st.codec != nil && st.codec.registers != nil) {
+            val res_got: res[*u8, A.Error] = A.zallocate[u8](?a, st.codec.rows.len::usize);
+            if (sel res_got.err) { ret 2; }
+            seen[s] = res_got.ok;
+        }
+        s = s + 1;
+    }
+    val t:      *u8   = ?READ_WRITE[0];
+    val len:    usize = $length_of(READ_WRITE);
+    var failed: u32   = 0;
+    var at:     usize = 0;
+    for (at < len) {
+        if (t[at] == '#') {
+            for (at < len && t[at] != '\n') { at = at + 1; }
+            at = at + 1;
+            cnt;
+        }
+        val isa:  View = word(t, len, ?at);
+        val key:  View = word(t, len, ?at);
+        val bits: View = word(t, len, ?at);
+        at = at + 1;
+        if (spelled(isa, "twins") == 1) {
+            val reach: u64 = number_of(key, 10);
+            val want:  u64 = number_of(bits, 10);
+            val got:   u64 = twinned(reach::u8);
+            if (got != want) {
+                print.eprintlnf("x86 rows whose twin reaches {} are {}, the file states {}", reach, got, want);
+                failed = failed + 1;
+            }
+            cnt;
+        }
+        var found: u1  = 0;
+        var k:     u32 = 0;
+        for (k < REGISTRY.count && found == 0) {
+            val st: *set.Set = REGISTRY.sets[k];
+            k = k + 1;
+            if (seen[k - 1] == nil || spelled(isa, st.arches.at[0].arch.name) == 0) { cnt; }
+            found = 1;
+            val opt_row: opt[u32] = index.find_view(?st.codec.keys, key, 0);
+            if (sel opt_row.none) {
+                var buf: [256]u8;
+                print.eprintlnf("the file names {}, which {} no longer has", text_of(key, ?buf), st.arches.at[0].arch.name);
+                failed = failed + 1;
+                cnt;
+            }
+            val r: *row.Row = ?st.codec.rows.at[opt_row.some];
+            seen[k - 1][opt_row.some] = 1;
+            if (read_written(r)::u64 != number_of(bits, 16)) {
+                print.eprintlnf("{} reads and writes operands {:x}, the file states them as {:x}", r.key, read_written(r), number_of(bits, 16));
+                failed = failed + 1;
+            }
+        }
+        if (found == 0) {
+            var buf: [256]u8;
+            print.eprintlnf("the file names an architecture no set serves first, {}", text_of(isa, ?buf));
+            failed = failed + 1;
+        }
+    }
+    s = 0;
+    for (s < REGISTRY.count) {
+        val st: *set.Set = REGISTRY.sets[s];
+        s = s + 1;
+        if (seen[s - 1] == nil) { cnt; }
+        var i: u32 = 0;
+        for (i < st.codec.rows.len) {
+            val r: *row.Row = ?st.codec.rows.at[i];
+            if (seen[s - 1][i] == 0 && read_written(r) != 0) {
+                print.eprintlnf("{} reads and writes operands {:x}, which the file does not name", r.key, read_written(r));
+                failed = failed + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if (failed != 0) { ret 1; }
 }
